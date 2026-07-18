@@ -2,6 +2,8 @@
 
 Direct git commits, skip working copies — many writers, no merges, nothing lost.
 
+> **Status:** design-complete; v1 in development. The npm package is a name-hold placeholder — don't install it yet.
+
 ## Example
 
 ```ts
@@ -11,11 +13,13 @@ const store = await open({ repo: ".", ref: "refs/heads/main", writer: "worker-3"
 
 await store.apply(async (map) => {
   map.set("tasks/124-dark-mode.md", "# Dark mode\nstatus: open\n")
-  map.set("board.md", (await map.get("board.md")) + "- [ ] 124-dark-mode\n")
+  map.set("board.md", ((await map.get("board.md")) ?? "") + "- [ ] 124-dark-mode\n")
 }, "create task 124")
 ```
 
 Creates a task and updates the board — **one commit, both files or neither**. No checkout involved: writes are captured in memory and built straight into git's object database. If another writer lands first, gitomic re-runs the function on their version — no merge.
+
+In short: an immutable map (the git tree), an overlay of pending writes, and a pointer that only advances if nobody moved it first.
 
 ## The problem
 
@@ -32,9 +36,9 @@ gitomic is for anyone who wants **files as the source of truth** and **many conc
 1. A write builds its files directly in git's object database — no checkout involved. Many files, one commit: all or nothing.
 2. One publish rule: move the branch pointer (the **ref**) to the new commit — only if nobody else moved it first (`git update-ref`; remote: `push --force-with-lease`).
 3. Lose the race? gitomic re-runs your **update function** on the winner's version. Text is never merged.
-4. Every commit records who, why, and a sequence number — a retried write can't apply twice, and history reads as a decision log.
+4. Every commit records who, why, and a sequence number — a retried write can't apply twice, and the audit trail is plain `git log`.
 
-In short: an immutable map (the git tree), an overlay of pending writes, and a pointer that only advances if nobody moved it first.
+**Your own checkout is safe — and unaware.** gitomic never touches working copies, including yours: your clone just falls behind and catches up with a normal `git pull`.
 
 ### The race, in detail
 
@@ -50,9 +54,9 @@ Losing is cheap: memory plus unreferenced objects (normal `git gc` cleans them).
 
 ```ts
 const store = await open({
-  repo: "path/inside/repo",
+  repo: ".",                   // any path inside the repo — the root is discovered
   ref: "refs/heads/main",
-  writer: "worker-3",
+  writer: "worker-3",          // recorded on every commit; keys retry-dedup
   remote: "origin",            // optional: races are decided at origin
 })
 
@@ -62,13 +66,15 @@ store.commit(changes, opts?)   // Map<path, content | null> (null deletes) → o
 store.apply(fn, why?)          // fn(map) — runs, commits, re-runs on a race
 ```
 
-The map your update function receives is almost a JS `Map`:
+**When to use which:** `commit()` is a blind write — your content wins over whatever is there. If your write depends on *anything you read*, use `apply()`.
+
+The map your update function receives speaks `Map` vocabulary:
 
 - `get(path)` — read (async, fetched lazily)
 - `set(path, content)` — write (instant, in-memory)
 - `delete(path)` — remove
 - `has(path)` — check
-- `list(dir)` — list one directory
+- `list(dir)` — one directory's entry names (not full paths)
 - `map.changes` — the underlying `Map`, the same shape `commit()` accepts
 
 Reads see your own pending writes. One rule: touch nothing but the map — the function may run more than once.
@@ -83,8 +89,7 @@ await store.apply(async (map) => {
   for (const name of await map.list("tasks")) {              // list
     const task = await map.get(`tasks/${name}`)              // read
     if (!task?.includes("status: done")) continue
-    if (await map.has(`archive/${name}`))                    // check
-      throw new Conflict(`archive/${name} already exists`)
+    if (await map.has(`archive/${name}`)) continue           // already archived — skip
     map.set(`archive/${name}`, task)                         // write
     map.delete(`tasks/${name}`)                              // remove
   }
@@ -92,6 +97,21 @@ await store.apply(async (map) => {
 ```
 
 All the loop's moves land as one commit — five or none.
+
+`Conflict` is for invariants — the rule CRDTs can't enforce:
+
+```ts
+import { Conflict } from "gitomic"
+
+// only one writer may claim a task
+await store.apply(async (map) => {
+  const owner = await map.get("claims/124.md")
+  if (owner && owner !== "worker-3") throw new Conflict(`124 claimed by ${owner}`)
+  map.set("claims/124.md", "worker-3")
+}, "claim 124")
+```
+
+Two writers race this; exactly one wins — the loser's re-run *sees* the winner's claim and aborts cleanly.
 
 Same store, other faces — each adapter is a thin layer over the core:
 
@@ -115,13 +135,13 @@ const storage = createStorage({ driver: asUnstorage(store) })   // unstorage dri
 **Good for:**
 
 - Many writers, one clean history — no server, no lock files
-- A full audit trail on every change: who, why, when
+- A full audit trail on every change — who, why, when, readable with plain `git log`
 - Consistent snapshot reads from anywhere — no checkout needed
 - Plain git underneath: log it, push it, back it up
 
 **Not for:**
 
-- Very high write rates — `shell` does a handful of writes per second, `iso` tens; not a telemetry store
+- Very high write rates — a handful of commits per second with the zero-dependency `shell` backend, tens with the isomorphic-git one; not a telemetry store
 - Code — a re-run write isn't re-tested; keep code changes in review and CI
 - Offline or multi-master use — all writers race against one authoritative ref, by design
 - Side effects — your update function may re-run; keep clocks, network, and disk out of it
@@ -133,8 +153,6 @@ const storage = createStorage({ driver: asUnstorage(store) })   // unstorage dri
 - **The same idea elsewhere** — Gerrit NoteDb, git-bug, Irmin, Jujutsu (inside git); Kubernetes server-side apply, Replicache, Delta Lake (outside it). Datomic inspired the name and the philosophy.
 
 ## Status
-
-Design done; v1 in development. The npm package is a name-hold placeholder — don't install it yet.
 
 v1 ships two backends:
 
