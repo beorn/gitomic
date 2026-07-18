@@ -1,6 +1,6 @@
 # gitomic
 
-Atomic git writes without a working copy — many writers, no merges, nothing lost.
+Direct git commits, skip working copies — many writers, no merges, nothing lost.
 
 ## The problem
 
