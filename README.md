@@ -15,36 +15,36 @@ await store.apply(async (map) => {
 }, "create task 124")
 ```
 
-This creates a task file and adds it to the board — **one commit, both files or neither**. No checkout was touched: the writes were captured in memory and built directly into git's object database. If another writer committed first, gitomic re-runs the function on their version instead of merging.
+Creates a task and updates the board — **one commit, both files or neither**. No checkout involved: writes are captured in memory and built straight into git's object database. If another writer lands first, gitomic re-runs the function on their version — no merge.
 
 ## The problem
 
 Several programs write the same files: agents, scripts, you in an editor.
 
 - **Plain file writes** race — the last save wins, edits vanish.
-- **Lock files** cover one file at a time, and keep no history.
-- **A database** handles concurrent writes, but your data no longer lives in files.
+- **Lock files** guard one file at a time and keep no history.
+- **A database** handles concurrency but takes your data out of files.
 
 gitomic is for anyone who wants **files as the source of truth** and **many concurrent writers** without those trade-offs. Built for fleets of AI agents sharing a repo — but nothing about it is agent-specific.
 
 ## How it works
 
 1. A write builds its files directly in git's object database — no checkout involved. Many files, one commit: all or nothing.
-2. Publishing follows one rule: move the branch pointer (the **ref**) to the new commit — but only if nobody else moved it first (`git update-ref`; with a remote, `push --force-with-lease`).
-3. If someone else got there first, gitomic re-runs your **update function** on top of their version. Text is never merged.
-4. Every commit records who, why, and a sequence number — so a retried write can never apply twice, and history reads as a decision log.
+2. One publish rule: move the branch pointer (the **ref**) to the new commit — only if nobody else moved it first (`git update-ref`; remote: `push --force-with-lease`).
+3. Lose the race? gitomic re-runs your **update function** on the winner's version. Text is never merged.
+4. Every commit records who, why, and a sequence number — a retried write can't apply twice, and history reads as a decision log.
 
-In short: gitomic is an immutable map (the git tree), an overlay of pending writes, and a pointer that only advances if nobody else moved it first.
+In short: an immutable map (the git tree), an overlay of pending writes, and a pointer that only advances if nobody moved it first.
 
 ### The race, in detail
 
-1. Read the tip commit and pin its tree. Run your update function against that frozen view; collect its writes in memory.
-2. Build the new commit and try the swap: *advance the ref from the pinned tip to my commit*.
-3. If the ref moved meanwhile, discard the collected writes and start over from the **new** tip — a full re-run, not a patch: your function sees the winner's state and may decide differently (or throw `Conflict`, which ends the attempt cleanly).
-4. Before retrying, wait a short **random, roughly-doubling delay** (capped at ~150ms). Randomness matters: with fixed delays, racing writers retry in lockstep and collide forever — jitter spreads them out.
-5. Attempts are bounded — after repeated losses gitomic gives up with `RetriesExhausted` instead of spinning.
+1. Pin the tip's tree. Run your update function against that frozen view; collect writes in memory.
+2. Build the commit and try the swap: advance the ref from the pinned tip to it.
+3. If the ref moved, discard the writes and start over from the new tip — a full re-run, not a patch: the function sees the winner's state and may decide differently, or throw `Conflict` to stop cleanly.
+4. Wait a short random, roughly-doubling delay (≤ ~150ms) before retrying. The randomness matters: fixed delays make racing writers collide in lockstep forever.
+5. Attempts are bounded — repeated losses end in `RetriesExhausted`, not spinning.
 
-Losing costs almost nothing: the discarded attempt was memory plus unreferenced git objects (cleaned by normal `git gc`). In testing, 3 writers × 100 concurrent writes generated 431 retries — and 300 of 300 writes landed exactly once.
+Losing is cheap: memory plus unreferenced objects (normal `git gc` cleans them). In testing, 3 writers × 100 concurrent writes caused 431 retries — and 300/300 landed exactly once.
 
 ## API
 
@@ -64,14 +64,14 @@ store.apply(fn, why?)          // fn(map) — runs, commits, re-runs on a race
 
 The map your update function receives is almost a JS `Map`:
 
-- `get(path)` — read (async, fetched lazily from the object database)
+- `get(path)` — read (async, fetched lazily)
 - `set(path, content)` — write (instant, in-memory)
 - `delete(path)` — remove
 - `has(path)` — check
 - `ls(dir)` — list one directory
 - `map.changes` — the underlying `Map`, the same shape `commit()` accepts
 
-Reads see your own pending writes. One rule: your update function must touch nothing but the map, because it may run more than once.
+Reads see your own pending writes. One rule: touch nothing but the map — the function may run more than once.
 
 ### Adapters — same store, other faces
 
@@ -96,7 +96,7 @@ await store.apply(async (map) => {
 }, "archive finished tasks")
 ```
 
-However many files the loop touches, they land as one commit — five moves or none. In the test suite, 3 writers firing 100 concurrent writes produce a straight-line history: zero merges, zero lost updates.
+All the loop's moves land as one commit — five or none.
 
 ## Good for / not for
 
@@ -110,7 +110,7 @@ However many files the loop touches, they land as one commit — five moves or n
 **Not for:**
 
 - Very high write rates — `shell` does a handful of writes per second, `iso` tens; not a telemetry store
-- Code — a re-run write isn't re-tested; keep code changes in normal review and CI
+- Code — a re-run write isn't re-tested; keep code changes in review and CI
 - Offline or multi-master use — all writers race against one authoritative ref, by design
 - Side effects — your update function may re-run; keep clocks, network, and disk out of it
 
@@ -127,7 +127,7 @@ Design done; v1 in development. The npm package is a name-hold placeholder — d
 v1 ships two backends:
 
 - `shell` — zero dependencies; the git binary you already have
-- `iso` — optional import; [isomorphic-git](https://isomorphic-git.org) builds objects in-process for ~10× the write throughput; the ref compare-and-swap stays on native git, and an object-id equivalence suite holds both backends bit-identical
+- `iso` — optional import; [isomorphic-git](https://isomorphic-git.org) builds objects in-process (~10× write throughput); CAS stays on native git; an object-id equivalence suite holds both backends bit-identical
 
 Planned: `mem` backend for tests · field-level claims · multi-ref transactions.
 
