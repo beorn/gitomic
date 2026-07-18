@@ -31,25 +31,6 @@ Several programs write the same files: agents, scripts, you in an editor.
 
 gitomic is for anyone who wants **files as the source of truth** and **many concurrent writers** without those trade-offs. Built for fleets of AI agents sharing a repo — but nothing about it is agent-specific.
 
-## How it works
-
-1. A write builds its files directly in git's object database — no checkout involved. Many files, one commit: all or nothing.
-2. One publish rule: move the branch pointer (the **ref**) to the new commit — only if nobody else moved it first (`git update-ref`; remote: `push --force-with-lease`).
-3. Lose the race? gitomic re-runs your **update function** on the winner's version. Text is never merged.
-4. Every commit records who, why, and a sequence number — a retried write can't apply twice, and the audit trail is plain `git log`.
-
-**Your own checkout is safe — and unaware.** gitomic never touches working copies, including yours: your clone just falls behind and catches up with a normal `git pull`.
-
-### The race, in detail
-
-1. Pin the tip's tree. Run your update function against that frozen view; collect writes in memory.
-2. Build the commit and try the swap: advance the ref from the pinned tip to it.
-3. If the ref moved, discard the writes and start over from the new tip — a full re-run, not a patch: the function sees the winner's state and may decide differently, or throw `Conflict` to stop cleanly.
-4. Wait a short random, roughly-doubling delay (≤ ~150ms) before retrying. The randomness matters: fixed delays make racing writers collide in lockstep forever.
-5. Attempts are bounded — repeated losses end in `RetriesExhausted`, not spinning.
-
-Losing is cheap: memory plus unreferenced objects (normal `git gc` cleans them). In testing, 3 writers × 100 concurrent writes caused 431 retries — and 300/300 landed exactly once.
-
 ## API
 
 ```ts
@@ -143,7 +124,7 @@ const storage = createStorage({ driver: asUnstorage(store) })   // unstorage dri
 
 - Very high write rates — a handful of commits per second with the zero-dependency `shell` backend, tens with the isomorphic-git one; not a telemetry store
 - Code — a re-run write isn't re-tested; keep code changes in review and CI
-- Offline or multi-master use — all writers race against one authoritative ref, by design
+- Peer-to-peer offline sync — two disconnected writers can't merge with each other; that's CRDT territory. (Solo offline is fine: local-ref mode works fully offline, and remote mode can queue ops and replay them on reconnect — conflicts just surface late.)
 - Side effects — your update function may re-run; keep clocks, network, and disk out of it
 
 ## Alternatives & prior art
@@ -152,13 +133,33 @@ const storage = createStorage({ driver: asUnstorage(store) })   // unstorage dri
 - **CRDTs** (Automerge, Yjs) — merge without coordination, but can't enforce rules like "only one writer may claim this."
 - **The same idea elsewhere** — Gerrit NoteDb, git-bug, Irmin, Jujutsu (inside git); Kubernetes server-side apply, Replicache, Delta Lake (outside it). Datomic inspired the name and the philosophy.
 
+## How it works
+
+1. A write builds its files directly in git's object database — no checkout involved. Many files, one commit: all or nothing.
+2. One publish rule: move the branch pointer (the **ref**) to the new commit — only if nobody else moved it first (`git update-ref`; remote: `push --force-with-lease`).
+3. Lose the race? gitomic re-runs your **update function** on the winner's version. Text is never merged.
+4. Every commit records who, why, and a sequence number — a retried write can't apply twice, and the audit trail is plain `git log`.
+
+**Your own checkout is safe — and unaware.** gitomic never touches working copies, including yours: your clone just falls behind and catches up with a normal `git pull`.
+
+### The race, in detail
+
+1. Pin the tip's tree. Run your update function against that frozen view; collect writes in memory.
+2. Build the commit and try the swap: advance the ref from the pinned tip to it.
+3. If the ref moved, discard the writes and start over from the new tip — a full re-run, not a patch: the function sees the winner's state and may decide differently, or throw `Conflict` to stop cleanly.
+4. Wait a short random, roughly-doubling delay (≤ ~150ms) before retrying. The randomness matters: fixed delays make racing writers collide in lockstep forever.
+5. Attempts are bounded — repeated losses end in `RetriesExhausted`, not spinning.
+
+Losing is cheap: memory plus unreferenced objects (normal `git gc` cleans them). In testing, 3 writers × 100 concurrent writes caused 431 retries — and 300/300 landed exactly once.
+
 ## Status
 
-v1 ships two backends:
+v1 ships three backends:
 
 - `shell` — zero dependencies; the git binary you already have
-- `iso` — optional import; [isomorphic-git](https://isomorphic-git.org) builds objects in-process (~10× write throughput); CAS stays on native git; an object-id equivalence suite holds both backends bit-identical
+- `iso` — optional import; [isomorphic-git](https://isomorphic-git.org) builds objects in-process (~10× write throughput); CAS stays on native git; an object-id equivalence suite holds all backends bit-identical
+- `mem` — in-memory, no git binary, no disk; instant unit tests against the same API
 
-Planned: `mem` backend for tests · field-level claims · multi-ref transactions.
+Planned: offline op queue with replay-on-reconnect · field-level claims · multi-ref transactions.
 
 MIT © Bjørn Stabell
