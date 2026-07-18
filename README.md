@@ -11,7 +11,7 @@ import { open } from "gitomic"
 
 const store = await open({ repo: ".", ref: "main", writer: "worker-3" })
 
-await store.apply(async (map) => {
+await store.transact(async (map) => {
   map.set("notes/milk.md", "buy milk")
   map.set("index.md", ((await map.get("index.md")) ?? "") + "milk\n")
 }, "add note")
@@ -52,13 +52,13 @@ const store = await open({
   remote: "origin",            // optional — see below
 })
 
-store.head()                   // newest commit id
-store.read(at?)                // read-only view at that commit — lazy
-store.commit(changes, opts?)   // Map<path, content|null> → one CAS attempt
-store.apply(fn, why?)          // fn(map): run, commit, re-run on a race
+store.head()                      // newest commit id
+store.at(commit?)                 // read-only snapshot at that commit — lazy
+store.commit(changes, why, opts?) // Map<path, content|null> → one CAS attempt
+store.transact(fn, why)           // fn(map): run, commit, re-run on a race
 ```
 
-**When to use which:** `commit()` is one guarded write of content you already have — it throws if the ref moved, never overwrites. If your write depends on *anything you read*, use `apply()`.
+**When to use which:** `commit()` is one guarded write of content you already have — it throws if the ref moved, never overwrites. If your write depends on *anything you read*, use `transact()`. Every write names a `why` — it becomes the commit message.
 
 **`remote`:** origin becomes the decider — each publish is a fetch + `push --force-with-lease`. One network round-trip per write, and origin is, honestly, your server. Omit it for purely local stores.
 
@@ -68,7 +68,7 @@ The map your update function receives:
 - `set(path, content)` — write (instant, in-memory)
 - `delete(path)` — remove
 - `has(path)` — check (async — await it)
-- `list(dir)` — one directory's entry names
+- `keys(prefix?)` — paths under a prefix; omit for all (async — await it)
 - `map.changes` — the underlying `Map`, same shape `commit()` takes
 
 Values are UTF-8 strings in v1. Reads see your own pending writes.
@@ -78,11 +78,12 @@ Values are UTF-8 strings in v1. Reads see your own pending writes.
 All five verbs in one update function:
 
 ```ts
-await store.apply(async (map) => {
-  for (const name of await map.list("inbox")) {
-    if (await map.has(`archive/${name}`)) continue
-    map.set(`archive/${name}`, await map.get(`inbox/${name}`))
-    map.delete(`inbox/${name}`)
+await store.transact(async (map) => {
+  for (const path of await map.keys("inbox/")) {
+    const dest = path.replace("inbox/", "archive/")
+    if (await map.has(dest)) continue
+    map.set(dest, await map.get(path))
+    map.delete(path)
   }
 }, "archive inbox")
 ```
@@ -94,21 +95,21 @@ However many files move, they land as one commit — all or none.
 ```ts
 import { Conflict } from "gitomic"
 
-await store.apply(async (map) => {
+await store.transact(async (map) => {
   const owner = await map.get("locks/deploy")
   if (owner && owner !== "worker-3") throw new Conflict(`taken by ${owner}`)
   map.set("locks/deploy", "worker-3")
 }, "take deploy lock")
 ```
 
-Two writers race this; exactly one wins. The loser's re-run *sees* the winner's lock and aborts — `Conflict` surfaces to your caller (`RetriesExhausted` is the only other error `apply` adds).
+Two writers race this; exactly one wins. The loser's re-run *sees* the winner's lock and aborts — `Conflict` surfaces to your caller (`RetriesExhausted` is the only other error `transact` adds).
 
 Same store, other faces — each adapter is a thin layer:
 
 ```ts
 import { withFs, asFs, asKv, asUnstorage } from "gitomic/adapters"
 
-await store.apply(withFs(async (fs) => {        // node:fs verbs, still transactional
+await store.transact(withFs(async (fs) => {     // node:fs verbs, still transactional
   await fs.writeFile("notes/today.md", note)
 }), "add note")
 
@@ -117,9 +118,9 @@ await asKv(store).set("index.md", text, "edit") // one call = one commit
 const storage = createStorage({ driver: asUnstorage(store) })
 ```
 
-## Good for / not for
+## When to use it
 
-**Good for:**
+**Use it for:**
 
 - Many writers, one clean history — no server, no lock files
 - Audit trail on every change — who, why, when, via plain `git log`
@@ -160,10 +161,10 @@ Losing is cheap — memory plus objects `git gc` reclaims. Spike: 3 writers × 1
 
 v1 ships three backends:
 
-- `shell` — zero dependencies; the git binary you already have
+- `shell` — shells out to the `git` command you already have; zero dependencies
 - `iso` — optional; [isomorphic-git](https://isomorphic-git.org) builds objects in-process (~10× faster writes); CAS stays native; an oid-equivalence suite holds all backends bit-identical
 - `mem` — in-memory, no git binary; instant unit tests against the same API
 
-Planned: offline op queue with replay-on-reconnect · field-level claims · multi-ref transactions.
+Planned: offline op queue with replay-on-reconnect · field-level claims · multi-ref transactions · remote-only stores — open a URL, no local repo; the git wire protocol already does lazy reads (partial fetch) and CAS writes (push is old→new under the server's ref lock).
 
 MIT © Bjørn Stabell
