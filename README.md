@@ -75,7 +75,8 @@ Prefer filesystem ergonomics? That's composed, not core: `withFs(async fs => {..
 - **SQLite** — better for relational or high-rate data; you give up files-as-truth.
 - **Lock files / flock** — fine for one file, no cross-file atomicity, no history.
 - **CRDTs (Automerge, Yjs)** — merge without coordination, great offline; but auto-merge can't enforce invariants ("two claims both win"), which serialized replay prevents.
-- **The same pattern, embedded elsewhere**: Gerrit **NoteDb** (review state in refs, atomic ref transactions), **git-bug** (issues as op-logs), **Irmin** (`test_and_set`), **Jujutsu**; and outside git — Kubernetes **server-side apply**, **Replicache** server reconciliation, **Delta Lake/Iceberg** optimistic commits. gitomic is that pattern as a small standalone library.
+- **Datomic** — the closest spiritual ancestor, and half the name (git + atomic, with the Datomic echo intended): immutable facts, a single serializing writer, derived disposable indexes, every past state queryable forever. gitomic is that philosophy with files and a git ref instead of datoms and a transactor.
+- **The same pattern, embedded elsewhere**: Gerrit **NoteDb** (review state in refs, atomic ref transactions), **git-bug** (issues as op-logs), **Irmin** (`test_and_set`), **Jujutsu**; and outside git — Kubernetes **server-side apply**, **Replicache** server reconciliation, **Delta Lake/Iceberg** optimistic commits, **immer** and Redux (the pure-function-over-frozen-state shape of `apply`). gitomic is that pattern as a small standalone library.
 
 ## Status & roadmap
 
