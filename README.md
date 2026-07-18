@@ -60,24 +60,23 @@ store.at(commit?: string): Snapshot      // read-only view there — lazy
 store.transact(fn: Update, why: string): Promise<Committed>
 ```
 
-**One write verb.** `transact` runs your update function, commits its writes as one git commit, and re-runs it if another writer got there first. `why` is required — it becomes the commit message.
+`transact` runs your update function and lands its writes as one commit, re-running it if another writer got there first. `why` is required — it becomes the commit message.
 
 **`remote`:** origin becomes the decider — each publish is a fetch + `push --force-with-lease`. One network round-trip per write, and origin is, honestly, your server. Omit it for purely local stores.
 
 The map your update function receives:
 
-- `get(path)` — read (async — await it)
-- `set(path, content)` — write (instant, in-memory)
+- `get(path)` — read
+- `set(path, content)` — write
 - `delete(path)` — remove
-- `has(path)` — check (async — await it)
-- `keys(prefix?)` — paths under a prefix; omit for all (async — await it)
-- `changes` — the writes so far: a plain `Map` of path → text (`null` = delete)
+- `has(path)` — check
+- `keys(prefix?)` — paths under a prefix; omit for all
 
-Values are UTF-8 strings in v1. Reads see your own pending writes. A `Snapshot` from `at()` has the read half only: `get` / `has` / `keys`.
+Reads (`get`, `has`, `keys`) are async — await them; `set` and `delete` are instant, in-memory. Values are UTF-8 strings in v1. Reads see your own pending writes. A `Snapshot` from `at()` has the read side only: `get` / `has` / `keys`.
 
 ## The full tour
 
-All five verbs in one update function:
+The whole map, in one update function:
 
 ```ts
 await store.transact(async (map) => {
@@ -111,7 +110,7 @@ Same store, other faces — each adapter is a thin layer:
 ```ts
 import { withFs, asFs, asKv, asUnstorage } from "gitomic/adapters"
 
-await store.transact(withFs(async (fs) => {     // node:fs verbs, still transactional
+await store.transact(withFs(async (fs) => {     // node:fs calls, still transactional
   await fs.writeFile("notes/today.md", note)
 }), "add note")
 
@@ -134,7 +133,7 @@ const storage = createStorage({ driver: asUnstorage(store) })
 - High write rates — a few commits/sec (`shell`), tens (`iso`); not telemetry
 - Code — replayed writes aren't re-tested; keep code in review and CI
 - Merging two *offline* writers — CRDT territory. (Solo offline is fine; remote ops can queue and replay on reconnect.)
-- Side effects — the function may re-run; no clocks, network, or disk
+- Side effects — the update function may re-run
 
 ## Alternatives & prior art
 
