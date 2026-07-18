@@ -61,7 +61,7 @@ Other dialects are adapters, not core: `withFs()` for fs-style recipes, `asFs()`
 
 **Good for:** many writers with one clean history — no server, no lock files. A full audit trail (who, why, when) on every change. Consistent snapshot reads from anywhere, no checkout needed. And it's plain git: log it, push it, back it up.
 
-**Not for:** high write rates (think a handful of writes per second, not thousands). Code — a replayed patch can't validate itself, so keep code on your merge queue. Offline multi-master — there is one arbiter ref, on purpose. Impure operations — recipes may re-run, so no clocks, network, or disk inside.
+**Not for:** very high write rates — the `shell` backend does a handful of writes per second, the `iso` backend tens; neither is a telemetry store. Code — a replayed patch can't validate itself, so keep code on your merge queue. Offline multi-master — there is one arbiter ref, on purpose. Impure operations — recipes may re-run, so no clocks, network, or disk inside.
 
 ## Alternatives & prior art
 
@@ -71,6 +71,6 @@ Other dialects are adapters, not core: `withFs()` for fs-style recipes, `asFs()`
 
 ## Status
 
-Design done; v1 in development. The npm name is a reserved, deprecated placeholder until then. Planned: `withFs` / `asFs` / `asKv` adapters, the unstorage driver, an in-memory backend for tests, an isomorphic-git backend, field-level claims, multi-ref transactions.
+Design done; v1 in development. The npm name is a reserved, deprecated placeholder until then. v1 ships **two backends**: `shell` (zero dependencies — the git binary you already have) and `iso` (optional import; [isomorphic-git](https://isomorphic-git.org) builds objects in-process for ~10× the write throughput — the ref compare-and-swap stays on native git either way, and an object-id-equivalence test suite holds the two backends bit-identical). Planned: `withFs` / `asFs` / `asKv` adapters, the unstorage driver, an in-memory backend for tests, field-level claims, multi-ref transactions.
 
 MIT © Bjørn Stabell
