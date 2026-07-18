@@ -52,13 +52,15 @@ const store = await open({
   remote: "origin",            // optional — see below
 })
 
-store.head()                      // newest commit id
-store.at(commit?)                 // read-only snapshot at that commit — lazy
-store.commit(changes, why, opts?) // Map<path, content|null> → one CAS attempt
-store.transact(fn, why)           // fn(map): run, commit, re-run on a race
+type Update = (map: GitMap) => Promise<void>
+type Committed = { oid: string; retries: number }
+
+store.head(): Promise<string>            // newest commit id
+store.at(commit?: string): Snapshot      // read-only view there — lazy
+store.transact(fn: Update, why: string): Promise<Committed>
 ```
 
-**When to use which:** `commit()` is one guarded write of content you already have — it throws if the ref moved, never overwrites. If your write depends on *anything you read*, use `transact()`. Every write names a `why` — it becomes the commit message.
+**One write verb.** `transact` runs your update function, commits its writes as one git commit, and re-runs it if another writer got there first. `why` is required — it becomes the commit message.
 
 **`remote`:** origin becomes the decider — each publish is a fetch + `push --force-with-lease`. One network round-trip per write, and origin is, honestly, your server. Omit it for purely local stores.
 
@@ -69,9 +71,9 @@ The map your update function receives:
 - `delete(path)` — remove
 - `has(path)` — check (async — await it)
 - `keys(prefix?)` — paths under a prefix; omit for all (async — await it)
-- `map.changes` — the underlying `Map`, same shape `commit()` takes
+- `changes` — the writes so far: a plain `Map` of path → text (`null` = delete)
 
-Values are UTF-8 strings in v1. Reads see your own pending writes.
+Values are UTF-8 strings in v1. Reads see your own pending writes. A `Snapshot` from `at()` has the read half only: `get` / `has` / `keys`.
 
 ## The full tour
 
