@@ -39,22 +39,22 @@ store.commit(changes, opts?)    // the base primitive: Map<path, content | null>
 store.apply(fn, why?)           // fn: (draft: Draft) => Promise<void> — immer-style recipe, re-run on race
 ```
 
-One noun, one borrowed dialect. A **Draft** implements [unstorage](https://unstorage.unjs.io)'s driver contract verbatim — `getItem`, `setItem`, `hasItem`, `removeItem`, `getKeys` — so if you know unstorage you already know the API, and code written against unstorage runs inside a recipe unchanged (becoming transactional for free). Reads fetch lazily from git's object database; writes land in an in-memory overlay — `draft.changes`, the literal `Map` that `commit()` accepts. Like an immer draft, it reflects its own edits: read-after-write sees your write. `read()` returns the read-only mood. Rules: touch only the draft, and the recipe may run more than once — the same contract as Firestore's `runTransaction` (and the same optimistic check-then-commit as Deno KV's `atomic().check()`).
+One noun, the most common shape in the language. A **Draft** is almost a `Map`: `get`, `set`, `has`, `delete` transfer verbatim, plus the one verb every store adds — `ls(dir)` — because a lazy store can't honor Map's synchronous iteration (unstorage calls it `getKeys`, Cloudflare KV calls it `list`; ours reads exactly one directory level, so full-tree walks stay deliberate). Reads are async, fetched lazily from git's object database; writes are synchronous Map inserts, and `draft.changes` is the literal `Map` that `commit()` accepts. Like an immer draft, it reflects its own edits: read-after-write sees your write. `read()` returns the read-only mood. Rules: touch only the draft, and the recipe may run more than once — the same contract as Firestore's `runTransaction` (and the same optimistic check-then-commit as Deno KV's `atomic().check()`).
 
 ## Example
 
 ```ts
 await store.apply(async (d) => {
-  const task = await d.getItem("tasks/123-fix-login.md")
-  if (task === null) throw new Conflict("task 123 no longer exists")
-  await d.setItem("tasks/123-fix-login.md", task.replace("status: open", "status: done"))
-  await d.setItem("board.md", (await d.getItem("board.md")).replace("- [ ] 123", "- [x] 123"))
+  const task = await d.get("tasks/123-fix-login.md")
+  if (task === undefined) throw new Conflict("task 123 no longer exists")
+  d.set("tasks/123-fix-login.md", task.replace("status: open", "status: done"))
+  d.set("board.md", (await d.get("board.md")).replace("- [ ] 123", "- [x] 123"))
 }, "close 123 — fix shipped")
 ```
 
 Both files change together or not at all. If another writer lands first, the recipe re-runs against a fresh draft of their version; under a 3-writer × 100-op stress test this yields a strictly linear history — zero merges, zero lost updates.
 
-Prefer filesystem ergonomics? That's composed, not core: `withFs(async fs => {...})` adapts an fs-style recipe (`readFile`/`writeFile`/`rm`) onto a draft, and `asFs(store, at?)` presents any snapshot as a `node:fs`-compatible object for third-party libraries. And since the draft already speaks unstorage's dialect, the **unstorage driver** is a thin shim: `setItem` outside a recipe becomes one atomic commit, batch `setItems` becomes **one** commit, `getMeta` surfaces who/why/when — a read-write, atomic sibling to the read-only GitHub driver.
+Prefer another dialect? That's composed, not core: `withFs(async fs => {...})` adapts an fs-style recipe (`readFile`/`writeFile`/`rm`) onto a draft, and `asFs(store, at?)` presents any snapshot as a `node:fs`-compatible object for third-party libraries. The **[unstorage](https://unstorage.unjs.io) driver** is a ~30-line adapter (pure renames: `get`→`getItem`, `ls`-walked→`getKeys`): `setItem` outside a recipe becomes one atomic commit, batch `setItems` becomes **one** commit, `getMeta` surfaces who/why/when — a read-write, atomic sibling to the read-only GitHub driver.
 
 ## Pros
 
