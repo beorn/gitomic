@@ -6,7 +6,7 @@ Atomic git writes without a working copy — many writers, no merges, nothing lo
 
 Several programs write the same files: agents, scripts, you in an editor. Plain writes race — the last save wins and edits vanish. Lock files cover one file at a time and keep no history. A database fixes writes but takes your files away.
 
-gitomic keeps files as the source of truth and makes concurrent writes safe.
+gitomic is for anyone who wants **files as the source of truth** and **many concurrent writers** without picking one of those poisons. It was built for fleets of AI agents sharing a repo, but nothing about it is agent-specific.
 
 ## How it works
 
