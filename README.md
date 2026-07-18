@@ -57,10 +57,10 @@ type Committed = { oid: string; retries: number }
 
 store.head(): Promise<string>            // newest commit id
 store.at(commit?: string): Snapshot      // read-only view there — lazy
-store.transact(fn: Update, why: string): Promise<Committed>
+store.transact(fn: Update, message: string): Promise<Committed>
 ```
 
-`transact` runs your update function and lands its writes as one commit, re-running it if another writer got there first. `why` is required — it becomes the commit message.
+`transact` runs your update function and lands its writes as one commit, re-running it if another writer got there first. `message` is required — it becomes the commit message; say why, not what.
 
 **`remote`:** origin becomes the decider — each publish is a fetch + `push --force-with-lease`. One network round-trip per write, and origin is, honestly, your server. Omit it for purely local stores.
 
