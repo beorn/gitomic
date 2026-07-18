@@ -2,7 +2,7 @@
 
 Direct git commits, skip working copies — many writers, no merges, nothing lost.
 
-> **Pre-release.** v1 in development; the npm name is a placeholder — read now, don't install yet. Numbers are from the spike's test suite.
+> **Pre-release.** Not on npm yet — the name is held and the API may still change. Performance numbers are from the prototype's test suite.
 
 ## Example
 
@@ -48,7 +48,7 @@ Several programs write the same files: agents, scripts, you in an editor.
 const store = await open({
   repo: ".",                   // any path inside the repo
   ref: "main",                 // short names accepted
-  writer: "worker-3",          // stamped on every commit; keys retry-dedup
+  writer: "worker-3",          // required — unique per live writer; keys retry-dedup
   remote: "origin",            // optional — see below
 })
 
@@ -60,19 +60,25 @@ store.at(commit?: string): Snapshot      // read-only view there — lazy
 store.transact(fn: Update, message: string): Promise<Committed>
 ```
 
-`transact` runs your update function and lands its writes as one commit, re-running it if another writer got there first. `message` is required — it becomes the commit message; say why, not what.
+`transact` runs your update function and lands its writes as one commit, re-running it if another writer got there first. `message` is required — it becomes the commit message; say why, not what. `writer` must not be shared by two live processes — the retry-dedup counter is per writer, so a shared name can double-apply or skip.
 
-**`remote`:** origin becomes the decider — each publish is a fetch + `push --force-with-lease`. One network round-trip per write, and origin is, honestly, your server. Omit it for purely local stores.
+**`remote`:** origin becomes the decider. Every write is one round trip — fetch, then push under the remote's ref lock; the lease check is compare-and-swap, never history rewriting, so a push either fast-forwards or triggers a re-run. Reads stay local and lag until the next fetch. Origin is, honestly, your server; omit it for purely local stores.
 
 The map your update function receives:
 
-- `get(path)` — read
-- `set(path, content)` — write
-- `delete(path)` — remove
-- `has(path)` — check
-- `keys(prefix?)` — paths under a prefix; omit for all
+```ts
+type GitMap = {
+  get(path: string): Promise<string | undefined>  // sees your own pending writes
+  set(path: string, content: string): void        // instant, in-memory
+  delete(path: string): void                      // instant, in-memory
+  has(path: string): Promise<boolean>
+  keys(prefix?: string): Promise<string[]>        // paths under a prefix; omit for all
+}
 
-Reads (`get`, `has`, `keys`) are async — await them; `set` and `delete` are instant, in-memory. Values are UTF-8 strings in v1. Reads see your own pending writes. A `Snapshot` from `at()` has the read side only: `get` / `has` / `keys`.
+type Snapshot = Pick<GitMap, "get" | "has" | "keys">  // what at() returns — reads only
+```
+
+Paths are git tree paths — forward slashes, no leading slash; `keys` returns full paths, sorted. Values are UTF-8 strings in v1 — no binary yet. `at()` pins its commit at call time (omit for the current tip) and reads lazily — a bad commit id throws on first read.
 
 ## The full tour
 
@@ -105,7 +111,7 @@ await store.transact(async (map) => {
 
 Two writers race this; exactly one wins. The loser's re-run *sees* the winner's lock and aborts — `Conflict` surfaces to your caller (`RetriesExhausted` is the only other error `transact` adds).
 
-Same store, other faces — each adapter is a thin layer:
+Same store, other faces. The rule: `asX(store)` re-views the store as interface X (read-only where a write would bypass the transaction); `withX(fn)` wraps your update function so X-shaped calls stay transactional:
 
 ```ts
 import { withFs, asFs, asKv, asUnstorage } from "gitomic/adapters"
@@ -114,7 +120,7 @@ await store.transact(withFs(async (fs) => {     // node:fs calls, still transact
   await fs.writeFile("notes/today.md", note)
 }), "add note")
 
-const files = asFs(store)                       // read-only node:fs view of the tip
+const files = asFs(store)                       // read-only node:fs view of the tip; writes throw
 await asKv(store).set("index.md", text, "edit") // one call = one commit
 const storage = createStorage({ driver: asUnstorage(store) })
 ```
@@ -130,7 +136,7 @@ const storage = createStorage({ driver: asUnstorage(store) })
 
 **Not for:**
 
-- High write rates — a few commits/sec (`shell`), tens (`iso`); not telemetry
+- High write rates — a few commits/sec with the default `shell` backend (spawns `git`), tens with the in-process `iso` backend; not telemetry
 - Code — replayed writes aren't re-tested; keep code in review and CI
 - Merging two *offline* writers — CRDT territory. (Solo offline is fine; remote ops can queue and replay on reconnect.)
 - Side effects — the update function may re-run
@@ -139,22 +145,14 @@ const storage = createStorage({ driver: asUnstorage(store) })
 
 - **SQLite** — better for relational or high-rate data; files stop being files.
 - **CRDTs** (Automerge, Yjs) — merge freely, but can't enforce "only one may claim this."
-- **Same idea elsewhere** — Gerrit NoteDb, git-bug, Irmin, Jujutsu; Kubernetes server-side apply, Replicache, Delta Lake. Datomic inspired the name and philosophy.
+- **Same idea elsewhere** — Gerrit NoteDb, git-bug, Irmin, Jujutsu. Datomic inspired the name and philosophy.
 
 ## How it works
 
 1. Writes build files straight into git's object database — many files, one commit.
-2. Publish = move the ref to the new commit, only if nobody moved it first.
-3. Lose the race? The update function re-runs on the winner's version. No merges.
+2. Publish = move the ref to the new commit, only if nobody moved it first. Writers can be separate processes — the ref swap is atomic in every backend.
+3. Lose the race? The update function re-runs on the winner's version — no merges. Retries back off with a random, roughly-doubling delay (≤150ms; jitter prevents lockstep) and are bounded (default 10) before `RetriesExhausted`. Same-process writers queue locally.
 4. Commits carry who, why, and a per-writer counter — retries can't apply twice.
-
-### The race, in detail
-
-1. Pin the tip's tree; run the update function; collect writes in memory.
-2. Build the commit; swap the ref from the pinned tip to it.
-3. Ref moved? Discard, re-run on the new tip — or throw `Conflict` to stop.
-4. Retry after a random, roughly-doubling delay (≤150ms) — jitter prevents lockstep.
-5. Attempts are bounded; then `RetriesExhausted`. Same-process writers queue locally.
 
 Losing is cheap — memory plus objects `git gc` reclaims. Spike: 3 writers × 100 concurrent writes, 431 retries, 300/300 landed exactly once.
 
