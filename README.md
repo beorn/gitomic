@@ -36,8 +36,7 @@ gitomic is for anyone who wants **files as the source of truth** and **many conc
 
 In short: gitomic is an immutable map (the git tree), an overlay of pending writes, and a pointer that only advances if nobody else moved it first.
 
-<details>
-<summary><b>Aside: how replay-with-backoff actually works</b></summary>
+### The race, in detail
 
 1. Read the tip commit and pin its tree. Run your update function against that frozen view; collect its writes in memory.
 2. Build the new commit and try the swap: *advance the ref from the pinned tip to my commit*.
@@ -46,8 +45,6 @@ In short: gitomic is an immutable map (the git tree), an overlay of pending writ
 5. Attempts are bounded — after repeated losses gitomic gives up with `RetriesExhausted` instead of spinning.
 
 Losing costs almost nothing: the discarded attempt was memory plus unreferenced git objects (cleaned by normal `git gc`). In testing, 3 writers × 100 concurrent writes generated 431 retries — and 300 of 300 writes landed exactly once.
-
-</details>
 
 ## API
 
