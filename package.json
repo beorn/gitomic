@@ -1,0 +1,24 @@
+{
+  "name": "gitomic",
+  "version": "0.0.1",
+  "description": "Atomic, merge-free state commits over git: compare-and-swap on a ref with semantic replay.",
+  "license": "MIT",
+  "author": "Bjørn Stabell <bjorn@stabell.org>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/beorn/gitomic.git"
+  },
+  "homepage": "https://github.com/beorn/gitomic#readme",
+  "bugs": "https://github.com/beorn/gitomic/issues",
+  "keywords": [
+    "git",
+    "atomic",
+    "compare-and-swap",
+    "cas",
+    "database",
+    "state",
+    "event-sourcing",
+    "optimistic-concurrency",
+    "transaction"
+  ]
+}
