@@ -28,7 +28,7 @@ b81d0e7 worker-1: archive inbox
 4c99a01 bjorn: reword index
 ```
 
-**Where did the file go?** gitomic writes to the *branch*, never to files on disk. A checkout sees the new commits after `git pull`; read through the store (or `git show`) instead. Sharing a live checkout? Point gitomic at a bare repo or a ref your editor isn't on.
+**Where did the file go?** Normal git works file-side: edit working-copy files, stage, commit. gitomic inverts that — it builds the commit *object-side*, directly in git's database, and moves the branch to it; no working copy is in the loop. So it writes to the *branch*, never to files on disk. A checkout sees the new commits after `git pull`; read through the store (or `git show`) instead. Sharing a live checkout? Point gitomic at a bare repo or a ref your editor isn't on.
 
 In short: an immutable map (the git tree), an overlay of pending writes, and a pointer that only advances if nobody moved it first.
 
