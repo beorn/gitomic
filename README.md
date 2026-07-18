@@ -73,19 +73,14 @@ The map your update function receives is almost a JS `Map`:
 
 Reads see your own pending writes. One rule: touch nothing but the map — the function may run more than once.
 
-### Adapters — same store, other faces
+## The full tour
 
-- `withFs(fn)` — write using `node:fs` verbs: `readFile`, `writeFile`, `rm`
-- `asFs(store, at?)` — read any snapshot through a `node:fs`-compatible object
-- `asKv(store)` — one-call reads and writes: `get(path)`, `set(path, content, why)`
-- `asUnstorage(store)` — an [unstorage](https://unstorage.unjs.io) driver: `get`→`getItem`, recursive `list`→`getKeys`
-
-## A fuller example
+All five verbs in one update function:
 
 ```ts
-// archive every finished task — all five verbs in one update function
+// archive every finished task
 await store.apply(async (map) => {
-  for (const name of await map.list("tasks")) {                // list
+  for (const name of await map.list("tasks")) {              // list
     const task = await map.get(`tasks/${name}`)              // read
     if (!task?.includes("status: done")) continue
     if (await map.has(`archive/${name}`))                    // check
@@ -97,6 +92,23 @@ await store.apply(async (map) => {
 ```
 
 All the loop's moves land as one commit — five or none.
+
+Same store, other faces — each adapter is a thin layer over the core:
+
+```ts
+import { withFs, asFs, asKv, asUnstorage } from "gitomic/adapters"
+
+await store.apply(withFs(async (fs) => {           // node:fs verbs, still transactional
+  await fs.writeFile("notes/today.md", note)
+}), "add note")
+
+const files = asFs(store)                          // read-only node:fs view of the tip
+console.log(await files.readFile("board.md"))
+
+await asKv(store).set("board.md", text, "edit")    // one call = one commit
+
+const storage = createStorage({ driver: asUnstorage(store) })   // unstorage driver
+```
 
 ## Good for / not for
 
