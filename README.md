@@ -2,6 +2,28 @@
 
 Direct git commits, skip working copies — many writers, no merges, nothing lost.
 
+## Example
+
+```ts
+import { open, Conflict } from "gitomic"
+
+const store = await open({ repo: ".", ref: "refs/heads/main", writer: "worker-3" })
+
+// archive every finished task — all five verbs in one write function
+await store.apply(async (d) => {
+  for (const name of await d.ls("tasks")) {                  // list
+    const task = await d.get(`tasks/${name}`)                // read
+    if (!task?.includes("status: done")) continue
+    if (await d.has(`archive/${name}`))                      // check
+      throw new Conflict(`archive/${name} already exists`)
+    d.set(`archive/${name}`, task)                           // write
+    d.delete(`tasks/${name}`)                                // remove
+  }
+}, "archive finished tasks")
+```
+
+What just happened: the function read the newest commit, and its writes were captured in memory — no checkout was touched. When it returned, gitomic built the new files directly in git's object database and landed them as **one commit**: however many files the loop moved, it's five moves or none. If another writer committed first, gitomic re-ran the function on their version instead of merging. In the test suite, 3 writers firing 100 concurrent writes produce a straight-line history: zero merges, zero lost updates.
+
 ## The problem
 
 Several programs write the same files: agents, scripts, you in an editor.
@@ -24,8 +46,6 @@ In short: gitomic is an immutable map (the git tree), an overlay of pending writ
 ## API
 
 ```ts
-import { open, Conflict } from "gitomic"
-
 const store = await open({
   repo: "path/inside/repo",
   ref: "refs/heads/main",
@@ -56,24 +76,6 @@ Reads see your own pending writes. One rule: your write function must touch noth
 - `asFs(store, at?)` — read any snapshot through a `node:fs`-compatible object
 - `asKv(store)` — one-call reads and writes: `get(path)`, `set(path, content, why)`
 - `asUnstorage(store)` — an [unstorage](https://unstorage.unjs.io) driver: `get`→`getItem`, recursive `ls`→`getKeys`
-
-## Example
-
-```ts
-// archive every finished task — all five verbs in one write function
-await store.apply(async (d) => {
-  for (const name of await d.ls("tasks")) {                  // list
-    const task = await d.get(`tasks/${name}`)                // read
-    if (!task?.includes("status: done")) continue
-    if (await d.has(`archive/${name}`))                      // check
-      throw new Conflict(`archive/${name} already exists`)
-    d.set(`archive/${name}`, task)                           // write
-    d.delete(`tasks/${name}`)                                // remove
-  }
-}, "archive finished tasks")
-```
-
-However many files the loop touches, they land as one commit — five moves or none. In the test suite, 3 writers firing 100 concurrent writes produce a straight-line history: zero merges, zero lost updates.
 
 ## Good for / not for
 
