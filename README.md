@@ -54,7 +54,7 @@ await store.apply(async (snap, changes) => {
 
 Both files change together or not at all. If another writer lands first, the function re-runs against their snapshot; under a 3-writer × 100-op stress test this yields a strictly linear history — zero merges, zero lost updates.
 
-Prefer filesystem ergonomics? That's composed, not core: `withFs(async fs => {...})` adapts an fs-style recipe (`readFile`/`writeFile`/`rm`) onto `(snap, changes)`, and `asFs(store, at?)` presents any snapshot as a `node:fs`-compatible object for third-party libraries.
+Prefer filesystem ergonomics? That's composed, not core: `withFs(async fs => {...})` adapts an fs-style recipe (`readFile`/`writeFile`/`rm`) onto `(snap, changes)`, and `asFs(store, at?)` presents any snapshot as a `node:fs`-compatible object for third-party libraries. An [unstorage](https://unstorage.unjs.io) driver is planned on the same principle — `getItem`/`getKeys` from snapshots, `setItem` as an atomic commit, batch `setItems` as **one** commit, `getMeta` surfacing who/why/when — a read-write, atomic sibling to the read-only GitHub driver.
 
 ## Pros
 
@@ -79,6 +79,6 @@ Prefer filesystem ergonomics? That's composed, not core: `withFs(async fs => {..
 
 ## Status & roadmap
 
-Design locked; v1 (shell backend) in development — the npm package is a deprecated placeholder until then. Planned: `withFs()` / `asFs()` / `asKv()` adapters · `mem` backend for tests · isomorphic-git backend (objects in-process; the CAS stays on native git) · field-level claims · multi-ref transactions · text-merge overlay for concurrent free-text.
+Design locked; v1 (shell backend) in development — the npm package is a deprecated placeholder until then. Planned: `withFs()` / `asFs()` / `asKv()` adapters · `unstorage` driver · `mem` backend for tests · isomorphic-git backend (objects in-process; the CAS stays on native git) · field-level claims · multi-ref transactions · text-merge overlay for concurrent free-text.
 
 MIT © Bjørn Stabell
