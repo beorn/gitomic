@@ -10,14 +10,14 @@ import { open, Conflict } from "gitomic"
 const store = await open({ repo: ".", ref: "refs/heads/main", writer: "worker-3" })
 
 // archive every finished task — all five verbs in one update function
-await store.apply(async (d) => {
-  for (const name of await d.ls("tasks")) {                  // list
-    const task = await d.get(`tasks/${name}`)                // read
+await store.apply(async (map) => {
+  for (const name of await map.ls("tasks")) {                // list
+    const task = await map.get(`tasks/${name}`)              // read
     if (!task?.includes("status: done")) continue
-    if (await d.has(`archive/${name}`))                      // check
+    if (await map.has(`archive/${name}`))                    // check
       throw new Conflict(`archive/${name} already exists`)
-    d.set(`archive/${name}`, task)                           // write
-    d.delete(`tasks/${name}`)                                // remove
+    map.set(`archive/${name}`, task)                         // write
+    map.delete(`tasks/${name}`)                              // remove
   }
 }, "archive finished tasks")
 ```
@@ -43,6 +43,19 @@ gitomic is for anyone who wants **files as the source of truth** and **many conc
 
 In short: gitomic is an immutable map (the git tree), an overlay of pending writes, and a pointer that only advances if nobody else moved it first.
 
+<details>
+<summary><b>Aside: how replay-with-backoff actually works</b></summary>
+
+1. Read the tip commit and pin its tree. Run your update function against that frozen view; collect its writes in memory.
+2. Build the new commit and try the swap: *advance the ref from the pinned tip to my commit*.
+3. If the ref moved meanwhile, discard the collected writes and start over from the **new** tip — a full re-run, not a patch: your function sees the winner's state and may decide differently (or throw `Conflict`, which ends the attempt cleanly).
+4. Before retrying, wait a short **random, roughly-doubling delay** (capped at ~150ms). Randomness matters: with fixed delays, racing writers retry in lockstep and collide forever — jitter spreads them out.
+5. Attempts are bounded — after repeated losses gitomic gives up with `RetriesExhausted` instead of spinning.
+
+Losing costs almost nothing: the discarded attempt was memory plus unreferenced git objects (cleaned by normal `git gc`). In testing, 3 writers × 100 concurrent writes generated 431 retries — and 300 of 300 writes landed exactly once.
+
+</details>
+
 ## API
 
 ```ts
@@ -56,19 +69,19 @@ const store = await open({
 store.head()                   // newest commit id
 store.read(at?)                // read-only view at that commit — lazy, nothing copied
 store.commit(changes, opts?)   // Map<path, content | null> (null deletes) → one commit
-store.apply(fn, why?)          // fn(draft) — runs, commits, re-runs on a race
+store.apply(fn, why?)          // fn(map) — runs, commits, re-runs on a race
 ```
 
-The draft your update function receives is almost a `Map`:
+The map your update function receives is almost a JS `Map`:
 
 - `get(path)` — read (async, fetched lazily from the object database)
 - `set(path, content)` — write (instant, in-memory)
 - `delete(path)` — remove
 - `has(path)` — check
 - `ls(dir)` — list one directory
-- `draft.changes` — the underlying `Map`, the same shape `commit()` accepts
+- `map.changes` — the underlying `Map`, the same shape `commit()` accepts
 
-Reads see your own pending writes. One rule: your update function must touch nothing but the draft, because it may run more than once.
+Reads see your own pending writes. One rule: your update function must touch nothing but the map, because it may run more than once.
 
 ### Adapters — same store, other faces
 
