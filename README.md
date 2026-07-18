@@ -34,27 +34,27 @@ const store = await open({
 })
 
 store.head()                    // newest commit id
-store.read(at?)                 // Snapshot — a lazy handle: get(path), ls(dir); nothing is copied
-store.commit(changes, opts?)    // Map<path, content | null> (null = delete) → one CAS attempt
-store.apply(fn, why?)           // fn: (snap, changes) => Promise<void> — atomic, re-run on race
+store.read(at?)                 // Snapshot — read-only draft: getItem, hasItem, getKeys; lazy, nothing copied
+store.commit(changes, opts?)    // the base primitive: Map<path, content | null> → one CAS attempt
+store.apply(fn, why?)           // fn: (draft: Draft) => Promise<void> — immer-style recipe, re-run on race
 ```
 
-Two nouns, both plain: a **Snapshot** (frozen reads from one commit, fetched lazily per file) and a **Map** (your pending writes — the actual `Map` instance that becomes the commit). Rules: read only `snap`, write only `changes`, and the function may run more than once — the same contract as Firestore's `runTransaction`.
+One noun, one borrowed dialect. A **Draft** implements [unstorage](https://unstorage.unjs.io)'s driver contract verbatim — `getItem`, `setItem`, `hasItem`, `removeItem`, `getKeys` — so if you know unstorage you already know the API, and code written against unstorage runs inside a recipe unchanged (becoming transactional for free). Reads fetch lazily from git's object database; writes land in an in-memory overlay — `draft.changes`, the literal `Map` that `commit()` accepts. Like an immer draft, it reflects its own edits: read-after-write sees your write. `read()` returns the read-only mood. Rules: touch only the draft, and the recipe may run more than once — the same contract as Firestore's `runTransaction` (and the same optimistic check-then-commit as Deno KV's `atomic().check()`).
 
 ## Example
 
 ```ts
-await store.apply(async (snap, changes) => {
-  const task = await snap.get("tasks/123-fix-login.md")
-  if (task === undefined) throw new Conflict("task 123 no longer exists")
-  changes.set("tasks/123-fix-login.md", task.replace("status: open", "status: done"))
-  changes.set("board.md", (await snap.get("board.md")).replace("- [ ] 123", "- [x] 123"))
+await store.apply(async (d) => {
+  const task = await d.getItem("tasks/123-fix-login.md")
+  if (task === null) throw new Conflict("task 123 no longer exists")
+  await d.setItem("tasks/123-fix-login.md", task.replace("status: open", "status: done"))
+  await d.setItem("board.md", (await d.getItem("board.md")).replace("- [ ] 123", "- [x] 123"))
 }, "close 123 — fix shipped")
 ```
 
-Both files change together or not at all. If another writer lands first, the function re-runs against their snapshot; under a 3-writer × 100-op stress test this yields a strictly linear history — zero merges, zero lost updates.
+Both files change together or not at all. If another writer lands first, the recipe re-runs against a fresh draft of their version; under a 3-writer × 100-op stress test this yields a strictly linear history — zero merges, zero lost updates.
 
-Prefer filesystem ergonomics? That's composed, not core: `withFs(async fs => {...})` adapts an fs-style recipe (`readFile`/`writeFile`/`rm`) onto `(snap, changes)`, and `asFs(store, at?)` presents any snapshot as a `node:fs`-compatible object for third-party libraries. An [unstorage](https://unstorage.unjs.io) driver is planned on the same principle — `getItem`/`getKeys` from snapshots, `setItem` as an atomic commit, batch `setItems` as **one** commit, `getMeta` surfacing who/why/when — a read-write, atomic sibling to the read-only GitHub driver.
+Prefer filesystem ergonomics? That's composed, not core: `withFs(async fs => {...})` adapts an fs-style recipe (`readFile`/`writeFile`/`rm`) onto a draft, and `asFs(store, at?)` presents any snapshot as a `node:fs`-compatible object for third-party libraries. And since the draft already speaks unstorage's dialect, the **unstorage driver** is a thin shim: `setItem` outside a recipe becomes one atomic commit, batch `setItems` becomes **one** commit, `getMeta` surfaces who/why/when — a read-write, atomic sibling to the read-only GitHub driver.
 
 ## Pros
 
@@ -68,14 +68,14 @@ Prefer filesystem ergonomics? That's composed, not core: `withFs(async fs => {..
 - Not for high write rates: shelled git tops out around a handful of writes/second. Fine for coordination state; wrong for telemetry.
 - Not for code or patches: replay assumes an operation can validate itself against new state. A rebased code diff can't (tests must run) — keep code on your merge queue.
 - One arbiter ref by design — this is optimistic serialization, not partition-tolerant multi-master.
-- Operation functions must be pure (read only their snapshot, write only their changes map) — that's what makes re-running them safe.
+- Recipes must be pure (touch only their draft — no clock, network, or real disk) — that's what makes re-running them safe.
 
 ## Alternatives & prior art
 
 - **SQLite** — better for relational or high-rate data; you give up files-as-truth.
 - **Lock files / flock** — fine for one file, no cross-file atomicity, no history.
 - **CRDTs (Automerge, Yjs)** — merge without coordination, great offline; but auto-merge can't enforce invariants ("two claims both win"), which serialized replay prevents.
-- **Datomic** — the closest spiritual ancestor, and half the name (git + atomic, with the Datomic echo intended): immutable facts, a single serializing writer, derived disposable indexes, every past state queryable forever. gitomic is that philosophy with files and a git ref instead of datoms and a transactor.
+- **Datomic** — a name-nod and an inspiration (immutable history, derived disposable indexes, past states stay readable), claimed humbly: gitomic has no datoms, no Datalog, no transactor infrastructure — just files and a git ref borrowing the philosophy.
 - **The same pattern, embedded elsewhere**: Gerrit **NoteDb** (review state in refs, atomic ref transactions), **git-bug** (issues as op-logs), **Irmin** (`test_and_set`), **Jujutsu**; and outside git — Kubernetes **server-side apply**, **Replicache** server reconciliation, **Delta Lake/Iceberg** optimistic commits, **immer** and Redux (the pure-function-over-frozen-state shape of `apply`). gitomic is that pattern as a small standalone library.
 
 ## Status & roadmap
