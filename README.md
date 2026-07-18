@@ -68,7 +68,7 @@ The map your update function receives is almost a JS `Map`:
 - `set(path, content)` — write (instant, in-memory)
 - `delete(path)` — remove
 - `has(path)` — check
-- `ls(dir)` — list one directory
+- `list(dir)` — list one directory
 - `map.changes` — the underlying `Map`, the same shape `commit()` accepts
 
 Reads see your own pending writes. One rule: touch nothing but the map — the function may run more than once.
@@ -78,14 +78,14 @@ Reads see your own pending writes. One rule: touch nothing but the map — the f
 - `withFs(fn)` — write using `node:fs` verbs: `readFile`, `writeFile`, `rm`
 - `asFs(store, at?)` — read any snapshot through a `node:fs`-compatible object
 - `asKv(store)` — one-call reads and writes: `get(path)`, `set(path, content, why)`
-- `asUnstorage(store)` — an [unstorage](https://unstorage.unjs.io) driver: `get`→`getItem`, recursive `ls`→`getKeys`
+- `asUnstorage(store)` — an [unstorage](https://unstorage.unjs.io) driver: `get`→`getItem`, recursive `list`→`getKeys`
 
 ## A fuller example
 
 ```ts
 // archive every finished task — all five verbs in one update function
 await store.apply(async (map) => {
-  for (const name of await map.ls("tasks")) {                // list
+  for (const name of await map.list("tasks")) {                // list
     const task = await map.get(`tasks/${name}`)              // read
     if (!task?.includes("status: done")) continue
     if (await map.has(`archive/${name}`))                    // check
