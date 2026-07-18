@@ -2,7 +2,7 @@
 
 Direct git commits, skip working copies — many writers, no merges, nothing lost.
 
-> **Status:** design-complete; v1 in development. The npm package is a name-hold placeholder — don't install it yet.
+> **Pre-release.** v1 is in development; the npm name is a placeholder — read now, don't install yet. Numbers below are from the working spike's test suite.
 
 ## Example
 
@@ -17,7 +17,18 @@ await store.apply(async (map) => {
 }, "create task 124")
 ```
 
-Creates a task and updates the board — **one commit, both files or neither**. No checkout involved: writes are captured in memory and built straight into git's object database. If another writer lands first, gitomic re-runs the function on their version — no merge.
+Creates a task and updates the board — **one commit, both files or neither**. If another writer lands first, gitomic re-runs the function on their version — no merge. **That re-run is the contract:** the function computes everything from the map it's given — no clocks, no network, no outer state — because it may run more than once.
+
+The history is the audit log, in plain git:
+
+```
+$ git log --oneline -3
+9f3c2ab (main) worker-3: create task 124
+b81d0e7 worker-1: archive finished tasks
+4c99a01 bjorn: reword board intro
+```
+
+**Where did the file go?** gitomic writes to the *branch*, never to files on disk — `cat tasks/124-dark-mode.md` shows nothing new until that checkout runs `git pull`. Read through the store (`store.read()`, `git show`) instead, and point gitomic at a bare repo or a ref your editor isn't sitting on when you share a live checkout.
 
 In short: an immutable map (the git tree), an overlay of pending writes, and a pointer that only advances if nobody moved it first.
 
@@ -36,29 +47,32 @@ gitomic is for anyone who wants **files as the source of truth** and **many conc
 ```ts
 const store = await open({
   repo: ".",                   // any path inside the repo — the root is discovered
-  ref: "refs/heads/main",
+  ref: "refs/heads/main",      // short "main" is accepted and normalized
   writer: "worker-3",          // recorded on every commit; keys retry-dedup
-  remote: "origin",            // optional: races are decided at origin
+  remote: "origin",            // optional — see below
 })
 
 store.head()                   // newest commit id
 store.read(at?)                // read-only view at that commit — lazy, nothing copied
-store.commit(changes, opts?)   // Map<path, content | null> (null deletes) → one commit
-store.apply(fn, why?)          // fn(map) — runs, commits, re-runs on a race
+store.commit(changes, opts?)   // Map<path, content | null> (null deletes) → ONE CAS attempt;
+                               // throws StaleParent if the ref moved — never a silent overwrite
+store.apply(fn, why?)          // fn(map) — runs, commits, re-runs on a race; returns the commit id
 ```
 
-**When to use which:** `commit()` is a blind write — your content wins over whatever is there. If your write depends on *anything you read*, use `apply()`.
+**When to use which:** `commit()` is a single guarded write of content you already have. If your write depends on *anything you read*, use `apply()`.
 
-The map your update function receives speaks `Map` vocabulary:
+**About `remote`:** when set, origin is the arbiter — every publish is a fetch + `push --force-with-lease`, so each write costs a network round-trip and origin is, honestly, your server. Omit it and everything is local.
 
-- `get(path)` — read (async, fetched lazily)
+The map your update function receives:
+
+- `get(path)` — read (async — await it; fetched lazily)
 - `set(path, content)` — write (instant, in-memory)
 - `delete(path)` — remove
-- `has(path)` — check
+- `has(path)` — check (async — await it)
 - `list(dir)` — one directory's entry names (not full paths)
 - `map.changes` — the underlying `Map`, the same shape `commit()` accepts
 
-Reads see your own pending writes. One rule: touch nothing but the map — the function may run more than once.
+Values are UTF-8 strings in v1. Reads see your own pending writes. One rule: touch nothing but the map — the function may run more than once.
 
 ## The full tour
 
@@ -92,7 +106,7 @@ await store.apply(async (map) => {
 }, "claim 124")
 ```
 
-Two writers race this; exactly one wins — the loser's re-run *sees* the winner's claim and aborts cleanly.
+Two writers race this; exactly one wins — the loser's re-run *sees* the winner's claim, and the `Conflict` it throws surfaces to the caller (catch it; `RetriesExhausted` is the only other error `apply` adds).
 
 Same store, other faces — each adapter is a thin layer over the core:
 
@@ -106,7 +120,7 @@ await store.apply(withFs(async (fs) => {           // node:fs verbs, still trans
 const files = asFs(store)                          // read-only node:fs view of the tip
 console.log(await files.readFile("board.md"))
 
-await asKv(store).set("board.md", text, "edit")    // one call = one commit
+await asKv(store).set("board.md", text, "edit")    // one call = one commit — don't loop it; batches belong in apply()
 
 const storage = createStorage({ driver: asUnstorage(store) })   // unstorage driver
 ```
@@ -122,7 +136,7 @@ const storage = createStorage({ driver: asUnstorage(store) })   // unstorage dri
 
 **Not for:**
 
-- Very high write rates — a handful of commits per second with the zero-dependency `shell` backend, tens with the isomorphic-git one; not a telemetry store
+- Very high write rates — a handful of commits per second with the zero-dependency `shell` backend, tens with the in-process one; not a telemetry store
 - Code — a re-run write isn't re-tested; keep code changes in review and CI
 - Peer-to-peer offline sync — two disconnected writers can't merge with each other; that's CRDT territory. (Solo offline is fine: local-ref mode works fully offline, and remote mode can queue ops and replay them on reconnect — conflicts just surface late.)
 - Side effects — your update function may re-run; keep clocks, network, and disk out of it
@@ -138,9 +152,7 @@ const storage = createStorage({ driver: asUnstorage(store) })   // unstorage dri
 1. A write builds its files directly in git's object database — no checkout involved. Many files, one commit: all or nothing.
 2. One publish rule: move the branch pointer (the **ref**) to the new commit — only if nobody else moved it first (`git update-ref`; remote: `push --force-with-lease`).
 3. Lose the race? gitomic re-runs your **update function** on the winner's version. Text is never merged.
-4. Every commit records who, why, and a sequence number — a retried write can't apply twice, and the audit trail is plain `git log`.
-
-**Your own checkout is safe — and unaware.** gitomic never touches working copies, including yours: your clone just falls behind and catches up with a normal `git pull`.
+4. Every commit records who, why, and a per-writer sequence number (its high-water mark rides inside the tree) — a retried write can't apply twice, even after a crash.
 
 ### The race, in detail
 
@@ -148,7 +160,7 @@ const storage = createStorage({ driver: asUnstorage(store) })   // unstorage dri
 2. Build the commit and try the swap: advance the ref from the pinned tip to it.
 3. If the ref moved, discard the writes and start over from the new tip — a full re-run, not a patch: the function sees the winner's state and may decide differently, or throw `Conflict` to stop cleanly.
 4. Wait a short random, roughly-doubling delay (≤ ~150ms) before retrying. The randomness matters: fixed delays make racing writers collide in lockstep forever.
-5. Attempts are bounded — repeated losses end in `RetriesExhausted`, not spinning.
+5. Attempts are bounded — repeated losses end in `RetriesExhausted`, not spinning. (Writers in one process are serialized on a local queue first, so only genuine cross-process races retry at all.)
 
 Losing is cheap: memory plus unreferenced objects (normal `git gc` cleans them). In testing, 3 writers × 100 concurrent writes caused 431 retries — and 300/300 landed exactly once.
 
