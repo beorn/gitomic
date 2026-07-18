@@ -34,25 +34,27 @@ const store = await open({
 })
 
 store.head()                    // newest commit id
-store.read(at?)                 // read-only snapshot filesystem at that commit
-store.apply(fn, why?)           // fn: (fs: GitFs) => Promise<void> — atomic, re-run on race
-store.commit(changes, opts?)    // base primitive: Map<path, content | null>, one CAS attempt
+store.read(at?)                 // Snapshot — a lazy handle: get(path), ls(dir); nothing is copied
+store.commit(changes, opts?)    // Map<path, content | null> (null = delete) → one CAS attempt
+store.apply(fn, why?)           // fn: (snap, changes) => Promise<void> — atomic, re-run on race
 ```
 
-`GitFs` is a snapshot-pinned subset of node's `fs/promises` (`readFile`, `readdir`, `exists`, `stat`, `writeFile`, `rm`, `rename`). Writes land in an in-memory overlay, never on disk; the overlay becomes the commit when your function returns. Rules: the function touches only its `fs`, and may run more than once — same contract as Firestore's `runTransaction`.
+Two nouns, both plain: a **Snapshot** (frozen reads from one commit, fetched lazily per file) and a **Map** (your pending writes — the actual `Map` instance that becomes the commit). Rules: read only `snap`, write only `changes`, and the function may run more than once — the same contract as Firestore's `runTransaction`.
 
 ## Example
 
 ```ts
-await store.apply(async (fs) => {
-  const task = "tasks/123-fix-login.md"
-  if (!(await fs.exists(task))) throw new Conflict("task 123 no longer exists")
-  await fs.writeFile(task, (await fs.readFile(task)).replace("status: open", "status: done"))
-  await fs.writeFile("board.md", (await fs.readFile("board.md")).replace("- [ ] 123", "- [x] 123"))
+await store.apply(async (snap, changes) => {
+  const task = await snap.get("tasks/123-fix-login.md")
+  if (task === undefined) throw new Conflict("task 123 no longer exists")
+  changes.set("tasks/123-fix-login.md", task.replace("status: open", "status: done"))
+  changes.set("board.md", (await snap.get("board.md")).replace("- [ ] 123", "- [x] 123"))
 }, "close 123 — fix shipped")
 ```
 
-Both files change together or not at all. If another writer lands first, the function re-runs on their version; under a 3-writer × 100-op stress test this yields a strictly linear history — zero merges, zero lost updates.
+Both files change together or not at all. If another writer lands first, the function re-runs against their snapshot; under a 3-writer × 100-op stress test this yields a strictly linear history — zero merges, zero lost updates.
+
+Prefer filesystem ergonomics? That's composed, not core: `withFs(async fs => {...})` adapts an fs-style recipe (`readFile`/`writeFile`/`rm`) onto `(snap, changes)`, and `asFs(store, at?)` presents any snapshot as a `node:fs`-compatible object for third-party libraries.
 
 ## Pros
 
@@ -66,7 +68,7 @@ Both files change together or not at all. If another writer lands first, the fun
 - Not for high write rates: shelled git tops out around a handful of writes/second. Fine for coordination state; wrong for telemetry.
 - Not for code or patches: replay assumes an operation can validate itself against new state. A rebased code diff can't (tests must run) — keep code on your merge queue.
 - One arbiter ref by design — this is optimistic serialization, not partition-tolerant multi-master.
-- Operation functions must be pure (no clock, network, or real disk) — that's what makes re-running them safe.
+- Operation functions must be pure (read only their snapshot, write only their changes map) — that's what makes re-running them safe.
 
 ## Alternatives & prior art
 
@@ -77,6 +79,6 @@ Both files change together or not at all. If another writer lands first, the fun
 
 ## Status & roadmap
 
-Design locked; v1 (shell backend) in development — the npm package is a deprecated placeholder until then. Planned: `mem` backend for tests · isomorphic-git backend (objects in-process; the CAS stays on native git) · `asFs()` / `asKv()` adapters · field-level claims · multi-ref transactions · text-merge overlay for concurrent free-text.
+Design locked; v1 (shell backend) in development — the npm package is a deprecated placeholder until then. Planned: `withFs()` / `asFs()` / `asKv()` adapters · `mem` backend for tests · isomorphic-git backend (objects in-process; the CAS stays on native git) · field-level claims · multi-ref transactions · text-merge overlay for concurrent free-text.
 
 MIT © Bjørn Stabell
