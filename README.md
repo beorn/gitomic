@@ -9,7 +9,7 @@ import { open, Conflict } from "gitomic"
 
 const store = await open({ repo: ".", ref: "refs/heads/main", writer: "worker-3" })
 
-// archive every finished task — all five verbs in one write function
+// archive every finished task — all five verbs in one update function
 await store.apply(async (d) => {
   for (const name of await d.ls("tasks")) {                  // list
     const task = await d.get(`tasks/${name}`)                // read
@@ -38,7 +38,7 @@ gitomic is for anyone who wants **files as the source of truth** and **many conc
 
 1. A write builds its files directly in git's object database — no checkout involved. Many files, one commit: all or nothing.
 2. Publishing follows one rule: move the branch pointer (the **ref**) to the new commit — but only if nobody else moved it first (`git update-ref`; with a remote, `push --force-with-lease`).
-3. If someone else got there first, gitomic re-runs your **write function** on top of their version. Text is never merged.
+3. If someone else got there first, gitomic re-runs your **update function** on top of their version. Text is never merged.
 4. Every commit records who, why, and a sequence number — so a retried write can never apply twice, and history reads as a decision log.
 
 In short: gitomic is an immutable map (the git tree), an overlay of pending writes, and a pointer that only advances if nobody else moved it first.
@@ -59,7 +59,7 @@ store.commit(changes, opts?)   // Map<path, content | null> (null deletes) → o
 store.apply(fn, why?)          // fn(draft) — runs, commits, re-runs on a race
 ```
 
-The draft your write function receives is almost a `Map`:
+The draft your update function receives is almost a `Map`:
 
 - `get(path)` — read (async, fetched lazily from the object database)
 - `set(path, content)` — write (instant, in-memory)
@@ -68,7 +68,7 @@ The draft your write function receives is almost a `Map`:
 - `ls(dir)` — list one directory
 - `draft.changes` — the underlying `Map`, the same shape `commit()` accepts
 
-Reads see your own pending writes. One rule: your write function must touch nothing but the draft, because it may run more than once.
+Reads see your own pending writes. One rule: your update function must touch nothing but the draft, because it may run more than once.
 
 ### Adapters — same store, other faces
 
@@ -91,7 +91,7 @@ Reads see your own pending writes. One rule: your write function must touch noth
 - Very high write rates — `shell` does a handful of writes per second, `iso` tens; not a telemetry store
 - Code — a re-run write isn't re-tested; keep code changes in normal review and CI
 - Offline or multi-master use — all writers race against one authoritative ref, by design
-- Side effects — your write function may re-run; keep clocks, network, and disk out of it
+- Side effects — your update function may re-run; keep clocks, network, and disk out of it
 
 ## Alternatives & prior art
 
