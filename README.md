@@ -40,15 +40,20 @@ A draft is almost a `Map`: `get`, `set`, `has`, `delete`, plus `ls(dir)` to list
 ## Example
 
 ```ts
+// archive every finished task — all five verbs in one recipe
 await store.apply(async (d) => {
-  const task = await d.get("tasks/123-fix-login.md")
-  if (task === undefined) throw new Conflict("task 123 no longer exists")
-  d.set("tasks/123-fix-login.md", task.replace("status: open", "status: done"))
-  d.set("board.md", (await d.get("board.md")).replace("- [ ] 123", "- [x] 123"))
-}, "close 123 — fix shipped")
+  for (const name of await d.ls("tasks")) {                  // list one directory
+    const task = await d.get(`tasks/${name}`)                // read
+    if (!task?.includes("status: done")) continue
+    if (await d.has(`archive/${name}`))                      // check
+      throw new Conflict(`archive/${name} already exists`)
+    d.set(`archive/${name}`, task)                           // write
+    d.delete(`tasks/${name}`)                                // remove
+  }
+}, "archive finished tasks")
 ```
 
-Both files land together or not at all. Measured with 3 writers firing 100 concurrent ops: straight-line history, zero merges, zero lost updates.
+However many files the loop touches, they land as one commit — five moves or none. Measured with 3 writers firing 100 concurrent ops: straight-line history, zero merges, zero lost updates.
 
 Other dialects are adapters, not core: `withFs()` for fs-style recipes, `asFs()` to make a snapshot look like `node:fs`, and an [unstorage](https://unstorage.unjs.io) driver that is mostly renames (`get`→`getItem`, walked `ls`→`getKeys`).
 
