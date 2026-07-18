@@ -1,6 +1,6 @@
 # gitomic
 
-Atomic, merge-free writes to shared files, using git as the database.
+Git changes without a working copy — fast, atomic, safe.
 
 ## The problem
 
