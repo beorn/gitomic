@@ -1,25 +1,21 @@
 # gitomic
 
-Git changes without a working copy — fast, atomic, safe.
+Atomic git writes without a working copy — many writers, no merges, nothing lost.
 
 ## The problem
 
-You have several processes writing the same small pile of files — task lists, status boards, config, notes. Agents, cron jobs, scripts, maybe a human with an editor. Today your options are bad:
+Several programs write the same files: agents, scripts, you in an editor. Plain writes race — the last save wins and edits vanish. Lock files cover one file at a time and keep no history. A database fixes writes but takes your files away.
 
-- **Plain file writes** race: last save wins, someone's edit silently vanishes.
-- **Lock files** serialize one file at a time, but a change spanning three files can die halfway, and you get no history and no answer to "who changed this and why."
-- **A real database** fixes writes but takes the files away — no editor, no grep, no diffs, no git tooling, and the humans lose their workflow.
-
-gitomic is for anyone who wants **files as the source of truth** and **many concurrent writers** without picking one of those poisons. It was built for fleets of AI agents sharing a repo, but nothing about it is agent-specific.
+gitomic keeps files as the source of truth and makes concurrent writes safe.
 
 ## How it works
 
-1. A write never touches checked-out files. It builds the new file contents **directly in git's object database** and wraps them in **one commit** — so a change to five files is all-or-nothing.
-2. Publishing is a **compare-and-swap** on one ref: *"make Y the new tip — but only if the tip is still X"* (`git update-ref`). One ref is the single arbiter; with a remote, `push --force-with-lease` is the same check against `origin`.
-3. Lost the race? Your operation is a **function**, so gitomic re-runs it against the new tip. It finds its target in the winner's version and edits *that* — or throws a real conflict ("the task I was closing is gone"). Text is never merged.
-4. Every commit records **who / sequence / why** — history reads as a decision log, and a duplicate submission (retry after a lost ack) returns the original result instead of applying twice.
+1. A write builds its result directly in git's object database. No checkout is touched. Changes to many files become one commit — all or nothing.
+2. Publishing is one rule: *advance the ref to my commit, but only if it hasn't moved* (`git update-ref`, or `push --force-with-lease` against a remote).
+3. If someone else got there first, your operation is a function — gitomic re-runs it on their version. Text is never merged.
+4. Every commit records who, why, and a sequence number. Retries can't apply twice. History reads as a decision log.
 
-The whole design in one sentence: *an immutable map (a git tree), a tiny overlay map (your pending writes), and a pointer that only advances if nobody moved it first.*
+In one sentence: an immutable map (the git tree), a small overlay map (your pending writes), and a pointer that only moves if nobody else moved it first.
 
 ## API
 
@@ -29,17 +25,17 @@ import { open, Conflict } from "gitomic"
 const store = await open({
   repo: "path/inside/repo",
   ref: "refs/heads/main",
-  writer: "worker-3",           // durable identity; sequence numbers managed for you
-  remote: "origin",             // optional — when set, the remote ref is the arbiter
+  writer: "worker-3",
+  remote: "origin",            // optional: makes origin the arbiter
 })
 
-store.head()                    // newest commit id
-store.read(at?)                 // Snapshot — read-only draft: getItem, hasItem, getKeys; lazy, nothing copied
-store.commit(changes, opts?)    // the base primitive: Map<path, content | null> → one CAS attempt
-store.apply(fn, why?)           // fn: (draft: Draft) => Promise<void> — immer-style recipe, re-run on race
+store.head()                   // newest commit id
+store.read(at?)                // read-only view at that commit — lazy, nothing copied
+store.commit(changes, opts?)   // Map<path, content | null> → one commit, if the ref hasn't moved
+store.apply(fn, why?)          // fn(draft) — runs, commits, re-runs on a race
 ```
 
-One noun, the most common shape in the language. A **Draft** is almost a `Map`: `get`, `set`, `has`, `delete` transfer verbatim, plus the one verb every store adds — `ls(dir)` — because a lazy store can't honor Map's synchronous iteration (unstorage calls it `getKeys`, Cloudflare KV calls it `list`; ours reads exactly one directory level, so full-tree walks stay deliberate). Reads are async, fetched lazily from git's object database; writes are synchronous Map inserts, and `draft.changes` is the literal `Map` that `commit()` accepts. Like an immer draft, it reflects its own edits: read-after-write sees your write. `read()` returns the read-only mood. Rules: touch only the draft, and the recipe may run more than once — the same contract as Firestore's `runTransaction` (and the same optimistic check-then-commit as Deno KV's `atomic().check()`).
+A draft is almost a `Map`: `get`, `set`, `has`, `delete`, plus `ls(dir)` to list one directory. Reads are async and lazy; writes are plain Map inserts, and `draft.changes` is the Map that `commit()` takes. Read-after-write sees your write, like immer. One rule: touch nothing but the draft — it may run twice (the `runTransaction` contract).
 
 ## Example
 
@@ -52,34 +48,24 @@ await store.apply(async (d) => {
 }, "close 123 — fix shipped")
 ```
 
-Both files change together or not at all. If another writer lands first, the recipe re-runs against a fresh draft of their version; under a 3-writer × 100-op stress test this yields a strictly linear history — zero merges, zero lost updates.
+Both files land together or not at all. Measured with 3 writers firing 100 concurrent ops: straight-line history, zero merges, zero lost updates.
 
-Prefer another dialect? That's composed, not core: `withFs(async fs => {...})` adapts an fs-style recipe (`readFile`/`writeFile`/`rm`) onto a draft, and `asFs(store, at?)` presents any snapshot as a `node:fs`-compatible object for third-party libraries. The **[unstorage](https://unstorage.unjs.io) driver** is a ~30-line adapter (pure renames: `get`→`getItem`, `ls`-walked→`getKeys`): `setItem` outside a recipe becomes one atomic commit, batch `setItems` becomes **one** commit, `getMeta` surfaces who/why/when — a read-write, atomic sibling to the read-only GitHub driver.
+Other dialects are adapters, not core: `withFs()` for fs-style recipes, `asFs()` to make a snapshot look like `node:fs`, and an [unstorage](https://unstorage.unjs.io) driver that is mostly renames (`get`→`getItem`, walked `ls`→`getKeys`).
 
-## Pros
+## Good for / not for
 
-- Multi-file atomicity, zero lost updates, and a who/why audit log — with no server to run.
-- Nothing ever dirties a checkout; readers pin one commit id and see a consistent snapshot from anywhere.
-- It's plain git underneath: inspect with `git log`, sync with `git push`, back up like any repo.
-- Zero dependencies — shells out to the git binary you already have.
+**Good for:** many writers with one clean history — no server, no lock files. A full audit trail (who, why, when) on every change. Consistent snapshot reads from anywhere, no checkout needed. And it's plain git: log it, push it, back it up.
 
-## Cons
-
-- Not for high write rates: shelled git tops out around a handful of writes/second. Fine for coordination state; wrong for telemetry.
-- Not for code or patches: replay assumes an operation can validate itself against new state. A rebased code diff can't (tests must run) — keep code on your merge queue.
-- One arbiter ref by design — this is optimistic serialization, not partition-tolerant multi-master.
-- Recipes must be pure (touch only their draft — no clock, network, or real disk) — that's what makes re-running them safe.
+**Not for:** high write rates (think a handful of writes per second, not thousands). Code — a replayed patch can't validate itself, so keep code on your merge queue. Offline multi-master — there is one arbiter ref, on purpose. Impure operations — recipes may re-run, so no clocks, network, or disk inside.
 
 ## Alternatives & prior art
 
-- **SQLite** — better for relational or high-rate data; you give up files-as-truth.
-- **Lock files / flock** — fine for one file, no cross-file atomicity, no history.
-- **CRDTs (Automerge, Yjs)** — merge without coordination, great offline; but auto-merge can't enforce invariants ("two claims both win"), which serialized replay prevents.
-- **Datomic** — a name-nod and an inspiration (immutable history, derived disposable indexes, past states stay readable), claimed humbly: gitomic has no datoms, no Datalog, no transactor infrastructure — just files and a git ref borrowing the philosophy.
-- **The same pattern, embedded elsewhere**: Gerrit **NoteDb** (review state in refs, atomic ref transactions), **git-bug** (issues as op-logs), **Irmin** (`test_and_set`), **Jujutsu**; and outside git — Kubernetes **server-side apply**, **Replicache** server reconciliation, **Delta Lake/Iceberg** optimistic commits, **immer** and Redux (the pure-function-over-frozen-state shape of `apply`). gitomic is that pattern as a small standalone library.
+- **SQLite** — better for relational or high-rate data, but your files stop being files.
+- **CRDTs** (Automerge, Yjs) — merge without coordination, but can't enforce rules like "only one writer may claim this."
+- **The same idea elsewhere**: Gerrit NoteDb, git-bug, Irmin, Jujutsu (inside git); Kubernetes server-side apply, Replicache, Delta Lake (outside it). Datomic inspired the name and the philosophy. gitomic is the small standalone version.
 
-## Status & roadmap
+## Status
 
-Design locked; v1 (shell backend) in development — the npm package is a deprecated placeholder until then. Planned: `withFs()` / `asFs()` / `asKv()` adapters · `unstorage` driver · `mem` backend for tests · isomorphic-git backend (objects in-process; the CAS stays on native git) · field-level claims · multi-ref transactions · text-merge overlay for concurrent free-text.
+Design done; v1 in development. The npm name is a reserved, deprecated placeholder until then. Planned: `withFs` / `asFs` / `asKv` adapters, the unstorage driver, an in-memory backend for tests, an isomorphic-git backend, field-level claims, multi-ref transactions.
 
 MIT © Bjørn Stabell
