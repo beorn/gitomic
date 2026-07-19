@@ -22,6 +22,7 @@ type WorkerResult = {
 describe("shell contention acceptance", () => {
   test("lands 3 writers x 100 exactly once on a strictly linear history", async () => {
     const fixture = await createBareRepo()
+    const controller = new AbortController()
     try {
       const writerNames = ["writer-a", "writer-b", "writer-c"]
       const outputs = await Promise.all(
@@ -29,7 +30,10 @@ describe("shell contention acceptance", () => {
           async (writerName) =>
             await execFileAsync("bun", [worker, fixture.repo, writerName, "100"], {
               encoding: "utf8",
+              killSignal: "SIGKILL",
               maxBuffer: 10 * 1024 * 1024,
+              signal: controller.signal,
+              timeout: 270_000,
             }),
         ),
       )
@@ -57,6 +61,7 @@ describe("shell contention acceptance", () => {
         expect(operations.filter((operation) => operation.startsWith(`${writer}:`))).toHaveLength(100)
       }
     } finally {
+      controller.abort()
       await fixture.cleanup()
     }
   }, 300_000)

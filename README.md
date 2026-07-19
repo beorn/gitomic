@@ -170,13 +170,13 @@ const test = await open({ repo: "my-test", ref: "main", writer: "test", backend:
 1. Writes build files straight into git's object database — many files, one commit.
 2. Publish = move the ref to the new commit, only if nobody moved it first. Writers can be separate processes — the ref swap is atomic in every backend.
 3. Lose the race? The update function re-runs on the winner's version — no merges. Retries back off with a random, roughly-doubling delay (≤150ms; jitter prevents lockstep) and are bounded (default 10) before `RetriesExhausted`. Same-process writers queue locally.
-4. Commits carry who, why, and a per-writer counter — retries can't apply twice.
+4. Commits carry who, why, and a per-writer counter — retries can't apply twice. If an acknowledgement is ambiguous, recovery checks one bounded near-tip batch for the original commit and fails loudly instead of walking the repo's whole history.
 
 Losing is cheap — memory plus objects `git gc` reclaims. The conformance suite runs 3 writers × 100 concurrent writes and verifies 300/300 land exactly once on one linear tip.
 
 ## Status
 
-v1 ships three backends:
+The v1 source includes three backends:
 
 - `shell` — shells out to the `git` command you already have; zero dependencies
 - `iso` — optional; [isomorphic-git](https://isomorphic-git.org) builds objects in-process (about 7× faster writes on the development host); CAS stays native; an oid-equivalence suite holds all backends bit-identical

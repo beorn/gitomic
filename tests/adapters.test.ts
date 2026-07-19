@@ -38,6 +38,9 @@ describe("adapter contracts", () => {
     await store.transact(async (map) => map.set("one.txt", "one"), "seed")
 
     expect(await files.readFile("one.txt", "utf8")).toBe("one")
+    expect(await files.readFile("one.txt", "base64")).toBe(Buffer.from("one").toString("base64"))
+    const access = files.access
+    await expect(access("one.txt")).resolves.toBeUndefined()
     await expect(files.writeFile("two.txt", "two")).rejects.toBeInstanceOf(ReadOnlyError)
     await expect(files.rm("one.txt")).rejects.toMatchObject({ code: "EROFS" })
     expect(await store.at().keys()).toEqual(["one.txt"])

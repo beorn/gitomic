@@ -7,6 +7,7 @@ if (repo === undefined || writer === undefined || countText === undefined) {
 const count = Number(countText)
 if (!Number.isSafeInteger(count) || count < 1) throw new TypeError("count must be a positive integer")
 
+const deadline = Date.now() + 240_000
 const store = await open({ repo, ref: "main", writer })
 const committed = []
 let exhaustedCalls = 0
@@ -26,6 +27,12 @@ for (let index = 0; index < count; index += 1) {
     } catch (error) {
       if (!(error instanceof RetriesExhausted)) throw error
       exhaustedCalls += 1
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `${writer} exceeded the 240s stress-worker deadline at operation ${index + 1} after ${exhaustedCalls} exhausted calls`,
+          { cause: error },
+        )
+      }
     }
   }
 }

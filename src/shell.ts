@@ -18,6 +18,7 @@ type GitOptions = {
 }
 
 const ZERO_OID = "0000000000000000000000000000000000000000"
+const TRANSACTION_SEARCH_LIMIT = 1_024
 
 export function createShellBackend(): GitomicBackend {
   const resolveGitDir = createGitDirResolver()
@@ -38,7 +39,7 @@ export function createShellBackend(): GitomicBackend {
 async function run(command: string, args: readonly string[], options: GitOptions = {}): Promise<GitResult> {
   return await new Promise((resolveResult, reject) => {
     const child = spawn(command, args, {
-      env: { ...process.env, GIT_TERMINAL_PROMPT: "0", ...options.env },
+      env: { ...process.env, ...options.env, GIT_TERMINAL_PROMPT: "0", LC_ALL: "C" },
       stdio: ["pipe", "pipe", "pipe"],
     })
     const stdout: Buffer[] = []
@@ -184,19 +185,56 @@ async function writeCommit(repo: string, input: CommitInput): Promise<Oid> {
 async function compareAndSwap(repo: string, ref: string, next: Oid, expected: Oid): Promise<boolean> {
   const result = await run("git", gitArgs(repo, ["update-ref", ref, next, expected]))
   if (result.code === 0) return true
-  if ((await head(repo, ref)) !== expected) return false
   const detail = result.stderr.toString("utf8").trim()
+  if (isCompareAndSwapRejection(detail)) return false
   throw new Error(`git update-ref failed (${result.code})${detail ? `: ${detail}` : ""}`)
 }
 
 async function findTransaction(repo: string, tip: Oid, writer: string, seq: number): Promise<Oid | undefined> {
-  const commits = text(await git(repo, ["rev-list", "--first-parent", tip]))
-  for (const oid of commits.split("\n")) {
-    if (!oid) continue
-    const body = (await git(repo, ["show", "-s", "--format=%n%B", oid])).toString("utf8")
-    if (transactionMatches(body, writer, seq)) return oid
+  const output = await git(repo, [
+    "rev-list",
+    "--first-parent",
+    `--max-count=${TRANSACTION_SEARCH_LIMIT + 1}`,
+    "--no-commit-header",
+    "--format=%H%x00%B%x00",
+    tip,
+  ])
+  const commits = parseTransactionHistory(output)
+  for (const commit of commits.slice(0, TRANSACTION_SEARCH_LIMIT)) {
+    if (transactionMatches(commit.message, writer, seq)) return commit.oid
+  }
+  if (commits.length > TRANSACTION_SEARCH_LIMIT) {
+    throw new Error(
+      `transaction lookup for writer ${JSON.stringify(writer)} sequence ${seq} exceeded ${TRANSACTION_SEARCH_LIMIT} first-parent commits; the ambiguous acknowledgement is too old to resolve safely`,
+    )
   }
   return undefined
+}
+
+function isCompareAndSwapRejection(detail: string): boolean {
+  return (
+    /cannot lock ref .*: is at [0-9a-f]+ but expected [0-9a-f]+/.test(detail) ||
+    /cannot lock ref .*: reference already exists/.test(detail) ||
+    /cannot lock ref .*: reference is missing but expected [0-9a-f]+/.test(detail)
+  )
+}
+
+function parseTransactionHistory(output: Buffer): Array<{ oid: Oid; message: string }> {
+  const fields = output.toString("utf8").split("\0")
+  const trailing = fields.pop()
+  if (trailing?.trim()) throw new Error("git rev-list returned trailing transaction data")
+  if (fields.length % 2 !== 0) throw new Error("git rev-list returned a malformed transaction record")
+
+  const commits: Array<{ oid: Oid; message: string }> = []
+  for (let index = 0; index < fields.length; index += 2) {
+    const oid = fields[index]?.replace(/^\n/, "")
+    const message = fields[index + 1]
+    if (oid === undefined || message === undefined || !/^[0-9a-f]{40,64}$/.test(oid)) {
+      throw new Error("git rev-list returned a malformed transaction record")
+    }
+    commits.push({ oid, message })
+  }
+  return commits
 }
 
 async function fetchRemote(repo: string, ref: string, remote: string): Promise<Oid> {
@@ -220,10 +258,17 @@ async function compareAndSwapRemote(
   )
   if (result.code !== 0) {
     const detail = `${result.stdout.toString("utf8")}\n${result.stderr.toString("utf8")}`.trim()
-    if (/\brejected\b|stale info|fetch first/i.test(detail)) return false
+    if (isRemoteCompareAndSwapRejection(detail)) return false
     throw new Error(`git push failed (${result.code})${detail ? `: ${detail}` : ""}`)
   }
   const local = await head(repo, ref)
   if (local === expected) await compareAndSwap(repo, ref, next, expected)
   return true
+}
+
+function isRemoteCompareAndSwapRejection(detail: string): boolean {
+  return detail.split("\n").some((line) => {
+    const [flag, , summary] = line.split("\t")
+    return flag === "!" && summary === "[rejected] (stale info)"
+  })
 }

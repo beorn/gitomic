@@ -81,7 +81,25 @@ function makeReadView(snapshot: () => Snapshot): FsView {
       throw new FsError("ENOENT", "read", normalized)
     }
     const encoding = encodingFrom(options)
-    return encoding === null || encoding === "buffer" ? Buffer.from(value, "utf8") : value
+    const buffer = Buffer.from(value, "utf8")
+    return encoding === null || encoding === "buffer" ? buffer : buffer.toString(encoding)
+  }
+  const stat = async (path: PathLike): Promise<FsStat> => {
+    const normalized = directoryPath(path)
+    const view = snapshot()
+    const value = normalized === "" ? undefined : await view.get(normalized)
+    if (value !== undefined) {
+      return {
+        size: Buffer.byteLength(value, "utf8"),
+        isFile: () => true,
+        isDirectory: () => false,
+      }
+    }
+    const prefix = normalized === "" ? "" : `${normalized}/`
+    if (normalized === "" || (await view.keys(prefix)).length > 0) {
+      return { size: 0, isFile: () => false, isDirectory: () => true }
+    }
+    throw new FsError("ENOENT", "stat", normalized)
   }
   return {
     readFile: readFile as FsView["readFile"],
@@ -102,25 +120,9 @@ function makeReadView(snapshot: () => Snapshot): FsView {
       if (directory !== "" && entries.size === 0) throw new FsError("ENOENT", "scandir", directory)
       return [...entries].sort()
     },
-    async stat(path) {
-      const normalized = directoryPath(path)
-      const view = snapshot()
-      const value = normalized === "" ? undefined : await view.get(normalized)
-      if (value !== undefined) {
-        return {
-          size: Buffer.byteLength(value, "utf8"),
-          isFile: () => true,
-          isDirectory: () => false,
-        }
-      }
-      const prefix = normalized === "" ? "" : `${normalized}/`
-      if (normalized === "" || (await view.keys(prefix)).length > 0) {
-        return { size: 0, isFile: () => false, isDirectory: () => true }
-      }
-      throw new FsError("ENOENT", "stat", normalized)
-    },
+    stat,
     async access(path) {
-      await this.stat(path)
+      await stat(path)
     },
   }
 }

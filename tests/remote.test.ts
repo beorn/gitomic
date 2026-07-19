@@ -3,6 +3,8 @@
 // @consumer remote-arbitrated gitomic writers
 
 import { describe, expect, test } from "vitest"
+import { chmod, writeFile } from "node:fs/promises"
+import { join } from "node:path"
 
 import { open } from "../src/index.js"
 import { createRemoteRepos, git } from "./helpers/git.js"
@@ -67,4 +69,30 @@ describe("remote arbitration", () => {
       await fixture.cleanup()
     }
   }, 30_000)
+
+  test("propagates a remote policy rejection without replaying it as contention", async () => {
+    const fixture = await createRemoteRepos()
+    try {
+      const store = await open({
+        repo: fixture.left,
+        ref: "main",
+        writer: "policy-test",
+        remote: "origin",
+      })
+      const hook = join(fixture.remote, "hooks", "pre-receive")
+      await writeFile(hook, '#!/bin/sh\necho "policy denied" >&2\nexit 1\n', "utf8")
+      await chmod(hook, 0o755)
+      let attempts = 0
+
+      await expect(
+        store.transact(async (map) => {
+          attempts += 1
+          map.set("blocked", "write")
+        }, "blocked by policy"),
+      ).rejects.toThrow("policy denied")
+      expect(attempts).toBe(1)
+    } finally {
+      await fixture.cleanup()
+    }
+  })
 })
