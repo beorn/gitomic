@@ -2,7 +2,15 @@
 
 Direct git commits, skip working copies — many writers, no merges, nothing lost.
 
-> **Pre-release.** Not on npm yet — the name is held and the API may still change. The implementation and its conformance suite live in this repository.
+> **0.x release.** The implementation and conformance suite are ready for use; the API may still change before 1.0.
+
+## Install
+
+```sh
+npm install gitomic
+```
+
+The default `shell` backend has no runtime dependencies. Install `isomorphic-git` alongside gitomic only when using the optional `gitomic/iso` entry point.
 
 ## Example
 
