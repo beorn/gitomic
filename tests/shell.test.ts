@@ -63,6 +63,10 @@ async function createGitWrapper(): Promise<{
       "  process.exit(0)",
       "}",
       'const updateRef = args.indexOf("update-ref")',
+      "if (updateRef >= 0 && process.env.GITOMIC_UPDATE_REF_ERROR) {",
+      "  process.stderr.write(process.env.GITOMIC_UPDATE_REF_ERROR)",
+      "  process.exit(128)",
+      "}",
       'if (updateRef >= 0 && process.env.GITOMIC_FAIL_UPDATE_REF === "true") {',
       '  process.stderr.write("fatal: simulated persistent update-ref failure\\n")',
       "  process.exit(1)",
@@ -274,6 +278,27 @@ describe.sequential("shell backend failure boundaries", () => {
         "simulated persistent update-ref failure",
       )
       expect(await backend.head("ignored", "refs/heads/main")).toBe(winner)
+    } finally {
+      restore()
+      await wrapper.cleanup()
+    }
+  })
+
+  test("replays when another update-ref process temporarily owns the ref lock", async () => {
+    const wrapper = await createGitWrapper()
+    const expected = "1".repeat(40)
+    const next = "2".repeat(40)
+    const restore = replaceEnvironment({
+      GITOMIC_FAKE_GITDIR: "/tmp/gitomic-fake.git",
+      GITOMIC_UPDATE_REF_ERROR:
+        "fatal: prepare: cannot lock ref 'refs/heads/main': Unable to create '/tmp/gitomic-fake.git/refs/heads/main.lock': File exists.\n",
+      LC_ALL: "C",
+      PATH: `${wrapper.bin}${delimiter}${process.env.PATH ?? ""}`,
+    })
+    try {
+      await expect(createShellBackend().compareAndSwap("ignored", "refs/heads/main", next, expected)).resolves.toBe(
+        false,
+      )
     } finally {
       restore()
       await wrapper.cleanup()
