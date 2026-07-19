@@ -2,7 +2,7 @@
 
 Direct git commits, skip working copies — many writers, no merges, nothing lost.
 
-> **Pre-release.** Not on npm yet — the name is held and the API may still change. Performance numbers are from the prototype's test suite.
+> **Pre-release.** Not on npm yet — the name is held and the API may still change. The implementation and its conformance suite live in this repository.
 
 ## Example
 
@@ -28,7 +28,7 @@ b81d0e7 worker-1: archive inbox
 4c99a01 bjorn: reword index
 ```
 
-**Where did the file go?** Normal git works file-side: edit working-copy files, stage, commit. gitomic inverts that — it builds the commit *object-side*, directly in git's database, and moves the branch to it; no working copy is in the loop. So it writes to the *branch*, never to files on disk. A checkout sees the new commits after `git pull`; read through the store (or `git show`) instead. Sharing a live checkout? Point gitomic at a bare repo or a ref your editor isn't on.
+**Where did the file go?** Normal git works file-side: edit working-copy files, stage, commit. gitomic inverts that — it builds the commit _object-side_, directly in git's database, and moves the branch to it; no working copy is in the loop. So it writes to the _branch_, never to files on disk. A checkout sees the new commits after `git pull`; read through the store (or `git show`) instead. Sharing a live checkout? Point gitomic at a bare repo or a ref your editor isn't on.
 
 In short: an immutable map (the git tree), an overlay of pending writes, and a pointer that only advances if nobody moved it first.
 
@@ -62,20 +62,20 @@ store.transact(fn: Update, message: string): Promise<Committed>
 
 `transact` runs your update function and lands its writes as one commit, re-running it if another writer got there first. `message` is required — it becomes the commit message; say why, not what. `writer` must not be shared by two live processes — the retry-dedup counter is per writer, so a shared name can double-apply or skip.
 
-**`remote`:** origin becomes the decider. Every write is one round trip — fetch, then push under the remote's ref lock; the lease check is compare-and-swap, never history rewriting, so a push either fast-forwards or triggers a re-run. Reads stay local and lag until the next fetch. Origin is, honestly, your server; omit it for purely local stores.
+**`remote`:** origin becomes the decider. Every write is one fetch/push cycle under the remote's ref lock; the lease check is compare-and-swap, never history rewriting, so a push either fast-forwards or triggers a re-run. Reads stay local and lag until the next fetch. Origin is, honestly, your server; omit it for purely local stores.
 
 The map your update function receives:
 
 ```ts
 type GitMap = {
-  get(path: string): Promise<string | undefined>  // sees your own pending writes
-  set(path: string, content: string): void        // instant, in-memory
-  delete(path: string): void                      // instant, in-memory
+  get(path: string): Promise<string | undefined> // sees your own pending writes
+  set(path: string, content: string): void // instant, in-memory
+  delete(path: string): void // instant, in-memory
   has(path: string): Promise<boolean>
-  keys(prefix?: string): Promise<string[]>        // paths under a prefix; omit for all
+  keys(prefix?: string): Promise<string[]> // paths under a prefix; omit for all
 }
 
-type Snapshot = Pick<GitMap, "get" | "has" | "keys">  // what at() returns — reads only
+type Snapshot = Pick<GitMap, "get" | "has" | "keys"> // what at() returns — reads only
 ```
 
 Paths are git tree paths — forward slashes, no leading slash; `keys` returns full paths, sorted. Values are UTF-8 strings in v1 — no binary yet. `at()` pins its commit at call time (omit for the current tip) and reads lazily — a bad commit id throws on first read.
@@ -89,7 +89,9 @@ await store.transact(async (map) => {
   for (const path of await map.keys("inbox/")) {
     const dest = path.replace("inbox/", "archive/")
     if (await map.has(dest)) continue
-    map.set(dest, await map.get(path))
+    const content = await map.get(path)
+    if (content === undefined) throw new Conflict(`missing ${path}`)
+    map.set(dest, content)
     map.delete(path)
   }
 }, "archive inbox")
@@ -109,21 +111,37 @@ await store.transact(async (map) => {
 }, "take deploy lock")
 ```
 
-Two writers race this; exactly one wins. The loser's re-run *sees* the winner's lock and aborts — `Conflict` surfaces to your caller (`RetriesExhausted` is the only other error `transact` adds).
+Two writers race this; exactly one wins. The loser's re-run _sees_ the winner's lock and aborts — `Conflict` surfaces to your caller (`RetriesExhausted` is the only other error `transact` adds).
 
 Same store, other faces. The rule: `asX(store)` re-views the store as interface X (read-only where a write would bypass the transaction); `withX(fn)` wraps your update function so X-shaped calls stay transactional:
 
 ```ts
 import { withFs, asFs, asKv, asUnstorage } from "gitomic/adapters"
 
-await store.transact(withFs(async (fs) => {     // node:fs calls, still transactional
-  await fs.writeFile("notes/today.md", note)
-}), "add note")
+await store.transact(
+  withFs(async (fs) => {
+    // node:fs calls, still transactional
+    await fs.writeFile("notes/today.md", note)
+  }),
+  "add note",
+)
 
-const files = asFs(store)                       // read-only node:fs view of the tip; writes throw
+const files = asFs(store) // read-only node:fs view of the tip; writes throw
 await asKv(store).set("index.md", text, "edit") // one call = one commit
 const storage = createStorage({ driver: asUnstorage(store) })
 ```
+
+The zero-dependency `shell` backend is the default. Select an optional backend explicitly:
+
+```ts
+import { createIsoBackend } from "gitomic/iso"
+import { createMemBackend } from "gitomic/mem"
+
+const fast = await open({ repo: ".", ref: "main", writer: "worker-3", backend: createIsoBackend() })
+const test = await open({ repo: "my-test", ref: "main", writer: "test", backend: createMemBackend() })
+```
+
+`iso` uses `isomorphic-git` for in-process object reads/writes while keeping ref CAS native. `mem` creates canonical Git objects entirely in memory and requires neither a repository nor the `git` executable.
 
 ## When to use it
 
@@ -136,9 +154,9 @@ const storage = createStorage({ driver: asUnstorage(store) })
 
 **Not for:**
 
-- High write rates — a few commits/sec with the default `shell` backend (spawns `git`), tens with the in-process `iso` backend; not telemetry
+- High write rates — low tens of commits/sec with the default `shell` backend (spawns `git`), around a hundred with the in-process `iso` backend; not telemetry
 - Code — replayed writes aren't re-tested; keep code in review and CI
-- Merging two *offline* writers — CRDT territory. (Solo offline is fine; remote ops can queue and replay on reconnect.)
+- Merging two _offline_ writers — CRDT territory. (Solo offline is fine; remote ops can queue and replay on reconnect.)
 - Side effects — the update function may re-run
 
 ## Alternatives & prior art
@@ -154,15 +172,17 @@ const storage = createStorage({ driver: asUnstorage(store) })
 3. Lose the race? The update function re-runs on the winner's version — no merges. Retries back off with a random, roughly-doubling delay (≤150ms; jitter prevents lockstep) and are bounded (default 10) before `RetriesExhausted`. Same-process writers queue locally.
 4. Commits carry who, why, and a per-writer counter — retries can't apply twice.
 
-Losing is cheap — memory plus objects `git gc` reclaims. Spike: 3 writers × 100 concurrent writes, 431 retries, 300/300 landed exactly once.
+Losing is cheap — memory plus objects `git gc` reclaims. The conformance suite runs 3 writers × 100 concurrent writes and verifies 300/300 land exactly once on one linear tip.
 
 ## Status
 
 v1 ships three backends:
 
 - `shell` — shells out to the `git` command you already have; zero dependencies
-- `iso` — optional; [isomorphic-git](https://isomorphic-git.org) builds objects in-process (~10× faster writes); CAS stays native; an oid-equivalence suite holds all backends bit-identical
+- `iso` — optional; [isomorphic-git](https://isomorphic-git.org) builds objects in-process (about 7× faster writes on the development host); CAS stays native; an oid-equivalence suite holds all backends bit-identical
 - `mem` — in-memory, no git binary; instant unit tests against the same API
+
+Run `bun run bench` to measure the backends locally. On the development host, the checked-in 20-commit benchmark measured 12.35 commits/s for `shell` and 81.63 commits/s for `iso` (6.61×); absolute numbers depend heavily on filesystem and process-spawn cost.
 
 Planned: offline op queue with replay-on-reconnect · field-level claims · multi-ref transactions · remote-only stores — open a URL, no local repo; the git wire protocol already does lazy reads (partial fetch) and CAS writes (push is old→new under the server's ref lock).
 
