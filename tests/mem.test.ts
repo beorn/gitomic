@@ -8,6 +8,17 @@ import { open } from "../src/index.js"
 import { createMemBackend } from "../src/mem.js"
 
 describe("mem backend", () => {
+  test("rejects a duplicate live writer without invoking Git", async () => {
+    const backend = createMemBackend()
+    await open({ repo: "writer-lease", ref: "main", writer: "worker-a", backend })
+
+    await expect(open({ repo: "writer-lease", ref: "main", writer: "worker-a", backend })).rejects.toThrow(
+      'writer "worker-a" is already open',
+    )
+    await expect(open({ repo: "writer-lease", ref: "main", writer: "worker-b", backend })).resolves.toBeDefined()
+    await expect(open({ repo: "other-repo", ref: "main", writer: "worker-a", backend })).resolves.toBeDefined()
+  })
+
   test("runs without a repository or git process and emits real Git object ids", async () => {
     const backend = createMemBackend()
     const store = await open({ repo: "unit-test", ref: "main", writer: "worker-a", backend })
@@ -54,4 +65,16 @@ describe("mem backend", () => {
     expect(new Set(commits)).toHaveLength(300)
     expect(commits).not.toContain(undefined)
   }, 30_000)
+
+  test("fails loudly beyond the bounded receipt lookup horizon", async () => {
+    const backend = createMemBackend()
+    const store = await open({ repo: "receipt-horizon", ref: "main", writer: "history-writer", backend })
+    for (let index = 0; index < 1_025; index += 1) {
+      await store.transact(async (map) => map.set("count", String(index + 1)), `history ${index + 1}`)
+    }
+
+    await expect(backend.findTransaction("receipt-horizon", await store.head(), "missing-writer", 1)).rejects.toThrow(
+      "exceeded 1024 first-parent commits",
+    )
+  })
 })

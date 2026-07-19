@@ -26,6 +26,7 @@ export type CommitInput = {
 }
 
 export type GitomicBackend = {
+  acquireWriter(repo: string, writer: string): Promise<void>
   head(repo: string, ref: string): Promise<Oid>
   readFiles(repo: string, commit: Oid): Promise<ReadonlyMap<string, string>>
   writeCommit(repo: string, input: CommitInput): Promise<Oid>

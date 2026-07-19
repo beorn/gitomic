@@ -1,4 +1,11 @@
-import { encodeCommit, encodeFiles, formatCommitMessage, INITIAL_TIMESTAMP } from "./git-object.js"
+import {
+  encodeCommit,
+  encodeFiles,
+  formatCommitMessage,
+  INITIAL_TIMESTAMP,
+  TRANSACTION_SEARCH_LIMIT,
+  transactionLookupExceeded,
+} from "./git-object.js"
 import type { CommitInput, GitomicBackend, Oid } from "./types.js"
 
 type MemCommit = {
@@ -28,6 +35,7 @@ function createInitialCommit(): MemCommit {
 
 export function createMemBackend(): GitomicBackend {
   const repos = new Map<string, MemRepo>()
+  const writers = new Set<string>()
 
   const getRepo = (name: string): MemRepo => {
     let repo = repos.get(name)
@@ -94,14 +102,31 @@ export function createMemBackend(): GitomicBackend {
   const findTransaction = async (name: string, tip: Oid, writer: string, seq: number): Promise<Oid | undefined> => {
     const commits = getRepo(name).commits
     let oid: Oid | undefined = tip
+    let inspected = 0
     while (oid !== undefined) {
+      if (inspected >= TRANSACTION_SEARCH_LIMIT) throw transactionLookupExceeded(writer, seq)
       const commit = commits.get(oid)
       if (commit === undefined) throw new Error(`unknown commit: ${oid}`)
+      inspected += 1
       if (commit.writer === writer && commit.seq === seq) return oid
       oid = commit.parent
     }
     return undefined
   }
 
-  return { head, readFiles, writeCommit, compareAndSwap, findTransaction }
+  const backend: GitomicBackend = {
+    acquireWriter: async (name, writer) => {
+      const key = `${name}\0${writer}`
+      if (writers.has(key)) {
+        throw new Error(`writer ${JSON.stringify(writer)} is already open; pass a unique writer for each live store`)
+      }
+      writers.add(key)
+    },
+    head,
+    readFiles,
+    writeCommit,
+    compareAndSwap,
+    findTransaction,
+  }
+  return backend
 }

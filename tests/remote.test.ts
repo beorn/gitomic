@@ -3,11 +3,16 @@
 // @consumer remote-arbitrated gitomic writers
 
 import { describe, expect, test } from "vitest"
-import { chmod, writeFile } from "node:fs/promises"
+import { chmod, readFile, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 
 import { open } from "../src/index.js"
 import { createRemoteRepos, git } from "./helpers/git.js"
+
+type TraceEvent = {
+  event?: string
+  argv?: string[]
+}
 
 function deferred(): { promise: Promise<void>; resolve(): void } {
   let resolve!: () => void
@@ -18,6 +23,32 @@ function deferred(): { promise: Promise<void>; resolve(): void } {
 }
 
 describe("remote arbitration", () => {
+  test("fetches through a transaction-private ref instead of shared FETCH_HEAD", async () => {
+    const fixture = await createRemoteRepos()
+    const previousTrace = process.env.GIT_TRACE2_EVENT
+    try {
+      const trace = join(fixture.left, "fetch-trace.json")
+      process.env.GIT_TRACE2_EVENT = trace
+
+      await open({ repo: fixture.left, ref: "main", writer: "fetch-isolation", remote: "origin" })
+
+      const events = (await readFile(trace, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as TraceEvent)
+      const fetch = events.find((event) => event.event === "start" && event.argv?.includes("fetch"))
+      expect(fetch?.argv).toContain("--no-write-fetch-head")
+      expect(
+        fetch?.argv?.some((argument) => /^refs\/heads\/main:refs\/gitomic\/fetch\/[0-9a-f-]+$/.test(argument)),
+      ).toBe(true)
+      expect(await git(fixture.left, "for-each-ref", "refs/gitomic/fetch")).toBe("")
+    } finally {
+      if (previousTrace === undefined) delete process.env.GIT_TRACE2_EVENT
+      else process.env.GIT_TRACE2_EVENT = previousTrace
+      await fixture.cleanup()
+    }
+  })
+
   test("replays a rejected lease on the origin winner without a merge", async () => {
     const fixture = await createRemoteRepos()
     try {

@@ -31,17 +31,56 @@ export async function git(repo: string, ...args: string[]): Promise<string> {
   return stdout.trim()
 }
 
-export async function createBareRepo(): Promise<{
+export async function gitWithInput(repo: string, input: string | Uint8Array, ...args: string[]): Promise<string> {
+  return await new Promise<string>((resolveGit, rejectGit) => {
+    const child = execFile("git", ["--git-dir", repo, ...args], { env: gitEnvironment() }, (error, stdout, stderr) => {
+      if (error !== null) {
+        rejectGit(new Error(`git ${args[0] ?? "command"} failed: ${stderr.trim()}`))
+        return
+      }
+      resolveGit(stdout.trim())
+    })
+    child.stdin?.end(input)
+  })
+}
+
+export async function appendEmptyHistory(repo: string, initial: string, count: number): Promise<void> {
+  const stream: string[] = []
+  for (let index = 0; index < count; index += 1) {
+    const mark = index + 1
+    const parent = index === 0 ? initial : `:${index}`
+    const message = `history ${mark}\n`
+    stream.push(
+      `commit refs/heads/main\nmark :${mark}\ncommitter gitomic <gitomic@localhost> ${946_684_801 + index} +0000\ndata ${Buffer.byteLength(message)}\n${message}from ${parent}\n\n`,
+    )
+  }
+  stream.push("done\n")
+  await gitWithInput(repo, stream.join(""), "fast-import", "--quiet")
+}
+
+export async function createBareRepo(
+  options: { refFormat?: "files" | "reftable"; objectFormat?: "sha1" | "sha256" } = {},
+): Promise<{
   repo: string
   initial: string
   cleanup(): Promise<void>
 }> {
   const dir = await mkdtemp(join(tmpdir(), "gitomic-test-"))
   const repo = join(dir, "state.git")
-  await execFileAsync("git", ["init", "--bare", "--quiet", "--object-format=sha1", repo], {
-    env: gitEnvironment(),
-  })
-  const initial = await git(repo, "commit-tree", EMPTY_TREE, "-m", "initial")
+  await execFileAsync(
+    "git",
+    [
+      "init",
+      "--bare",
+      "--quiet",
+      `--object-format=${options.objectFormat ?? "sha1"}`,
+      ...(options.refFormat === undefined ? [] : [`--ref-format=${options.refFormat}`]),
+      repo,
+    ],
+    { env: gitEnvironment() },
+  )
+  const emptyTree = await gitWithInput(repo, "", "mktree")
+  const initial = await git(repo, "commit-tree", emptyTree, "-m", "initial")
   await git(repo, "update-ref", "refs/heads/main", initial)
   await git(repo, "symbolic-ref", "HEAD", "refs/heads/main")
   return {

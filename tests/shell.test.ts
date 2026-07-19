@@ -2,7 +2,7 @@
 // @level l1
 // @consumer default shell-backend users
 
-import { spawn } from "node:child_process"
+import { spawnSync } from "node:child_process"
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { delimiter, join } from "node:path"
@@ -10,9 +10,12 @@ import { delimiter, join } from "node:path"
 import { describe, expect, test } from "vitest"
 
 import { createShellBackend, open } from "../src/index.js"
-import { createBareRepo } from "./helpers/git.js"
+import { appendEmptyHistory, createBareRepo } from "./helpers/git.js"
 
 const TRANSACTION_SEARCH_LIMIT = 1_024
+const gitInitHelp = spawnSync("git", ["init", "-h"], { encoding: "utf8" })
+const supportsReftable = `${gitInitHelp.stdout}${gitInitHelp.stderr}`.includes("--ref-format")
+const supportsObjectFormat = `${gitInitHelp.stdout}${gitInitHelp.stderr}`.includes("--object-format")
 
 type TraceEvent = {
   event?: string
@@ -51,7 +54,11 @@ async function createGitWrapper(): Promise<{
       "const args = process.argv.slice(2)",
       "const log = process.env.GITOMIC_GIT_ENV_LOG",
       'if (log) appendFileSync(log, `${process.env.LC_ALL ?? "<unset>"}\\n`)',
-      'if (args.includes("--absolute-git-dir")) {',
+      'if (args[0] === "--version") {',
+      '  process.stdout.write(`git version ${process.env.GITOMIC_FAKE_GIT_VERSION ?? "2.39.0"}\\n`)',
+      "  process.exit(0)",
+      "}",
+      'if (args.includes("--git-common-dir")) {',
       "  process.stdout.write(`${process.env.GITOMIC_FAKE_GITDIR}\\n`)",
       "  process.exit(0)",
       "}",
@@ -78,35 +85,109 @@ async function createGitWrapper(): Promise<{
   }
 }
 
-async function runWithInput(command: string, args: string[], input: string): Promise<void> {
-  await new Promise<void>((resolveRun, rejectRun) => {
-    const child = spawn(command, args, { stdio: ["pipe", "ignore", "pipe"] })
-    const stderr: Buffer[] = []
-    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk))
-    child.once("error", rejectRun)
-    child.once("close", (code) => {
-      if (code === 0) resolveRun()
-      else rejectRun(new Error(`${command} exited ${code ?? 1}: ${Buffer.concat(stderr).toString("utf8").trim()}`))
-    })
-    child.stdin.end(input)
-  })
-}
-
-async function appendEmptyHistory(repo: string, initial: string, count: number): Promise<void> {
-  const stream: string[] = []
-  for (let index = 0; index < count; index += 1) {
-    const mark = index + 1
-    const parent = index === 0 ? initial : `:${index}`
-    const message = `history ${mark}\n`
-    stream.push(
-      `commit refs/heads/main\nmark :${mark}\ncommitter gitomic <gitomic@localhost> ${946_684_801 + index} +0000\ndata ${Buffer.byteLength(message)}\n${message}from ${parent}\n\n`,
-    )
-  }
-  stream.push("done\n")
-  await runWithInput("git", ["--git-dir", repo, "fast-import", "--quiet"], stream.join(""))
-}
-
 describe.sequential("shell backend failure boundaries", () => {
+  test("fails open when Git is too old for the durability contract", async () => {
+    const wrapper = await createGitWrapper()
+    const restore = replaceEnvironment({
+      GITOMIC_FAKE_GIT_VERSION: "2.35.9",
+      LC_ALL: "C",
+      PATH: `${wrapper.bin}${delimiter}${process.env.PATH ?? ""}`,
+    })
+    try {
+      await expect(createShellBackend().head("ignored", "refs/heads/main")).rejects.toThrow(
+        "Git 2.36 or newer is required",
+      )
+    } finally {
+      restore()
+      await wrapper.cleanup()
+    }
+  })
+
+  test("accepts the standard Git for Windows version suffix", async () => {
+    const wrapper = await createGitWrapper()
+    const expected = "1".repeat(40)
+    const restore = replaceEnvironment({
+      GITOMIC_FAKE_GITDIR: "/tmp/gitomic-fake.git",
+      GITOMIC_FAKE_GIT_VERSION: "2.45.2.windows.1",
+      GITOMIC_FAKE_HEAD: expected,
+      LC_ALL: "C",
+      PATH: `${wrapper.bin}${delimiter}${process.env.PATH ?? ""}`,
+    })
+    try {
+      await expect(createShellBackend().head("ignored", "refs/heads/main")).resolves.toBe(expected)
+    } finally {
+      restore()
+      await wrapper.cleanup()
+    }
+  })
+
+  test("passes repository durability config on every transaction write command", async () => {
+    const fixture = await createBareRepo()
+    const previousTrace = process.env.GIT_TRACE2_EVENT
+    try {
+      const trace = join(fixture.repo, "write-durability-trace.json")
+      process.env.GIT_TRACE2_EVENT = trace
+      const store = await open({ repo: fixture.repo, ref: "main", writer: "durable-writer" })
+
+      await store.transact(async (map) => map.set("value", "durable"), "durable write")
+
+      const events = (await readFile(trace, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as TraceEvent)
+      const writeCommands = ["hash-object", "update-index", "write-tree", "commit-tree", "update-ref"]
+      for (const command of writeCommands) {
+        const starts = events.filter((event) => event.event === "start" && event.argv?.includes(command))
+        expect(starts.length, `${command} did not run`).toBeGreaterThan(0)
+        for (const event of starts) {
+          expect(event.argv).toContain("core.fsync=loose-object,reference")
+          expect(event.argv).toContain("core.fsyncMethod=fsync")
+        }
+      }
+      const refTransactions = events.filter((event) => event.event === "start" && event.argv?.includes("update-ref"))
+      const publishTransactions = refTransactions.filter((event) => event.argv?.includes("--stdin"))
+      expect(publishTransactions).toHaveLength(1)
+      expect(
+        refTransactions.some((event) => event.argv?.some((argument) => argument.startsWith("refs/gitomic/writers/"))),
+      ).toBe(true)
+    } finally {
+      if (previousTrace === undefined) delete process.env.GIT_TRACE2_EVENT
+      else process.env.GIT_TRACE2_EVENT = previousTrace
+      await fixture.cleanup()
+    }
+  })
+
+  test.runIf(supportsReftable)("delegates inflight pins to native Git for reftable repositories", async () => {
+    const fixture = await createBareRepo({ refFormat: "reftable" })
+    try {
+      const store = await open({ repo: fixture.repo, ref: "main", writer: "reftable-writer" })
+
+      const committed = await store.transact(async (map) => map.set("value", "reftable"), "write reftable state")
+
+      expect(await store.head()).toBe(committed.oid)
+      expect(await store.at().get("value")).toBe("reftable")
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  test.runIf(supportsObjectFormat)("supports SHA-256 object ids in the shell backend", async () => {
+    const fixture = await createBareRepo({ objectFormat: "sha256" })
+    try {
+      const store = await open({ repo: fixture.repo, ref: "main", writer: "sha256-shell" })
+
+      const written = await store.transact(async (map) => map.set("value", "sha256"), "write SHA-256 state")
+      expect(written.oid).toMatch(/^[0-9a-f]{64}$/)
+      expect(await store.at().get("value")).toBe("sha256")
+
+      const removed = await store.transact(async (map) => map.delete("value"), "delete SHA-256 state")
+      expect(removed.oid).toMatch(/^[0-9a-f]{64}$/)
+      expect(await store.at().has("value")).toBe(false)
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
   test("finds an acknowledged transaction with one bounded history process", async () => {
     const fixture = await createBareRepo()
     const previousTrace = process.env.GIT_TRACE2_EVENT

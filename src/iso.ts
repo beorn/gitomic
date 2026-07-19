@@ -1,19 +1,23 @@
 import * as nodeFs from "node:fs"
 
-import {
-  readBlob,
-  readCommit,
-  readTree,
-  resolveRef,
-  writeBlob,
-  writeCommit as writeIsoCommit,
-  writeTree,
-} from "isomorphic-git"
-import type { CommitObject, FsClient, TreeEntry } from "isomorphic-git"
+import { readBlob, readCommit, readTree, resolveRef } from "isomorphic-git"
+import type { FsClient } from "isomorphic-git"
 
-import { formatCommitMessage, GITOMIC_EMAIL, GITOMIC_NAME, transactionMatches } from "./git-object.js"
-import { createGitDirResolver, createShellBackend } from "./shell.js"
+import {
+  encodeBlob,
+  encodeCommit,
+  encodeTreeEntries,
+  formatCommitMessage,
+  TRANSACTION_SEARCH_LIMIT,
+  transactionLookupExceeded,
+  transactionMatches,
+} from "./git-object.js"
+import type { GitObject, GitTreeObjectEntry } from "./git-object.js"
+import { createDurableObjectWriter } from "./iso-durable.js"
+import { assertRegularBlob } from "./path.js"
+import { createShellRuntime } from "./shell.js"
 import type { CommitInput, GitomicBackend, Oid } from "./types.js"
+import { decodeUtf8 } from "./utf8.js"
 
 type BlobEntry = {
   kind: "blob" | "commit"
@@ -28,23 +32,40 @@ type TreeNode = {
 
 export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBackend {
   const fs = options.fs ?? nodeFs
+  const objectWriter = createDurableObjectWriter(fs)
   const cache = {}
-  const shell = createShellBackend()
-  const fetchRemote = shell.fetchRemote
-  const compareAndSwapRemote = shell.compareAndSwapRemote
-  if (fetchRemote === undefined || compareAndSwapRemote === undefined) {
-    throw new Error("shell backend remote methods are unavailable")
+  const shellRuntime = createShellRuntime()
+  const shell = shellRuntime.backend
+  const resolveCommonGitDir = shellRuntime.resolveGitDir
+  const refStorage = shellRuntime.refStorage
+  const resolveGitDir = async (repo: string): Promise<string> => {
+    const gitdir = await resolveCommonGitDir(repo)
+    if ((await shellRuntime.objectFormat(repo)) !== "sha1") {
+      throw new Error("iso backend supports SHA-1 repositories only; use the shell backend for SHA-256")
+    }
+    return gitdir
   }
-  const resolveGitDir = createGitDirResolver()
 
-  const loadTree = async (gitdir: string, oid: Oid): Promise<TreeNode> => {
+  const loadTree = async (gitdir: string, oid: Oid, prefix = ""): Promise<TreeNode> => {
     const result = await readTree({ fs, gitdir, oid, cache })
+    const canonicalEntries = result.tree.map((entry): GitTreeObjectEntry => {
+      const path = prefix === "" ? entry.path : `${prefix}/${entry.path}`
+      if (entry.type === "tree") return { mode: "40000", path: entry.path, oid: entry.oid }
+      assertRegularBlob(path, entry.mode, entry.type)
+      const mode = entry.mode === "100755" ? "100755" : "100644"
+      return { mode, path: entry.path, oid: entry.oid }
+    })
+    if (encodeTreeEntries(canonicalEntries).oid !== oid) {
+      throw new Error(`Git tree ${oid} contains path bytes that are not valid UTF-8 or canonical Git tree order`)
+    }
     const entries = new Map<string, TreeNode | BlobEntry>()
     await Promise.all(
       result.tree.map(async (entry) => {
+        const path = prefix === "" ? entry.path : `${prefix}/${entry.path}`
         if (entry.type === "tree") {
-          entries.set(entry.path, await loadTree(gitdir, entry.oid))
+          entries.set(entry.path, await loadTree(gitdir, entry.oid, path))
         } else {
+          assertRegularBlob(path, entry.mode, entry.type)
           entries.set(entry.path, { kind: entry.type, mode: entry.mode, oid: entry.oid })
         }
       }),
@@ -65,7 +86,7 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
             await visit(entry, path)
           } else if (entry.kind === "blob") {
             const result = await readBlob({ fs, gitdir, oid: entry.oid, cache })
-            files.set(path, Buffer.from(result.blob).toString("utf8"))
+            files.set(path, decodeUtf8(result.blob, `Git blob at ${JSON.stringify(path)}`))
           }
         }),
       )
@@ -74,12 +95,7 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
     return files
   }
 
-  const applyChange = async (
-    gitdir: string,
-    root: TreeNode,
-    path: string,
-    content: string | undefined,
-  ): Promise<void> => {
+  const applyChange = (root: TreeNode, path: string, content: string | undefined, oid?: Oid): void => {
     const parts = path.split("/")
     const filename = parts.pop()
     if (filename === undefined) throw new TypeError(`invalid git tree path: ${JSON.stringify(path)}`)
@@ -102,55 +118,49 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
     }
     const existing = node.entries.get(filename)
     if (existing?.kind === "tree") throw new TypeError(`path is a tree: ${path}`)
-    const oid = await writeBlob({ fs, gitdir, blob: Buffer.from(content, "utf8") })
+    if (oid === undefined) throw new Error(`missing prepared blob for ${JSON.stringify(path)}`)
     node.entries.set(filename, {
       kind: "blob",
-      mode: existing?.mode ?? "100644",
+      mode: "100644",
       oid,
     })
-  }
-
-  const writeNode = async (gitdir: string, node: TreeNode): Promise<Oid> => {
-    const tree: TreeEntry[] = []
-    for (const [path, entry] of node.entries) {
-      if (entry.kind === "tree") {
-        if (entry.entries.size === 0) continue
-        tree.push({ mode: "040000", path, oid: await writeNode(gitdir, entry), type: "tree" })
-      } else {
-        tree.push({ mode: entry.mode, path, oid: entry.oid, type: entry.kind })
-      }
-    }
-    return await writeTree({ fs, gitdir, tree })
   }
 
   const writeCommit = async (repo: string, input: CommitInput): Promise<Oid> => {
     const gitdir = await resolveGitDir(repo)
     const parentResult = await readCommit({ fs, gitdir, oid: input.parent, cache })
     const root = await loadTree(gitdir, parentResult.commit.tree)
-    for (const [path, content] of input.changes) await applyChange(gitdir, root, path, content)
-    const tree = await writeNode(gitdir, root)
+    const objects = new Map<Oid, GitObject>()
+    const blobs = new Map<string, Oid>()
+    for (const [path, content] of input.changes) {
+      if (content === undefined) continue
+      const blob = encodeBlob(Buffer.from(content, "utf8"))
+      objects.set(blob.oid, blob)
+      blobs.set(path, blob.oid)
+    }
+    for (const [path, content] of input.changes) applyChange(root, path, content, blobs.get(path))
+    const tree = encodeTreeNode(root, objects)
     const timestamp = parentResult.commit.committer.timestamp + 1
-    const signature = {
-      name: GITOMIC_NAME,
-      email: GITOMIC_EMAIL,
-      timestamp,
-      timezoneOffset: 0,
-    }
-    const commit: CommitObject = {
+    const commit = encodeCommit({
       tree,
-      parent: [input.parent],
-      author: signature,
-      committer: signature,
+      parent: input.parent,
+      timestamp,
       message: formatCommitMessage(input.writer, input.message, input.seq),
-    }
-    return await writeIsoCommit({ fs, gitdir, commit })
+    })
+    objects.set(commit.oid, commit)
+    await objectWriter.writeObjects(gitdir, objects.values())
+    await shellRuntime.pinCommit(repo, input.writer, commit.oid)
+    return commit.oid
   }
 
   const findTransaction = async (repo: string, tip: Oid, writer: string, seq: number): Promise<Oid | undefined> => {
     const gitdir = await resolveGitDir(repo)
     let oid: Oid | undefined = tip
+    let inspected = 0
     while (oid !== undefined) {
+      if (inspected >= TRANSACTION_SEARCH_LIMIT) throw transactionLookupExceeded(writer, seq)
       const { commit } = await readCommit({ fs, gitdir, oid, cache })
+      inspected += 1
       if (transactionMatches(commit.message, writer, seq)) return oid
       oid = commit.parent[0]
     }
@@ -158,12 +168,31 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
   }
 
   return {
-    head: async (repo, ref) => await resolveRef({ fs, gitdir: await resolveGitDir(repo), ref }),
+    ...shell,
+    head: async (repo, ref) => {
+      const gitdir = await resolveGitDir(repo)
+      return (await refStorage(repo)) === "files" ? await resolveRef({ fs, gitdir, ref }) : await shell.head(repo, ref)
+    },
     readFiles,
     writeCommit,
-    compareAndSwap: shell.compareAndSwap,
     findTransaction,
-    fetchRemote,
-    compareAndSwapRemote,
   }
+}
+
+function encodeTreeNode(node: TreeNode, objects: Map<Oid, GitObject>): Oid {
+  const entries: GitTreeObjectEntry[] = []
+  for (const [path, entry] of node.entries) {
+    if (entry.kind === "tree") {
+      if (entry.entries.size === 0) continue
+      entries.push({ mode: "40000", path, oid: encodeTreeNode(entry, objects) })
+      continue
+    }
+    if (entry.mode !== "100644" && entry.mode !== "100755") {
+      throw new Error(`unsupported Git tree mode ${entry.mode} at ${JSON.stringify(path)}`)
+    }
+    entries.push({ mode: entry.mode, path, oid: entry.oid })
+  }
+  const tree = encodeTreeEntries(entries)
+  objects.set(tree.oid, tree)
+  return tree.oid
 }

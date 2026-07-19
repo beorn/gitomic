@@ -1,7 +1,9 @@
 import { Conflict, RetriesExhausted } from "./errors.js"
-import { assertPath, assertPrefix, INTERNAL_PREFIX, isPublicPath } from "./path.js"
+import { validateOid } from "./git-object.js"
+import { assertTreeShape, INTERNAL_PREFIX, isPublicPath, normalizePath, normalizePrefix } from "./path.js"
 import { createShellBackend } from "./shell.js"
 import type { Committed, GitMap, GitomicBackend, Oid, OpenOptions, Snapshot, Store, Update } from "./types.js"
+import { assertUtf8 } from "./utf8.js"
 
 export { Conflict, RetriesExhausted }
 export { createShellBackend } from "./shell.js"
@@ -11,7 +13,7 @@ export async function open(options: OpenOptions): Promise<Store> {
   const context = await prepareStore(options)
   const enqueue = createQueue()
   return {
-    head: () => context.backend.head(context.repo, context.ref),
+    head: async () => backendOid(await context.backend.head(context.repo, context.ref)),
     at: (commit) => makeSnapshot(context, commit),
     transact: (update, message) => enqueue(async () => await transact(context, update, message)),
   }
@@ -34,11 +36,14 @@ async function prepareStore(options: OpenOptions): Promise<StoreContext> {
   const ref = normalizeRef(options.ref)
   const writer = options.writer
   const backend = options.backend ?? createShellBackend()
+  if (typeof backend.acquireWriter !== "function") {
+    throw new TypeError("backend must implement acquireWriter(repo, writer) to enforce one live owner per writer")
+  }
   const remote = options.remote
   let refresh: () => Promise<Oid>
   let publish: (next: Oid, expected: Oid) => Promise<boolean>
   if (remote === undefined) {
-    refresh = async () => await backend.head(repo, ref)
+    refresh = async () => backendOid(await backend.head(repo, ref))
     publish = async (next, expected) => await backend.compareAndSwap(repo, ref, next, expected)
   } else {
     const fetchRemote = backend.fetchRemote
@@ -46,10 +51,11 @@ async function prepareStore(options: OpenOptions): Promise<StoreContext> {
     if (fetchRemote === undefined || compareAndSwapRemote === undefined) {
       throw new TypeError("this backend cannot arbitrate remotely; omit remote or use the shell/iso backend")
     }
-    refresh = async () => await fetchRemote(repo, ref, remote)
+    refresh = async () => backendOid(await fetchRemote(repo, ref, remote))
     publish = async (next, expected) => await compareAndSwapRemote(repo, ref, next, expected, remote)
   }
   await refresh()
+  await backend.acquireWriter(repo, writer)
   return { repo, ref, writer, backend, refresh, publish }
 }
 
@@ -57,34 +63,39 @@ async function transact(context: StoreContext, update: Update, message: string):
   if (typeof message !== "string" || message.trim().length === 0) {
     throw new TypeError("message must say why this transaction exists")
   }
+  assertUtf8(message, "message")
+  if (message.includes("\0")) throw new TypeError("message cannot contain NUL because Git commit messages forbid it")
   let retries = 0
   let attempts = 0
   let seq: number | undefined
   while (true) {
     attempts += 1
     const parent = await context.refresh()
-    const base = await context.backend.readFiles(context.repo, parent)
+    const base = checkedFiles(await context.backend.readFiles(context.repo, parent))
     seq ??= readSequence(base, context.writer) + 1
     const { map, changes } = makeOverlay(base)
     await update(map)
     const effective = removeNoopChanges(base, changes)
     if (effective.size === 0) return { oid: parent, retries }
     effective.set(metadataPath(context.writer), writeSequence(context.writer, seq))
-    const next = await context.backend.writeCommit(context.repo, {
-      parent,
-      changes: effective,
-      message: message.trim(),
-      writer: context.writer,
-      seq,
-    })
+    assertNextTree(base, effective)
+    const next = backendOid(
+      await context.backend.writeCommit(context.repo, {
+        parent,
+        changes: effective,
+        message: message.trim(),
+        writer: context.writer,
+        seq,
+      }),
+    )
     if (await context.publish(next, parent)) return { oid: next, retries }
 
     retries += 1
     const winner = await context.refresh()
-    const winnerFiles = await context.backend.readFiles(context.repo, winner)
+    const winnerFiles = checkedFiles(await context.backend.readFiles(context.repo, winner))
     if (readSequence(winnerFiles, context.writer) >= seq) {
       const landed = await context.backend.findTransaction(context.repo, winner, context.writer, seq)
-      if (landed !== undefined) return { oid: landed, retries }
+      if (landed !== undefined) return { oid: backendOid(landed), retries }
       throw new Error(
         `writer ${JSON.stringify(context.writer)} sequence ${seq} is marked landed but unreachable; use a unique writer per live process`,
       )
@@ -95,26 +106,46 @@ async function transact(context: StoreContext, update: Update, message: string):
 }
 
 function makeSnapshot(context: StoreContext, commit?: Oid): Snapshot {
-  const pinned = commit === undefined ? context.backend.head(context.repo, context.ref) : Promise.resolve(commit)
+  const pinned =
+    commit === undefined
+      ? context.backend.head(context.repo, context.ref).then(backendOid)
+      : Promise.resolve(validateOid(commit))
   let files: Promise<ReadonlyMap<string, string>> | undefined
   const load = (): Promise<ReadonlyMap<string, string>> => {
-    files ??= pinned.then((oid) => context.backend.readFiles(context.repo, oid))
+    files ??= pinned.then((oid) => context.backend.readFiles(context.repo, oid)).then(checkedFiles)
     return files
   }
   return {
     async get(path) {
-      assertPath(path)
-      return (await load()).get(path)
+      return (await load()).get(normalizePath(path))
     },
     async has(path) {
-      assertPath(path)
-      return (await load()).has(path)
+      return (await load()).has(normalizePath(path))
     },
     async keys(prefix = "") {
-      assertPrefix(prefix)
-      return [...(await load()).keys()].filter((path) => isPublicPath(path) && path.startsWith(prefix)).sort()
+      const normalized = normalizePrefix(prefix)
+      return [...(await load()).keys()].filter((path) => isPublicPath(path) && path.startsWith(normalized)).sort()
     },
   }
+}
+
+function checkedFiles(files: ReadonlyMap<string, string>): ReadonlyMap<string, string> {
+  assertTreeShape(files.keys())
+  for (const [path, content] of files) assertUtf8(content, `Git blob at ${JSON.stringify(path)}`)
+  return files
+}
+
+function assertNextTree(base: ReadonlyMap<string, string>, changes: ReadonlyMap<string, string | undefined>): void {
+  const next = new Map(base)
+  for (const [path, content] of changes) {
+    if (content === undefined) next.delete(path)
+    else next.set(path, content)
+  }
+  assertTreeShape(next.keys())
+}
+
+function backendOid(value: unknown): Oid {
+  return validateOid(value, "backend returned an invalid Git object id")
 }
 
 function makeOverlay(base: ReadonlyMap<string, string>): {
@@ -125,30 +156,27 @@ function makeOverlay(base: ReadonlyMap<string, string>): {
   const get = (path: string): string | undefined => (changes.has(path) ? changes.get(path) : base.get(path))
   const map: GitMap = {
     async get(path) {
-      assertPath(path)
-      return get(path)
+      return get(normalizePath(path))
     },
     set(path, content) {
-      assertPath(path)
-      if (typeof content !== "string") throw new TypeError("gitomic v1 values must be UTF-8 strings")
-      changes.set(path, content)
+      const normalized = normalizePath(path)
+      assertUtf8(content, "gitomic v1 values")
+      changes.set(normalized, content)
     },
     delete(path) {
-      assertPath(path)
-      changes.set(path, undefined)
+      changes.set(normalizePath(path), undefined)
     },
     async has(path) {
-      assertPath(path)
-      return get(path) !== undefined
+      return get(normalizePath(path)) !== undefined
     },
     async keys(prefix = "") {
-      assertPrefix(prefix)
+      const normalized = normalizePrefix(prefix)
       const keys = new Set([...base.keys()].filter(isPublicPath))
       for (const [path, value] of changes) {
         if (value === undefined) keys.delete(path)
         else keys.add(path)
       }
-      return [...keys].filter((path) => path.startsWith(prefix)).sort()
+      return [...keys].filter((path) => path.startsWith(normalized)).sort()
     },
   }
   return { map, changes }
@@ -167,20 +195,41 @@ function createQueue(): <T>(operation: () => Promise<T>) => Promise<T> {
 }
 
 function assertWriter(writer: string): void {
-  const hasControlCharacter =
-    typeof writer === "string" &&
-    [...writer].some((character) => {
-      const codePoint = character.codePointAt(0) ?? 0
-      return codePoint <= 0x1f || codePoint === 0x7f
-    })
-  if (typeof writer !== "string" || writer.trim().length === 0 || hasControlCharacter) {
+  assertUtf8(writer, "writer")
+  const hasControlCharacter = [...writer].some((character) => {
+    const codePoint = character.codePointAt(0) ?? 0
+    return codePoint <= 0x1f || codePoint === 0x7f
+  })
+  if (writer.trim().length === 0 || hasControlCharacter) {
     throw new TypeError("writer must be a non-empty, single-line identifier")
   }
 }
 
 function normalizeRef(ref: string): string {
-  if (typeof ref !== "string" || ref.length === 0) throw new TypeError("ref is required")
-  return ref.startsWith("refs/") ? ref : `refs/heads/${ref}`
+  assertUtf8(ref, "ref")
+  if (ref.length === 0) throw new TypeError("ref is required")
+  const normalized = ref.startsWith("refs/") ? ref : `refs/heads/${ref}`
+  if (normalized === "refs/gitomic" || normalized.startsWith("refs/gitomic/")) {
+    throw new TypeError("refs/gitomic/ is reserved for Gitomic's internal reachability and lease refs")
+  }
+  const components = normalized.split("/")
+  if (
+    normalized.startsWith("/") ||
+    normalized.endsWith("/") ||
+    normalized.endsWith(".") ||
+    normalized.includes("..") ||
+    normalized.includes("@{") ||
+    [...normalized].some(isInvalidRefCharacter) ||
+    components.some((component) => component.length === 0 || component.startsWith(".") || component.endsWith(".lock"))
+  ) {
+    throw new TypeError(`invalid Git ref: ${JSON.stringify(ref)}`)
+  }
+  return normalized
+}
+
+function isInvalidRefCharacter(character: string): boolean {
+  const codePoint = character.codePointAt(0) ?? 0
+  return codePoint <= 0x20 || codePoint === 0x7f || "~^:?*[\\".includes(character)
 }
 
 function metadataPath(writer: string): string {

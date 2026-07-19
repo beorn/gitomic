@@ -32,6 +32,20 @@ describe("adapter contracts", () => {
     expect(await store.at(committed.oid).get("notes/today.md")).toBeUndefined()
   })
 
+  test("withFs rejects bytes that are not valid UTF-8 without changing state", async () => {
+    const store = await createStore("with-fs-invalid-utf8")
+
+    await expect(
+      store.transact(
+        withFs(async (fs) => {
+          await fs.writeFile("binary.dat", Uint8Array.of(0xff))
+        }),
+        "reject binary input",
+      ),
+    ).rejects.toThrow("valid UTF-8")
+    expect(await store.at().keys()).toEqual([])
+  })
+
   test("asFs tracks the tip for reads and rejects every mutating face", async () => {
     const store = await createStore("as-fs")
     const files = asFs(store)

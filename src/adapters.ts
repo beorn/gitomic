@@ -1,6 +1,7 @@
 import { posix } from "node:path"
 
 import type { GitMap, Snapshot, Store, Update } from "./types.js"
+import { decodeUtf8 } from "./utf8.js"
 
 type PathLike = string
 type ReadEncoding = BufferEncoding | "buffer" | null
@@ -132,7 +133,7 @@ function makeTransactionFs(map: GitMap): TransactionFs {
   return {
     ...read,
     async writeFile(path, data) {
-      map.set(filePath(path), typeof data === "string" ? data : Buffer.from(data).toString("utf8"))
+      map.set(filePath(path), typeof data === "string" ? data : decodeUtf8(data, "fs.writeFile data"))
     },
     async unlink(path) {
       const normalized = filePath(path)
