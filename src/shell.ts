@@ -35,6 +35,7 @@ type PinnedCommit = {
 }
 
 const DURABLE_GIT_CONFIG = ["-c", "core.fsync=loose-object,reference", "-c", "core.fsyncMethod=fsync"] as const
+const REF_LOCK_RETRY_LIMIT = 10
 
 export function createShellBackend(): GitomicBackend {
   return createShellRuntime().backend
@@ -442,11 +443,7 @@ async function writeCommit(repo: string, input: CommitInput): Promise<Oid> {
 }
 
 async function compareAndSwap(repo: string, ref: string, next: Oid, expected: Oid): Promise<boolean> {
-  const result = await run("git", durableGitArgs(repo, ["update-ref", ref, next, expected]))
-  if (result.code === 0) return true
-  const detail = result.stderr.toString("utf8").trim()
-  if (isCompareAndSwapRejection(detail)) return false
-  throw new Error(`git update-ref failed (${result.code})${detail ? `: ${detail}` : ""}`)
+  return await runRefCompareAndSwap(repo, ref, ["update-ref", ref, next, expected])
 }
 
 async function compareAndSwapPinned(
@@ -464,14 +461,30 @@ async function compareAndSwapPinned(
     "commit",
     "",
   ].join("\n")
-  const result = await run("git", durableGitArgs(repo, ["update-ref", "--stdin"]), { input })
-  if (result.code === 0) {
+  const landed = await runRefCompareAndSwap(repo, ref, ["update-ref", "--stdin"], { input })
+  if (landed) {
     pin.released = true
-    return true
   }
-  const detail = result.stderr.toString("utf8").trim()
-  if (isCompareAndSwapRejection(detail)) return false
-  throw new Error(`git update-ref failed (${result.code})${detail ? `: ${detail}` : ""}`)
+  return landed
+}
+
+async function runRefCompareAndSwap(
+  repo: string,
+  ref: string,
+  args: readonly string[],
+  options: GitOptions = {},
+): Promise<boolean> {
+  for (let lockRetries = 0; ; lockRetries += 1) {
+    const result = await run("git", durableGitArgs(repo, args), options)
+    if (result.code === 0) return true
+    const detail = result.stderr.toString("utf8").trim()
+    if (isCompareAndSwapRejection(detail)) return false
+    if (isTransientRefLock(detail, ref) && lockRetries < REF_LOCK_RETRY_LIMIT) {
+      await delayForRefLock(lockRetries + 1)
+      continue
+    }
+    throw new Error(`git update-ref failed (${result.code})${detail ? `: ${detail}` : ""}`)
+  }
 }
 
 async function writeInflightRef(
@@ -614,6 +627,22 @@ function isCompareAndSwapRejection(detail: string): boolean {
     /cannot lock ref .*: reference already exists/.test(detail) ||
     /cannot lock ref .*: reference is missing but expected [0-9a-f]+/.test(detail)
   )
+}
+
+function isTransientRefLock(detail: string, ref: string): boolean {
+  return (
+    detail.includes(`cannot lock ref '${ref}'`) &&
+    detail.includes("Unable to create ") &&
+    detail.includes(".lock': File exists")
+  )
+}
+
+function delayForRefLock(attempt: number): Promise<void> {
+  const ceiling = Math.min(25, 2 ** Math.min(attempt, 5))
+  const milliseconds = 1 + Math.random() * ceiling
+  return new Promise((resolveDelay) => {
+    setTimeout(resolveDelay, milliseconds)
+  })
 }
 
 function parseTransactionHistory(output: Buffer): Array<{ oid: Oid; message: string }> {

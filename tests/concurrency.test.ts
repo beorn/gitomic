@@ -4,7 +4,10 @@
 
 import { spawn } from "node:child_process"
 import { createHash } from "node:crypto"
+import { unlink, writeFile } from "node:fs/promises"
 import { hostname } from "node:os"
+import { join } from "node:path"
+import { setTimeout as delay } from "node:timers/promises"
 import { fileURLToPath } from "node:url"
 
 import { describe, expect, test } from "vitest"
@@ -288,6 +291,25 @@ describe("semantic CAS replay", () => {
 
       await expect(open({ repo: fixture.repo, ref: "main", writer })).rejects.toThrow("must be valid UTF-8")
     } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  test("retries a transient ref lock without abandoning the pinned publish", async () => {
+    const fixture = await createBareRepo()
+    const lock = join(fixture.repo, "refs/heads/main.lock")
+    const store = await open({ repo: fixture.repo, ref: "main", writer: "lock-contender" })
+    await writeFile(lock, "held by concurrent update-ref\n", "utf8")
+    const release = delay(500).then(async () => await unlink(lock))
+    try {
+      const committed = await store.transact(async (map) => map.set("value", "published"), "wait for ref lock")
+
+      expect(await store.head()).toBe(committed.oid)
+      expect(await store.at().get("value")).toBe("published")
+      expect(await git(fixture.repo, "for-each-ref", "refs/gitomic/inflight")).toBe("")
+    } finally {
+      await release.catch(() => undefined)
+      await unlink(lock).catch(() => undefined)
       await fixture.cleanup()
     }
   })
