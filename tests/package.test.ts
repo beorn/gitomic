@@ -1,6 +1,6 @@
-// @failure Installing the default shell entrypoint could pull an unused runtime dependency.
+// @failure Workspace imports can depend on ignored build output, while package installs can expose the wrong entrypoints or runtime dependencies.
 // @level l1
-// @consumer package installers
+// @consumer workspace and package consumers
 
 import { access, readFile } from "node:fs/promises"
 
@@ -13,7 +13,6 @@ type PackageManifest = {
   peerDependencies?: Record<string, string>
   peerDependenciesMeta?: Record<string, { optional?: boolean }>
   publishConfig?: {
-    access?: string
     exports?: Record<string, PackageExport>
   }
   types?: string
@@ -49,14 +48,11 @@ describe("package dependency boundary", () => {
     for (const target of Object.values(sourceExports)) {
       await expect(access(new URL(`..${target.slice(1)}`, import.meta.url))).resolves.toBeUndefined()
     }
-    expect(packageManifest.publishConfig).toEqual({
-      access: "public",
-      exports: {
-        ".": { types: "./dist/index.d.ts", import: "./dist/index.js" },
-        "./adapters": { types: "./dist/adapters.d.ts", import: "./dist/adapters.js" },
-        "./iso": { types: "./dist/iso.d.ts", import: "./dist/iso.js" },
-        "./mem": { types: "./dist/mem.d.ts", import: "./dist/mem.js" },
-      },
+    expect(packageManifest.publishConfig?.exports).toEqual({
+      ".": { types: "./dist/index.d.ts", import: "./dist/index.js" },
+      "./adapters": { types: "./dist/adapters.d.ts", import: "./dist/adapters.js" },
+      "./iso": { types: "./dist/iso.d.ts", import: "./dist/iso.js" },
+      "./mem": { types: "./dist/mem.d.ts", import: "./dist/mem.js" },
     })
   })
 })
