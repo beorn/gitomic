@@ -28,26 +28,31 @@
   ],
   "type": "module",
   "sideEffects": false,
-  "types": "./dist/index.d.ts",
   "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
-    },
-    "./adapters": {
-      "types": "./dist/adapters.d.ts",
-      "import": "./dist/adapters.js"
-    },
-    "./iso": {
-      "types": "./dist/iso.d.ts",
-      "import": "./dist/iso.js"
-    },
-    "./mem": {
-      "types": "./dist/mem.d.ts",
-      "import": "./dist/mem.js"
-    }
+    ".": "./src/index.ts",
+    "./adapters": "./src/adapters.ts",
+    "./iso": "./src/iso.ts",
+    "./mem": "./src/mem.ts"
   },
   "publishConfig": {
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "import": "./dist/index.js"
+      },
+      "./adapters": {
+        "types": "./dist/adapters.d.ts",
+        "import": "./dist/adapters.js"
+      },
+      "./iso": {
+        "types": "./dist/iso.d.ts",
+        "import": "./dist/iso.js"
+      },
+      "./mem": {
+        "types": "./dist/mem.d.ts",
+        "import": "./dist/mem.js"
+      }
+    },
     "access": "public"
   },
   "scripts": {
