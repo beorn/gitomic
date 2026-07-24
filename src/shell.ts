@@ -445,7 +445,7 @@ async function compareAndSwap(repo: string, ref: string, next: Oid, expected: Oi
   const result = await run("git", durableGitArgs(repo, ["update-ref", ref, next, expected]))
   if (result.code === 0) return true
   const detail = result.stderr.toString("utf8").trim()
-  if (isCompareAndSwapRejection(detail)) return false
+  if (isCompareAndSwapRejection(detail) || isTransientRefLockContention(detail)) return false
   throw new Error(`git update-ref failed (${result.code})${detail ? `: ${detail}` : ""}`)
 }
 
@@ -470,7 +470,7 @@ async function compareAndSwapPinned(
     return true
   }
   const detail = result.stderr.toString("utf8").trim()
-  if (isCompareAndSwapRejection(detail)) return false
+  if (isCompareAndSwapRejection(detail) || isTransientRefLockContention(detail)) return false
   throw new Error(`git update-ref failed (${result.code})${detail ? `: ${detail}` : ""}`)
 }
 
@@ -614,6 +614,10 @@ function isCompareAndSwapRejection(detail: string): boolean {
     /cannot lock ref .*: reference already exists/.test(detail) ||
     /cannot lock ref .*: reference is missing but expected [0-9a-f]+/.test(detail)
   )
+}
+
+function isTransientRefLockContention(detail: string): boolean {
+  return /cannot lock ref .*\.lock['"]?: File exists\.?/.test(detail)
 }
 
 function parseTransactionHistory(output: Buffer): Array<{ oid: Oid; message: string }> {

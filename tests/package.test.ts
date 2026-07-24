@@ -7,6 +7,9 @@ import { access, readFile } from "node:fs/promises"
 import { describe, expect, test } from "vitest"
 
 type PackageManifest = {
+  version: string
+  files?: string[]
+  packageManager?: string
   dependencies?: Record<string, string>
   exports?: Record<string, PackageExport>
   optionalDependencies?: Record<string, string>
@@ -32,6 +35,10 @@ describe("package dependency boundary", () => {
     expect(packageManifest.optionalDependencies).toBeUndefined()
     expect(packageManifest.peerDependencies).toEqual({ "isomorphic-git": "^1.38.7" })
     expect(packageManifest.peerDependenciesMeta).toEqual({ "isomorphic-git": { optional: true } })
+    expect(
+      packageManifest.packageManager,
+      "a Bun pin blocks the canonical pnpm pack/publish release path",
+    ).toBeUndefined()
   })
 
   test("resolves workspaces from tracked source while publishing built entrypoints", async () => {
@@ -54,5 +61,15 @@ describe("package dependency boundary", () => {
       "./iso": { types: "./dist/iso.d.ts", import: "./dist/iso.js" },
       "./mem": { types: "./dist/mem.d.ts", import: "./dist/mem.js" },
     })
+  })
+
+  test("keeps public release metadata aligned with the packed artifact", async () => {
+    const packageManifest = await manifest()
+    const changelog = await readFile(new URL("../CHANGELOG.md", import.meta.url), "utf8")
+    const readme = await readFile(new URL("../README.md", import.meta.url), "utf8")
+
+    expect(packageManifest.files).toContain("CHANGELOG.md")
+    expect(changelog).toContain(`## ${packageManifest.version}`)
+    expect(readme).not.toContain("Not on npm yet")
   })
 })
