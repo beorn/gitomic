@@ -92,6 +92,14 @@ type Snapshot = Pick<GitMap, "get" | "has" | "keys"> // what at() returns — re
 
 Paths are git tree paths — forward slashes, no leading slash; public paths and prefixes normalize to Unicode NFC, and `keys` returns full canonical paths, sorted. Existing trees must already be NFC, valid UTF-8, free of file/directory collisions, and contain regular blobs only: invalid path bytes, symlink entries, and gitlinks fail loudly instead of being replaced, followed, or ignored. Values are strict UTF-8 strings in v1 — invalid stored bytes and unpaired JavaScript surrogates fail; there is no binary mode yet. The whole `refs/gitomic/` namespace is reserved for protocol state. `at()` accepts only a full lowercase 40- or 64-hex object id and pins it at call time (omit for the current tip); a well-formed but missing id throws on first read.
 
+### Ownership manifests
+
+`parseOwnershipManifest(raw, { label?, acceptPath })` parses a version-1
+path/source declaration into sorted paths and an exact source-object mapping.
+The parser rejects malformed Git paths, duplicates, schema drift, and any path
+the caller's policy declines. Gitomic owns this generic mechanism; it does not
+choose an application's state partition.
+
 ## The full tour
 
 The whole map, in one update function:

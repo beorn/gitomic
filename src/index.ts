@@ -7,7 +7,9 @@ import { assertUtf8 } from "./utf8.js"
 
 export { Conflict, RetriesExhausted }
 export { createShellBackend } from "./shell.js"
+export { parseOwnershipManifest } from "./ownership-manifest.js"
 export type { Committed, GitMap, GitomicBackend, Oid, OpenOptions, Snapshot, Store, Update } from "./types.js"
+export type { OwnershipManifest, OwnershipManifestPolicy } from "./ownership-manifest.js"
 
 export async function open(options: OpenOptions): Promise<Store> {
   const context = await prepareStore(options)
