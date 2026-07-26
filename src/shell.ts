@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process"
 import { createHash, randomUUID } from "node:crypto"
-import { mkdir, mkdtemp, open as openFile, rename, rm, unlink } from "node:fs/promises"
+import { mkdir, mkdtemp, open as openFile, rename, rm, unlink, writeFile } from "node:fs/promises"
 import { hostname, tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 
@@ -404,20 +404,45 @@ async function writeCommit(repo: string, input: CommitInput): Promise<Oid> {
   const indexEnv = { GIT_INDEX_FILE: index }
   try {
     await gitWrite(repo, ["read-tree", input.parent], { env: indexEnv })
-    for (const [path, content] of input.changes) {
-      if (content === undefined) {
-        await gitWrite(repo, ["update-index", "-z", "--index-info"], {
-          env: indexEnv,
-          input: Buffer.concat([
-            Buffer.from(`0 ${"0".repeat(input.parent.length)}\t`, "utf8"),
-            Buffer.from(path, "utf8"),
-            Buffer.from([0]),
-          ]),
-        })
-        continue
+    const changes = [...input.changes]
+    const blobFiles: string[] = []
+    for (const [position, [, content]] of changes.entries()) {
+      if (content === undefined) continue
+      const blobFile = join(indexDir, `blob-${position}`)
+      await writeFile(blobFile, content, "utf8")
+      blobFiles.push(blobFile)
+    }
+    const blobOutput =
+      blobFiles.length === 0
+        ? ""
+        : text(
+            await gitWrite(repo, ["hash-object", "-w", "--stdin-paths", "--no-filters"], {
+              input: `${blobFiles.join("\n")}\n`,
+            }),
+          )
+    const blobs =
+      blobOutput === ""
+        ? []
+        : blobOutput.split("\n").map((oid, position) => validateOid(oid, `invalid blob id at position ${position}`))
+    if (blobs.length !== blobFiles.length) {
+      throw new Error(`git hash-object returned ${blobs.length} blob ids for ${blobFiles.length} inputs`)
+    }
+    if (changes.length > 0) {
+      const zeroOid = "0".repeat(input.parent.length)
+      let blobPosition = 0
+      const indexInfo: Buffer[] = []
+      for (const [path, content] of changes) {
+        const oid = content === undefined ? zeroOid : blobs[blobPosition++]
+        indexInfo.push(
+          Buffer.from(`${content === undefined ? "0" : "100644"} ${oid}\t`, "utf8"),
+          Buffer.from(path, "utf8"),
+          Buffer.from([0]),
+        )
       }
-      const blob = text(await gitWrite(repo, ["hash-object", "-w", "--stdin"], { input: content }))
-      await gitWrite(repo, ["update-index", "--add", "--cacheinfo", "100644", blob, path], { env: indexEnv })
+      await gitWrite(repo, ["update-index", "--add", "-z", "--index-info"], {
+        env: indexEnv,
+        input: Buffer.concat(indexInfo),
+      })
     }
     const tree = text(await gitWrite(repo, ["write-tree"], { env: indexEnv }))
     const parentTime = Number(text(await git(repo, ["show", "-s", "--format=%ct", input.parent])))

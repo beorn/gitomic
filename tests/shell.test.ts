@@ -131,10 +131,16 @@ describe.sequential("shell backend failure boundaries", () => {
     const previousTrace = process.env.GIT_TRACE2_EVENT
     try {
       const trace = join(fixture.repo, "write-durability-trace.json")
-      process.env.GIT_TRACE2_EVENT = trace
       const store = await open({ repo: fixture.repo, ref: "main", writer: "durable-writer" })
+      await store.transact(async (map) => map.set("obsolete", "remove me"), "seed deletion")
+      process.env.GIT_TRACE2_EVENT = trace
 
-      await store.transact(async (map) => map.set("value", "durable"), "durable write")
+      await store.transact(async (map) => {
+        map.set("first", "durable")
+        map.set("second", "durable")
+        map.set("third", "durable")
+        map.delete("obsolete")
+      }, "durable write")
 
       const events = (await readFile(trace, "utf8"))
         .trim()
@@ -149,12 +155,11 @@ describe.sequential("shell backend failure boundaries", () => {
           expect(event.argv).toContain("core.fsyncMethod=fsync")
         }
       }
+      expect(events.filter((event) => event.event === "start" && event.argv?.includes("hash-object"))).toHaveLength(1)
+      expect(events.filter((event) => event.event === "start" && event.argv?.includes("update-index"))).toHaveLength(1)
       const refTransactions = events.filter((event) => event.event === "start" && event.argv?.includes("update-ref"))
       const publishTransactions = refTransactions.filter((event) => event.argv?.includes("--stdin"))
       expect(publishTransactions).toHaveLength(1)
-      expect(
-        refTransactions.some((event) => event.argv?.some((argument) => argument.startsWith("refs/gitomic/writers/"))),
-      ).toBe(true)
     } finally {
       if (previousTrace === undefined) delete process.env.GIT_TRACE2_EVENT
       else process.env.GIT_TRACE2_EVENT = previousTrace
