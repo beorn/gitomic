@@ -680,9 +680,12 @@ async function compareAndSwapRemote(
   return true
 }
 
-function isRemoteCompareAndSwapRejection(detail: string): boolean {
+export function isRemoteCompareAndSwapRejection(detail: string): boolean {
   return detail.split("\n").some((line) => {
     const [flag, , summary] = line.split("\t")
-    return flag === "!" && summary === "[rejected] (stale info)"
+    return (
+      flag === "!" &&
+      (summary === "[rejected] (stale info)" || summary === "[remote rejected] (incorrect old value provided)")
+    )
   })
 }

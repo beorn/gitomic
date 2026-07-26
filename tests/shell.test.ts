@@ -10,6 +10,7 @@ import { delimiter, join } from "node:path"
 import { describe, expect, test } from "vitest"
 
 import { createShellBackend, open } from "../src/index.js"
+import { isRemoteCompareAndSwapRejection } from "../src/shell.js"
 import { appendEmptyHistory, createBareRepo } from "./helpers/git.js"
 
 const TRANSACTION_SEARCH_LIMIT = 1_024
@@ -303,5 +304,19 @@ describe.sequential("shell backend failure boundaries", () => {
       restore()
       await wrapper.cleanup()
     }
+  })
+
+  test("classifies both client-side and server-side lease losses as CAS contention", () => {
+    expect(isRemoteCompareAndSwapRejection("!\trefs/heads/main:refs/heads/main\t[rejected] (stale info)\nDone\n")).toBe(
+      true,
+    )
+    expect(
+      isRemoteCompareAndSwapRejection(
+        "!\tabc123:refs/heads/main\t[remote rejected] (incorrect old value provided)\nDone\n",
+      ),
+    ).toBe(true)
+    expect(
+      isRemoteCompareAndSwapRejection("!\tabc123:refs/heads/main\t[remote rejected] (policy denied)\nDone\n"),
+    ).toBe(false)
   })
 })
