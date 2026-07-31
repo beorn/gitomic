@@ -14,7 +14,7 @@ import {
 } from "./git-object.js"
 import type { GitObject, GitTreeObjectEntry } from "./git-object.js"
 import { createDurableObjectWriter } from "./iso-durable.js"
-import { assertRegularBlob } from "./path.js"
+import { assertGitPrefixMatched, assertRegularBlob, normalizePrefix } from "./path.js"
 import { createShellRuntime } from "./shell.js"
 import type { CommitInput, GitomicBackend, Oid } from "./types.js"
 import { decodeUtf8 } from "./utf8.js"
@@ -46,24 +46,31 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
     return gitdir
   }
 
-  const loadTree = async (gitdir: string, oid: Oid, prefix = ""): Promise<TreeNode> => {
+  const loadTree = async (gitdir: string, oid: Oid, prefix = "", readPrefix = ""): Promise<TreeNode> => {
     const result = await readTree({ fs, gitdir, oid, cache })
-    const canonicalEntries = result.tree.map((entry): GitTreeObjectEntry => {
-      const path = prefix === "" ? entry.path : `${prefix}/${entry.path}`
-      if (entry.type === "tree") return { mode: "40000", path: entry.path, oid: entry.oid }
-      assertRegularBlob(path, entry.mode, entry.type)
-      const mode = entry.mode === "100755" ? "100755" : "100644"
-      return { mode, path: entry.path, oid: entry.oid }
-    })
-    if (encodeTreeEntries(canonicalEntries).oid !== oid) {
-      throw new Error(`Git tree ${oid} contains path bytes that are not valid UTF-8 or canonical Git tree order`)
+    if (readPrefix === "") {
+      const canonicalEntries = result.tree.map((entry): GitTreeObjectEntry => {
+        const path = prefix === "" ? entry.path : `${prefix}/${entry.path}`
+        if (entry.type === "tree") return { mode: "40000", path: entry.path, oid: entry.oid }
+        assertRegularBlob(path, entry.mode, entry.type)
+        const mode = entry.mode === "100755" ? "100755" : "100644"
+        return { mode, path: entry.path, oid: entry.oid }
+      })
+      if (encodeTreeEntries(canonicalEntries).oid !== oid) {
+        throw new Error(`Git tree ${oid} contains path bytes that are not valid UTF-8 or canonical Git tree order`)
+      }
     }
     const entries = new Map<string, TreeNode | BlobEntry>()
     await Promise.all(
       result.tree.map(async (entry) => {
         const path = prefix === "" ? entry.path : `${prefix}/${entry.path}`
+        const intersects =
+          readPrefix === "" ||
+          path.startsWith(readPrefix) ||
+          (entry.type === "tree" && readPrefix.startsWith(`${path}/`))
+        if (!intersects) return
         if (entry.type === "tree") {
-          entries.set(entry.path, await loadTree(gitdir, entry.oid, path))
+          entries.set(entry.path, await loadTree(gitdir, entry.oid, path, readPrefix))
         } else {
           assertRegularBlob(path, entry.mode, entry.type)
           entries.set(entry.path, { kind: entry.type, mode: entry.mode, oid: entry.oid })
@@ -73,10 +80,11 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
     return { kind: "tree", entries }
   }
 
-  const readFiles = async (repo: string, oid: Oid): Promise<ReadonlyMap<string, string>> => {
+  const readFiles = async (repo: string, oid: Oid, prefix?: string): Promise<ReadonlyMap<string, string>> => {
+    const normalizedPrefix = prefix === undefined ? "" : normalizePrefix(prefix)
     const gitdir = await resolveGitDir(repo)
     const { commit } = await readCommit({ fs, gitdir, oid, cache })
-    const root = await loadTree(gitdir, commit.tree)
+    const root = await loadTree(gitdir, commit.tree, "", normalizedPrefix)
     const files = new Map<string, string>()
     const visit = async (node: TreeNode, prefix: string): Promise<void> => {
       await Promise.all(
@@ -84,7 +92,7 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
           const path = prefix === "" ? name : `${prefix}/${name}`
           if (entry.kind === "tree") {
             await visit(entry, path)
-          } else if (entry.kind === "blob") {
+          } else if (entry.kind === "blob" && path.startsWith(normalizedPrefix)) {
             const result = await readBlob({ fs, gitdir, oid: entry.oid, cache })
             files.set(path, decodeUtf8(result.blob, `Git blob at ${JSON.stringify(path)}`))
           }
@@ -92,6 +100,7 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
       )
     }
     await visit(root, "")
+    assertGitPrefixMatched(files.size, repo, oid, normalizedPrefix)
     return files
   }
 

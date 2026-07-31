@@ -7,6 +7,7 @@ import {
   transactionLookupExceeded,
 } from "./git-object.js"
 import type { CommitInput, GitomicBackend, Oid } from "./types.js"
+import { assertGitPrefixMatched, normalizePrefix } from "./path.js"
 
 type MemCommit = {
   oid: Oid
@@ -57,10 +58,13 @@ export function createMemBackend(): GitomicBackend {
     return oid
   }
 
-  const readFiles = async (name: string, commit: Oid): Promise<ReadonlyMap<string, string>> => {
+  const readFiles = async (name: string, commit: Oid, prefix?: string): Promise<ReadonlyMap<string, string>> => {
     const found = getRepo(name).commits.get(commit)
     if (found === undefined) throw new Error(`unknown commit: ${commit}`)
-    return new Map(found.files)
+    const normalizedPrefix = prefix === undefined ? "" : normalizePrefix(prefix)
+    const files = new Map([...found.files].filter(([path]) => path.startsWith(normalizedPrefix)))
+    assertGitPrefixMatched(files.size, name, commit, normalizedPrefix)
+    return files
   }
 
   const writeCommit = async (name: string, input: CommitInput): Promise<Oid> => {

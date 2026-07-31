@@ -102,6 +102,15 @@ omitting the OID pins the refreshed tip at the time `at()` is called.
 signal is aborted. It observes at one-second intervals by default;
 `pollIntervalMs` is available for latency-sensitive callers and tests.
 
+Snapshot reads are prefix-scoped without a second reader implementation.
+`get(path)`, `has(path)`, and `keys(prefix)` pass their normalized scope through
+the existing backend `readFiles(repo, commit, prefix?)` operation, so unrelated
+binary blobs are not decoded. A direct backend prefix read that matches nothing
+throws `GitPrefixNotFoundError` naming the prefix, repository, and commit;
+Snapshot translates that low-level distinction into its established
+`undefined` / `false` / empty-array missing-value semantics. Transactions never
+pass a prefix: they remain whole-tree strict.
+
 **`remote`:** origin becomes the decider. Every write is one fetch/push cycle under the remote's ref lock; the lease check is compare-and-swap, never history rewriting, so a push either fast-forwards or triggers a re-run. The local ref is then a cache of origin: reads stay local and lag until the next fetch, and an unpushed local-only tip may be replaced by origin's tip. Do not use a ref that carries unrelated local work. Origin is, honestly, your server; omit it for purely local stores.
 
 **Sharing `main` with a delivery queue:** use a strict path partition: gitomic owns its declared state paths and the queue owns code paths; neither writes the other's partition. The ref only fast-forwards. The queue never rebases or rewrites already-published gitomic commits—if its candidate is stale, it must rebuild a descendant of the current tip. Without all three invariants, use a separate ref.
@@ -120,7 +129,7 @@ type GitMap = {
 type Snapshot = Pick<GitMap, "get" | "has" | "keys"> // what at() returns — reads only
 ```
 
-Paths are git tree paths — forward slashes, no leading slash; public paths and prefixes normalize to Unicode NFC, and `keys` returns full canonical paths, sorted. Existing trees must already be NFC, valid UTF-8, free of file/directory collisions, and contain regular blobs only: invalid path bytes, symlink entries, and gitlinks fail loudly instead of being replaced, followed, or ignored. Values are strict UTF-8 strings in v1 — invalid stored bytes and unpaired JavaScript surrogates fail; there is no binary mode yet. The whole `refs/gitomic/` namespace is reserved for protocol state. `at()` accepts only a full lowercase 40- or 64-hex object id and pins it at call time (omit for the current tip); a well-formed but missing id throws on first read.
+Paths are git tree paths — forward slashes, no leading slash; public paths and prefixes normalize to Unicode NFC, and `keys` returns full canonical paths, sorted. Every path/value inside the requested Snapshot scope must be NFC, valid UTF-8, free of file/directory collisions, and a regular blob: invalid path bytes, symlink entries, gitlinks, and invalid matching blob bytes fail loudly instead of being replaced, followed, or ignored. Values are strict UTF-8 strings in v1 — there is no binary value mode. Unscoped Snapshot reads and every transaction validate the whole tree; a scoped read does not decode blob values outside its scope. Unpaired JavaScript surrogates always fail on write. The whole `refs/gitomic/` namespace is reserved for protocol state. `at()` accepts only a full lowercase 40- or 64-hex object id and pins it at call time (omit for the current tip); a well-formed but missing id throws on first read.
 
 ### Ownership manifests
 

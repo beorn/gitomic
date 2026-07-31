@@ -33,6 +33,12 @@ describe("mem backend", () => {
     expect(committed.oid).toMatch(/^[0-9a-f]{40}$/)
     expect(committed.oid).not.toBe(initial)
     expect(await store.at(committed.oid).get("hello.txt")).toBe("hello\n")
+    await expect(backend.readFiles("unit-test", committed.oid, "hello")).resolves.toEqual(
+      new Map([["hello.txt", "hello\n"]]),
+    )
+    await expect(backend.readFiles("unit-test", committed.oid, "missing/")).rejects.toThrow(
+      /prefix "missing\/" matched no files.+repository "unit-test".+commit/iu,
+    )
   })
 
   test("lands 3 writers x 100 operations exactly once on one linear tip", async () => {

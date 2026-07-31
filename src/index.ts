@@ -1,6 +1,14 @@
 import { Conflict, RetriesExhausted } from "./errors.js"
 import { validateOid } from "./git-object.js"
-import { assertTreeShape, INTERNAL_PREFIX, isPublicPath, normalizePath, normalizePrefix } from "./path.js"
+import {
+  assertGitPrefixMatched,
+  assertTreeShape,
+  INTERNAL_PREFIX,
+  isGitPrefixNotFoundError,
+  isPublicPath,
+  normalizePath,
+  normalizePrefix,
+} from "./path.js"
 import { createShellBackend } from "./shell.js"
 import type {
   Committed,
@@ -175,21 +183,45 @@ function makeSnapshot(
   resolveCurrent: () => Promise<Oid> = async () => backendOid(await context.backend.head(context.repo, context.ref)),
 ): Snapshot {
   const pinned = commit === undefined ? resolveCurrent().then(backendOid) : Promise.resolve(validateOid(commit))
-  let files: Promise<ReadonlyMap<string, string>> | undefined
-  const load = (): Promise<ReadonlyMap<string, string>> => {
-    files ??= pinned.then((oid) => context.backend.readFiles(context.repo, oid)).then(checkedFiles)
+  const loads = new Map<string, Promise<ReadonlyMap<string, string>>>()
+  const load = (prefix: string): Promise<ReadonlyMap<string, string>> => {
+    for (const [loadedPrefix, files] of loads) {
+      if (prefix.startsWith(loadedPrefix)) return files
+    }
+    const files = pinned.then(async (oid) => {
+      try {
+        const scoped = checkedFiles(
+          await context.backend.readFiles(context.repo, oid, prefix === "" ? undefined : prefix),
+        )
+        assertGitPrefixMatched(
+          [...scoped.keys()].filter((path) => path.startsWith(prefix)).length,
+          context.repo,
+          oid,
+          prefix,
+        )
+        return scoped
+      } catch (error) {
+        if (prefix !== "" && isGitPrefixNotFoundError(error)) return new Map<string, string>()
+        throw error
+      }
+    })
+    loads.set(prefix, files)
     return files
   }
   return {
     async get(path) {
-      return (await load()).get(normalizePath(path))
+      const normalized = normalizePath(path)
+      return (await load(normalized)).get(normalized)
     },
     async has(path) {
-      return (await load()).has(normalizePath(path))
+      const normalized = normalizePath(path)
+      return (await load(normalized)).has(normalized)
     },
     async keys(prefix = "") {
       const normalized = normalizePrefix(prefix)
-      return [...(await load()).keys()].filter((path) => isPublicPath(path) && path.startsWith(normalized)).sort()
+      return [...(await load(normalized)).keys()]
+        .filter((path) => isPublicPath(path) && path.startsWith(normalized))
+        .sort()
     },
   }
 }

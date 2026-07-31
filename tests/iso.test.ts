@@ -8,7 +8,7 @@ import { spawnSync } from "node:child_process"
 import type { FsClient } from "isomorphic-git"
 import { describe, expect, test } from "vitest"
 
-import { open } from "../src/index.js"
+import { createShellBackend, open, openReader } from "../src/index.js"
 import type { GitMap } from "../src/index.js"
 import { createIsoBackend } from "../src/iso.js"
 import { createMemBackend } from "../src/mem.js"
@@ -226,6 +226,45 @@ describe("iso backend", () => {
       ]
       for (const store of stores) {
         await expect(store.at().get("invalid.txt")).rejects.toThrow("valid UTF-8")
+      }
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  test("scopes reader blob validation to the requested path prefix in both Git backends", async () => {
+    const fixture = await createBareRepo()
+    try {
+      const invalid = await gitWithInput(fixture.repo, Uint8Array.of(0xff), "hash-object", "-w", "--stdin")
+      const valid = await gitWithInput(fixture.repo, "valid\n", "hash-object", "-w", "--stdin")
+      const tree = await gitWithInput(
+        fixture.repo,
+        `100644 blob ${invalid}\tinvalid.bin\0` +
+          `120000 blob ${valid}\tunrelated-link\0` +
+          `100644 blob ${valid}\tvalid.txt\0`,
+        "mktree",
+        "-z",
+      )
+      const commit = await git(fixture.repo, "commit-tree", tree, "-p", fixture.initial, "-m", "mixed blobs")
+      await git(fixture.repo, "update-ref", "refs/heads/main", commit, fixture.initial)
+
+      const readers = [
+        await openReader({ repo: fixture.repo, ref: "main" }),
+        await openReader({ repo: fixture.repo, ref: "main", backend: createIsoBackend() }),
+      ]
+      for (const reader of readers) {
+        const snapshot = reader.at(commit)
+        await expect(snapshot.get("valid.txt")).resolves.toBe("valid\n")
+        await expect(snapshot.keys("valid")).resolves.toEqual(["valid.txt"])
+        await expect(snapshot.get("missing.txt")).resolves.toBeUndefined()
+        await expect(snapshot.keys("missing/")).resolves.toEqual([])
+        await expect(snapshot.get("invalid.bin")).rejects.toThrow("valid UTF-8")
+        await expect(snapshot.keys()).rejects.toThrow()
+      }
+      for (const backend of [createShellBackend(), createIsoBackend()]) {
+        await expect(backend.readFiles(fixture.repo, commit, "missing/")).rejects.toThrow(
+          /prefix "missing\/" matched no files.+repository.+commit/iu,
+        )
       }
     } finally {
       await fixture.cleanup()

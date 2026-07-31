@@ -13,7 +13,7 @@ import {
   transactionMatches,
   validateOid,
 } from "./git-object.js"
-import { assertRegularBlob } from "./path.js"
+import { assertGitPrefixMatched, assertRegularBlob, normalizePrefix } from "./path.js"
 import type { CommitInput, GitomicBackend, Oid } from "./types.js"
 import { decodeUtf8 } from "./utf8.js"
 
@@ -107,7 +107,7 @@ export function createShellRuntime(): {
   const backend: GitomicBackend = {
     acquireWriter: async (repo, writer) => await acquireWriterLease(await resolveGitDir(repo), writer),
     head: async (repo, ref) => await head(await resolveGitDir(repo), ref),
-    readFiles: async (repo, commit) => await readFiles(await resolveGitDir(repo), commit),
+    readFiles: async (repo, commit, prefix) => await readFiles(await resolveGitDir(repo), commit, prefix),
     writeCommit: async (repo, input) => {
       const oid = await writeCommit(await resolveGitDir(repo), input)
       await pinCommit(repo, input.writer, oid)
@@ -348,7 +348,8 @@ async function head(repo: string, ref: string): Promise<Oid> {
   return text(await git(repo, ["rev-parse", "--verify", ref]))
 }
 
-async function readFiles(repo: string, commit: Oid): Promise<ReadonlyMap<string, string>> {
+async function readFiles(repo: string, commit: Oid, prefix?: string): Promise<ReadonlyMap<string, string>> {
+  const normalizedPrefix = prefix === undefined ? "" : normalizePrefix(prefix)
   const listing = await git(repo, ["ls-tree", "-r", "-z", "--full-tree", commit])
   const entries: Array<{ oid: Oid; path: string }> = []
   for (const record of decodeUtf8(listing, "Git tree paths").split("\0")) {
@@ -363,9 +364,11 @@ async function readFiles(repo: string, commit: Oid): Promise<ReadonlyMap<string,
     if (mode === undefined || type === undefined || oid === undefined) {
       throw new Error("git ls-tree returned malformed entry metadata")
     }
+    if (!path.startsWith(normalizedPrefix)) continue
     assertRegularBlob(path, mode, type)
     entries.push({ oid, path })
   }
+  assertGitPrefixMatched(entries.length, repo, commit, normalizedPrefix)
   if (entries.length === 0) return new Map()
 
   const output = await git(repo, ["cat-file", "--batch"], {
