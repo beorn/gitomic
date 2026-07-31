@@ -72,6 +72,36 @@ store.transact(fn: Update, message: string): Promise<Committed>
 
 `writer` is an opaque caller string and the retry-dedup counter's identity. Include your launcher or process instance id when one role can have multiple live instances. `open` atomically claims that exact string for the lifetime of the process: the built-in Git backends store a generation record under `refs/gitomic/writers/` and acquire it with ref compare-and-swap. The record carries a library-minted UUID, hostname, process id, and open time. A second live owner fails loudly; a dead same-host owner is reclaimed with another compare-and-swap, while a foreign-host record fails safe with an explicit inspection remedy. There is no `Store.close()` in v1, so a writer id is intentionally process/launcher-lifetime. The library does not inspect Hab, Ag, environment variables, or any agent naming convention.
 
+Read-only consumers use the same exact snapshots without claiming a writer:
+
+```ts
+import { openReader } from "gitomic"
+
+const reader = await openReader({ repo: ".", ref: "main" })
+const revision = await reader.head()
+const pinned = reader.at(revision)
+
+for (const path of await pinned.keys("notes/")) {
+  console.log(path, await pinned.get(path))
+}
+
+const controller = new AbortController()
+for await (const change of reader.watch({
+  after: revision,
+  signal: controller.signal,
+})) {
+  console.log(`${change.from} -> ${change.to}`)
+}
+```
+
+`openReader` defaults `ref` to `main`, never calls `acquireWriter`, and accepts
+the same optional `remote` and `backend` selections as `open`. `head()` refreshes
+the selected local or remote ref. `at(oid)` is an immutable lazy snapshot;
+omitting the OID pins the refreshed tip at the time `at()` is called.
+`watch({ after, signal })` emits ref-tip changes and stops promptly when the
+signal is aborted. It observes at one-second intervals by default;
+`pollIntervalMs` is available for latency-sensitive callers and tests.
+
 **`remote`:** origin becomes the decider. Every write is one fetch/push cycle under the remote's ref lock; the lease check is compare-and-swap, never history rewriting, so a push either fast-forwards or triggers a re-run. The local ref is then a cache of origin: reads stay local and lag until the next fetch, and an unpushed local-only tip may be replaced by origin's tip. Do not use a ref that carries unrelated local work. Origin is, honestly, your server; omit it for purely local stores.
 
 **Sharing `main` with a delivery queue:** use a strict path partition: gitomic owns its declared state paths and the queue owns code paths; neither writes the other's partition. The ref only fast-forwards. The queue never rebases or rewrites already-published gitomic commits—if its candidate is stale, it must rebuild a descendant of the current tip. Without all three invariants, use a separate ref.

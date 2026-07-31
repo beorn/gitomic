@@ -44,6 +44,30 @@ export type OpenOptions = {
   backend?: GitomicBackend
 }
 
+export type OpenReaderOptions = {
+  repo: string
+  ref?: string
+  remote?: string
+  backend?: GitomicBackend
+}
+
+export type RefTipChange = {
+  from: Oid
+  to: Oid
+}
+
+export type RefTipWatchOptions = {
+  after: Oid
+  signal: AbortSignal
+  pollIntervalMs?: number
+}
+
+export type Reader = {
+  head(): Promise<Oid>
+  at(commit?: Oid): Snapshot
+  watch(options: RefTipWatchOptions): AsyncIterable<RefTipChange>
+}
+
 export type Store = {
   head(): Promise<Oid>
   at(commit?: Oid): Snapshot

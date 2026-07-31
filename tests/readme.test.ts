@@ -45,6 +45,9 @@ describe("README example", () => {
       "local ref is then a cache",
       "path partition",
       "never rebases",
+      "openReader",
+      "never calls `acquireWriter`",
+      "pollIntervalMs",
       "trusted perimeter",
       "not a security boundary",
     ]) {

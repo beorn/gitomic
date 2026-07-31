@@ -11,6 +11,7 @@ First implementation release.
 - Filesystem, key-value, and unstorage adapters.
 - Compare-and-swap replay, writer/sequence idempotency, and remote lease support.
 - Generic versioned ownership-manifest parsing with caller-supplied path policy.
+- Lease-free `openReader` snapshots and abortable local/remote ref-tip change streams.
 
 ### Reliability
 
