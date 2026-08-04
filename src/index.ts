@@ -1,14 +1,48 @@
 import { Conflict, RetriesExhausted } from "./errors.js"
 import { validateOid } from "./git-object.js"
-import { assertTreeShape, INTERNAL_PREFIX, isPublicPath, normalizePath, normalizePrefix } from "./path.js"
+import {
+  assertGitPrefixMatched,
+  assertTreeShape,
+  INTERNAL_PREFIX,
+  isGitPrefixNotFoundError,
+  isPublicPath,
+  normalizePath,
+  normalizePrefix,
+} from "./path.js"
 import { createShellBackend } from "./shell.js"
-import type { Committed, GitMap, GitomicBackend, Oid, OpenOptions, Snapshot, Store, Update } from "./types.js"
+import type {
+  Committed,
+  GitMap,
+  GitomicBackend,
+  Oid,
+  OpenOptions,
+  OpenReaderOptions,
+  Reader,
+  RefTipChange,
+  RefTipWatchOptions,
+  Snapshot,
+  Store,
+  Update,
+} from "./types.js"
 import { assertUtf8 } from "./utf8.js"
 
 export { Conflict, RetriesExhausted }
 export { createShellBackend } from "./shell.js"
 export { parseOwnershipManifest } from "./ownership-manifest.js"
-export type { Committed, GitMap, GitomicBackend, Oid, OpenOptions, Snapshot, Store, Update } from "./types.js"
+export type {
+  Committed,
+  GitMap,
+  GitomicBackend,
+  Oid,
+  OpenOptions,
+  OpenReaderOptions,
+  Reader,
+  RefTipChange,
+  RefTipWatchOptions,
+  Snapshot,
+  Store,
+  Update,
+} from "./types.js"
 export type { OwnershipManifest, OwnershipManifestPolicy } from "./ownership-manifest.js"
 
 export async function open(options: OpenOptions): Promise<Store> {
@@ -21,6 +55,15 @@ export async function open(options: OpenOptions): Promise<Store> {
   }
 }
 
+export async function openReader(options: OpenReaderOptions): Promise<Reader> {
+  const context = await prepareReader(options)
+  return {
+    head: context.refresh,
+    at: (commit) => makeSnapshot(context, commit, context.refresh),
+    watch: (watchOptions) => watchRef(context, watchOptions),
+  }
+}
+
 type StoreContext = {
   repo: string
   ref: string
@@ -30,7 +73,15 @@ type StoreContext = {
   publish(next: Oid, expected: Oid): Promise<boolean>
 }
 
+type ReaderContext = {
+  repo: string
+  ref: string
+  backend: GitomicBackend
+  refresh(): Promise<Oid>
+}
+
 const DEFAULT_MAX_ATTEMPTS = 10
+const DEFAULT_READER_POLL_INTERVAL_MS = 1_000
 
 async function prepareStore(options: OpenOptions): Promise<StoreContext> {
   assertWriter(options.writer)
@@ -59,6 +110,25 @@ async function prepareStore(options: OpenOptions): Promise<StoreContext> {
   await refresh()
   await backend.acquireWriter(repo, writer)
   return { repo, ref, writer, backend, refresh, publish }
+}
+
+async function prepareReader(options: OpenReaderOptions): Promise<ReaderContext> {
+  const repo = options.repo
+  const ref = normalizeRef(options.ref ?? "main")
+  const backend = options.backend ?? createShellBackend()
+  const remote = options.remote
+  let refresh: () => Promise<Oid>
+  if (remote === undefined) {
+    refresh = async () => backendOid(await backend.head(repo, ref))
+  } else {
+    const fetchRemote = backend.fetchRemote
+    if (fetchRemote === undefined) {
+      throw new TypeError("this backend cannot refresh a remote; omit remote or use the shell/iso backend")
+    }
+    refresh = async () => backendOid(await fetchRemote(repo, ref, remote))
+  }
+  await refresh()
+  return { repo, ref, backend, refresh }
 }
 
 async function transact(context: StoreContext, update: Update, message: string): Promise<Committed> {
@@ -107,28 +177,117 @@ async function transact(context: StoreContext, update: Update, message: string):
   }
 }
 
-function makeSnapshot(context: StoreContext, commit?: Oid): Snapshot {
-  const pinned =
-    commit === undefined
-      ? context.backend.head(context.repo, context.ref).then(backendOid)
-      : Promise.resolve(validateOid(commit))
-  let files: Promise<ReadonlyMap<string, string>> | undefined
-  const load = (): Promise<ReadonlyMap<string, string>> => {
-    files ??= pinned.then((oid) => context.backend.readFiles(context.repo, oid)).then(checkedFiles)
+function makeSnapshot(
+  context: Pick<StoreContext, "repo" | "ref" | "backend">,
+  commit?: Oid,
+  resolveCurrent: () => Promise<Oid> = async () => backendOid(await context.backend.head(context.repo, context.ref)),
+): Snapshot {
+  const pinned = commit === undefined ? resolveCurrent().then(backendOid) : Promise.resolve(validateOid(commit))
+  const loads = new Map<string, Promise<ReadonlyMap<string, string>>>()
+  const load = (prefix: string): Promise<ReadonlyMap<string, string>> => {
+    for (const [loadedPrefix, files] of loads) {
+      if (prefix.startsWith(loadedPrefix)) return files
+    }
+    const files = pinned.then(async (oid) => {
+      try {
+        const scoped = checkedFiles(
+          await context.backend.readFiles(context.repo, oid, prefix === "" ? undefined : prefix),
+        )
+        assertGitPrefixMatched(
+          [...scoped.keys()].filter((path) => path.startsWith(prefix)).length,
+          context.repo,
+          oid,
+          prefix,
+        )
+        return scoped
+      } catch (error) {
+        if (prefix !== "" && isGitPrefixNotFoundError(error)) return new Map<string, string>()
+        throw error
+      }
+    })
+    loads.set(prefix, files)
     return files
   }
   return {
     async get(path) {
-      return (await load()).get(normalizePath(path))
+      const normalized = normalizePath(path)
+      return (await load(normalized)).get(normalized)
     },
     async has(path) {
-      return (await load()).has(normalizePath(path))
+      const normalized = normalizePath(path)
+      return (await load(normalized)).has(normalized)
     },
     async keys(prefix = "") {
       const normalized = normalizePrefix(prefix)
-      return [...(await load()).keys()].filter((path) => isPublicPath(path) && path.startsWith(normalized)).sort()
+      return [...(await load(normalized)).keys()]
+        .filter((path) => isPublicPath(path) && path.startsWith(normalized))
+        .sort()
     },
   }
+}
+
+async function* watchRef(context: ReaderContext, options: RefTipWatchOptions): AsyncIterable<RefTipChange> {
+  let previous = validateOid(options.after, "reader watch requires a valid after object id")
+  const pollIntervalMs = normalizePollInterval(options.pollIntervalMs)
+  while (!options.signal.aborted) {
+    const next = await untilAborted(context.refresh(), options.signal)
+    if (next === undefined) return
+    if (next !== previous) {
+      const change = { from: previous, to: next }
+      previous = next
+      yield change
+      continue
+    }
+    if (!(await waitForPoll(pollIntervalMs, options.signal))) return
+  }
+}
+
+function untilAborted<T>(pending: Promise<T>, signal: AbortSignal): Promise<T | undefined> {
+  if (signal.aborted) return Promise.resolve(undefined)
+  return new Promise((resolve, reject) => {
+    const cleanup = (): void => signal.removeEventListener("abort", onAbort)
+    const onAbort = (): void => {
+      cleanup()
+      resolve(undefined)
+    }
+    signal.addEventListener("abort", onAbort, { once: true })
+    pending.then(
+      (value) => {
+        cleanup()
+        resolve(value)
+      },
+      (error: unknown) => {
+        cleanup()
+        reject(error)
+      },
+    )
+  })
+}
+
+function normalizePollInterval(value: number | undefined): number {
+  const interval = value ?? DEFAULT_READER_POLL_INTERVAL_MS
+  if (!Number.isSafeInteger(interval) || interval <= 0) {
+    throw new TypeError("pollIntervalMs must be a positive integer")
+  }
+  return interval
+}
+
+function waitForPoll(milliseconds: number, signal: AbortSignal): Promise<boolean> {
+  if (signal.aborted) return Promise.resolve(false)
+  return new Promise((resolveWait) => {
+    let settled = false
+    const settle = (elapsed: boolean): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      signal.removeEventListener("abort", onAbort)
+      resolveWait(elapsed)
+    }
+    const onAbort = (): void => settle(false)
+    // raw-lifecycle-ok: the awaited reader poll owns and clears this timer and abort listener.
+    const timer = setTimeout(() => settle(true), milliseconds)
+    signal.addEventListener("abort", onAbort, { once: true })
+  })
 }
 
 function checkedFiles(files: ReadonlyMap<string, string>): ReadonlyMap<string, string> {

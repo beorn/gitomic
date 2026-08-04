@@ -2,6 +2,40 @@ import { assertUtf8 } from "./utf8.js"
 
 export const INTERNAL_PREFIX = ".gitomic/"
 
+export type GitPrefixNotFoundError = Error & {
+  readonly name: "GitPrefixNotFoundError"
+  readonly code: "git_prefix_not_found"
+  readonly repo: string
+  readonly commit: string
+  readonly prefix: string
+}
+
+export function isGitPrefixNotFoundError(error: unknown): error is GitPrefixNotFoundError {
+  return (
+    error instanceof Error &&
+    "code" in error &&
+    error.code === "git_prefix_not_found" &&
+    "prefix" in error &&
+    typeof error.prefix === "string"
+  )
+}
+
+export function assertGitPrefixMatched(count: number, repo: string, commit: string, prefix: string): void {
+  if (prefix === "" || count > 0) return
+  throw Object.assign(
+    new Error(
+      `Git tree prefix ${JSON.stringify(prefix)} matched no files in repository ${JSON.stringify(repo)} at commit ${commit}`,
+    ),
+    {
+      name: "GitPrefixNotFoundError" as const,
+      code: "git_prefix_not_found" as const,
+      repo,
+      commit,
+      prefix,
+    },
+  )
+}
+
 export function normalizePath(path: string): string {
   assertUtf8(path, "git tree path")
   const normalized = path.normalize("NFC")

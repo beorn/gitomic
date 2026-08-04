@@ -28,7 +28,8 @@ export type CommitInput = {
 export type GitomicBackend = {
   acquireWriter(repo: string, writer: string): Promise<void>
   head(repo: string, ref: string): Promise<Oid>
-  readFiles(repo: string, commit: Oid): Promise<ReadonlyMap<string, string>>
+  /** Read the whole tree, or only paths matching a non-empty string prefix. */
+  readFiles(repo: string, commit: Oid, prefix?: string): Promise<ReadonlyMap<string, string>>
   writeCommit(repo: string, input: CommitInput): Promise<Oid>
   compareAndSwap(repo: string, ref: string, next: Oid, expected: Oid): Promise<boolean>
   findTransaction(repo: string, head: Oid, writer: string, seq: number): Promise<Oid | undefined>
@@ -42,6 +43,30 @@ export type OpenOptions = {
   writer: string
   remote?: string
   backend?: GitomicBackend
+}
+
+export type OpenReaderOptions = {
+  repo: string
+  ref?: string
+  remote?: string
+  backend?: GitomicBackend
+}
+
+export type RefTipChange = {
+  from: Oid
+  to: Oid
+}
+
+export type RefTipWatchOptions = {
+  after: Oid
+  signal: AbortSignal
+  pollIntervalMs?: number
+}
+
+export type Reader = {
+  head(): Promise<Oid>
+  at(commit?: Oid): Snapshot
+  watch(options: RefTipWatchOptions): AsyncIterable<RefTipChange>
 }
 
 export type Store = {
