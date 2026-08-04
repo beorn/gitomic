@@ -5,6 +5,7 @@
 import { access, readFile } from "node:fs/promises"
 
 import { describe, expect, test } from "vitest"
+import { openReader } from "../src/index.js"
 
 type PackageManifest = {
   version: string
@@ -70,6 +71,8 @@ describe("package dependency boundary", () => {
 
     expect(packageManifest.files).toContain("CHANGELOG.md")
     expect(changelog).toContain(`## ${packageManifest.version}`)
+    expect(openReader).toBeTypeOf("function")
+    expect(readme).toContain('import { openReader } from "gitomic"')
     expect(readme).not.toContain("Not on npm yet")
   })
 })
