@@ -64,7 +64,7 @@
     "format:write": "oxfmt .",
     "lint": "oxlint src tests benchmarks",
     "prepack": "bun run build",
-    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:stress": "vitest run --config vitest.stress.config.ts",
     "test:watch": "vitest"
