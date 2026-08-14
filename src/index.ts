@@ -11,6 +11,7 @@ import {
 } from "./path.js"
 import { createShellBackend } from "./shell.js"
 import type {
+  BlobValue,
   Committed,
   GitMap,
   GitomicBackend,
@@ -24,12 +25,13 @@ import type {
   Store,
   Update,
 } from "./types.js"
-import { assertUtf8 } from "./utf8.js"
+import { assertUtf8, decodeUtf8 } from "./utf8.js"
 
 export { Conflict, RetriesExhausted }
 export { createShellBackend } from "./shell.js"
 export { parseOwnershipManifest } from "./ownership-manifest.js"
 export type {
+  BlobValue,
   Committed,
   GitMap,
   GitomicBackend,
@@ -183,8 +185,8 @@ function makeSnapshot(
   resolveCurrent: () => Promise<Oid> = async () => backendOid(await context.backend.head(context.repo, context.ref)),
 ): Snapshot {
   const pinned = commit === undefined ? resolveCurrent().then(backendOid) : Promise.resolve(validateOid(commit))
-  const loads = new Map<string, Promise<ReadonlyMap<string, string>>>()
-  const load = (prefix: string): Promise<ReadonlyMap<string, string>> => {
+  const loads = new Map<string, Promise<ReadonlyMap<string, BlobValue>>>()
+  const load = (prefix: string): Promise<ReadonlyMap<string, BlobValue>> => {
     for (const [loadedPrefix, files] of loads) {
       if (prefix.startsWith(loadedPrefix)) return files
     }
@@ -201,7 +203,7 @@ function makeSnapshot(
         )
         return scoped
       } catch (error) {
-        if (prefix !== "" && isGitPrefixNotFoundError(error)) return new Map<string, string>()
+        if (prefix !== "" && isGitPrefixNotFoundError(error)) return new Map<string, BlobValue>()
         throw error
       }
     })
@@ -211,7 +213,7 @@ function makeSnapshot(
   return {
     async get(path) {
       const normalized = normalizePath(path)
-      return (await load(normalized)).get(normalized)
+      return readValue((await load(normalized)).get(normalized), normalized)
     },
     async has(path) {
       const normalized = normalizePath(path)
@@ -290,13 +292,32 @@ function waitForPoll(milliseconds: number, signal: AbortSignal): Promise<boolean
   })
 }
 
-function checkedFiles(files: ReadonlyMap<string, string>): ReadonlyMap<string, string> {
+/**
+ * Validate the shape of a tree read, without forcing every value through UTF-8.
+ *
+ * Paths are still strict: `assertTreeShape` rejects reserved, colliding and
+ * malformed paths for the whole tree. Values are checked only when the backend
+ * already decoded them — a byte value is a blob gitomic cannot represent as a
+ * v1 value, and refusing it HERE would make the entire tree unreadable and
+ * every transaction on it impossible. The refusal moves to the point of use:
+ * `get` on that path throws, while `keys`, `has`, `set` and `delete` work, and
+ * an untouched binary blob rides into the next commit unchanged.
+ */
+function checkedFiles(files: ReadonlyMap<string, BlobValue>): ReadonlyMap<string, BlobValue> {
   assertTreeShape(files.keys())
-  for (const [path, content] of files) assertUtf8(content, `Git blob at ${JSON.stringify(path)}`)
+  for (const [path, content] of files) {
+    if (typeof content === "string") assertUtf8(content, `Git blob at ${JSON.stringify(path)}`)
+  }
   return files
 }
 
-function assertNextTree(base: ReadonlyMap<string, string>, changes: ReadonlyMap<string, string | undefined>): void {
+/** Decode one stored value at the point a caller actually reads it. */
+function readValue(value: BlobValue | undefined, path: string): string | undefined {
+  if (value === undefined || typeof value === "string") return value
+  return decodeUtf8(value, `Git blob at ${JSON.stringify(path)}`)
+}
+
+function assertNextTree(base: ReadonlyMap<string, BlobValue>, changes: ReadonlyMap<string, string | undefined>): void {
   const next = new Map(base)
   for (const [path, content] of changes) {
     if (content === undefined) next.delete(path)
@@ -309,12 +330,14 @@ function backendOid(value: unknown): Oid {
   return validateOid(value, "backend returned an invalid Git object id")
 }
 
-function makeOverlay(base: ReadonlyMap<string, string>): {
+function makeOverlay(base: ReadonlyMap<string, BlobValue>): {
   map: GitMap
   changes: Map<string, string | undefined>
 } {
   const changes = new Map<string, string | undefined>()
-  const get = (path: string): string | undefined => (changes.has(path) ? changes.get(path) : base.get(path))
+  const get = (path: string): string | undefined =>
+    changes.has(path) ? changes.get(path) : readValue(base.get(path), path)
+  const present = (path: string): boolean => (changes.has(path) ? changes.get(path) !== undefined : base.has(path))
   const map: GitMap = {
     async get(path) {
       return get(normalizePath(path))
@@ -328,7 +351,7 @@ function makeOverlay(base: ReadonlyMap<string, string>): {
       changes.set(normalizePath(path), undefined)
     },
     async has(path) {
-      return get(normalizePath(path)) !== undefined
+      return present(normalizePath(path))
     },
     async keys(prefix = "") {
       const normalized = normalizePrefix(prefix)
@@ -397,8 +420,9 @@ function metadataPath(writer: string): string {
   return `${INTERNAL_PREFIX}writers/${Buffer.from(writer, "utf8").toString("base64url")}.json`
 }
 
-function readSequence(files: ReadonlyMap<string, string>, writer: string): number {
-  const raw = files.get(metadataPath(writer))
+function readSequence(files: ReadonlyMap<string, BlobValue>, writer: string): number {
+  const path = metadataPath(writer)
+  const raw = readValue(files.get(path), path)
   if (raw === undefined) return 0
   try {
     const value: unknown = JSON.parse(raw)
@@ -425,10 +449,17 @@ function writeSequence(writer: string, seq: number): string {
 }
 
 function removeNoopChanges(
-  base: ReadonlyMap<string, string>,
+  base: ReadonlyMap<string, BlobValue>,
   changes: ReadonlyMap<string, string | undefined>,
 ): Map<string, string | undefined> {
-  return new Map([...changes].filter(([path, value]) => base.get(path) !== value))
+  return new Map(
+    [...changes].filter(([path, value]) => {
+      const current = base.get(path)
+      // A byte-valued entry is never equal to a string write: replacing a
+      // binary blob with text is a real change, not a no-op.
+      return typeof current === "string" || current === undefined ? current !== value : true
+    }),
+  )
 }
 
 function delayForRetry(retries: number): Promise<void> {

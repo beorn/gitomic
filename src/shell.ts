@@ -14,8 +14,8 @@ import {
   validateOid,
 } from "./git-object.js"
 import { assertGitPrefixMatched, assertRegularBlob, normalizePrefix } from "./path.js"
-import type { CommitInput, GitomicBackend, Oid } from "./types.js"
-import { decodeUtf8 } from "./utf8.js"
+import type { BlobValue, CommitInput, GitomicBackend, Oid } from "./types.js"
+import { decodeBlob, decodeUtf8 } from "./utf8.js"
 
 type GitResult = {
   stdout: Buffer
@@ -348,7 +348,7 @@ async function head(repo: string, ref: string): Promise<Oid> {
   return text(await git(repo, ["rev-parse", "--verify", ref]))
 }
 
-async function readFiles(repo: string, commit: Oid, prefix?: string): Promise<ReadonlyMap<string, string>> {
+async function readFiles(repo: string, commit: Oid, prefix?: string): Promise<ReadonlyMap<string, BlobValue>> {
   const normalizedPrefix = prefix === undefined ? "" : normalizePrefix(prefix)
   const listing = await git(repo, ["ls-tree", "-r", "-z", "--full-tree", commit])
   const entries: Array<{ oid: Oid; path: string }> = []
@@ -377,8 +377,11 @@ async function readFiles(repo: string, commit: Oid, prefix?: string): Promise<Re
   return parseBatch(entries, output)
 }
 
-function parseBatch(entries: ReadonlyArray<{ oid: Oid; path: string }>, output: Buffer): ReadonlyMap<string, string> {
-  const files = new Map<string, string>()
+function parseBatch(
+  entries: ReadonlyArray<{ oid: Oid; path: string }>,
+  output: Buffer,
+): ReadonlyMap<string, BlobValue> {
+  const files = new Map<string, BlobValue>()
   let offset = 0
   for (const entry of entries) {
     const newline = output.indexOf(0x0a, offset)
@@ -394,7 +397,7 @@ function parseBatch(entries: ReadonlyArray<{ oid: Oid; path: string }>, output: 
     if (!Number.isSafeInteger(size) || size < 0 || end >= output.length || output[end] !== 0x0a) {
       throw new Error(`git cat-file --batch returned a malformed blob for ${entry.oid}`)
     }
-    files.set(entry.path, decodeUtf8(output.subarray(start, end), `Git blob at ${JSON.stringify(entry.path)}`))
+    files.set(entry.path, decodeBlob(output.subarray(start, end)))
     offset = end + 1
   }
   if (offset !== output.length) throw new Error("git cat-file --batch returned trailing data")

@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- A single blob that is not valid UTF-8 no longer makes an entire tree
+  unreadable. The whole-tree read stopped eagerly decoding every blob, so
+  `keys`, `has`, `set`, `delete` and `transact` all work in a tree that mixes
+  text with an image, and an untouched binary blob rides into the next commit
+  as the same object. Reading such a value still fails loudly and names the
+  path — gitomic v1 values remain UTF-8 strings. `GitomicBackend.readFiles` may
+  now return raw bytes for such an entry; a backend that only returns strings
+  satisfies the signature unchanged.
+
 ## 0.1.0 — 2026-07-19
 
 First implementation release.

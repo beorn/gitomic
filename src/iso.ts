@@ -16,8 +16,8 @@ import type { GitObject, GitTreeObjectEntry } from "./git-object.js"
 import { createDurableObjectWriter } from "./iso-durable.js"
 import { assertGitPrefixMatched, assertRegularBlob, normalizePrefix } from "./path.js"
 import { createShellRuntime } from "./shell.js"
-import type { CommitInput, GitomicBackend, Oid } from "./types.js"
-import { decodeUtf8 } from "./utf8.js"
+import type { BlobValue, CommitInput, GitomicBackend, Oid } from "./types.js"
+import { decodeBlob } from "./utf8.js"
 
 type BlobEntry = {
   kind: "blob" | "commit"
@@ -80,12 +80,12 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
     return { kind: "tree", entries }
   }
 
-  const readFiles = async (repo: string, oid: Oid, prefix?: string): Promise<ReadonlyMap<string, string>> => {
+  const readFiles = async (repo: string, oid: Oid, prefix?: string): Promise<ReadonlyMap<string, BlobValue>> => {
     const normalizedPrefix = prefix === undefined ? "" : normalizePrefix(prefix)
     const gitdir = await resolveGitDir(repo)
     const { commit } = await readCommit({ fs, gitdir, oid, cache })
     const root = await loadTree(gitdir, commit.tree, "", normalizedPrefix)
-    const files = new Map<string, string>()
+    const files = new Map<string, BlobValue>()
     const visit = async (node: TreeNode, prefix: string): Promise<void> => {
       await Promise.all(
         [...node.entries].map(async ([name, entry]) => {
@@ -94,7 +94,7 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
             await visit(entry, path)
           } else if (entry.kind === "blob" && path.startsWith(normalizedPrefix)) {
             const result = await readBlob({ fs, gitdir, oid: entry.oid, cache })
-            files.set(path, decodeUtf8(result.blob, `Git blob at ${JSON.stringify(path)}`))
+            files.set(path, decodeBlob(result.blob))
           }
         }),
       )
