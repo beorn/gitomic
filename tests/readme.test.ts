@@ -21,8 +21,9 @@ async function readmeExample(containing: string): Promise<string> {
   const readme = await readFile(new URL("../README.md", import.meta.url), "utf8")
   const blocks = [...readme.matchAll(/```ts\n([\s\S]*?)\n```/g)].map((match) => match[1] ?? "")
   const block = blocks.find((candidate) => candidate.includes(containing))
-  if (block === undefined)
+  if (block === undefined) {
     throw new Error(`README TypeScript example containing ${JSON.stringify(containing)} not found`)
+  }
   return block.replace(/^import[^\n]+\n\n/, "")
 }
 
@@ -41,6 +42,8 @@ describe("README example", () => {
       "NFC",
       "symlink",
       "gitlink",
+      "Gitomic-Instance",
+      "label, not a lock",
       "refs/gitomic/inflight",
       "local ref is then a cache",
       "path partition",

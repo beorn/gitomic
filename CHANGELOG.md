@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+### Changed
+
+- Transaction identity is now unique by construction instead of coordinated.
+  Every `open` mints a UUID for that one live store and stamps it on each commit
+  as a `Gitomic-Instance` trailer, beside a `Gitomic-Seq` counter that starts at
+  zero and lives only in memory. `(instance, seq)` cannot collide with any other
+  process, alive or dead, so retry deduplication needs nothing stored anywhere.
+- `OpenOptions.writer` is now optional and purely a human-readable label for the
+  audit trail (default `"gitomic"`). It may repeat across processes, restarts,
+  and machines. Existing callers passing a writer keep working unchanged.
+- `findTransaction` takes the transaction's base commit and its store instance:
+  `findTransaction(repo, head, base, instance, seq)`. The search stops at `base`
+  — nothing older can be the sought commit — so it reads only the commits that
+  arrived during one publish attempt rather than a fixed near-tip batch, and
+  still fails loudly when a chain runs past the horizon without reaching it.
+- `CommitInput` carries `instance` beside `writer`, and is now exported.
+
+### Removed
+
+- The per-writer sequence ledger under `.gitomic/writers/`. Transactions no
+  longer write bookkeeping into the tree they commit, and the retry path no
+  longer reads the winner's whole tree to consult it. `.gitomic/` stays a
+  reserved path namespace that callers cannot write.
+- The writer lease refs under `refs/gitomic/writers/` and the backend's
+  `acquireWriter` operation. The lease used a `kill(pid, 0)` liveness probe,
+  so a stale lease plus a recycled process id could refuse every subsequent
+  `open` permanently. Two live stores may now share a writer label; give
+  simultaneous writers distinct labels so they do not share an inflight pin
+  slot. Backends that wrap a built-in backend by spreading it are unaffected.
+
 ### Fixed
 
 - A single blob that is not valid UTF-8 no longer makes an entire tree

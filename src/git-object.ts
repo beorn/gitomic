@@ -50,17 +50,34 @@ export function validateOid(value: unknown, label = "invalid Git object id"): Oi
   return value
 }
 
-export function formatCommitMessage(writer: string, message: string, seq: number): string {
-  return `${writer}: ${message}\n\nGitomic-Writer: ${writer}\nGitomic-Seq: ${seq}\n`
+/**
+ * Build the commit message for one transaction.
+ *
+ * `writer` is the caller's human-readable label: it leads the subject so
+ * `git log --oneline` reads as an audit trail, and it repeats as a trailer so
+ * `git log --format=%(trailers:key=Gitomic-Writer,valueonly)` can group by it.
+ * `instance` is the library-minted id of the one live store that produced this
+ * commit. The label is a name and may repeat across processes; the instance is
+ * an identity and cannot, which is why `transactionMatches` keys on it.
+ */
+export function formatCommitMessage(writer: string, instance: string, message: string, seq: number): string {
+  return `${writer}: ${message}\n\nGitomic-Writer: ${writer}\nGitomic-Instance: ${instance}\nGitomic-Seq: ${seq}\n`
 }
 
-export function transactionMatches(message: string, writer: string, seq: number): boolean {
-  return message.trimEnd().endsWith(`Gitomic-Writer: ${writer}\nGitomic-Seq: ${seq}`)
+/**
+ * Recognize a commit as one specific store instance's transaction.
+ *
+ * Deliberately blind to the writer label: two live processes may share a label,
+ * so a label-keyed match could claim another process's commit as this one's and
+ * drop this one's writes. `(instance, seq)` is unique by construction.
+ */
+export function transactionMatches(message: string, instance: string, seq: number): boolean {
+  return message.trimEnd().endsWith(`Gitomic-Instance: ${instance}\nGitomic-Seq: ${seq}`)
 }
 
-export function transactionLookupExceeded(writer: string, seq: number): Error {
+export function transactionLookupExceeded(instance: string, seq: number): Error {
   return new Error(
-    `transaction lookup for writer ${JSON.stringify(writer)} sequence ${seq} exceeded ${TRANSACTION_SEARCH_LIMIT} first-parent commits; the ambiguous acknowledgement is too old to resolve safely`,
+    `transaction lookup for store instance ${JSON.stringify(instance)} sequence ${seq} exceeded ${TRANSACTION_SEARCH_LIMIT} first-parent commits without reaching the commit it was built on; the ambiguous acknowledgement cannot be resolved safely`,
   )
 }
 

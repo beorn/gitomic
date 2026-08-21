@@ -31,12 +31,14 @@ export type CommitInput = {
   parent: Oid
   changes: ReadonlyMap<string, string | undefined>
   message: string
+  /** The caller's human-readable label. Not an identity: it may repeat. */
   writer: string
+  /** The one live store that produced this commit. Unique by construction. */
+  instance: string
   seq: number
 }
 
 export type GitomicBackend = {
-  acquireWriter(repo: string, writer: string): Promise<void>
   head(repo: string, ref: string): Promise<Oid>
   /**
    * Read the whole tree, or only paths matching a non-empty string prefix.
@@ -51,7 +53,15 @@ export type GitomicBackend = {
   readFiles(repo: string, commit: Oid, prefix?: string): Promise<ReadonlyMap<string, BlobValue>>
   writeCommit(repo: string, input: CommitInput): Promise<Oid>
   compareAndSwap(repo: string, ref: string, next: Oid, expected: Oid): Promise<boolean>
-  findTransaction(repo: string, head: Oid, writer: string, seq: number): Promise<Oid | undefined>
+  /**
+   * Search `head`'s first-parent chain for one store instance's transaction.
+   *
+   * `base` is the commit that transaction was built on: nothing older can be
+   * it, so reaching `base` — or the root — ends the search conclusively with
+   * `undefined`. A chain that runs past the bounded horizon without reaching
+   * `base` is genuinely ambiguous and must throw rather than answer.
+   */
+  findTransaction(repo: string, head: Oid, base: Oid, instance: string, seq: number): Promise<Oid | undefined>
   fetchRemote?(repo: string, ref: string, remote: string): Promise<Oid>
   compareAndSwapRemote?(repo: string, ref: string, next: Oid, expected: Oid, remote: string): Promise<boolean>
 }
@@ -59,7 +69,12 @@ export type GitomicBackend = {
 export type OpenOptions = {
   repo: string
   ref: string
-  writer: string
+  /**
+   * Optional human-readable label for this store's commits. It names a role,
+   * not an instance: reusing it across processes is fine and expected. Every
+   * `open` mints its own unique identity underneath.
+   */
+  writer?: string
   remote?: string
   backend?: GitomicBackend
 }

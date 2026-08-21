@@ -1,9 +1,10 @@
+import { randomUUID } from "node:crypto"
+
 import { Conflict, RetriesExhausted } from "./errors.js"
 import { validateOid } from "./git-object.js"
 import {
   assertGitPrefixMatched,
   assertTreeShape,
-  INTERNAL_PREFIX,
   isGitPrefixNotFoundError,
   isPublicPath,
   normalizePath,
@@ -33,6 +34,7 @@ export { parseOwnershipManifest } from "./ownership-manifest.js"
 export type {
   BlobValue,
   Committed,
+  CommitInput,
   GitMap,
   GitomicBackend,
   Oid,
@@ -53,7 +55,7 @@ export async function open(options: OpenOptions): Promise<Store> {
   return {
     head: async () => backendOid(await context.backend.head(context.repo, context.ref)),
     at: (commit) => makeSnapshot(context, commit),
-    transact: (update, message) => enqueue(async () => await transact(context, update, message)),
+    transact: (update, message) => enqueue(async () => transact(context, update, message)),
   }
 }
 
@@ -69,10 +71,14 @@ export async function openReader(options: OpenReaderOptions): Promise<Reader> {
 type StoreContext = {
   repo: string
   ref: string
+  /** Human-readable label for the audit trail. */
   writer: string
+  /** This store's unique identity, minted at `open`. */
+  instance: string
   backend: GitomicBackend
   refresh(): Promise<Oid>
   publish(next: Oid, expected: Oid): Promise<boolean>
+  nextSeq(): number
 }
 
 type ReaderContext = {
@@ -84,22 +90,27 @@ type ReaderContext = {
 
 const DEFAULT_MAX_ATTEMPTS = 10
 const DEFAULT_READER_POLL_INTERVAL_MS = 1_000
+const DEFAULT_WRITER_LABEL = "gitomic"
 
 async function prepareStore(options: OpenOptions): Promise<StoreContext> {
-  assertWriter(options.writer)
+  if (options.writer !== undefined) assertWriter(options.writer)
   const repo = options.repo
   const ref = normalizeRef(options.ref)
-  const writer = options.writer
+  const writer = options.writer ?? DEFAULT_WRITER_LABEL
+  // One id per open. Nothing else in the world can mint it, so `(instance, seq)`
+  // identifies a transaction without a lock, a lease, or a stored high-water
+  // mark to seed it from — including against a crashed predecessor that used
+  // the same writer label.
+  const instance = randomUUID()
+  let seq = 0
+  const nextSeq = (): number => seq++
   const backend = options.backend ?? createShellBackend()
-  if (typeof backend.acquireWriter !== "function") {
-    throw new TypeError("backend must implement acquireWriter(repo, writer) to enforce one live owner per writer")
-  }
   const remote = options.remote
   let refresh: () => Promise<Oid>
   let publish: (next: Oid, expected: Oid) => Promise<boolean>
   if (remote === undefined) {
     refresh = async () => backendOid(await backend.head(repo, ref))
-    publish = async (next, expected) => await backend.compareAndSwap(repo, ref, next, expected)
+    publish = async (next, expected) => backend.compareAndSwap(repo, ref, next, expected)
   } else {
     const fetchRemote = backend.fetchRemote
     const compareAndSwapRemote = backend.compareAndSwapRemote
@@ -107,11 +118,10 @@ async function prepareStore(options: OpenOptions): Promise<StoreContext> {
       throw new TypeError("this backend cannot arbitrate remotely; omit remote or use the shell/iso backend")
     }
     refresh = async () => backendOid(await fetchRemote(repo, ref, remote))
-    publish = async (next, expected) => await compareAndSwapRemote(repo, ref, next, expected, remote)
+    publish = async (next, expected) => compareAndSwapRemote(repo, ref, next, expected, remote)
   }
   await refresh()
-  await backend.acquireWriter(repo, writer)
-  return { repo, ref, writer, backend, refresh, publish }
+  return { repo, ref, writer, instance, backend, refresh, publish, nextSeq }
 }
 
 async function prepareReader(options: OpenReaderOptions): Promise<ReaderContext> {
@@ -141,17 +151,18 @@ async function transact(context: StoreContext, update: Update, message: string):
   if (message.includes("\0")) throw new TypeError("message cannot contain NUL because Git commit messages forbid it")
   let retries = 0
   let attempts = 0
+  // Allocated once and reused across replays: every attempt is the SAME
+  // transaction, so they must share one `(instance, seq)` receipt.
   let seq: number | undefined
   while (true) {
     attempts += 1
     const parent = await context.refresh()
     const base = checkedFiles(await context.backend.readFiles(context.repo, parent))
-    seq ??= readSequence(base, context.writer) + 1
     const { map, changes } = makeOverlay(base)
     await update(map)
     const effective = removeNoopChanges(base, changes)
     if (effective.size === 0) return { oid: parent, retries }
-    effective.set(metadataPath(context.writer), writeSequence(context.writer, seq))
+    seq ??= context.nextSeq()
     assertNextTree(base, effective)
     const next = backendOid(
       await context.backend.writeCommit(context.repo, {
@@ -159,21 +170,21 @@ async function transact(context: StoreContext, update: Update, message: string):
         changes: effective,
         message: message.trim(),
         writer: context.writer,
+        instance: context.instance,
         seq,
       }),
     )
     if (await context.publish(next, parent)) return { oid: next, retries }
 
     retries += 1
+    // A refused publish is usually plain contention, but an acknowledgement can
+    // also be lost after the write landed. Look for this exact receipt before
+    // replaying: replaying a landed transaction would apply it twice. The scan
+    // stops at `parent`, so it reads only the commits that arrived during this
+    // attempt.
     const winner = await context.refresh()
-    const winnerFiles = checkedFiles(await context.backend.readFiles(context.repo, winner))
-    if (readSequence(winnerFiles, context.writer) >= seq) {
-      const landed = await context.backend.findTransaction(context.repo, winner, context.writer, seq)
-      if (landed !== undefined) return { oid: backendOid(landed), retries }
-      throw new Error(
-        `writer ${JSON.stringify(context.writer)} sequence ${seq} is marked landed but unreachable; use a unique writer per live process`,
-      )
-    }
+    const landed = await context.backend.findTransaction(context.repo, winner, parent, context.instance, seq)
+    if (landed !== undefined) return { oid: backendOid(landed), retries }
     if (attempts >= DEFAULT_MAX_ATTEMPTS) throw new RetriesExhausted(retries)
     await delayForRetry(retries)
   }
@@ -374,10 +385,11 @@ function createQueue(): <T>(operation: () => Promise<T>) => Promise<T> {
       () => undefined,
       () => undefined,
     )
-    return await result
+    return result
   }
 }
 
+/** The label leads the subject and is echoed as a trailer, so it stays single-line. */
 function assertWriter(writer: string): void {
   assertUtf8(writer, "writer")
   const hasControlCharacter = [...writer].some((character) => {
@@ -394,7 +406,7 @@ function normalizeRef(ref: string): string {
   if (ref.length === 0) throw new TypeError("ref is required")
   const normalized = ref.startsWith("refs/") ? ref : `refs/heads/${ref}`
   if (normalized === "refs/gitomic" || normalized.startsWith("refs/gitomic/")) {
-    throw new TypeError("refs/gitomic/ is reserved for Gitomic's internal reachability and lease refs")
+    throw new TypeError("refs/gitomic/ is reserved for Gitomic's internal reachability refs")
   }
   const components = normalized.split("/")
   if (
@@ -414,38 +426,6 @@ function normalizeRef(ref: string): string {
 function isInvalidRefCharacter(character: string): boolean {
   const codePoint = character.codePointAt(0) ?? 0
   return codePoint <= 0x20 || codePoint === 0x7f || "~^:?*[\\".includes(character)
-}
-
-function metadataPath(writer: string): string {
-  return `${INTERNAL_PREFIX}writers/${Buffer.from(writer, "utf8").toString("base64url")}.json`
-}
-
-function readSequence(files: ReadonlyMap<string, BlobValue>, writer: string): number {
-  const path = metadataPath(writer)
-  const raw = readValue(files.get(path), path)
-  if (raw === undefined) return 0
-  try {
-    const value: unknown = JSON.parse(raw)
-    if (
-      typeof value === "object" &&
-      value !== null &&
-      "writer" in value &&
-      value.writer === writer &&
-      "seq" in value &&
-      typeof value.seq === "number" &&
-      Number.isSafeInteger(value.seq) &&
-      value.seq >= 0
-    ) {
-      return value.seq
-    }
-  } catch {
-    // Report corrupt internal state with one stable public error below.
-  }
-  throw new Error(`invalid gitomic high-water mark for writer ${JSON.stringify(writer)}`)
-}
-
-function writeSequence(writer: string, seq: number): string {
-  return `${JSON.stringify({ writer, seq })}\n`
 }
 
 function removeNoopChanges(

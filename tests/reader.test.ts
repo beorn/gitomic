@@ -1,6 +1,6 @@
-// @failure Read-only branch consumers could acquire writer leases, observe moving snapshots, or leak ref-watch timers.
+// @failure Read-only branch consumers could write to the repository, observe moving snapshots, or leak ref-watch timers.
 // @level l1
-// @consumer lease-free Git snapshot consumers
+// @consumer read-only Git snapshot consumers
 
 import { describe, expect, test, vi } from "vitest"
 
@@ -8,17 +8,21 @@ import { open, openReader } from "../src/index.js"
 import type { GitomicBackend } from "../src/index.js"
 import { createMemBackend } from "../src/mem.js"
 
-describe("lease-free reader", () => {
-  test("opens without acquiring a writer and reads an exact pinned snapshot", async () => {
+describe("read-only reader", () => {
+  test("opens without writing to the repository and reads an exact pinned snapshot", async () => {
     const backend = createMemBackend()
     const writer = await open({ repo: "reader-snapshot", ref: "main", writer: "writer", backend })
     const first = await writer.transact(async (map) => map.set("notes/one.md", "one\n"), "write one")
-    let acquireCalls = 0
+    let mutations = 0
     const readerBackend: GitomicBackend = {
       ...backend,
-      acquireWriter: async () => {
-        acquireCalls += 1
-        throw new Error("reader must not acquire a writer")
+      writeCommit: async () => {
+        mutations += 1
+        throw new Error("reader must not write an object")
+      },
+      compareAndSwap: async () => {
+        mutations += 1
+        throw new Error("reader must not move a ref")
       },
     }
 
@@ -26,7 +30,7 @@ describe("lease-free reader", () => {
     const snapshot = reader.at(first.oid)
     await writer.transact(async (map) => map.set("notes/two.md", "two\n"), "write two")
 
-    expect(acquireCalls).toBe(0)
+    expect(mutations).toBe(0)
     expect(await snapshot.keys()).toEqual(["notes/one.md"])
     expect(await snapshot.get("notes/one.md")).toBe("one\n")
     expect(await snapshot.get("notes/two.md")).toBeUndefined()

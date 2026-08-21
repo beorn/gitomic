@@ -154,7 +154,7 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
       tree,
       parent: input.parent,
       timestamp,
-      message: formatCommitMessage(input.writer, input.message, input.seq),
+      message: formatCommitMessage(input.writer, input.instance, input.message, input.seq),
     })
     objects.set(commit.oid, commit)
     await objectWriter.writeObjects(gitdir, objects.values())
@@ -162,15 +162,22 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
     return commit.oid
   }
 
-  const findTransaction = async (repo: string, tip: Oid, writer: string, seq: number): Promise<Oid | undefined> => {
+  const findTransaction = async (
+    repo: string,
+    tip: Oid,
+    base: Oid,
+    instance: string,
+    seq: number,
+  ): Promise<Oid | undefined> => {
     const gitdir = await resolveGitDir(repo)
     let oid: Oid | undefined = tip
     let inspected = 0
-    while (oid !== undefined) {
-      if (inspected >= TRANSACTION_SEARCH_LIMIT) throw transactionLookupExceeded(writer, seq)
+    // Stop at `base`: the sought commit is its child, so nothing older can be it.
+    while (oid !== undefined && oid !== base) {
+      if (inspected >= TRANSACTION_SEARCH_LIMIT) throw transactionLookupExceeded(instance, seq)
       const { commit } = await readCommit({ fs, gitdir, oid, cache })
       inspected += 1
-      if (transactionMatches(commit.message, writer, seq)) return oid
+      if (transactionMatches(commit.message, instance, seq)) return oid
       oid = commit.parent[0]
     }
     return undefined
@@ -180,7 +187,7 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
     ...shell,
     head: async (repo, ref) => {
       const gitdir = await resolveGitDir(repo)
-      return (await refStorage(repo)) === "files" ? await resolveRef({ fs, gitdir, ref }) : await shell.head(repo, ref)
+      return (await refStorage(repo)) === "files" ? resolveRef({ fs, gitdir, ref }) : shell.head(repo, ref)
     },
     readFiles,
     writeCommit,

@@ -9,7 +9,7 @@ import type { FsClient } from "isomorphic-git"
 import { describe, expect, test } from "vitest"
 
 import { createShellBackend, open, openReader } from "../src/index.js"
-import type { GitMap } from "../src/index.js"
+import type { CommitInput, GitMap, GitomicBackend, Oid } from "../src/index.js"
 import { createIsoBackend } from "../src/iso.js"
 import { createMemBackend } from "../src/mem.js"
 import { appendEmptyHistory, createBareRepo, git, gitWithInput } from "./helpers/git.js"
@@ -19,43 +19,106 @@ const gitInitHelp = spawnSync("git", ["init", "-h"], { encoding: "utf8" })
 const supportsReftable = `${gitInitHelp.stdout}${gitInitHelp.stderr}`.includes("--ref-format")
 const supportsObjectFormat = `${gitInitHelp.stdout}${gitInitHelp.stderr}`.includes("--object-format")
 
+/**
+ * Publish one identical transaction through every backend and report their oids.
+ *
+ * Identity is passed in rather than minted, because a store mints a unique
+ * instance per `open` on purpose: two stores agreeing on a commit oid would
+ * mean they had failed to distinguish themselves. What must agree is the
+ * SERIALIZATION — same input, same Git object — so the comparison drives
+ * `writeCommit` directly.
+ */
+async function publishEverywhere(
+  targets: ReadonlyArray<{ repo: string; backend: GitomicBackend }>,
+  input: Omit<CommitInput, "parent">,
+): Promise<Oid[]> {
+  const oids: Oid[] = []
+  for (const { repo, backend } of targets) {
+    const parent = await backend.head(repo, "refs/heads/main")
+    const next = await backend.writeCommit(repo, { ...input, parent })
+    expect(await backend.compareAndSwap(repo, "refs/heads/main", next, parent)).toBe(true)
+    oids.push(next)
+  }
+  return oids
+}
+
 describe("iso backend", () => {
-  test("keeps shell, iso, and mem object-id equivalent across writes and deletion", async () => {
+  test("serializes byte-identical commit objects in shell, iso, and mem", async () => {
     const shellFixture = await createBareRepo()
     const isoFixture = await createBareRepo()
     try {
-      const shell = await open({ repo: shellFixture.repo, ref: "main", writer: "same-writer" })
-      const iso = await open({
-        repo: isoFixture.repo,
-        ref: "main",
-        writer: "same-writer",
-        backend: createIsoBackend(),
+      const targets = [
+        { repo: shellFixture.repo, backend: createShellBackend() },
+        { repo: isoFixture.repo, backend: createIsoBackend() },
+        { repo: "three-backend-equivalence", backend: createMemBackend() },
+      ]
+      const identity = { writer: "same-writer", instance: "3f9d1c02-5b7a-4e18-9c44-0a2b6d8e1f30" }
+      expect(
+        new Set(
+          await Promise.all(targets.map(async ({ repo, backend }) => await backend.head(repo, "refs/heads/main"))),
+        ),
+      ).toHaveLength(1)
+
+      const first = await publishEverywhere(targets, {
+        ...identity,
+        seq: 0,
+        message: "first",
+        changes: new Map([
+          ["nested/a.txt", "a\n"],
+          ["nested/deeper/b.txt", "b\n"],
+          ["root.txt", "root\n"],
+        ]),
       })
-      const mem = await open({
-        repo: "three-backend-equivalence",
-        ref: "main",
-        writer: "same-writer",
-        backend: createMemBackend(),
+      expect(new Set(first)).toHaveLength(1)
+
+      const second = await publishEverywhere(targets, {
+        ...identity,
+        seq: 1,
+        message: "second",
+        changes: new Map([
+          ["nested/a.txt", undefined],
+          ["nested/deeper/b.txt", "b\nchanged\n"],
+        ]),
       })
-      const stores = [shell, iso, mem]
-      expect(new Set(await Promise.all(stores.map(async (store) => await store.head())))).toHaveLength(1)
+
+      expect(new Set(second)).toHaveLength(1)
+      for (const { repo, backend } of targets) {
+        const files = await backend.readFiles(repo, second[0] as Oid)
+        expect([...files.keys()].sort()).toEqual(["nested/deeper/b.txt", "root.txt"])
+        expect(files.get("nested/deeper/b.txt")).toBe("b\nchanged\n")
+      }
+    } finally {
+      await Promise.all([shellFixture.cleanup(), isoFixture.cleanup()])
+    }
+  })
+
+  test("agrees on tree contents across shell, iso, and mem transactions", async () => {
+    const shellFixture = await createBareRepo()
+    const isoFixture = await createBareRepo()
+    try {
+      const stores = [
+        await open({ repo: shellFixture.repo, ref: "main", writer: "same-writer" }),
+        await open({ repo: isoFixture.repo, ref: "main", writer: "same-writer", backend: createIsoBackend() }),
+        await open({ repo: "three-backend-parity", ref: "main", writer: "same-writer", backend: createMemBackend() }),
+      ]
       const first = async (map: GitMap): Promise<void> => {
         map.set("nested/a.txt", "a\n")
         map.set("nested/deeper/b.txt", "b\n")
         map.set("root.txt", "root\n")
       }
-      const firstCommits = await Promise.all(stores.map(async (store) => await store.transact(first, "first")))
-      expect(new Set(firstCommits.map((commit) => commit.oid))).toHaveLength(1)
+      await Promise.all(stores.map(async (store) => await store.transact(first, "first")))
 
       const second = async (map: GitMap): Promise<void> => {
         map.delete("nested/a.txt")
         map.set("nested/deeper/b.txt", `${await map.get("nested/deeper/b.txt")}changed\n`)
       }
-      const secondCommits = await Promise.all(stores.map(async (store) => await store.transact(second, "second")))
+      await Promise.all(stores.map(async (store) => await store.transact(second, "second")))
 
-      expect(new Set(secondCommits.map((commit) => commit.oid))).toHaveLength(1)
-      expect(await iso.at().keys()).toEqual(["nested/deeper/b.txt", "root.txt"])
-      expect(await iso.at().get("nested/deeper/b.txt")).toBe("b\nchanged\n")
+      for (const store of stores) {
+        expect(await store.at().keys()).toEqual(["nested/deeper/b.txt", "root.txt"])
+        expect(await store.at().get("nested/deeper/b.txt")).toBe("b\nchanged\n")
+        expect(await store.at().get("root.txt")).toBe("root\n")
+      }
     } finally {
       await Promise.all([shellFixture.cleanup(), isoFixture.cleanup()])
     }
@@ -125,21 +188,22 @@ describe("iso backend", () => {
         const commit = await git(fixture.repo, "commit-tree", tree, "-p", fixture.initial, "-m", "executable seed")
         await git(fixture.repo, "update-ref", "refs/heads/main", commit, fixture.initial)
       }
-      const shell = await open({ repo: shellFixture.repo, ref: "main", writer: "same-writer" })
-      const iso = await open({
-        repo: isoFixture.repo,
-        ref: "main",
-        writer: "same-writer",
-        backend: createIsoBackend(),
-      })
 
-      const commits = await Promise.all(
-        [shell, iso].map(
-          async (store) => await store.transact(async (map) => map.set("script", "after\n"), "edit script"),
-        ),
+      const commits = await publishEverywhere(
+        [
+          { repo: shellFixture.repo, backend: createShellBackend() },
+          { repo: isoFixture.repo, backend: createIsoBackend() },
+        ],
+        {
+          writer: "same-writer",
+          instance: "3f9d1c02-5b7a-4e18-9c44-0a2b6d8e1f30",
+          seq: 0,
+          message: "edit script",
+          changes: new Map([["script", "after\n"]]),
+        },
       )
 
-      expect(new Set(commits.map((commit) => commit.oid))).toHaveLength(1)
+      expect(new Set(commits)).toHaveLength(1)
       expect(await git(shellFixture.repo, "ls-tree", "main", "script")).toMatch(/^100644 blob /)
       expect(await git(isoFixture.repo, "ls-tree", "main", "script")).toMatch(/^100644 blob /)
     } finally {
@@ -303,9 +367,10 @@ describe("iso backend", () => {
       const backend = createIsoBackend()
       const tip = await backend.head(fixture.repo, "refs/heads/main")
 
-      await expect(backend.findTransaction(fixture.repo, tip, "missing-writer", 1)).rejects.toThrow(
+      await expect(backend.findTransaction(fixture.repo, tip, fixture.initial, "missing-instance", 1)).rejects.toThrow(
         `exceeded ${TRANSACTION_SEARCH_LIMIT} first-parent commits`,
       )
+      await expect(backend.findTransaction(fixture.repo, tip, tip, "missing-instance", 1)).resolves.toBeUndefined()
     } finally {
       await fixture.cleanup()
     }
@@ -351,11 +416,18 @@ describe("iso backend", () => {
       await store.transact(async (map) => map.set("value", "durable"), "durable iso write")
 
       const renames = operations.filter((operation) => operation.startsWith("rename:"))
-      expect(renames.length).toBeGreaterThanOrEqual(4)
+      // One blob, one tree, one commit: gitomic writes no bookkeeping objects.
+      expect(renames).toHaveLength(3)
       expect(renames.every((operation) => operation.includes("/objects/"))).toBe(true)
-      expect(operations.filter((operation) => operation.startsWith("sync:")).length).toBeGreaterThanOrEqual(
-        renames.length * 2,
+      for (const rename of renames) {
+        const temporary = rename.slice("rename:".length).split(":")[0] as string
+        expect(operations.indexOf(`sync:${temporary}`), rename).toBeGreaterThanOrEqual(0)
+        expect(operations.indexOf(`sync:${temporary}`), rename).toBeLessThan(operations.indexOf(rename))
+      }
+      const directorySyncs = operations.filter(
+        (operation) => operation.startsWith("sync:") && !operation.includes(".tmp"),
       )
+      expect(directorySyncs.some((operation) => operation.endsWith("/objects"))).toBe(true)
     } finally {
       await fixture.cleanup()
     }

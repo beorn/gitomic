@@ -4,14 +4,13 @@
 
 import { spawn } from "node:child_process"
 import { createHash } from "node:crypto"
-import { hostname } from "node:os"
 import { fileURLToPath } from "node:url"
 
 import { describe, expect, test } from "vitest"
 
 import { Conflict, createShellBackend, open } from "../src/index.js"
 import type { GitomicBackend } from "../src/index.js"
-import { createBareRepo, git, gitWithInput } from "./helpers/git.js"
+import { createBareRepo, git } from "./helpers/git.js"
 
 const crashBeforePublish = fileURLToPath(new URL("fixtures/crash-before-publish.ts", import.meta.url))
 const writerOpen = fileURLToPath(new URL("fixtures/writer-open.ts", import.meta.url))
@@ -139,7 +138,7 @@ describe("semantic CAS replay", () => {
       expect(await store.at().get("once")).toBe("only once")
       expect(await git(fixture.repo, "rev-list", "--count", "main")).toBe("2")
       const operations = await git(fixture.repo, "log", "--format=%(trailers:key=Gitomic-Seq,valueonly)", "main")
-      expect(operations.split("\n").filter((line) => line === "1")).toHaveLength(1)
+      expect(operations.split("\n").filter((line) => line === "0")).toHaveLength(1)
     } finally {
       await fixture.cleanup()
     }
@@ -234,59 +233,52 @@ describe("semantic CAS replay", () => {
     }
   }, 30_000)
 
-  test("rejects a concurrent process using the same writer and reclaims its lock after a hard kill", async () => {
+  test("lands both processes that share one writer label, each under its own identity", async () => {
     const fixture = await createBareRepo()
-    const first = spawn("bun", [writerOpen, fixture.repo, "one-role", "hold"], {
+    const holding = spawn("bun", [writerOpen, fixture.repo, "one-role", "hold"], {
       stdio: ["ignore", "pipe", "pipe"],
     })
     try {
-      expect(await waitForLine(first)).toBe("opened")
-      const writerHash = createHash("sha256").update("one-role", "utf8").digest("hex")
-      const leaseRef = `refs/gitomic/writers/${writerHash}`
-      const leaseOid = await git(fixture.repo, "rev-parse", "--verify", leaseRef)
-      const lease = JSON.parse(await git(fixture.repo, "cat-file", "blob", leaseOid)) as {
-        writer: string
-        instance: string
-        pid: number
-        host: string
-        openedAt: string
-      }
-      expect(lease).toMatchObject({ writer: "one-role", pid: first.pid, host: hostname() })
-      expect(lease.instance).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
-      expect(Number.isNaN(Date.parse(lease.openedAt))).toBe(false)
+      expect(await waitForLine(holding)).toBe("opened")
 
-      const duplicate = await runChild([writerOpen, fixture.repo, "one-role", "once"])
-      expect(duplicate.code).not.toBe(0)
-      expect(duplicate.stderr).toContain('writer "one-role" is already open')
+      // No lease, so a second live process under the same label is admitted…
+      const concurrent = await runChild([writerOpen, fixture.repo, "one-role", "write"])
+      expect(concurrent).toMatchObject({ code: 0 })
+      // …and so is a successor after the first is hard-killed, with no stale
+      // record to reclaim and no recycled pid to misjudge.
+      holding.kill("SIGKILL")
+      await new Promise<void>((resolveExit) => holding.once("close", () => resolveExit()))
+      const successor = await runChild([writerOpen, fixture.repo, "one-role", "write"])
+      expect(successor).toMatchObject({ code: 0 })
 
-      first.kill("SIGKILL")
-      await new Promise<void>((resolveExit) => first.once("close", () => resolveExit()))
-      const recovered = await runChild([writerOpen, fixture.repo, "one-role", "once"])
-      expect(recovered).toMatchObject({ code: 0, stdout: "opened\n" })
+      expect(await git(fixture.repo, "for-each-ref", "refs/gitomic/writers")).toBe("")
+      const body = await git(fixture.repo, "log", "--format=%B%x00", "main")
+      const receipts = body
+        .split("\0")
+        .map((message) => /Gitomic-Instance: ([^\n]+)\nGitomic-Seq: (\d+)/.exec(message))
+        .filter((match): match is RegExpExecArray => match !== null)
+      // Same label, same sequence number, different identities: no collision.
+      expect(receipts).toHaveLength(2)
+      expect(new Set(receipts.map((match) => match[1]))).toHaveLength(2)
+      expect(receipts.map((match) => match[2])).toEqual(["0", "0"])
+      expect(await git(fixture.repo, "log", "--format=%s", "main")).toContain("one-role: concurrent write")
     } finally {
-      first.kill("SIGKILL")
+      holding.kill("SIGKILL")
       await fixture.cleanup()
     }
   }, 30_000)
 
-  test("rejects non-UTF-8 writer-generation metadata instead of interpreting replacement characters", async () => {
+  test("keeps the reserved tree namespace empty of gitomic's own bookkeeping", async () => {
     const fixture = await createBareRepo()
     try {
-      const writer = "corrupt-lease"
-      const writerHash = createHash("sha256").update(writer, "utf8").digest("hex")
-      const leaseRef = `refs/gitomic/writers/${writerHash}`
-      const lease = Buffer.concat([
-        Buffer.from(
-          `{"writer":"${writer}","instance":"00000000-0000-4000-8000-000000000000","pid":999999,"host":"`,
-          "utf8",
-        ),
-        Buffer.from([0xff]),
-        Buffer.from('","openedAt":"2000-01-01T00:00:00.000Z"}\n', "utf8"),
-      ])
-      const oid = await gitWithInput(fixture.repo, lease, "hash-object", "-w", "--stdin")
-      await git(fixture.repo, "update-ref", leaseRef, oid)
+      const store = await open({ repo: fixture.repo, ref: "main", writer: "bookkeeping-free" })
 
-      await expect(open({ repo: fixture.repo, ref: "main", writer })).rejects.toThrow("must be valid UTF-8")
+      await store.transact(async (map) => map.set("value", "one"), "first write")
+      await store.transact(async (map) => map.set("value", "two"), "second write")
+
+      // Identity lives in the commit message; nothing rides in the tree.
+      expect(await git(fixture.repo, "ls-tree", "-r", "--name-only", "main")).toBe("value")
+      expect(await store.at().keys()).toEqual(["value"])
     } finally {
       await fixture.cleanup()
     }

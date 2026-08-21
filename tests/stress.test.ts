@@ -50,15 +50,16 @@ async function expectLinearContention(writerCount: number, operationsPerWriter: 
     expect(parents.at(-1)?.split(" ")).toHaveLength(1)
 
     const messages = await git(fixture.repo, "log", "--format=%B%x00", "main")
-    const operations = messages
+    const receipts = messages
       .split("\0")
-      .map((message) => message.match(/Gitomic-Writer: ([^\n]+)\nGitomic-Seq: (\d+)\s*$/))
+      .map((message) => message.match(/Gitomic-Writer: ([^\n]+)\nGitomic-Instance: ([^\n]+)\nGitomic-Seq: (\d+)\s*$/))
       .filter((match): match is RegExpMatchArray => match !== null)
-      .map((match) => `${match[1]}:${match[2]}`)
-    expect(operations).toHaveLength(expected)
-    expect(new Set(operations)).toHaveLength(expected)
+    expect(receipts).toHaveLength(expected)
+    // Every transaction carries a receipt no other process could mint.
+    expect(new Set(receipts.map((match) => `${match[2]}:${match[3]}`))).toHaveLength(expected)
+    expect(new Set(receipts.map((match) => match[2]))).toHaveLength(writerCount)
     for (const writer of writerNames) {
-      expect(operations.filter((operation) => operation.startsWith(`${writer}:`))).toHaveLength(operationsPerWriter)
+      expect(receipts.filter((match) => match[1] === writer)).toHaveLength(operationsPerWriter)
     }
   } finally {
     controller.abort()

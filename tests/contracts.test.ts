@@ -5,7 +5,7 @@
 import { describe, expect, test } from "vitest"
 
 import { open, RetriesExhausted } from "../src/index.js"
-import type { GitomicBackend } from "../src/index.js"
+import type { CommitInput, GitomicBackend } from "../src/index.js"
 import { createMemBackend } from "../src/mem.js"
 import { createBareRepo } from "./helpers/git.js"
 
@@ -39,19 +39,22 @@ describe("public contract guards", () => {
     )
   })
 
-  test("refuses a custom backend that cannot acquire the writer identity", async () => {
+  test("opens without a writer label and still names itself in the audit trail", async () => {
     const mem = createMemBackend()
-    const backend = {
-      head: mem.head,
-      readFiles: mem.readFiles,
-      writeCommit: mem.writeCommit,
-      compareAndSwap: mem.compareAndSwap,
-      findTransaction: mem.findTransaction,
-    } as GitomicBackend
+    let written: CommitInput | undefined
+    const backend: GitomicBackend = {
+      ...mem,
+      writeCommit: async (repo, input) => {
+        written = input
+        return await mem.writeCommit(repo, input)
+      },
+    }
+    const store = await open({ repo: "unlabelled", ref: "main", backend })
 
-    await expect(open({ repo: "unleased-backend", ref: "main", writer: "worker", backend })).rejects.toThrow(
-      "backend must implement acquireWriter",
-    )
+    await store.transact(async (map) => map.set("value", "one"), "write without a label")
+
+    expect(written?.writer).toBe("gitomic")
+    expect(written?.instance).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
   })
 
   test("rejects commit messages Git cannot encode before a backend diverges", async () => {
@@ -87,8 +90,17 @@ describe("public contract guards", () => {
     expect(attempts).toBe(10)
   })
 
-  test("queues same-store calls and assigns each writer sequence exactly once", async () => {
-    const backend = createMemBackend()
+  test("queues same-store calls and assigns each sequence exactly once from zero", async () => {
+    const mem = createMemBackend()
+    const instances: string[] = []
+    const backend: GitomicBackend = {
+      ...mem,
+      writeCommit: async (repo, input) => {
+        instances.push(input.instance)
+        return await mem.writeCommit(repo, input)
+      },
+    }
+    const initial = await mem.head("local-queue", "refs/heads/main")
     const store = await open({ repo: "local-queue", ref: "main", writer: "one-writer", backend })
 
     await Promise.all(
@@ -102,11 +114,17 @@ describe("public contract guards", () => {
 
     expect(await store.at().get("count")).toBe("20")
     expect(await store.at().keys("operations/")).toHaveLength(20)
+    const instance = instances[0]
+    expect(instance).toBeDefined()
+    expect(new Set(instances)).toEqual(new Set([instance]))
     const tip = await store.head()
     const commits = await Promise.all(
-      Array.from({ length: 20 }, (_, index) => backend.findTransaction("local-queue", tip, "one-writer", index + 1)),
+      Array.from({ length: 20 }, (_, index) =>
+        backend.findTransaction("local-queue", tip, initial, instance as string, index),
+      ),
     )
     expect(new Set(commits)).toHaveLength(20)
+    expect(commits).not.toContain(undefined)
   })
 
   test("round-trips and deletes Git-valid tabs and newlines in a path", async () => {

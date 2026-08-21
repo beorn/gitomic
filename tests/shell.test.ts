@@ -10,6 +10,7 @@ import { delimiter, join } from "node:path"
 import { describe, expect, test } from "vitest"
 
 import { createShellBackend, open } from "../src/index.js"
+import type { GitomicBackend } from "../src/index.js"
 import { isRemoteCompareAndSwapRejection } from "../src/shell.js"
 import { appendEmptyHistory, createBareRepo } from "./helpers/git.js"
 
@@ -202,13 +203,28 @@ describe.sequential("shell backend failure boundaries", () => {
     const fixture = await createBareRepo()
     const previousTrace = process.env.GIT_TRACE2_EVENT
     try {
-      const store = await open({ repo: fixture.repo, ref: "main", writer: "worker-a" })
+      const shell = createShellBackend()
+      const instances: string[] = []
+      const backend: GitomicBackend = {
+        ...shell,
+        writeCommit: async (repo, input) => {
+          instances.push(input.instance)
+          return await shell.writeCommit(repo, input)
+        },
+      }
+      const store = await open({ repo: fixture.repo, ref: "main", writer: "worker-a", backend })
       const first = await store.transact(async (map) => map.set("first", "1"), "first")
       await store.transact(async (map) => map.set("second", "2"), "second")
       const trace = join(fixture.repo, "find-transaction-trace.json")
       process.env.GIT_TRACE2_EVENT = trace
 
-      const found = await createShellBackend().findTransaction(fixture.repo, await store.head(), "worker-a", 1)
+      const found = await createShellBackend().findTransaction(
+        fixture.repo,
+        await store.head(),
+        fixture.initial,
+        instances[0] as string,
+        0,
+      )
 
       expect(found).toBe(first.oid)
       const events = (await readFile(trace, "utf8"))
@@ -231,16 +247,29 @@ describe.sequential("shell backend failure boundaries", () => {
     }
   })
 
-  test("fails loudly when an ambiguous acknowledgement is older than the bounded walk", async () => {
+  test("fails loudly when a receipt search runs past its horizon without reaching its base", async () => {
     const fixture = await createBareRepo()
     try {
       await appendEmptyHistory(fixture.repo, fixture.initial, TRANSACTION_SEARCH_LIMIT + 1)
       const backend = createShellBackend()
       const tip = await backend.head(fixture.repo, "refs/heads/main")
 
-      await expect(backend.findTransaction(fixture.repo, tip, "missing-writer", 1)).rejects.toThrow(
+      await expect(backend.findTransaction(fixture.repo, tip, fixture.initial, "missing-instance", 1)).rejects.toThrow(
         `exceeded ${TRANSACTION_SEARCH_LIMIT} first-parent commits`,
       )
+    } finally {
+      await fixture.cleanup()
+    }
+  }, 30_000)
+
+  test("reads only the commits after its base, however deep the history is", async () => {
+    const fixture = await createBareRepo()
+    try {
+      await appendEmptyHistory(fixture.repo, fixture.initial, TRANSACTION_SEARCH_LIMIT + 1)
+      const backend = createShellBackend()
+      const tip = await backend.head(fixture.repo, "refs/heads/main")
+
+      await expect(backend.findTransaction(fixture.repo, tip, tip, "missing-instance", 1)).resolves.toBeUndefined()
     } finally {
       await fixture.cleanup()
     }

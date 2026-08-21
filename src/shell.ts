@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process"
 import { createHash, randomUUID } from "node:crypto"
 import { mkdir, mkdtemp, open as openFile, rename, rm, unlink, writeFile } from "node:fs/promises"
-import { hostname, tmpdir } from "node:os"
+import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 
 import {
@@ -53,7 +53,7 @@ export function createShellRuntime(): {
   const refStorages = new Map<string, Promise<"files" | "native">>()
   const objectFormats = new Map<string, Promise<"sha1" | "sha256">>()
   const refStorage = async (repo: string): Promise<"files" | "native"> =>
-    await resolveRefStorage(await resolveGitDir(repo), refStorages)
+    resolveRefStorage(await resolveGitDir(repo), refStorages)
   const objectFormat = async (repo: string): Promise<"sha1" | "sha256"> => {
     const gitdir = await resolveGitDir(repo)
     let format = objectFormats.get(gitdir)
@@ -105,75 +105,28 @@ export function createShellRuntime(): {
     }
   }
   const backend: GitomicBackend = {
-    acquireWriter: async (repo, writer) => await acquireWriterLease(await resolveGitDir(repo), writer),
-    head: async (repo, ref) => await head(await resolveGitDir(repo), ref),
-    readFiles: async (repo, commit, prefix) => await readFiles(await resolveGitDir(repo), commit, prefix),
+    head: async (repo, ref) => head(await resolveGitDir(repo), ref),
+    readFiles: async (repo, commit, prefix) => readFiles(await resolveGitDir(repo), commit, prefix),
     writeCommit: async (repo, input) => {
       const oid = await writeCommit(await resolveGitDir(repo), input)
       await pinCommit(repo, input.writer, oid)
       return oid
     },
     compareAndSwap: async (repo, ref, next, expected) =>
-      await withPinnedCommit(repo, next, async (gitdir, pin) =>
+      withPinnedCommit(repo, next, async (gitdir, pin) =>
         pin === undefined
-          ? await compareAndSwap(gitdir, ref, next, expected)
-          : await compareAndSwapPinned(gitdir, ref, next, expected, pin),
+          ? compareAndSwap(gitdir, ref, next, expected)
+          : compareAndSwapPinned(gitdir, ref, next, expected, pin),
       ),
-    findTransaction: async (repo, tip, writer, seq) =>
-      await findTransaction(await resolveGitDir(repo), tip, writer, seq),
-    fetchRemote: async (repo, ref, remote) => await fetchRemote(await resolveGitDir(repo), ref, remote),
+    findTransaction: async (repo, tip, base, instance, seq) =>
+      findTransaction(await resolveGitDir(repo), tip, base, instance, seq),
+    fetchRemote: async (repo, ref, remote) => fetchRemote(await resolveGitDir(repo), ref, remote),
     compareAndSwapRemote: async (repo, ref, next, expected, remote) =>
-      await withPinnedCommit(
-        repo,
-        next,
-        async (gitdir, pin) => await compareAndSwapRemote(gitdir, ref, next, expected, remote, pin),
+      withPinnedCommit(repo, next, async (gitdir, pin) =>
+        compareAndSwapRemote(gitdir, ref, next, expected, remote, pin),
       ),
   }
   return { backend, resolveGitDir, refStorage, objectFormat, pinCommit }
-}
-
-type WriterLease = {
-  writer: string
-  instance: string
-  pid: number
-  host: string
-  openedAt: string
-}
-
-async function acquireWriterLease(repo: string, writer: string): Promise<void> {
-  const ref = writerLeaseRef(writer)
-  const lease: WriterLease = {
-    writer,
-    instance: randomUUID(),
-    pid: process.pid,
-    host: hostname(),
-    openedAt: new Date().toISOString(),
-  }
-  const next = validateOid(
-    text(await gitWrite(repo, ["hash-object", "-w", "--stdin"], { input: `${JSON.stringify(lease)}\n` })),
-  )
-  while (true) {
-    const current = await optionalRef(repo, ref)
-    if (current !== undefined) {
-      const owner = await readWriterLease(repo, ref, current, writer)
-      if (owner.host !== lease.host) {
-        throw new Error(
-          `writer ${JSON.stringify(writer)} is leased on host ${JSON.stringify(owner.host)}; pass a unique writer, or delete ${ref} only after proving that host's owner is gone`,
-        )
-      }
-      if (isProcessAlive(owner.pid)) {
-        throw new Error(
-          `writer ${JSON.stringify(writer)} is already open in process ${owner.pid}; pass a unique writer for each live process`,
-        )
-      }
-    }
-    const expected = current ?? "0".repeat(next.length)
-    const result = await run("git", durableGitArgs(repo, ["update-ref", ref, next, expected]))
-    if (result.code === 0) return
-    const detail = result.stderr.toString("utf8").trim()
-    if (isCompareAndSwapRejection(detail)) continue
-    throw new Error(`cannot acquire writer lease ${ref}${detail ? `: ${detail}` : ""}`)
-  }
 }
 
 async function optionalRef(repo: string, ref: string): Promise<Oid | undefined> {
@@ -181,65 +134,9 @@ async function optionalRef(repo: string, ref: string): Promise<Oid | undefined> 
   if (result.code === 1 && result.stdout.length === 0) return undefined
   if (result.code !== 0) {
     const detail = result.stderr.toString("utf8").trim()
-    throw new Error(`cannot inspect writer lease ${ref}${detail ? `: ${detail}` : ""}`)
+    throw new Error(`cannot inspect ref ${ref}${detail ? `: ${detail}` : ""}`)
   }
-  return validateOid(text(result.stdout), `writer lease ${ref} points to an invalid Git object id`)
-}
-
-async function readWriterLease(repo: string, ref: string, oid: Oid, writer: string): Promise<WriterLease> {
-  let bytes: Buffer
-  try {
-    bytes = await git(repo, ["cat-file", "blob", oid])
-  } catch (error) {
-    throw new Error(
-      `cannot read gitomic writer lease ${ref}; inspect or delete the ref after proving its owner is gone`,
-      {
-        cause: error,
-      },
-    )
-  }
-  const raw = decodeUtf8(bytes, `gitomic writer lease ${ref}`)
-  try {
-    const value: unknown = JSON.parse(raw)
-    if (
-      typeof value === "object" &&
-      value !== null &&
-      "writer" in value &&
-      value.writer === writer &&
-      "instance" in value &&
-      typeof value.instance === "string" &&
-      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value.instance) &&
-      "pid" in value &&
-      typeof value.pid === "number" &&
-      Number.isSafeInteger(value.pid) &&
-      value.pid > 0 &&
-      "host" in value &&
-      typeof value.host === "string" &&
-      value.host.length > 0 &&
-      "openedAt" in value &&
-      typeof value.openedAt === "string" &&
-      !Number.isNaN(Date.parse(value.openedAt))
-    ) {
-      return value as WriterLease
-    }
-  } catch {
-    // Report one stable, actionable error below.
-  }
-  throw new Error(`invalid gitomic writer lease ${ref}; inspect or delete the ref after proving its owner is gone`)
-}
-
-function writerLeaseRef(writer: string): string {
-  const id = createHash("sha256").update(writer, "utf8").digest("hex")
-  return `refs/gitomic/writers/${id}`
-}
-
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch (error) {
-    return !isNodeError(error) || error.code !== "ESRCH"
-  }
+  return validateOid(text(result.stdout), `ref ${ref} points to an invalid Git object id`)
 }
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {
@@ -256,7 +153,7 @@ function inflightRef(writer: string): string {
 }
 
 async function run(command: string, args: readonly string[], options: GitOptions = {}): Promise<GitResult> {
-  return await new Promise((resolveResult, reject) => {
+  return new Promise((resolveResult, reject) => {
     const child = spawn(command, args, {
       env: { ...process.env, ...options.env, GIT_TERMINAL_PROMPT: "0", LC_ALL: "C" },
       stdio: ["pipe", "pipe", "pipe"],
@@ -294,7 +191,7 @@ export function createGitDirResolver(): (repo: string) => Promise<string> {
     if (gitdir === undefined) {
       supportedVersion ??= requireSupportedGit()
       gitdir = supportedVersion
-        .then(async () => await run("git", ["-C", locator, "rev-parse", "--path-format=absolute", "--git-common-dir"]))
+        .then(async () => run("git", ["-C", locator, "rev-parse", "--path-format=absolute", "--git-common-dir"]))
         .then((result) => {
           if (result.code !== 0) {
             const detail = result.stderr.toString("utf8").trim()
@@ -464,7 +361,7 @@ async function writeCommit(repo: string, input: CommitInput): Promise<Oid> {
     return text(
       await gitWrite(repo, ["commit-tree", tree, "-p", input.parent], {
         env: identityEnv,
-        input: formatCommitMessage(input.writer, input.message, input.seq),
+        input: formatCommitMessage(input.writer, input.instance, input.message, input.seq),
       }),
     )
   } finally {
@@ -620,7 +517,15 @@ async function deleteRef(repo: string, ref: string, oid: Oid, failure: string): 
   }
 }
 
-async function findTransaction(repo: string, tip: Oid, writer: string, seq: number): Promise<Oid | undefined> {
+async function findTransaction(
+  repo: string,
+  tip: Oid,
+  base: Oid,
+  instance: string,
+  seq: number,
+): Promise<Oid | undefined> {
+  // `^base` is the stop condition: the sought commit is a child of `base`, so
+  // one process reads only what arrived after it, however deep the history is.
   const output = await git(repo, [
     "rev-list",
     "--first-parent",
@@ -628,13 +533,14 @@ async function findTransaction(repo: string, tip: Oid, writer: string, seq: numb
     "--no-commit-header",
     "--format=%H%x00%B%x00",
     tip,
+    `^${base}`,
   ])
   const commits = parseTransactionHistory(output)
   for (const commit of commits.slice(0, TRANSACTION_SEARCH_LIMIT)) {
-    if (transactionMatches(commit.message, writer, seq)) return commit.oid
+    if (transactionMatches(commit.message, instance, seq)) return commit.oid
   }
   if (commits.length > TRANSACTION_SEARCH_LIMIT) {
-    throw transactionLookupExceeded(writer, seq)
+    throw transactionLookupExceeded(instance, seq)
   }
   return undefined
 }
@@ -681,8 +587,9 @@ async function fetchRemote(repo: string, ref: string, remote: string): Promise<O
     return fetched
   } finally {
     const temporary = fetched ?? (await optionalRef(repo, scratch))
-    if (temporary !== undefined)
+    if (temporary !== undefined) {
       await deleteRef(repo, scratch, temporary, `cannot release temporary fetch ref ${scratch}`)
+    }
   }
 }
 

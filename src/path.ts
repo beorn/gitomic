@@ -1,5 +1,14 @@
 import { assertUtf8 } from "./utf8.js"
 
+/**
+ * A tree path namespace gitomic reserves and does not itself write.
+ *
+ * Nothing gitomic stores lives here: transaction identity rides in the commit
+ * message, not in the tree. The namespace stays closed to callers so a future
+ * in-tree protocol file cannot collide with application state that was already
+ * written there — and so `keys` never has to explain an entry the caller did
+ * not create.
+ */
 export const INTERNAL_PREFIX = ".gitomic/"
 
 export type GitPrefixNotFoundError = Error & {
@@ -50,7 +59,7 @@ export function normalizePath(path: string): string {
     throw new TypeError(`invalid git tree path: ${JSON.stringify(path)}`)
   }
   if (normalized.startsWith(INTERNAL_PREFIX) || normalized === INTERNAL_PREFIX.slice(0, -1)) {
-    throw new TypeError(`${INTERNAL_PREFIX} is reserved for gitomic metadata`)
+    throw new TypeError(`${INTERNAL_PREFIX} is a reserved gitomic path namespace`)
   }
   return normalized
 }
@@ -70,7 +79,7 @@ export function normalizePrefix(prefix: string): string {
     throw new TypeError(`invalid git tree prefix: ${JSON.stringify(prefix)}`)
   }
   if (normalized.startsWith(INTERNAL_PREFIX) || normalized === INTERNAL_PREFIX.slice(0, -1)) {
-    throw new TypeError(`${INTERNAL_PREFIX} is reserved for gitomic metadata`)
+    throw new TypeError(`${INTERNAL_PREFIX} is a reserved gitomic path namespace`)
   }
   return normalized
 }
@@ -115,7 +124,7 @@ function assertStoredPath(path: string): void {
   }
   if (path === INTERNAL_PREFIX.slice(0, -1)) {
     throw new Error(
-      `${JSON.stringify(path)} is reserved and collides with Gitomic metadata; rename that repository path before opening it with gitomic`,
+      `${JSON.stringify(path)} is reserved by gitomic; rename that repository path before opening it with gitomic`,
     )
   }
 }

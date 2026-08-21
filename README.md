@@ -56,7 +56,7 @@ Several programs write the same files: agents, scripts, you in an editor.
 const store = await open({
   repo: ".",                   // any path inside the repo
   ref: "main",                 // short names accepted
-  writer: "worker-3",          // required — opaque caller id; keys retry-dedup
+  writer: "worker-3",          // optional — label for the audit trail
   remote: "origin",            // optional — see below
 })
 
@@ -70,9 +70,21 @@ store.transact(fn: Update, message: string): Promise<Committed>
 
 `transact` runs your update function and lands its writes as one commit, re-running it if another writer got there first. `message` is required — it becomes the commit message; say why, not what.
 
-`writer` is an opaque caller string and the retry-dedup counter's identity. Include your launcher or process instance id when one role can have multiple live instances. `open` atomically claims that exact string for the lifetime of the process: the built-in Git backends store a generation record under `refs/gitomic/writers/` and acquire it with ref compare-and-swap. The record carries a library-minted UUID, hostname, process id, and open time. A second live owner fails loudly; a dead same-host owner is reclaimed with another compare-and-swap, while a foreign-host record fails safe with an explicit inspection remedy. There is no `Store.close()` in v1, so a writer id is intentionally process/launcher-lifetime. The library does not inspect Hab, Ag, environment variables, or any agent naming convention.
+`writer` is a **label, not a lock**. It names a role for humans — it leads the commit subject and repeats as a `Gitomic-Writer` trailer — and it is free to repeat across processes, restarts, and machines. Reuse `"indexer"` in fifty processes if that is what the audit trail should say. It defaults to `"gitomic"` when omitted. The library does not inspect Hab, Ag, environment variables, or any agent naming convention.
 
-Read-only consumers use the same exact snapshots without claiming a writer:
+Identity is minted, not declared. Every `open` mints a UUID for that one live store and stamps it on each commit as `Gitomic-Instance`, alongside a `Gitomic-Seq` counter that starts at zero:
+
+```
+worker-3: add note
+
+Gitomic-Writer: worker-3
+Gitomic-Instance: 3f9d1c02-5b7a-4e18-9c44-0a2b6d8e1f30
+Gitomic-Seq: 0
+```
+
+`(instance, seq)` is the receipt that makes retries idempotent, and nothing else can mint it — so **there is no lock to acquire, nothing to reclaim after a crash, and no way for two writers to collide by picking the same name.** A store that must replay after an ambiguous acknowledgement still holds its own UUID in memory, which is the only place it is ever needed; a process that died holds nothing, and nothing was left behind for the next one to clean up. There is no `Store.close()` and none is needed.
+
+Read-only consumers use the same exact snapshots:
 
 ```ts
 import { openReader } from "gitomic"
@@ -94,8 +106,8 @@ for await (const change of reader.watch({
 }
 ```
 
-`openReader` defaults `ref` to `main`, never calls `acquireWriter`, and accepts
-the same optional `remote` and `backend` selections as `open`. `head()` refreshes
+`openReader` defaults `ref` to `main`, writes nothing to the repository, and
+accepts the same optional `remote` and `backend` selections as `open`. `head()` refreshes
 the selected local or remote ref. `at(oid)` is an immutable lazy snapshot;
 omitting the OID pins the refreshed tip at the time `at()` is called.
 `watch({ after, signal })` emits ref-tip changes and stops promptly when the
@@ -111,7 +123,7 @@ Snapshot translates that low-level distinction into its established
 `undefined` / `false` / empty-array missing-value semantics. Transactions never
 pass a prefix: they remain whole-tree strict.
 
-**`remote`:** origin becomes the decider. Every write is one fetch/push cycle under the remote's ref lock; the lease check is compare-and-swap, never history rewriting, so a push either fast-forwards or triggers a re-run. The local ref is then a cache of origin: reads stay local and lag until the next fetch, and an unpushed local-only tip may be replaced by origin's tip. Do not use a ref that carries unrelated local work. Origin is, honestly, your server; omit it for purely local stores.
+**`remote`:** origin becomes the decider. Every write is one fetch/push cycle under the remote's ref lock; the push is a compare-and-swap (`--force-with-lease`), never history rewriting, so it either fast-forwards or triggers a re-run. The local ref is then a cache of origin: reads stay local and lag until the next fetch, and an unpushed local-only tip may be replaced by origin's tip. Do not use a ref that carries unrelated local work. Origin is, honestly, your server; omit it for purely local stores.
 
 **Sharing `main` with a delivery queue:** use a strict path partition: gitomic owns its declared state paths and the queue owns code paths; neither writes the other's partition. The ref only fast-forwards. The queue never rebases or rewrites already-published gitomic commits—if its candidate is stale, it must rebuild a descendant of the current tip. Without all three invariants, use a separate ref.
 
@@ -202,7 +214,7 @@ const test = await open({ repo: "my-test", ref: "main", writer: "test", backend:
 
 `iso` uses `isomorphic-git` for object reads, builds and durably writes canonical objects in-process, and keeps ref CAS native. `mem` creates canonical Git objects entirely in memory and requires neither a repository nor the `git` executable.
 
-A custom backend implements the public `GitomicBackend` contract, including `acquireWriter(repo, writer)`. That call must establish one live owner for the writer before `open` returns; omitting it is a runtime error as well as a type error. Backends that wrap a built-in backend can preserve the lifecycle contract by spreading the built-in object and overriding only the operations they own.
+A custom backend implements the public `GitomicBackend` contract: `head`, `readFiles`, `writeCommit`, `compareAndSwap`, and `findTransaction`, plus the optional remote pair. `writeCommit` receives the caller's `writer` label and the store's `instance` and `seq`, and must record all three so `findTransaction` can recognize `(instance, seq)` again. Backends that wrap a built-in backend keep every contract by spreading the built-in object and overriding only the operations they own.
 
 ## When to use it
 
@@ -231,19 +243,19 @@ A custom backend implements the public `GitomicBackend` contract, including `acq
 1. Writes build files straight into git's object database — many files, one commit.
 2. Publish = move the ref to the new commit, only if nobody moved it first. Writers can be separate processes — the ref swap is atomic in every backend.
 3. Lose the race? The update function re-runs on the winner's version — no merges. Retries back off with a random, roughly-doubling delay (≤150ms; jitter prevents lockstep) and are bounded (default 10) before `RetriesExhausted`. Same-process writers queue locally.
-4. Commits carry who, why, and a per-writer counter — retries can't apply twice. If an acknowledgement is ambiguous, recovery checks one bounded near-tip batch for the original commit and fails loudly instead of walking the repo's whole history.
+4. Commits carry who, why, and a receipt no other process can mint — retries can't apply twice. If an acknowledgement is ambiguous, recovery looks for that receipt among the commits that arrived since the one this transaction was built on, and fails loudly rather than walking the repo's whole history.
 
 Commit timestamps advance deterministically from the parent so every backend produces the same object id. They preserve order, not wall-clock time; store a domain timestamp in the data when real event time matters.
 
-Completed unpublished commits are pinned under `refs/gitomic/inflight/` before compare-and-swap, then unpinned after the publish result. With files-format refs, the hidden pin uses Git's loose-ref lockfile protocol: fsync, atomic rename, then directory fsync; other ref-storage formats delegate the pin to native Git. Publish and pin deletion share one native Git ref transaction. That keeps the full object graph reachable even during `git prune --expire=now`; a hard-killed writer leaves at most one pin for its writer id, and its next completed write replaces and releases it.
+Completed unpublished commits are pinned under `refs/gitomic/inflight/` before compare-and-swap, then unpinned after the publish result. With files-format refs, the hidden pin uses Git's loose-ref lockfile protocol: fsync, atomic rename, then directory fsync; other ref-storage formats delegate the pin to native Git. Publish and pin deletion share one native Git ref transaction. That keeps the full object graph reachable even during `git prune --expire=now`. The pin is keyed on the writer label so it is self-cleaning across restarts: a hard-killed writer leaves at most one pin for that label, and the next process using it replaces and releases the pin instead of leaking one per crash. The cost of that stable key is that two **concurrent** stores sharing a label share a pin slot and can fail each other's pin loudly — give simultaneous writers distinct labels.
 
 The conformance suite runs both 3 writers × 100 sustained writes and a 12-writer burst, verifying 300/300 land exactly once on one linear tip.
 
 ## Durability and trust
 
-No repository or machine-wide Git config is required. The shell backend requires Git 2.36 or newer, supports SHA-1 and SHA-256 repositories, and supplies `core.fsync=loose-object,reference` plus `core.fsyncMethod=fsync` on its own object and ref write commands. The iso backend is SHA-1-only (use `shell` for SHA-256); it writes every loose object to a same-directory temporary file, fsyncs it, renames it into place, then fsyncs the directory before the commit can be pinned or published. Its ref and writer-generation compare-and-swap operations still use Git 2.36+. The `mem` backend also emits canonical SHA-1 objects.
+No repository or machine-wide Git config is required. The shell backend requires Git 2.36 or newer, supports SHA-1 and SHA-256 repositories, and supplies `core.fsync=loose-object,reference` plus `core.fsyncMethod=fsync` on its own object and ref write commands. The iso backend is SHA-1-only (use `shell` for SHA-256); it writes every loose object to a same-directory temporary file, fsyncs it, renames it into place, then fsyncs the directory before the commit can be pinned or published. Its ref compare-and-swap operations still use Git 2.36+. The `mem` backend also emits canonical SHA-1 objects.
 
-Gitomic is designed for cooperating processes inside a trusted perimeter. Its writer lease, path checks, CAS, receipt scan, and audit trailers are accident guardrails and detectors; they are not a security boundary against a hostile process that can mutate the repository or impersonate a writer. Use filesystem/process isolation and remote authorization for that boundary.
+Gitomic is designed for cooperating processes inside a trusted perimeter. Its path checks, CAS, receipt scan, and audit trailers are accident guardrails and detectors; they are not a security boundary against a hostile process that can mutate the repository or forge a writer label. Use filesystem/process isolation and remote authorization for that boundary.
 
 ## Status
 
