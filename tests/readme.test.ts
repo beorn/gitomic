@@ -37,14 +37,21 @@ describe("README example", () => {
     const readme = await readFile(new URL("../README.md", import.meta.url), "utf8")
 
     for (const contract of [
-      "Git 2.36",
+      "git 2.36",
       "core.fsync",
       "NFC",
       "symlink",
       "gitlink",
       "Gitomic-Instance",
       "label, not a lock",
-      "refs/gitomic/inflight",
+      // The headline claim and the four limits that keep it honest.
+      "Nothing of ours in your files",
+      "tell a gitomic commit from one you made by hand",
+      "unreferenced objects until git's next `gc`",
+      "reflog entry",
+      "refs/gitomic/fetch/<uuid>",
+      "gc.pruneExpire",
+      "residual risk",
       "local ref is then a cache",
       "path partition",
       "never rebases",

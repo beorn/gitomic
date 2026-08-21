@@ -12,7 +12,7 @@ import { describe, expect, test } from "vitest"
 import { createShellBackend, open } from "../src/index.js"
 import type { GitomicBackend } from "../src/index.js"
 import { isRemoteCompareAndSwapRejection } from "../src/shell.js"
-import { appendEmptyHistory, createBareRepo } from "./helpers/git.js"
+import { appendEmptyHistory, createBareRepo, git } from "./helpers/git.js"
 
 const TRANSACTION_SEARCH_LIMIT = 1_024
 const gitInitHelp = spawnSync("git", ["init", "-h"], { encoding: "utf8" })
@@ -158,9 +158,11 @@ describe.sequential("shell backend failure boundaries", () => {
       }
       expect(events.filter((event) => event.event === "start" && event.argv?.includes("hash-object"))).toHaveLength(1)
       expect(events.filter((event) => event.event === "start" && event.argv?.includes("update-index"))).toHaveLength(1)
-      const refTransactions = events.filter((event) => event.event === "start" && event.argv?.includes("update-ref"))
-      const publishTransactions = refTransactions.filter((event) => event.argv?.includes("--stdin"))
-      expect(publishTransactions).toHaveLength(1)
+      // One ref write per transaction: the publish. No pin, no unpin, no
+      // multi-command ref transaction to sequence them.
+      const refWrites = events.filter((event) => event.event === "start" && event.argv?.includes("update-ref"))
+      expect(refWrites).toHaveLength(1)
+      expect(refWrites[0]?.argv).not.toContain("--stdin")
     } finally {
       if (previousTrace === undefined) delete process.env.GIT_TRACE2_EVENT
       else process.env.GIT_TRACE2_EVENT = previousTrace
@@ -168,7 +170,7 @@ describe.sequential("shell backend failure boundaries", () => {
     }
   })
 
-  test.runIf(supportsReftable)("delegates inflight pins to native Git for reftable repositories", async () => {
+  test.runIf(supportsReftable)("transacts in a reftable repository without a ref-storage special case", async () => {
     const fixture = await createBareRepo({ refFormat: "reftable" })
     try {
       const store = await open({ repo: fixture.repo, ref: "main", writer: "reftable-writer" })
@@ -177,6 +179,7 @@ describe.sequential("shell backend failure boundaries", () => {
 
       expect(await store.head()).toBe(committed.oid)
       expect(await store.at().get("value")).toBe("reftable")
+      expect(await git(fixture.repo, "for-each-ref", "refs/gitomic")).toBe("")
     } finally {
       await fixture.cleanup()
     }

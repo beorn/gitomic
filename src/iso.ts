@@ -157,8 +157,10 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
       message: formatCommitMessage(input.writer, input.instance, input.message, input.seq),
     })
     objects.set(commit.oid, commit)
+    // Durably written but unreferenced until the publish adopts it. No pin ref
+    // guards that window; see the residual-risk note on the shell backend's
+    // `writeCommit` and the README's durability section.
     await objectWriter.writeObjects(gitdir, objects.values())
-    await shellRuntime.pinCommit(repo, input.writer, commit.oid)
     return commit.oid
   }
 

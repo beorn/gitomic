@@ -21,6 +21,17 @@
 
 ### Removed
 
+- The inflight commit pins under `refs/gitomic/inflight/`, with the hand-rolled
+  loose-ref lockfile protocol (temp file, fsync, rename, directory fsync), the
+  `.gitomic-keep` sentinel file, the ref-storage special case, and the combined
+  publish-and-unpin ref transaction. A transaction now performs exactly one ref
+  write: the publish. The pins guarded the window in which a completed commit is
+  unreferenced; Git's default gc grace (`gc.pruneExpire = 2.weeks.ago`) covers
+  that window instead. **Residual risk, now stated in the README rather than
+  silently assumed:** an aggressive `gc.pruneExpire`, or `git gc --prune=now`
+  running concurrently with a transaction, can reclaim the commit mid-flight —
+  the publish then fails loudly on the missing object and never moves the ref.
+  `createShellRuntime()` no longer returns `pinCommit`.
 - The per-writer sequence ledger under `.gitomic/writers/`. Transactions no
   longer write bookkeeping into the tree they commit, and the retry path no
   longer reads the winner's whole tree to consult it. `.gitomic/` stays a

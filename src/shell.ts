@@ -1,8 +1,8 @@
 import { spawn } from "node:child_process"
-import { createHash, randomUUID } from "node:crypto"
-import { mkdir, mkdtemp, open as openFile, rename, rm, unlink, writeFile } from "node:fs/promises"
+import { randomUUID } from "node:crypto"
+import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { dirname, join, resolve } from "node:path"
+import { join, resolve } from "node:path"
 
 import {
   formatCommitMessage,
@@ -28,12 +28,6 @@ type GitOptions = {
   input?: string | Buffer
 }
 
-type PinnedCommit = {
-  oid: Oid
-  ref: string
-  released: boolean
-}
-
 const DURABLE_GIT_CONFIG = ["-c", "core.fsync=loose-object,reference", "-c", "core.fsyncMethod=fsync"] as const
 
 export function createShellBackend(): GitomicBackend {
@@ -45,11 +39,8 @@ export function createShellRuntime(): {
   resolveGitDir(repo: string): Promise<string>
   refStorage(repo: string): Promise<"files" | "native">
   objectFormat(repo: string): Promise<"sha1" | "sha256">
-  pinCommit(repo: string, writer: string, oid: Oid): Promise<void>
 } {
   const resolveGitDir = createGitDirResolver()
-  const pins = new Map<string, PinnedCommit>()
-  const inflightDirectories = new Map<string, Promise<void>>()
   const refStorages = new Map<string, Promise<"files" | "native">>()
   const objectFormats = new Map<string, Promise<"sha1" | "sha256">>()
   const refStorage = async (repo: string): Promise<"files" | "native"> =>
@@ -74,59 +65,32 @@ export function createShellRuntime(): {
       throw error
     }
   }
-  const pinCommit = async (repo: string, writer: string, oid: Oid): Promise<void> => {
-    const gitdir = await resolveGitDir(repo)
-    const ref = inflightRef(writer)
-    const key = pinKey(gitdir, oid)
-    if (pins.has(key)) throw new Error(`commit ${oid} is already pinned by this backend`)
-    const storage = await refStorage(repo)
-    if (storage === "files") await ensureInflightDirectory(gitdir, inflightDirectories)
-    const pin = await writeInflightRef(gitdir, ref, oid, storage)
-    pins.set(key, pin)
-  }
-  const withPinnedCommit = async <T>(
-    repo: string,
-    oid: Oid,
-    operation: (gitdir: string, pin: PinnedCommit | undefined) => Promise<T>,
-  ): Promise<T> => {
-    const gitdir = await resolveGitDir(repo)
-    const key = pinKey(gitdir, oid)
-    const pin = pins.get(key)
-    try {
-      return await operation(gitdir, pin)
-    } finally {
-      if (pin !== undefined) {
-        try {
-          await releasePinnedCommit(gitdir, pin)
-        } finally {
-          pins.delete(key)
-        }
-      }
-    }
-  }
   const backend: GitomicBackend = {
     head: async (repo, ref) => head(await resolveGitDir(repo), ref),
     readFiles: async (repo, commit, prefix) => readFiles(await resolveGitDir(repo), commit, prefix),
-    writeCommit: async (repo, input) => {
-      const oid = await writeCommit(await resolveGitDir(repo), input)
-      await pinCommit(repo, input.writer, oid)
-      return oid
-    },
-    compareAndSwap: async (repo, ref, next, expected) =>
-      withPinnedCommit(repo, next, async (gitdir, pin) =>
-        pin === undefined
-          ? compareAndSwap(gitdir, ref, next, expected)
-          : compareAndSwapPinned(gitdir, ref, next, expected, pin),
-      ),
+    // A completed commit is unreferenced until the compare-and-swap below adopts
+    // it. Gitomic writes NO ref to protect that window: Git's default gc grace
+    // (`gc.pruneExpire = 2.weeks.ago`) already covers a gap that is milliseconds
+    // wide, and a hidden reachability ref is a durable trace the caller did not
+    // ask for.
+    //
+    // RESIDUAL RISK — deliberately accepted, and stated in the README so it does
+    // not become an invisible assumption: a repository configured with an
+    // aggressive `gc.pruneExpire`, or anyone running `git gc --prune=now` /
+    // `git prune --expire=now` CONCURRENTLY with a transaction, can reclaim the
+    // commit inside that window. The publish then fails loudly on the missing
+    // object instead of moving the ref (see the pruned-mid-flight test in
+    // tests/concurrency.test.ts). To close the hole rather than accept it, a
+    // reachability ref belongs here — and the README claim must change with it.
+    writeCommit: async (repo, input) => writeCommit(await resolveGitDir(repo), input),
+    compareAndSwap: async (repo, ref, next, expected) => compareAndSwap(await resolveGitDir(repo), ref, next, expected),
     findTransaction: async (repo, tip, base, instance, seq) =>
       findTransaction(await resolveGitDir(repo), tip, base, instance, seq),
     fetchRemote: async (repo, ref, remote) => fetchRemote(await resolveGitDir(repo), ref, remote),
     compareAndSwapRemote: async (repo, ref, next, expected, remote) =>
-      withPinnedCommit(repo, next, async (gitdir, pin) =>
-        compareAndSwapRemote(gitdir, ref, next, expected, remote, pin),
-      ),
+      compareAndSwapRemote(await resolveGitDir(repo), ref, next, expected, remote),
   }
-  return { backend, resolveGitDir, refStorage, objectFormat, pinCommit }
+  return { backend, resolveGitDir, refStorage, objectFormat }
 }
 
 async function optionalRef(repo: string, ref: string): Promise<Oid | undefined> {
@@ -137,19 +101,6 @@ async function optionalRef(repo: string, ref: string): Promise<Oid | undefined> 
     throw new Error(`cannot inspect ref ${ref}${detail ? `: ${detail}` : ""}`)
   }
   return validateOid(text(result.stdout), `ref ${ref} points to an invalid Git object id`)
-}
-
-function isNodeError(error: unknown): error is NodeJS.ErrnoException {
-  return error instanceof Error && "code" in error
-}
-
-function pinKey(repo: string, oid: Oid): string {
-  return `${repo}\0${oid}`
-}
-
-function inflightRef(writer: string): string {
-  const id = createHash("sha256").update(writer, "utf8").digest("hex")
-  return `refs/gitomic/inflight/${id}`
 }
 
 async function run(command: string, args: readonly string[], options: GitOptions = {}): Promise<GitResult> {
@@ -377,69 +328,6 @@ async function compareAndSwap(repo: string, ref: string, next: Oid, expected: Oi
   throw new Error(`git update-ref failed (${result.code})${detail ? `: ${detail}` : ""}`)
 }
 
-async function compareAndSwapPinned(
-  repo: string,
-  ref: string,
-  next: Oid,
-  expected: Oid,
-  pin: PinnedCommit,
-): Promise<boolean> {
-  const input = [
-    "start",
-    `update ${ref} ${next} ${expected}`,
-    `delete ${pin.ref} ${next}`,
-    "prepare",
-    "commit",
-    "",
-  ].join("\n")
-  const result = await run("git", durableGitArgs(repo, ["update-ref", "--stdin"]), { input })
-  if (result.code === 0) {
-    pin.released = true
-    return true
-  }
-  const detail = result.stderr.toString("utf8").trim()
-  if (isCompareAndSwapRejection(detail) || isTransientRefLockContention(detail)) return false
-  throw new Error(`git update-ref failed (${result.code})${detail ? `: ${detail}` : ""}`)
-}
-
-async function writeInflightRef(
-  repo: string,
-  ref: string,
-  oid: Oid,
-  storage: "files" | "native",
-): Promise<PinnedCommit> {
-  if (storage === "native") {
-    const result = await run("git", durableGitArgs(repo, ["update-ref", ref, oid]))
-    if (result.code !== 0) {
-      const detail = result.stderr.toString("utf8").trim()
-      throw new Error(`cannot pin unpublished commit ${oid}${detail ? `: ${detail}` : ""}`)
-    }
-    return { oid, ref, released: false }
-  }
-  const path = join(repo, ref)
-  const directory = join(repo, "refs", "gitomic", "inflight")
-  const lock = `${path}.lock`
-  let file: Awaited<ReturnType<typeof openFile>> | undefined
-  let ownsLock = false
-  try {
-    file = await openFile(lock, "wx", 0o644)
-    ownsLock = true
-    await file.writeFile(`${oid}\n`, "utf8")
-    await file.sync()
-    await file.close()
-    file = undefined
-    await rename(lock, path)
-    ownsLock = false
-    await syncDirectory(directory)
-  } catch (error) {
-    await file?.close().catch(() => undefined)
-    if (ownsLock) await unlink(lock).catch(() => undefined)
-    const detail = error instanceof Error ? `: ${error.message}` : ""
-    throw new Error(`cannot pin unpublished commit ${oid}${detail}`, { cause: error })
-  }
-  return { oid, ref, released: false }
-}
-
 async function resolveRefStorage(
   repo: string,
   pending: Map<string, Promise<"files" | "native">>,
@@ -461,51 +349,6 @@ async function resolveRefStorage(
   } catch (error) {
     pending.delete(repo)
     throw error
-  }
-}
-
-async function ensureInflightDirectory(repo: string, pending: Map<string, Promise<void>>): Promise<void> {
-  let prepared = pending.get(repo)
-  if (prepared === undefined) {
-    prepared = (async () => {
-      const directory = join(repo, "refs", "gitomic", "inflight")
-      await mkdir(directory, { recursive: true })
-      const sentinel = join(directory, ".gitomic-keep")
-      try {
-        const file = await openFile(sentinel, "wx", 0o644)
-        try {
-          await file.writeFile("gitomic inflight ref namespace\n", "utf8")
-          await file.sync()
-        } finally {
-          await file.close()
-        }
-      } catch (error) {
-        if (!isNodeError(error) || error.code !== "EEXIST") throw error
-      }
-      for (const path of [directory, dirname(directory), join(repo, "refs"), repo]) await syncDirectory(path)
-    })()
-    pending.set(repo, prepared)
-  }
-  try {
-    await prepared
-  } catch (error) {
-    pending.delete(repo)
-    throw error
-  }
-}
-
-async function releasePinnedCommit(repo: string, pin: PinnedCommit): Promise<void> {
-  if (pin.released) return
-  await deleteRef(repo, pin.ref, pin.oid, `cannot release unpublished commit pin ${pin.oid}`)
-  pin.released = true
-}
-
-async function syncDirectory(directory: string): Promise<void> {
-  const handle = await openFile(directory, "r")
-  try {
-    await handle.sync()
-  } finally {
-    await handle.close()
   }
 }
 
@@ -599,7 +442,6 @@ async function compareAndSwapRemote(
   next: Oid,
   expected: Oid,
   remote: string,
-  pin?: PinnedCommit,
 ): Promise<boolean> {
   const result = await run(
     "git",
@@ -611,10 +453,7 @@ async function compareAndSwapRemote(
     throw new Error(`git push failed (${result.code})${detail ? `: ${detail}` : ""}`)
   }
   const local = await head(repo, ref)
-  if (local === expected) {
-    if (pin === undefined) await compareAndSwap(repo, ref, next, expected)
-    else await compareAndSwapPinned(repo, ref, next, expected, pin)
-  }
+  if (local === expected) await compareAndSwap(repo, ref, next, expected)
   return true
 }
 

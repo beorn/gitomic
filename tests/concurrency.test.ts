@@ -3,7 +3,6 @@
 // @consumer concurrent gitomic writers
 
 import { spawn } from "node:child_process"
-import { createHash } from "node:crypto"
 import { fileURLToPath } from "node:url"
 
 import { describe, expect, test } from "vitest"
@@ -144,7 +143,7 @@ describe("semantic CAS replay", () => {
     }
   })
 
-  test("pins an unpublished commit through immediate pruning and releases the pin after publish", async () => {
+  test("carries an unpublished commit through a default gc without writing a ref to protect it", async () => {
     const fixture = await createBareRepo()
     try {
       const shell = createShellBackend()
@@ -152,66 +151,56 @@ describe("semantic CAS replay", () => {
       const backend: GitomicBackend = {
         ...shell,
         async compareAndSwap(repo, ref, next, expected) {
-          const pins = await git(repo, "for-each-ref", "--format=%(objectname)", "refs/gitomic/inflight")
-          expect(pins.split("\n")).toContain(next)
-          await git(repo, "prune", "--expire=now")
+          // Mid-flight: the commit exists but nothing references it.
+          expect(await git(repo, "for-each-ref", "refs/gitomic")).toBe("")
+          // Default gc grace is 2 weeks, so a commit written milliseconds ago survives.
+          await git(repo, "gc", "--quiet")
           expect(await git(repo, "cat-file", "-t", next)).toBe("commit")
           inspected = true
           return await shell.compareAndSwap(repo, ref, next, expected)
         },
       }
-      const store = await open({ repo: fixture.repo, ref: "main", writer: "pinned-writer", backend })
+      const store = await open({ repo: fixture.repo, ref: "main", writer: "gc-window-writer", backend })
 
-      const committed = await store.transact(async (map) => map.set("value", "pinned"), "pin before publish")
+      const committed = await store.transact(async (map) => map.set("value", "survived"), "survive a default gc")
 
       expect(inspected).toBe(true)
       expect(await git(fixture.repo, "cat-file", "-t", committed.oid)).toBe("commit")
-      expect(await git(fixture.repo, "for-each-ref", "refs/gitomic/inflight")).toBe("")
+      expect(await store.at().get("value")).toBe("survived")
+      expect(await git(fixture.repo, "for-each-ref", "refs/gitomic")).toBe("")
     } finally {
       await fixture.cleanup()
     }
-  })
+  }, 30_000)
 
-  test("removes a packed stale pin when a failed publish releases its new loose pin", async () => {
+  test("fails loudly, not silently, if an aggressive prune reclaims a commit mid-flight", async () => {
+    // This is the RESIDUAL RISK of writing no pin ref, asserted rather than
+    // assumed: `--prune=now` concurrent with a transaction can reclaim the
+    // unreferenced commit. The contract is that the publish then refuses —
+    // it must never move the ref to a missing object. If gitomic ever pins
+    // again, this test should be replaced, not deleted quietly.
     const fixture = await createBareRepo()
     try {
-      const writer = "packed-pin-writer"
-      const writerHash = createHash("sha256").update(writer, "utf8").digest("hex")
-      const pinRef = `refs/gitomic/inflight/${writerHash}`
-      await git(fixture.repo, "update-ref", pinRef, fixture.initial)
-      await git(fixture.repo, "pack-refs", "--all")
-
-      const competitor = await open({ repo: fixture.repo, ref: "main", writer: "packed-pin-competitor" })
       const shell = createShellBackend()
-      let moveRef = true
       const backend: GitomicBackend = {
         ...shell,
         async compareAndSwap(repo, ref, next, expected) {
-          if (moveRef) {
-            moveRef = false
-            await competitor.transact(async (map) => map.set("winner", "competitor"), "move public ref")
-          }
+          await git(repo, "prune", "--expire=now")
           return await shell.compareAndSwap(repo, ref, next, expected)
         },
       }
-      const store = await open({ repo: fixture.repo, ref: "main", writer, backend })
-      let attempts = 0
+      const store = await open({ repo: fixture.repo, ref: "main", writer: "pruned-writer", backend })
 
-      await expect(
-        store.transact(async (map) => {
-          attempts += 1
-          if (attempts > 1) throw new Conflict("stop after failed publish")
-          map.set("loser", "unpublished")
-        }, "lose after replacing packed pin"),
-      ).rejects.toThrow(Conflict)
-
-      expect(await git(fixture.repo, "for-each-ref", pinRef)).toBe("")
+      await expect(store.transact(async (map) => map.set("value", "pruned"), "pruned mid-flight")).rejects.toThrow(
+        /nonexistent object/u,
+      )
+      expect(await git(fixture.repo, "rev-parse", "main")).toBe(fixture.initial)
     } finally {
       await fixture.cleanup()
     }
-  })
+  }, 30_000)
 
-  test("keeps a hard-killed writer's completed commit reachable through its inflight pin", async () => {
+  test("leaves no trace behind when a writer is hard-killed before publishing", async () => {
     const fixture = await createBareRepo()
     const child = spawn("bun", [crashBeforePublish, fixture.repo], { stdio: ["ignore", "pipe", "pipe"] })
     try {
@@ -221,10 +210,13 @@ describe("semantic CAS replay", () => {
       child.kill("SIGKILL")
       await new Promise<void>((resolveExit) => child.once("close", () => resolveExit()))
 
-      expect(
-        (await git(fixture.repo, "for-each-ref", "--format=%(objectname)", "refs/gitomic/inflight")).split("\n"),
-      ).toContain(next)
-      await git(fixture.repo, "prune", "--expire=now")
+      // The killed process left no ref and no tree entry to clean up, and the
+      // public ref never moved.
+      expect(await git(fixture.repo, "for-each-ref", "refs/gitomic")).toBe("")
+      expect(await git(fixture.repo, "rev-parse", "main")).toBe(fixture.initial)
+      // Its unreferenced commit still survives a default gc, so a supervisor can
+      // still inspect what the dead writer had built.
+      await git(fixture.repo, "gc", "--quiet")
       expect(await git(fixture.repo, "cat-file", "-t", next)).toBe("commit")
       expect(await git(fixture.repo, "show", `${next}:crash/value`)).toBe("still reachable")
     } finally {
