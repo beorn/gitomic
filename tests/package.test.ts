@@ -2,7 +2,7 @@
 // @level l1
 // @consumer workspace and package consumers
 
-import { access, readFile } from "node:fs/promises"
+import { readFile, stat } from "node:fs/promises"
 
 import { describe, expect, test } from "vitest"
 import { openReader } from "../src/index.js"
@@ -54,7 +54,8 @@ describe("package dependency boundary", () => {
     expect(packageManifest.types).toBeUndefined()
     expect(packageManifest.exports).toEqual(sourceExports)
     for (const target of Object.values(sourceExports)) {
-      await expect(access(new URL(`..${target.slice(1)}`, import.meta.url))).resolves.toBeUndefined()
+      const source = await stat(new URL(`..${target.slice(1)}`, import.meta.url))
+      expect(source.isFile()).toBe(true)
     }
     expect(packageManifest.publishConfig?.exports).toEqual({
       ".": { types: "./dist/index.d.ts", import: "./dist/index.js" },
