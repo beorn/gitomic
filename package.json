@@ -21,6 +21,9 @@
     "type": "git",
     "url": "git+https://github.com/beorn/gitomic.git"
   },
+  "bin": {
+    "gitomic": "./src/bin.ts"
+  },
   "files": [
     "dist",
     "README.md",
@@ -36,6 +39,9 @@
     "./mem": "./src/mem.ts"
   },
   "publishConfig": {
+    "bin": {
+      "gitomic": "./dist/bin.js"
+    },
     "exports": {
       ".": {
         "types": "./dist/index.d.ts",
