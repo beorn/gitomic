@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto"
 
 import { applyEdits, type Edit } from "./edits.js"
 import { Conflict, EditDoesNotApply, RetriesExhausted } from "./errors.js"
-import { validateOid } from "./git-object.js"
+import { objectOid, validateOid } from "./git-object.js"
 import {
   assertGitPrefixMatched,
   assertTreeShape,
@@ -246,6 +246,16 @@ function makeSnapshot(
     async get(path) {
       const normalized = normalizePath(path)
       return readValue((await load(normalized)).get(normalized), normalized)
+    },
+    async oid(path) {
+      const normalized = normalizePath(path)
+      const value = (await load(normalized)).get(normalized)
+      if (value === undefined) return undefined
+      // The oid is computed from the stored bytes directly — never through
+      // readValue — so it answers for a binary blob `get` would refuse to
+      // decode. A string round-trips to its UTF-8 bytes (gitomic's write
+      // guarantee), which is exactly the blob `apply`'s `expect` compares.
+      return objectOid("blob", typeof value === "string" ? Buffer.from(value, "utf8") : Buffer.from(value))
     },
     async has(path) {
       const normalized = normalizePath(path)

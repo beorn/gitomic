@@ -18,7 +18,17 @@ export type GitMap = {
   keys(prefix?: string): Promise<string[]>
 }
 
-export type Snapshot = Pick<GitMap, "get" | "has" | "keys">
+export type Snapshot = Pick<GitMap, "get" | "has" | "keys"> & {
+  /**
+   * The git blob oid of the content at `path`, or `undefined` when the path is
+   * absent. This is the natural precondition anchor: it is exactly what a `put`,
+   * `rm` or `mv` edit's `expect` is compared against (R46 — "the read's oid is
+   * the natural base"), so a caller reads it here and feeds it straight back as
+   * `expect`. Unlike `get`, it answers even for a binary blob whose value
+   * gitomic cannot decode: you can anchor an `rm`/`mv` on an image you never read.
+   */
+  oid(path: string): Promise<Oid | undefined>
+}
 
 /**
  * The mutation a transaction runs against the tip it attempts. `base` is that

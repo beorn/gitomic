@@ -146,6 +146,7 @@ for await (const change of reader.watch({
 - `openReader` defaults `ref` to `main` and takes the same optional `remote` and `backend` as `open`.
 - `head()` re-reads the chosen local or remote ref.
 - `at(oid)` is a fixed, lazy snapshot. Leave the id out to pin the tip as of the moment you call it.
+- `at(...).oid(path)` returns the git blob id of the content there, or `undefined` if absent — the natural `--expect` anchor for a later precondition write, and it answers even for a binary blob whose value cannot be decoded.
 - `watch({ after, signal })` yields ref-tip changes and stops promptly when the signal aborts. It looks once a second by default; `pollIntervalMs` is there for tests and latency-sensitive callers.
 
 Snapshot reads are scoped by path prefix through the one backend read path, so unrelated binary blobs are never decoded. A backend prefix read that matches nothing throws `GitPrefixNotFoundError` naming the prefix, repository, and commit; Snapshot turns that into its usual `undefined` / `false` / empty-array answers. Transactions never pass a prefix — they stay whole-tree strict.
@@ -167,7 +168,9 @@ type GitMap = {
   keys(prefix?: string): Promise<string[]> // paths under a prefix; omit for all
 }
 
-type Snapshot = Pick<GitMap, "get" | "has" | "keys"> // what at() returns — reads only
+type Snapshot = Pick<GitMap, "get" | "has" | "keys"> & {
+  oid(path: string): Promise<string | undefined> // the blob id there — your --expect anchor
+} // what at() returns — reads only
 ```
 
 Paths are git tree paths — forward slashes, no leading slash:

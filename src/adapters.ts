@@ -1,6 +1,6 @@
 import { posix } from "node:path"
 
-import type { GitMap, Snapshot, Store, Update } from "./types.js"
+import type { GitMap, Store, Update } from "./types.js"
 import { decodeUtf8 } from "./utf8.js"
 
 type PathLike = string
@@ -69,7 +69,9 @@ function encodingFrom(options: BufferEncoding | { encoding?: ReadEncoding } | nu
   return options?.encoding ?? null
 }
 
-function makeReadView(snapshot: () => Snapshot): FsView {
+// The fs read view reads only get/has/keys — the surface a GitMap and a Snapshot
+// share — so it takes that surface, not a full Snapshot (which also carries oid).
+function makeReadView(snapshot: () => Pick<GitMap, "get" | "has" | "keys">): FsView {
   const readFile = async (
     path: PathLike,
     options?: BufferEncoding | { encoding?: ReadEncoding } | null,

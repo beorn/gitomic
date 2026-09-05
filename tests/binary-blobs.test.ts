@@ -108,6 +108,27 @@ describe.each(backends)("binary blobs ride through the $name backend", ({ name, 
     }
   })
 
+  test("the image's oid is readable even though its value is not — the rm/mv anchor", async () => {
+    const fixture = await createMixedRepo()
+    try {
+      const reader = await openReader({
+        repo: fixture.repo,
+        ref: "main",
+        ...(backend === undefined ? {} : { backend }),
+      })
+      const snapshot = reader.at(fixture.initial)
+
+      // `get` refuses the binary value, but `oid` returns the real git blob oid —
+      // exactly the object `git hash-object` produced — so a caller can anchor an
+      // rm/mv precondition on an image without ever decoding it.
+      await expect(snapshot.get("assets/screenshot.png")).rejects.toThrow("valid UTF-8")
+      expect(await snapshot.oid("assets/screenshot.png")).toBe(fixture.binaryOid)
+      expect(await snapshot.oid("assets/missing.png")).toBeUndefined()
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
   test("the image can be deleted, and replacing it with text is a real change", async () => {
     const fixture = await createMixedRepo()
     try {
