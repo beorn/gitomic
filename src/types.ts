@@ -20,7 +20,14 @@ export type GitMap = {
 
 export type Snapshot = Pick<GitMap, "get" | "has" | "keys">
 
-export type Update = (map: GitMap) => Promise<void>
+/**
+ * The mutation a transaction runs against the tip it attempts. `base` is that
+ * tip's commit oid — the tree these edits are being checked against on THIS
+ * attempt. It is re-supplied on every CAS replay (a fresh tip each time), so a
+ * precondition-checking update can name the exact commit it refused on. A
+ * callback that ignores the second argument behaves exactly as before.
+ */
+export type Update = (map: GitMap, base: Oid) => Promise<void>
 
 export type Committed = {
   oid: Oid

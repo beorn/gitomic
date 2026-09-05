@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto"
 
-import { Conflict, RetriesExhausted } from "./errors.js"
+import { applyEdits, type Edit } from "./edits.js"
+import { Conflict, EditDoesNotApply, RetriesExhausted } from "./errors.js"
 import { validateOid } from "./git-object.js"
 import {
   assertGitPrefixMatched,
@@ -28,7 +29,10 @@ import type {
 } from "./types.js"
 import { assertUtf8, decodeUtf8 } from "./utf8.js"
 
-export { Conflict, RetriesExhausted }
+export { Conflict, EditDoesNotApply, RetriesExhausted }
+export type { EditKind, PreconditionType } from "./errors.js"
+export { applyEdits } from "./edits.js"
+export type { Edit } from "./edits.js"
 export { createShellBackend } from "./shell.js"
 export { parseOwnershipManifest } from "./ownership-manifest.js"
 export type {
@@ -57,6 +61,23 @@ export async function open(options: OpenOptions): Promise<Store> {
     at: (commit) => makeSnapshot(context, commit),
     transact: (update, message) => enqueue(async () => transact(context, update, message)),
   }
+}
+
+/**
+ * Land an edit list as one commit on the store's ref (R44). `base` is the
+ * commit the edits were authored against — the oid the author read, per R46.
+ * Several edits are one all-or-nothing commit; on a moved base each edit
+ * re-checks its own precondition (R45) and the first failure throws
+ * {@link EditDoesNotApply}, landing nothing. `append`-only lists and lists
+ * whose edits all leave the tree unchanged land as a no-op at the current tip.
+ */
+export async function apply(
+  store: Pick<Store, "transact">,
+  base: Oid,
+  edits: readonly Edit[],
+  message: string,
+): Promise<Committed> {
+  return store.transact((map, head) => applyEdits(map, base, head, edits), message)
 }
 
 export async function openReader(options: OpenReaderOptions): Promise<Reader> {
@@ -159,7 +180,7 @@ async function transact(context: StoreContext, update: Update, message: string):
     const parent = await context.refresh()
     const base = checkedFiles(await context.backend.readFiles(context.repo, parent))
     const { map, changes } = makeOverlay(base)
-    await update(map)
+    await update(map, parent)
     const effective = removeNoopChanges(base, changes)
     if (effective.size === 0) return { oid: parent, retries }
     seq ??= context.nextSeq()
