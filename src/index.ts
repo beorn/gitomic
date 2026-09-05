@@ -33,6 +33,7 @@ export { Conflict, EditDoesNotApply, RetriesExhausted }
 export type { EditKind, PreconditionType } from "./errors.js"
 export { applyEdits } from "./edits.js"
 export type { Edit } from "./edits.js"
+export { matchGlob } from "./glob.js"
 export { createShellBackend } from "./shell.js"
 export { parseOwnershipManifest } from "./ownership-manifest.js"
 export type {
