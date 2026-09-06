@@ -7,9 +7,15 @@ export class RetriesExhausted extends Error {
 
   constructor(
     readonly retries: number,
+    /** The time budget the transaction was given to land within, in milliseconds. */
+    readonly budgetMs: number,
     options?: ErrorOptions,
   ) {
-    super(`transaction did not land after ${retries} CAS attempts; retry later or reduce writer contention`, options)
+    super(
+      `transaction did not land within its ${budgetMs}ms retry budget (${retries} CAS attempts); ` +
+        `raise retryBudgetMs or reduce writer contention`,
+      options,
+    )
   }
 }
 
@@ -45,9 +51,15 @@ export class EditDoesNotApply extends Error {
     readonly preconditionType: PreconditionType,
     /** The path whose precondition failed (the destination path for `destination-absent`). */
     readonly path: string,
-    /** The content anchor the precondition names — the expected blob's sha256, or `null` for "absent". */
+    /**
+     * What the precondition is anchored on. At the file level this equals
+     * `path`; U2's node layer anchors on a node identity, extending this shape
+     * without changing it.
+     */
+    readonly anchor: string,
+    /** The content the precondition names — the expected git blob oid, or `null` for "absent". */
     readonly expected: string | null,
-    /** What was actually there at the attempted tree — a blob sha256, or `null` for "absent". */
+    /** What was actually there at the attempted tree — a git blob oid, or `null` for "absent". */
     readonly actual: string | null,
     /** The commit the edit was authored against. */
     readonly base: string,

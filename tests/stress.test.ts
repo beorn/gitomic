@@ -16,7 +16,6 @@ const worker = fileURLToPath(new URL("fixtures/stress-writer.ts", import.meta.ur
 
 type WorkerResult = {
   committed: Committed[]
-  exhaustedCalls: number
 }
 
 async function expectLinearContention(writerCount: number, operationsPerWriter: number): Promise<void> {
@@ -41,7 +40,6 @@ async function expectLinearContention(writerCount: number, operationsPerWriter: 
     const committed = results.flatMap((result) => result.committed)
 
     expect(new Set(committed.map((result) => result.oid))).toHaveLength(expected)
-    expect(results.every((result) => result.exhaustedCalls >= 0)).toBe(true)
     expect(await git(fixture.repo, "show", "main:count")).toBe(String(expected))
     expect(await git(fixture.repo, "rev-list", "--count", "main")).toBe(String(expected + 1))
     expect(await git(fixture.repo, "rev-list", "--min-parents=2", "main")).toBe("")

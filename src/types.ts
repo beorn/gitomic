@@ -94,6 +94,14 @@ export type OpenOptions = {
   writer?: string
   remote?: string
   backend?: GitomicBackend
+  /**
+   * How long, in milliseconds, a transaction keeps retrying a contended CAS
+   * before throwing {@link RetriesExhausted}. The budget is time, not an attempt
+   * count, and it resets whenever another writer lands (the race is making
+   * progress), so a healthy burst is never abandoned while a genuinely stuck
+   * transaction still fails. Defaults to 30_000.
+   */
+  retryBudgetMs?: number
 }
 
 export type OpenReaderOptions = {

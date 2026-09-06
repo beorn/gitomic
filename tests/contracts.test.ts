@@ -69,14 +69,17 @@ describe("public contract guards", () => {
     )
   })
 
-  test("bounds retries and reports the observed CAS failures", async () => {
+  test("gives up a never-landing transaction after its time budget, not a fixed attempt count", async () => {
     const mem = createMemBackend()
+    // A ref that never moves and a CAS that never succeeds: no writer ever lands,
+    // so the budget never resets and the transaction must give up once time runs out.
     const backend: GitomicBackend = { ...mem, compareAndSwap: async () => false }
     const store = await open({
       repo: "retry-limit",
       ref: "main",
       writer: "worker",
       backend,
+      retryBudgetMs: 50,
     })
     let attempts = 0
 
@@ -85,9 +88,11 @@ describe("public contract guards", () => {
       map.set("value", String(attempts))
     }, "never lands")
 
-    await expect(result).rejects.toMatchObject({ name: "RetriesExhausted", retries: 10 })
     await expect(result).rejects.toBeInstanceOf(RetriesExhausted)
-    expect(attempts).toBe(10)
+    await expect(result).rejects.toMatchObject({ name: "RetriesExhausted", budgetMs: 50 })
+    // Time, not a magic number: it retried more than once and stopped because
+    // 50ms elapsed with no progress, never at a fixed attempt count.
+    expect(attempts).toBeGreaterThan(1)
   })
 
   test("queues same-store calls and assigns each sequence exactly once from zero", async () => {

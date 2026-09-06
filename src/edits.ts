@@ -51,6 +51,7 @@ export async function applyEdits(map: GitMap, base: Oid, head: Oid, edits: reado
             "put",
             edit.expect === null ? "blob-absent" : "blob-identical",
             edit.path,
+            edit.path,
             edit.expect,
             current,
             base,
@@ -63,7 +64,17 @@ export async function applyEdits(map: GitMap, base: Oid, head: Oid, edits: reado
       case "rm": {
         const current = blobOid(await map.get(edit.path))
         if (current !== edit.expect) {
-          throw new EditDoesNotApply(index, "rm", "source-identical", edit.path, edit.expect, current, base, head)
+          throw new EditDoesNotApply(
+            index,
+            "rm",
+            "source-identical",
+            edit.path,
+            edit.path,
+            edit.expect,
+            current,
+            base,
+            head,
+          )
         }
         map.delete(edit.path)
         break
@@ -72,11 +83,31 @@ export async function applyEdits(map: GitMap, base: Oid, head: Oid, edits: reado
         const source = await map.get(edit.from)
         const sourceOid = blobOid(source)
         if (sourceOid !== edit.expect) {
-          throw new EditDoesNotApply(index, "mv", "source-identical", edit.from, edit.expect, sourceOid, base, head)
+          throw new EditDoesNotApply(
+            index,
+            "mv",
+            "source-identical",
+            edit.from,
+            edit.from,
+            edit.expect,
+            sourceOid,
+            base,
+            head,
+          )
         }
         const destinationOid = blobOid(await map.get(edit.to))
         if (destinationOid !== null) {
-          throw new EditDoesNotApply(index, "mv", "destination-absent", edit.to, null, destinationOid, base, head)
+          throw new EditDoesNotApply(
+            index,
+            "mv",
+            "destination-absent",
+            edit.to,
+            edit.to,
+            null,
+            destinationOid,
+            base,
+            head,
+          )
         }
         // source is defined here: its oid equalled a non-null expect.
         map.set(edit.to, source as string)

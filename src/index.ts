@@ -98,6 +98,8 @@ type StoreContext = {
   /** This store's unique identity, minted at `open`. */
   instance: string
   backend: GitomicBackend
+  /** How long a transaction keeps retrying a contended CAS before giving up (ms). */
+  retryBudgetMs: number
   refresh(): Promise<Oid>
   publish(next: Oid, expected: Oid): Promise<boolean>
   nextSeq(): number
@@ -110,7 +112,7 @@ type ReaderContext = {
   refresh(): Promise<Oid>
 }
 
-const DEFAULT_MAX_ATTEMPTS = 10
+const DEFAULT_RETRY_BUDGET_MS = 30_000
 const DEFAULT_READER_POLL_INTERVAL_MS = 1_000
 const DEFAULT_WRITER_LABEL = "gitomic"
 
@@ -127,6 +129,7 @@ async function prepareStore(options: OpenOptions): Promise<StoreContext> {
   let seq = 0
   const nextSeq = (): number => seq++
   const backend = options.backend ?? createShellBackend()
+  const retryBudgetMs = normalizeRetryBudget(options.retryBudgetMs)
   const remote = options.remote
   let refresh: () => Promise<Oid>
   let publish: (next: Oid, expected: Oid) => Promise<boolean>
@@ -143,7 +146,15 @@ async function prepareStore(options: OpenOptions): Promise<StoreContext> {
     publish = async (next, expected) => compareAndSwapRemote(repo, ref, next, expected, remote)
   }
   await refresh()
-  return { repo, ref, writer, instance, backend, refresh, publish, nextSeq }
+  return { repo, ref, writer, instance, backend, retryBudgetMs, refresh, publish, nextSeq }
+}
+
+function normalizeRetryBudget(value: number | undefined): number {
+  const budget = value ?? DEFAULT_RETRY_BUDGET_MS
+  if (!Number.isFinite(budget) || budget <= 0) {
+    throw new TypeError("retryBudgetMs must be a positive number of milliseconds")
+  }
+  return budget
 }
 
 async function prepareReader(options: OpenReaderOptions): Promise<ReaderContext> {
@@ -172,12 +183,17 @@ async function transact(context: StoreContext, update: Update, message: string):
   assertUtf8(message, "message")
   if (message.includes("\0")) throw new TypeError("message cannot contain NUL because Git commit messages forbid it")
   let retries = 0
-  let attempts = 0
   // Allocated once and reused across replays: every attempt is the SAME
   // transaction, so they must share one `(instance, seq)` receipt.
   let seq: number | undefined
+  // Contention policy lives HERE, not in callers: the budget is TIME, not a
+  // fixed attempt count. Under CAS one publish wins per round, so the unluckiest
+  // of N writers needs about N attempts — a fixed counter abandons a healthy
+  // burst by construction. The deadline resets whenever the ref advances (some
+  // writer landed): a burst that keeps landing someone is never abandoned, while
+  // a transaction that makes no progress for the whole budget fails loudly.
+  let deadline = Date.now() + context.retryBudgetMs
   while (true) {
-    attempts += 1
     const parent = await context.refresh()
     const base = checkedFiles(await context.backend.readFiles(context.repo, parent))
     const { map, changes } = makeOverlay(base)
@@ -207,7 +223,10 @@ async function transact(context: StoreContext, update: Update, message: string):
     const winner = await context.refresh()
     const landed = await context.backend.findTransaction(context.repo, winner, parent, context.instance, seq)
     if (landed !== undefined) return { oid: backendOid(landed), retries }
-    if (attempts >= DEFAULT_MAX_ATTEMPTS) throw new RetriesExhausted(retries)
+    // The ref advanced under us: a writer landed this round, so the race is
+    // making progress — extend the budget rather than abandon a healthy burst.
+    if (winner !== parent) deadline = Date.now() + context.retryBudgetMs
+    if (Date.now() >= deadline) throw new RetriesExhausted(retries, context.retryBudgetMs)
     await delayForRetry(retries)
   }
 }

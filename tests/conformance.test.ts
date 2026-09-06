@@ -15,8 +15,8 @@ import { promisify } from "node:util"
 
 import { describe, expect, test } from "vitest"
 
-import { apply, EditDoesNotApply, open, RetriesExhausted } from "../src/index.js"
-import type { Committed, Store } from "../src/index.js"
+import { apply, EditDoesNotApply, open } from "../src/index.js"
+import type { Committed } from "../src/index.js"
 import { objectOid } from "../src/git-object.js"
 import { createIsoBackend } from "../src/iso.js"
 import { createBareRepo, git } from "./helpers/git.js"
@@ -352,46 +352,36 @@ describe("apply at scale (K2 at fleet scale, F14)", () => {
         ),
       )
 
-      // At fifty fully-simultaneous writers, one `apply` call can exhaust its own
-      // bounded CAS budget (`RetriesExhausted`) under real ref-update contention —
-      // the library's own error message names the remedy ("retry later"), and
-      // `stress.test.ts`'s worker fixture already does exactly this at sustained
-      // concurrency. Mirror it here rather than hide it: count every exhaustion,
-      // bounded by a hard deadline so a genuine regression fails loudly instead of
-      // hanging, and report the count alongside the timing.
-      const deadline = Date.now() + 25_000
-      let exhaustedCalls = 0
-      const landOne = async (store: Store, index: number): Promise<Committed> => {
-        while (true) {
-          try {
-            return await apply(
-              store,
-              fixture.initial,
-              [
-                {
-                  kind: "put",
-                  path: `scale/writer-${String(index).padStart(2, "0")}.md`,
-                  content: `writer ${index}\n`,
-                  expect: null,
-                },
-              ],
-              `writer ${index} lands`,
-            )
-          } catch (error) {
-            if (!(error instanceof RetriesExhausted) || Date.now() >= deadline) throw error
-            exhaustedCalls += 1
-          }
-        }
-      }
-
+      // transact owns contention now — a time budget, not a counter — so there is
+      // NO outer retry loop: each writer applies exactly once and transact keeps
+      // racing until it lands within its budget (the budget resets on every observed
+      // landing, so a burst that keeps making progress is never abandoned). The
+      // disjoint blob-absent preconditions hold on whatever tip each attempt sees,
+      // so all fifty land.
       const started = performance.now()
-      const results = await Promise.all(writers.map((store, index) => landOne(store, index)))
+      const results = await Promise.all(
+        writers.map((store, index) =>
+          apply(
+            store,
+            fixture.initial,
+            [
+              {
+                kind: "put",
+                path: `scale/writer-${String(index).padStart(2, "0")}.md`,
+                content: `writer ${index}\n`,
+                expect: null,
+              },
+            ],
+            `writer ${index} lands`,
+          ),
+        ),
+      )
       const elapsedMs = performance.now() - started
-      // Published per the design's F14 scale line: the actual observed numbers,
-      // not asserted — this test has no latency gate, only a completion deadline.
+      const maxRetries = Math.max(...results.map((committed) => committed.retries))
+      // Published per the design's F14 scale line: the observed numbers, not asserted.
       console.log(
         `K2 at scale: ${writerCount} concurrent disjoint-path writers landed in ${elapsedMs.toFixed(0)}ms ` +
-          `(${exhaustedCalls} outer retries after RetriesExhausted)`,
+          `(max ${maxRetries} CAS retries on one writer)`,
       )
 
       // Every writer landed its own real commit — none lost, none duplicated.
