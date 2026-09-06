@@ -544,6 +544,95 @@ describe("gitomic CLI — apply", () => {
   })
 })
 
+describe("gitomic CLI — apply keyword-named paths (./ escape)", () => {
+  test("./name addresses a path spelled exactly like a clause keyword", async () => {
+    const backend = createMemBackend()
+    const putFile = await fileWith("put-content.md", "i am the file named put\n")
+
+    // A bare `put` in path position would start a second clause; `./put` is the path.
+    const result = await run(backend, ["apply", ADDRESS, "-m", "keyword-named path", "put", "./put", putFile])
+    expect(result.code).toBe(0)
+
+    // The escape names exactly `put` — not `./put`, which is not a valid gitomic path.
+    expect((await run(backend, ["read", ADDRESS, "put"])).stdout).toBe("i am the file named put\n")
+    expect((await run(backend, ["ls", ADDRESS])).stdout.trim().split("\n")).toEqual(["put"])
+  })
+
+  test("mv renames between keyword-named paths, both escaped with ./", async () => {
+    const backend = createMemBackend()
+    await writeOne(backend, "rm", "body\n") // a path literally named `rm`
+
+    const result = await run(backend, ["apply", ADDRESS, "-m", "rename keyword path", "mv", "./rm", "./mv"])
+    expect(result.code).toBe(0)
+    expect((await run(backend, ["read", ADDRESS, "rm"])).code).toBe(1)
+    expect((await run(backend, ["read", ADDRESS, "mv"])).stdout).toBe("body\n")
+  })
+
+  test("a bare keyword in path position is read as a new clause — the ./ escape is required", async () => {
+    const backend = createMemBackend()
+    const putFile = await fileWith("f.md", "x\n")
+
+    // `put put <file>`: the second bare `put` starts a new (malformed) clause, not a path.
+    const result = await run(backend, ["apply", ADDRESS, "-m", "unescaped keyword", "put", "put", putFile])
+    expect(result.code).toBe(2)
+  })
+})
+
+describe("gitomic CLI — --json receipt on write verbs", () => {
+  test("write --json prints a one-line {oid, retries} receipt instead of the bare oid", async () => {
+    const backend = createMemBackend()
+
+    const result = await writeOne(backend, "a.md", "one\n", ["--json"])
+    expect(result.code).toBe(0)
+    expect(result.stderr).toBe("")
+    expect(result.stdout.trimEnd().split("\n")).toHaveLength(1)
+    const receipt = JSON.parse(result.stdout.trim()) as { oid: string; retries: number }
+    expect(receipt.oid).toMatch(/^[0-9a-f]{40}$/)
+    expect(receipt.retries).toBe(0)
+    expect((await run(backend, ["read", ADDRESS, "a.md"])).stdout).toBe("one\n")
+  })
+
+  test("rm --json prints the {oid, retries} receipt", async () => {
+    const backend = createMemBackend()
+    await writeOne(backend, "a.md", "one\n")
+
+    const result = await run(backend, ["rm", ADDRESS, "-m", "json rm", "--json", "a.md"])
+    expect(result.code).toBe(0)
+    expect((JSON.parse(result.stdout.trim()) as { oid: string }).oid).toMatch(/^[0-9a-f]{40}$/)
+  })
+
+  test("mv --json prints the {oid, retries} receipt", async () => {
+    const backend = createMemBackend()
+    await writeOne(backend, "from.md", "body\n")
+
+    const result = await run(backend, ["mv", ADDRESS, "-m", "json mv", "--json", "from.md", "to.md"])
+    expect(result.code).toBe(0)
+    expect((JSON.parse(result.stdout.trim()) as { oid: string }).oid).toMatch(/^[0-9a-f]{40}$/)
+  })
+
+  test("apply --json prints the {oid, retries} receipt", async () => {
+    const backend = createMemBackend()
+    const putFile = await fileWith("new.md", "new\n")
+
+    const result = await run(backend, ["apply", ADDRESS, "-m", "json apply", "--json", "put", "new.md", putFile])
+    expect(result.code).toBe(0)
+    const receipt = JSON.parse(result.stdout.trim()) as { oid: string; retries: number }
+    expect(receipt.oid).toMatch(/^[0-9a-f]{40}$/)
+    expect(receipt.retries).toBe(0)
+  })
+
+  test("--json leaves a refusal facts-only on stderr (exit 3), with no JSON on stdout", async () => {
+    const backend = createMemBackend()
+    await writeOne(backend, "a.md", "one\n")
+
+    const result = await writeOne(backend, "a.md", "two\n", ["--json", "--expect", `a.md=${oidOf("not-this")}`])
+    expect(result.code).toBe(3)
+    expect(result.stdout).toBe("")
+    expect(result.stderr).toContain("edit-does-not-apply")
+    expect(result.stderr).toContain("kind=put")
+  })
+})
+
 describe("gitomic CLI — usage errors (exit 2, never silent)", () => {
   test("an unknown verb fails loudly, naming itself", async () => {
     const backend = createMemBackend()

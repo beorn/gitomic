@@ -86,9 +86,10 @@ const store = await open({
   ref: "main",                 // short names accepted
   writer: "worker-3",          // optional — label for the audit trail
   remote: "origin",            // optional — see below
+  retryBudgetMs: 30_000,       // optional — how long to keep retrying a contended write (default)
 })
 
-type Update = (map: GitMap) => Promise<void>
+type Update = (map: GitMap, base: string) => Promise<void>
 type Committed = { oid: string; retries: number }
 
 store.head(): Promise<string>            // newest commit id
@@ -96,7 +97,7 @@ store.at(commit?: string): Snapshot      // read-only view there — lazy
 store.transact(fn: Update, message: string): Promise<Committed>
 ```
 
-`transact` runs your update function and lands its writes as one commit, re-running it if another writer got there first. `message` is required — it becomes the commit message; say why, not what.
+`transact` runs your update function and lands its writes as one commit, re-running it if another writer got there first. `message` is required — it becomes the commit message; say why, not what. The update function's second argument, `base`, is the commit oid it is running against on this attempt — a fresh tip on every re-run — so a precondition check can name the exact commit it refused on.
 
 ### Who wrote it
 
@@ -183,6 +184,28 @@ Paths are git tree paths — forward slashes, no leading slash:
 - `at()` takes only a full lowercase 40- or 64-hex commit id and pins it when called. A well-formed but missing id throws on first read.
 - `refs/gitomic/` and the `.gitomic/` tree path are reserved. gitomic writes nothing to either, and refuses to let you.
 
+### The `apply` door — edits with preconditions
+
+`transact` is the general form: your function, any logic, one commit. When the writes are a plain LIST of edits with per-path preconditions — the shape a CLI, an HTTP handler, or another process hands you — `apply` lands them without a callback:
+
+```ts
+import { apply, type Edit } from "gitomic"
+
+// Read the blob ids you are anchoring on, then land the whole list as one commit.
+const base = await store.head()
+const oldNote = await store.at(base).oid("notes/old.md")
+if (oldNote === undefined) throw new Error("notes/old.md is gone")
+
+const edits: Edit[] = [
+  { kind: "put", path: "notes/today.md", content: "buy milk", expect: null }, // create: must be ABSENT
+  { kind: "append", path: "log.md", content: "bought milk\n" }, // no precondition
+  { kind: "rm", path: "notes/old.md", expect: oldNote }, // remove exactly this blob
+]
+const { oid } = await apply(store, base, edits, "sync notes")
+```
+
+`apply(store, base, edits, message)` lands the whole list as ONE all-or-nothing commit. `base` is the commit the edits were read against; the natural anchor for each `expect` is `store.at(base).oid(path)` — the git blob oid there, or `undefined` when the path is absent. Each edit re-checks its own precondition against the tree the commit actually attempts, so when a concurrent writer has moved the ref `apply` replays against the new tip for free (the same contract `transact` gives a callback). The FIRST edit whose precondition fails throws `EditDoesNotApply` — naming the edit index, the path, the oid it expected and the one it found, and both commits — and lands nothing. A `put` with `expect: null` demands the path be ABSENT (a create); `append` carries no precondition and always re-applies. Edits apply in order against the same attempted tree, so a later one can depend on an earlier one — `rm dest` then `mv src dest` frees the destination inside a single commit.
+
 ### Ownership manifests
 
 `parseOwnershipManifest(raw, { label?, acceptPath })` parses a version-1 path/source declaration into sorted paths and an exact source-object mapping. It rejects malformed git paths, duplicates, schema drift, and any path your policy declines. gitomic owns this mechanism; it does not choose your state partition.
@@ -218,7 +241,7 @@ await store.transact(async (map) => {
 }, "take deploy lock")
 ```
 
-Two writers race this; exactly one wins. The loser's re-run _sees_ the winner's lock and gives up — `Conflict` reaches your caller. (`RetriesExhausted` is the only other error `transact` adds.)
+Two writers race this; exactly one wins. The loser's re-run _sees_ the winner's lock and gives up — `Conflict` reaches your caller. (`RetriesExhausted` — a transaction that made no progress within its time budget — is the only other error `transact` itself adds; the `apply` door above adds `EditDoesNotApply`.)
 
 Same store, other faces. The rule: `asX(store)` re-views the store as interface X, read-only where a write would dodge the transaction; `withX(fn)` wraps your update function so X-shaped calls stay transactional:
 
@@ -252,6 +275,61 @@ const test = await open({ repo: "my-test", ref: "main", writer: "test", backend:
 
 A custom backend implements `GitomicBackend`: `head`, `readFiles`, `writeCommit`, `compareAndSwap`, `findTransaction`, plus the optional remote pair. `writeCommit` receives your `writer` label and the store's `instance` and `seq`, and must record all three so `findTransaction` can recognize `(instance, seq)` later. A backend that wraps a built-in one keeps every contract by spreading it and overriding only what it owns.
 
+## Command line
+
+The `gitomic` binary is the file-level door from a shell: read and write a ref by address, from anywhere, with no checkout.
+
+```sh
+$ gitomic read 'repo#main' notes/milk.md                       # print a path's content
+$ gitomic ls   'repo#main' 'notes/**'                          # matching paths, one per line
+$ gitomic grep 'repo#main' 'TODO' '*.md'                       # path:line for every match
+$ gitomic write 'repo#main' -m edit  notes/milk.md=./milk.md   # one put, one commit
+$ gitomic rm   'repo#main' -m drop   notes/old.md
+$ gitomic mv   'repo#main' -m 'file it'  inbox/a.md archive/a.md
+$ gitomic apply 'repo#main' -m batch  put new.md ./new.txt  rm old.md
+```
+
+**Address.** One argument, `<repo>#<ref>` — a repo path or URL, then the ref (default `main` with no `#`). QUOTE it in the shell: `#` is a glob operator under zsh's `extended_glob`, and `?` (a legal ref character) is one in every POSIX shell.
+
+**Read verbs** open an immutable snapshot, pinned at `--at <oid>` or the tip:
+
+| verb                                          | prints                                                     |
+| --------------------------------------------- | ---------------------------------------------------------- |
+| `read <addr> <path> [--at <oid>]`             | the path's exact content                                   |
+| `ls <addr> [<glob>] [--at <oid>]`             | matching paths, sorted, one per line                       |
+| `grep <addr> <pattern> [<glob>] [--at <oid>]` | `path:line` for every line matching the JS regex `pattern` |
+
+`read` on an absent path fails loudly (exit 1); `ls`/`grep` matching nothing print nothing and exit 0; `grep` skips a non-UTF-8 blob with a note on stderr rather than failing the whole scan.
+
+**Write verbs** open the store and land ONE commit per invocation:
+
+| verb                                                                                        | edit(s)                                                               |
+| ------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| `write <addr> -m <msg> [--json] [--expect <path>=<oid>]… [--create <path>]… <path>=<file>…` | one `put` per `<path>=<file>` (`-` is stdin)                          |
+| `rm <addr> -m <msg> [--json] [--expect <path>=<oid>]… <path>…`                              | one `rm` per path                                                     |
+| `mv <addr> -m <msg> [--json] <from> <to>`                                                   | one `mv`                                                              |
+| `apply <addr> -m <msg> [--base <oid>] [--json] <clause>…`                                   | one edit per `put`/`append`/`rm`/`mv` clause, in order, as one commit |
+
+Every precondition is the git BLOB oid `ls`/a prior write reports — never a raw hash of the file's bytes. Unless `--expect <path>=<oid>` names it (or `--create`, a strict create), a path's precondition is auto-read the moment the command starts — present means "replace exactly this", absent means a create — and re-checked against whatever tree the commit actually attempts, so the auto-read stays race-safe. `apply` clauses apply in order against one pinned base (`--base <oid>`, default the tip), so `rm to.md` then `mv from.md to.md` frees the destination inside one commit while the reverse order refuses. A path spelled like a clause keyword is written `./put` — git's own path form, which the CLI strips (a gitomic path never begins with `./`).
+
+`--writer <label>` labels the audit trail on any write verb. `--json` replaces the bare-oid line with a one-line receipt — the output contract for a script:
+
+```sh
+$ gitomic write 'repo#main' -m edit a.md=./a --json
+{"oid":"9f3c2ab…","retries":0}
+```
+
+Product output — content, paths, matches, the oid or receipt — goes to stdout; narration and errors to stderr. The exit codes are the whole contract, and nothing fails silently:
+
+| code | meaning                                                                                                                                                                           |
+| ---- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `0`  | ok                                                                                                                                                                                |
+| `1`  | a runtime/data error — a read miss, invalid UTF-8, a backend failure, `RetriesExhausted`; the subject names itself                                                                |
+| `2`  | a usage error — unknown verb, a missing or malformed argument or flag, a bad address                                                                                              |
+| `3`  | a CAS precondition refusal (`EditDoesNotApply`), reported facts-only on stderr: the kind, path, expected and actual oids, and both commits — never an owner, role, or remediation |
+
+`log`, `diff`, and `read --log` are not in this version.
+
 ## When to use it
 
 **Use it for:**
@@ -278,7 +356,7 @@ A custom backend implements `GitomicBackend`: `head`, `readFiles`, `writeCommit`
 
 1. Writes build files straight into git's object database — many files, one commit.
 2. Landing = move the ref to the new commit, only if nobody moved it first. Writers can be separate processes — the ref swap is atomic in every backend.
-3. Lose the race? The update function re-runs on the winner's version — no merges. Retries back off by a random, roughly doubling delay (≤150ms; the jitter stops lockstep) and are capped (default 10) before `RetriesExhausted`. Writers in one process queue locally.
+3. Lose the race? The update function re-runs on the winner's version — no merges. Retries back off by a random, roughly doubling delay (≤150ms; the jitter stops lockstep). Contention is bounded by TIME, not a fixed attempt count: a transaction keeps retrying for `retryBudgetMs` (default 30s), and the budget RESETS every time the ref advances — a writer landing means the race is making progress — so a healthy burst is never abandoned, while a transaction that makes no progress for the whole budget fails with `RetriesExhausted`. Writers in one process queue locally.
 4. Commits carry who, why, and a receipt no other process can mint, so a retry cannot apply twice. When git's answer is unclear, recovery looks for that receipt among the commits that arrived since the one this transaction was built on, and fails loudly rather than walking the whole history.
 
 Commit timestamps count up from the parent so every backend produces the same commit id. They preserve order, not wall-clock time; store a real timestamp in your data when event time matters.

@@ -8,6 +8,7 @@ import {
   matchGlob,
   open,
   openReader,
+  type Committed,
   type Edit,
   type GitomicBackend,
   type Oid,
@@ -40,7 +41,7 @@ import { decodeUtf8 } from "./utf8.js"
  * Write verbs (open + apply, one commit per invocation). Every `--expect`
  * or clause anchor is the git BLOB oid `ls`/a prior write's own commit
  * reports, never a raw hash of the file's bytes:
- * - `write <addr> -m <message> [--writer <label>] [--expect <path>=<oid>]...
+ * - `write <addr> -m <message> [--writer <label>] [--json] [--expect <path>=<oid>]...
  *   [--create <path>]... <path>=<file>...` — one `put` edit per
  *   `<path>=<file>` pair, `<file>` read from the local filesystem (`-` reads
  *   stdin). Each path's precondition: `--expect <path>=<oid>` uses that oid;
@@ -50,16 +51,16 @@ import { decodeUtf8 } from "./utf8.js"
  *   means "replace exactly this", absent means a create, the same rule
  *   `rm`/`mv` use below. `--expect` and `--create` on the same path is a
  *   usage error (contradictory preconditions), never a silent pick.
- * - `rm <addr> -m <message> [--writer <label>] [--expect <path>=<oid>]... <path>...`
+ * - `rm <addr> -m <message> [--writer <label>] [--json] [--expect <path>=<oid>]... <path>...`
  *   — one `rm` edit per path. A path with no matching `--expect` reads its OWN
  *   current oid the moment the command starts and uses that as the
  *   precondition — still race-safe, because `apply`'s CAS replay re-checks
  *   that same precondition against whatever tree the commit actually attempts.
- * - `mv <addr> -m <message> [--writer <label>] <from> <to>` — one `mv` edit;
+ * - `mv <addr> -m <message> [--writer <label>] [--json] <from> <to>` — one `mv` edit;
  *   the source's current oid is read the same way `rm`'s default is, and the
  *   destination must be absent (the library's own `mv` precondition — no flag
  *   for it).
- * - `apply <addr> -m <message> [--writer <label>] [--base <oid>] <clause>...`
+ * - `apply <addr> -m <message> [--writer <label>] [--base <oid>] [--json] <clause>...`
  *   — the general multi-edit verb: one `Edit` per clause, built in the order
  *   given and landed as ONE all-or-nothing commit (the first clause whose
  *   precondition is refused aborts every clause, per R44 — never a partial
@@ -76,13 +77,19 @@ import { decodeUtf8 } from "./utf8.js"
  *   shape. Clause ORDER is apply order against the SAME attempted tree, so a
  *   later clause can depend on an earlier one: `rm to.md` then
  *   `mv from.md to.md` frees `to.md` for the move inside one commit, while
- *   the reverse order refuses on `destination-absent`. (A `<path>`/`<file>`
- *   literally spelled `put`/`append`/`rm`/`mv` would be misread as starting
- *   a new clause — the grammar has no escaping for it.)
+ *   the reverse order refuses on `destination-absent`. A PATH spelled like a
+ *   clause keyword (`put`/`append`/`rm`/`mv`) is named by prefixing it `./` —
+ *   git's own "this is a path" form, which a gitomic tree path never begins
+ *   with, so the `./` is an unambiguous escape and is stripped. A FILE argument
+ *   spelled like a keyword is written `./rm` too, a normal relative path read
+ *   straight from disk.
  *
- * Every write verb prints the landed commit oid to stdout on success. Product
- * output (content, paths, matches, commit oid) goes to stdout; narration and
- * errors go to stderr.
+ * Every write verb prints the landed commit oid to stdout on success — or,
+ * with `--json`, a one-line `{"oid":<oid>,"retries":<n>}` receipt of the oid
+ * and how many CAS retries the landing took (the output contract for an agent
+ * scripting the door). Read verbs take no `--json`, and a refusal is unchanged
+ * by it. Product output (content, paths, matches, the oid or receipt) goes to
+ * stdout; narration and errors go to stderr.
  *
  * Exit codes — the only four, nothing else is a success:
  * - `0` ok.
@@ -228,6 +235,7 @@ async function runWrite(
     "--writer": "value",
     "--expect": "repeated",
     "--create": "repeated",
+    "--json": "boolean",
   })
   const address = requirePositional(positionals, 0, "<address>")
   const message = requireStringFlag(flags, "-m", "-m <message>")
@@ -251,7 +259,7 @@ async function runWrite(
   }
 
   const committed = await apply(store, base, edits, message)
-  stdout.write(`${committed.oid}\n`)
+  writeReceipt(stdout, committed, flags.get("--json") === true)
   return OK
 }
 
@@ -260,6 +268,7 @@ async function runRm(args: string[], stdout: CliWriter, backend: GitomicBackend 
     "-m": "value",
     "--writer": "value",
     "--expect": "repeated",
+    "--json": "boolean",
   })
   const address = requirePositional(positionals, 0, "<address>")
   const message = requireStringFlag(flags, "-m", "-m <message>")
@@ -284,12 +293,12 @@ async function runRm(args: string[], stdout: CliWriter, backend: GitomicBackend 
     edits.push({ kind: "rm", path, expect: anchor })
   }
   const committed = await apply(store, base, edits, message)
-  stdout.write(`${committed.oid}\n`)
+  writeReceipt(stdout, committed, flags.get("--json") === true)
   return OK
 }
 
 async function runMv(args: string[], stdout: CliWriter, backend: GitomicBackend | undefined): Promise<number> {
-  const { positionals, flags } = extractFlags(args, { "-m": "value", "--writer": "value" })
+  const { positionals, flags } = extractFlags(args, { "-m": "value", "--writer": "value", "--json": "boolean" })
   const address = requirePositional(positionals, 0, "<address>")
   const from = requirePositional(positionals, 1, "<from>")
   const to = requirePositional(positionals, 2, "<to>")
@@ -301,7 +310,7 @@ async function runMv(args: string[], stdout: CliWriter, backend: GitomicBackend 
   const expect = await store.at(base).oid(from)
   if (expect === undefined) throw new Error(`source path not found: ${JSON.stringify(from)} at ${address}`)
   const committed = await apply(store, base, [{ kind: "mv", from, to, expect }], message)
-  stdout.write(`${committed.oid}\n`)
+  writeReceipt(stdout, committed, flags.get("--json") === true)
   return OK
 }
 
@@ -322,6 +331,7 @@ async function runApply(
   let message: string | undefined
   let writer: string | undefined
   let base: Oid | undefined
+  let asJson = false
   while (true) {
     const token = queue.at(0)
     if (token === undefined || CLAUSE_KEYWORDS.has(token)) break
@@ -335,6 +345,9 @@ async function runApply(
         break
       case "--base":
         base = requireQueuedValue(queue, token)
+        break
+      case "--json":
+        asJson = true
         break
       default:
         throw new UsageError(`unrecognized flag: ${token}`)
@@ -350,7 +363,7 @@ async function runApply(
     edits.push(await parseClause(clause, snapshot, stdin, address))
   }
   const committed = await apply(store, startBase, edits, message)
-  stdout.write(`${committed.oid}\n`)
+  writeReceipt(stdout, committed, asJson)
   return OK
 }
 
@@ -381,10 +394,9 @@ function splitClauses(tokens: readonly string[]): string[][] {
 
 /**
  * Parse one clause's tokens (its kind keyword plus that clause's own args and
- * flags) into the `Edit` it names. A `<path>`/`<file>` literally spelled
- * `put`/`append`/`rm`/`mv` would be misread by {@link splitClauses} as
- * starting a new clause — not handled here, since the grammar has no
- * escaping for it.
+ * flags) into the `Edit` it names. A bare `put`/`append`/`rm`/`mv` token starts
+ * a new clause (see {@link splitClauses}); a path spelled like a keyword is
+ * escaped `./name` and de-escaped by {@link clausePath}.
  */
 async function parseClause(
   tokens: readonly string[],
@@ -409,10 +421,23 @@ async function parseClause(
   }
 }
 
+/**
+ * De-escape a clause PATH operand. A bare `put`/`append`/`rm`/`mv` token starts
+ * a new clause (see {@link splitClauses}), so a path spelled like a keyword is
+ * written `./name` — git's own "this is a path" form. A gitomic tree path never
+ * begins with `./` (a `.` segment is rejected), so a leading `./` is an
+ * unambiguous escape and is stripped here. A FILE argument spelled like a
+ * keyword is written the same way but stays a normal relative path read from
+ * disk, so only path operands pass through here.
+ */
+function clausePath(operand: string): string {
+  return operand.startsWith("./") ? operand.slice(2) : operand
+}
+
 async function parsePutClause(tokens: readonly string[], snapshot: Snapshot, stdin: CliStdin): Promise<Edit> {
   const { positionals, flags } = extractFlags(tokens, { "--expect": "value", "--create": "boolean" })
   assertNoExtraPositionals(positionals, 2, "put <path> <file>")
-  const path = requirePositional(positionals, 0, "put <path>")
+  const path = clausePath(requirePositional(positionals, 0, "put <path>"))
   const file = requirePositional(positionals, 1, "put <path> <file>")
   const expectFlag = optionalStringFlag(flags, "--expect")
   const createFlag = flags.get("--create") === true
@@ -425,7 +450,7 @@ async function parsePutClause(tokens: readonly string[], snapshot: Snapshot, std
 async function parseAppendClause(tokens: readonly string[], stdin: CliStdin): Promise<Edit> {
   const { positionals } = extractFlags(tokens, {})
   assertNoExtraPositionals(positionals, 2, "append <path> <file>")
-  const path = requirePositional(positionals, 0, "append <path>")
+  const path = clausePath(requirePositional(positionals, 0, "append <path>"))
   const file = requirePositional(positionals, 1, "append <path> <file>")
   const content = file === "-" ? await readStdin(stdin) : await readFileContent(file)
   return { kind: "append", path, content }
@@ -434,7 +459,7 @@ async function parseAppendClause(tokens: readonly string[], stdin: CliStdin): Pr
 async function parseRmClause(tokens: readonly string[], snapshot: Snapshot, address: string): Promise<Edit> {
   const { positionals, flags } = extractFlags(tokens, { "--expect": "value" })
   assertNoExtraPositionals(positionals, 1, "rm <path>")
-  const path = requirePositional(positionals, 0, "rm <path>")
+  const path = clausePath(requirePositional(positionals, 0, "rm <path>"))
   const anchor = await removalPrecondition(path, optionalStringFlag(flags, "--expect"), snapshot)
   if (anchor === undefined) throw new Error(`path not found, cannot remove: ${JSON.stringify(path)} at ${address}`)
   return { kind: "rm", path, expect: anchor }
@@ -443,8 +468,8 @@ async function parseRmClause(tokens: readonly string[], snapshot: Snapshot, addr
 async function parseMvClause(tokens: readonly string[], snapshot: Snapshot, address: string): Promise<Edit> {
   const { positionals, flags } = extractFlags(tokens, { "--expect": "value" })
   assertNoExtraPositionals(positionals, 2, "mv <from> <to>")
-  const from = requirePositional(positionals, 0, "mv <from>")
-  const to = requirePositional(positionals, 1, "mv <from> <to>")
+  const from = clausePath(requirePositional(positionals, 0, "mv <from>"))
+  const to = clausePath(requirePositional(positionals, 1, "mv <from> <to>"))
   const anchor = await removalPrecondition(from, optionalStringFlag(flags, "--expect"), snapshot)
   if (anchor === undefined) throw new Error(`source path not found: ${JSON.stringify(from)} at ${address}`)
   return { kind: "mv", from, to, expect: anchor }
@@ -553,6 +578,18 @@ async function removalPrecondition(
   snapshot: Snapshot,
 ): Promise<Oid | undefined> {
   return explicitExpect ?? (await snapshot.oid(path))
+}
+
+/**
+ * A write verb's success output: the committed oid on its own line, or — with
+ * `--json` — a one-line `{"oid":…,"retries":…}` receipt of the oid and how many
+ * CAS retries the landing took (the output contract for an agent scripting the
+ * door). An {@link EditDoesNotApply} refusal is unaffected: it stays facts-only
+ * on stderr with exit 3.
+ */
+function writeReceipt(stdout: CliWriter, committed: Committed, asJson: boolean): void {
+  if (asJson) stdout.write(`${JSON.stringify({ oid: committed.oid, retries: committed.retries })}\n`)
+  else stdout.write(`${committed.oid}\n`)
 }
 
 // --- argument parsing ------------------------------------------------------
