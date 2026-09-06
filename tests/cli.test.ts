@@ -170,16 +170,51 @@ describe("gitomic CLI — write", () => {
     expect(read.stdout).toBe("one\n")
   })
 
-  test("re-creating an already-present path (no --expect) refuses with exit 3", async () => {
+  test("a present path with no --expect/--create auto-reads its current oid and replaces it", async () => {
     const backend = createMemBackend()
     await writeOne(backend, "a.md", "one\n")
 
     const result = await writeOne(backend, "a.md", "two\n")
+    expect(result.code).toBe(0)
+    expect(result.stderr).toBe("")
+    expect((await run(backend, ["read", ADDRESS, "a.md"])).stdout).toBe("two\n")
+  })
+
+  test("write --create refuses when the path already exists, landing nothing", async () => {
+    const backend = createMemBackend()
+    await writeOne(backend, "a.md", "one\n")
+
+    const result = await writeOne(backend, "a.md", "two\n", ["--create", "a.md"])
     expect(result.code).toBe(3)
     expect(result.stderr).toContain("edit-does-not-apply")
     expect(result.stderr).toContain("precondition=blob-absent")
-
     expect((await run(backend, ["read", ADDRESS, "a.md"])).stdout).toBe("one\n")
+  })
+
+  test("write --create succeeds on an absent path, same as the default create", async () => {
+    const backend = createMemBackend()
+
+    const result = await writeOne(backend, "a.md", "one\n", ["--create", "a.md"])
+    expect(result.code).toBe(0)
+    expect((await run(backend, ["read", ADDRESS, "a.md"])).stdout).toBe("one\n")
+  })
+
+  test("--create and --expect together for the same path is a usage error", async () => {
+    const backend = createMemBackend()
+    const file = await fileWith("a.md", "one\n")
+    const result = await run(backend, [
+      "write",
+      ADDRESS,
+      "-m",
+      "contradiction",
+      "--expect",
+      `a.md=${oidOf("one\n")}`,
+      "--create",
+      "a.md",
+      `a.md=${file}`,
+    ])
+    expect(result.code).toBe(2)
+    expect(result.stderr).toContain("a.md")
   })
 
   test("several <path>=<file> pairs land as one commit", async () => {
@@ -368,6 +403,144 @@ describe("gitomic CLI — mv", () => {
     const result = await run(backend, ["mv", ADDRESS, "-m", "mv", "missing.md", "to.md"])
     expect(result.code).toBe(1)
     expect(result.stderr).toContain("missing.md")
+  })
+})
+
+describe("gitomic CLI — apply", () => {
+  test("apply lands a mixed put/append/rm/mv edit list as one commit", async () => {
+    const backend = createMemBackend()
+    await writeOne(backend, "keep.md", "keep\n")
+    await writeOne(backend, "gone.md", "bye\n")
+    await writeOne(backend, "moved-from.md", "moving\n")
+    await writeOne(backend, "log.md", "line1\n")
+    const putFile = await fileWith("new.md", "new content\n")
+    const appendFile = await fileWith("log-append.md", "line2\n")
+
+    const result = await run(backend, [
+      "apply",
+      ADDRESS,
+      "-m",
+      "mixed batch",
+      "put",
+      "new.md",
+      putFile,
+      "append",
+      "log.md",
+      appendFile,
+      "rm",
+      "gone.md",
+      "mv",
+      "moved-from.md",
+      "moved-to.md",
+    ])
+    expect(result.code).toBe(0)
+    expect(result.stdout.trim().length).toBeGreaterThan(0)
+
+    expect((await run(backend, ["read", ADDRESS, "new.md"])).stdout).toBe("new content\n")
+    expect((await run(backend, ["read", ADDRESS, "log.md"])).stdout).toBe("line1\nline2\n")
+    expect((await run(backend, ["read", ADDRESS, "gone.md"])).code).toBe(1)
+    expect((await run(backend, ["read", ADDRESS, "moved-from.md"])).code).toBe(1)
+    expect((await run(backend, ["read", ADDRESS, "moved-to.md"])).stdout).toBe("moving\n")
+    expect((await run(backend, ["read", ADDRESS, "keep.md"])).stdout).toBe("keep\n")
+  })
+
+  test("the overwrite-move: rm before mv frees the destination, landing both edits in one commit", async () => {
+    const backend = createMemBackend()
+    await writeOne(backend, "from.md", "body\n")
+    await writeOne(backend, "to.md", "occupied\n")
+
+    const result = await run(backend, [
+      "apply",
+      ADDRESS,
+      "-m",
+      "overwrite move",
+      "rm",
+      "to.md",
+      "mv",
+      "from.md",
+      "to.md",
+    ])
+    expect(result.code).toBe(0)
+    expect((await run(backend, ["read", ADDRESS, "to.md"])).stdout).toBe("body\n")
+    expect((await run(backend, ["read", ADDRESS, "from.md"])).code).toBe(1)
+  })
+
+  test("clause order matters: mv before rm refuses because the destination is still occupied", async () => {
+    const backend = createMemBackend()
+    await writeOne(backend, "from.md", "body\n")
+    await writeOne(backend, "to.md", "occupied\n")
+
+    const result = await run(backend, ["apply", ADDRESS, "-m", "wrong order", "mv", "from.md", "to.md", "rm", "to.md"])
+    expect(result.code).toBe(3)
+    expect(result.stderr).toContain("kind=mv")
+    expect(result.stderr).toContain("precondition=destination-absent")
+    expect((await run(backend, ["read", ADDRESS, "from.md"])).stdout).toBe("body\n")
+    expect((await run(backend, ["read", ADDRESS, "to.md"])).stdout).toBe("occupied\n")
+  })
+
+  test("a refused clause aborts the whole apply, landing nothing from an earlier clause either", async () => {
+    const backend = createMemBackend()
+    await writeOne(backend, "a.md", "one\n")
+    await writeOne(backend, "a.md", "two\n", ["--expect", `a.md=${oidOf("one\n")}`])
+    const putFile = await fileWith("b.md", "b content\n")
+
+    // "put b.md" (clause 0) would succeed alone; "rm a.md" (clause 1) carries a
+    // stale --expect (a.md moved to "two\n" above) and refuses. Because apply is
+    // all-or-nothing, clause 0's put must not land either.
+    const result = await run(backend, [
+      "apply",
+      ADDRESS,
+      "-m",
+      "should abort",
+      "put",
+      "b.md",
+      putFile,
+      "rm",
+      "a.md",
+      "--expect",
+      oidOf("one\n"),
+    ])
+    expect(result.code).toBe(3)
+    expect(result.stderr).toContain("kind=rm")
+    expect((await run(backend, ["read", ADDRESS, "b.md"])).code).toBe(1)
+    expect((await run(backend, ["read", ADDRESS, "a.md"])).stdout).toBe("two\n")
+  })
+
+  test("--base anchors auto-read at an earlier commit, refusing instead of silently using the live tip", async () => {
+    const backend = createMemBackend()
+    const first = await writeOne(backend, "a.md", "one\n")
+    await writeOne(backend, "a.md", "two\n", ["--expect", `a.md=${oidOf("one\n")}`])
+    const putFile = await fileWith("a-again.md", "three\n")
+
+    const result = await run(backend, [
+      "apply",
+      ADDRESS,
+      "-m",
+      "stale base",
+      "--base",
+      first.stdout.trim(),
+      "put",
+      "a.md",
+      putFile,
+    ])
+    expect(result.code).toBe(3)
+    expect(result.stderr).toContain("kind=put")
+    expect(result.stderr).toContain("path=a.md")
+    expect(result.stderr).toContain("precondition=blob-identical")
+    expect((await run(backend, ["read", ADDRESS, "a.md"])).stdout).toBe("two\n")
+  })
+
+  test("apply requires at least one clause", async () => {
+    const backend = createMemBackend()
+    const result = await run(backend, ["apply", ADDRESS, "-m", "nothing to do"])
+    expect(result.code).toBe(2)
+  })
+
+  test("an unknown apply clause keyword fails loudly instead of being misread as a path", async () => {
+    const backend = createMemBackend()
+    const result = await run(backend, ["apply", ADDRESS, "-m", "bad clause", "frobnicate", "a.md"])
+    expect(result.code).toBe(2)
+    expect(result.stderr).toContain("frobnicate")
   })
 })
 

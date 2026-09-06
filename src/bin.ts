@@ -24,7 +24,10 @@ import { decodeUtf8 } from "./utf8.js"
  * no checkout, from anywhere. See README.md for the library this fronts.
  *
  * Grammar: `gitomic <verb> <repo>#<ref> [args] [flags]`. The address is
- * `parseAddress`'s `<repo>#<ref>` (ref defaults to `main` with no `#`).
+ * `parseAddress`'s `<repo>#<ref>` (ref defaults to `main` with no `#`). QUOTE
+ * the address in the shell — `gitomic read 'repo#main' path`, never
+ * unquoted: `#` is a glob operator under zsh's `extended_glob`, and `?` (a
+ * legal ref character) is a glob operator in every POSIX shell.
  *
  * Read verbs (openReader, an immutable snapshot pinned at `--at` or the tip):
  * - `read <addr> <path> [--at <oid>]` — print the path's exact content to stdout.
@@ -34,13 +37,19 @@ import { decodeUtf8 } from "./utf8.js"
  *   A path that is not valid UTF-8 is skipped with a note on stderr rather than
  *   failing the whole scan.
  *
- * Write verbs (open + apply, one commit per invocation):
- * - `write <addr> -m <message> [--writer <label>] [--expect <path>=<oid>]... <path>=<file>...`
- *   — one `put` edit per `<path>=<file>` pair, `<file>` read from the local
- *   filesystem (`-` reads stdin). A path with no matching `--expect` is a
- *   CREATE (refuses if the path already exists) — there is no unconditional
- *   overwrite in U1. `<oid>` is the git BLOB oid `ls`/a prior write's own
- *   commit reports, never a raw hash of the file's bytes.
+ * Write verbs (open + apply, one commit per invocation). Every `--expect`
+ * or clause anchor is the git BLOB oid `ls`/a prior write's own commit
+ * reports, never a raw hash of the file's bytes:
+ * - `write <addr> -m <message> [--writer <label>] [--expect <path>=<oid>]...
+ *   [--create <path>]... <path>=<file>...` — one `put` edit per
+ *   `<path>=<file>` pair, `<file>` read from the local filesystem (`-` reads
+ *   stdin). Each path's precondition: `--expect <path>=<oid>` uses that oid;
+ *   `--create <path>` is a STRICT create (refuses if the path already
+ *   exists); otherwise the CLI auto-reads the path's own current oid the
+ *   moment the command starts and uses THAT as the precondition — present
+ *   means "replace exactly this", absent means a create, the same rule
+ *   `rm`/`mv` use below. `--expect` and `--create` on the same path is a
+ *   usage error (contradictory preconditions), never a silent pick.
  * - `rm <addr> -m <message> [--writer <label>] [--expect <path>=<oid>]... <path>...`
  *   — one `rm` edit per path. A path with no matching `--expect` reads its OWN
  *   current oid the moment the command starts and uses that as the
@@ -50,20 +59,42 @@ import { decodeUtf8 } from "./utf8.js"
  *   the source's current oid is read the same way `rm`'s default is, and the
  *   destination must be absent (the library's own `mv` precondition — no flag
  *   for it).
+ * - `apply <addr> -m <message> [--writer <label>] [--base <oid>] <clause>...`
+ *   — the general multi-edit verb: one `Edit` per clause, built in the order
+ *   given and landed as ONE all-or-nothing commit (the first clause whose
+ *   precondition is refused aborts every clause, per R44 — never a partial
+ *   apply). Each clause is introduced by its own kind keyword:
+ *     - `put <path> <file> [--expect <oid> | --create]`
+ *     - `append <path> <file>`
+ *     - `rm <path> [--expect <oid>]`
+ *     - `mv <from> <to> [--expect <oid>]`
+ *   `<file>` is read from the local filesystem, or stdin for `-`. `put`,
+ *   `rm` and `mv` without `--expect` (and `put` without `--create`)
+ *   auto-read their path's current oid at `--base` (default: the current
+ *   head) — the same rule `write` uses above; `put --create` is a strict
+ *   create; `append` carries no anchor at all, per the library's own `Edit`
+ *   shape. Clause ORDER is apply order against the SAME attempted tree, so a
+ *   later clause can depend on an earlier one: `rm to.md` then
+ *   `mv from.md to.md` frees `to.md` for the move inside one commit, while
+ *   the reverse order refuses on `destination-absent`. (A `<path>`/`<file>`
+ *   literally spelled `put`/`append`/`rm`/`mv` would be misread as starting
+ *   a new clause — the grammar has no escaping for it.)
  *
  * Every write verb prints the landed commit oid to stdout on success. Product
  * output (content, paths, matches, commit oid) goes to stdout; narration and
  * errors go to stderr.
  *
- * Exit codes: `0` success, `1` a read or backend failure (not-found, invalid
- * UTF-8, exhausted retries — the subject names itself in the message), `2` a
- * usage error (unknown verb, a missing or malformed argument or flag, a bad
- * address), `3` a CAS precondition refusal ({@link EditDoesNotApply}), reported
- * as facts only on stderr — never an owner, role, or remediation.
+ * Exit codes — the only four, nothing else is a success:
+ * - `0` ok.
+ * - `1` a runtime/data error: a read or backend failure (not-found, invalid
+ *   UTF-8, exhausted retries — the subject names itself in the message).
+ * - `2` a usage error (unknown verb, a missing or malformed argument or
+ *   flag, a bad address).
+ * - `3` an {@link EditDoesNotApply} CAS precondition refusal, reported as
+ *   facts only on stderr — never an owner, role, or remediation.
  *
  * Deliberately not built here (need new grammar or library plumbing this CLI
- * does not add): the general multi-edit-kind `apply` verb, `log`, `diff`,
- * `read --log`, `commit <checkout>`.
+ * does not add): `log`, `diff`, `read --log`, `commit <checkout>`.
  */
 export async function main(argv: string[], io: CliIo = {}): Promise<number> {
   const stdout = io.stdout ?? process.stdout
@@ -87,6 +118,8 @@ export async function main(argv: string[], io: CliIo = {}): Promise<number> {
         return await runRm(args, stdout, backend)
       case "mv":
         return await runMv(args, stdout, backend)
+      case "apply":
+        return await runApply(args, stdin, stdout, backend)
       default:
         throw new UsageError(`unknown verb: ${JSON.stringify(verb)}; expected one of ${VERBS.join(", ")}`)
     }
@@ -105,7 +138,7 @@ export type CliIo = {
   backend?: GitomicBackend
 }
 
-const VERBS = ["read", "ls", "grep", "write", "rm", "mv"] as const
+const VERBS = ["read", "ls", "grep", "write", "rm", "mv", "apply"] as const
 
 const OK = 0
 const RUNTIME_ERROR = 1
@@ -194,22 +227,29 @@ async function runWrite(
     "-m": "value",
     "--writer": "value",
     "--expect": "repeated",
+    "--create": "repeated",
   })
   const address = requirePositional(positionals, 0, "<address>")
   const message = requireStringFlag(flags, "-m", "-m <message>")
   const writer = optionalStringFlag(flags, "--writer")
   const pairs = parsePathFilePairs(positionals.slice(1))
+  const knownPaths = new Set(pairs.map((pair) => pair.path))
   const expect = parseExpectPairs(repeated.get("--expect") ?? [])
-  assertExpectTargetsKnown(expect, new Set(pairs.map((pair) => pair.path)), "written")
-
-  const edits: Edit[] = []
-  for (const { path, file } of pairs) {
-    const content = file === "-" ? await readStdin(stdin) : await readFileContent(file)
-    edits.push({ kind: "put", path, content, expect: expect.get(path) ?? null })
-  }
+  const create = parseUniquePaths("--create", repeated.get("--create") ?? [])
+  assertTargetsKnown("--expect", expect.keys(), knownPaths, "written")
+  assertTargetsKnown("--create", create, knownPaths, "written")
+  for (const path of create) assertNotContradictoryPrecondition(path, expect.has(path), true)
 
   const store = await openStoreFor(address, backend, writer)
   const base = await store.head()
+  const snapshot = store.at(base)
+  const edits: Edit[] = []
+  for (const { path, file } of pairs) {
+    const content = file === "-" ? await readStdin(stdin) : await readFileContent(file)
+    const anchor = await putPrecondition(path, expect.get(path), create.has(path), snapshot)
+    edits.push({ kind: "put", path, content, expect: anchor })
+  }
+
   const committed = await apply(store, base, edits, message)
   stdout.write(`${committed.oid}\n`)
   return OK
@@ -232,14 +272,14 @@ async function runRm(args: string[], stdout: CliWriter, backend: GitomicBackend 
     seen.add(path)
   }
   const expect = parseExpectPairs(repeated.get("--expect") ?? [])
-  assertExpectTargetsKnown(expect, seen, "removed")
+  assertTargetsKnown("--expect", expect.keys(), seen, "removed")
 
   const store = await openStoreFor(address, backend, writer)
   const base = await store.head()
   const snapshot = store.at(base)
   const edits: Edit[] = []
   for (const path of paths) {
-    const anchor = expect.get(path) ?? (await snapshot.oid(path))
+    const anchor = await removalPrecondition(path, expect.get(path), snapshot)
     if (anchor === undefined) throw new Error(`path not found, cannot remove: ${JSON.stringify(path)} at ${address}`)
     edits.push({ kind: "rm", path, expect: anchor })
   }
@@ -263,6 +303,160 @@ async function runMv(args: string[], stdout: CliWriter, backend: GitomicBackend 
   const committed = await apply(store, base, [{ kind: "mv", from, to, expect }], message)
   stdout.write(`${committed.oid}\n`)
   return OK
+}
+
+// --- apply verb ------------------------------------------------------------
+
+const CLAUSE_KEYWORDS = new Set(["put", "append", "rm", "mv"])
+
+async function runApply(
+  args: string[],
+  stdin: CliStdin,
+  stdout: CliWriter,
+  backend: GitomicBackend | undefined,
+): Promise<number> {
+  const queue = [...args]
+  const address = queue.shift()
+  if (address === undefined) throw new UsageError("missing <address>")
+
+  let message: string | undefined
+  let writer: string | undefined
+  let base: Oid | undefined
+  while (true) {
+    const token = queue.at(0)
+    if (token === undefined || CLAUSE_KEYWORDS.has(token)) break
+    queue.shift()
+    switch (token) {
+      case "-m":
+        message = requireQueuedValue(queue, token)
+        break
+      case "--writer":
+        writer = requireQueuedValue(queue, token)
+        break
+      case "--base":
+        base = requireQueuedValue(queue, token)
+        break
+      default:
+        throw new UsageError(`unrecognized flag: ${token}`)
+    }
+  }
+  if (message === undefined) throw new UsageError("missing -m <message>")
+
+  const store = await openStoreFor(address, backend, writer)
+  const startBase = base ?? (await store.head())
+  const snapshot = store.at(startBase)
+  const edits: Edit[] = []
+  for (const clause of splitClauses(queue)) {
+    edits.push(await parseClause(clause, snapshot, stdin, address))
+  }
+  const committed = await apply(store, startBase, edits, message)
+  stdout.write(`${committed.oid}\n`)
+  return OK
+}
+
+/** Shift the next token as a required flag value, failing loudly by the flag's own name. */
+function requireQueuedValue(queue: string[], flag: string): string {
+  const value = queue.shift()
+  if (value === undefined) throw new UsageError(`${flag} requires a value`)
+  return value
+}
+
+/** Split `apply`'s clause-region tokens into groups, each starting with `put`/`append`/`rm`/`mv`. */
+function splitClauses(tokens: readonly string[]): string[][] {
+  const clauses: string[][] = []
+  for (const token of tokens) {
+    if (CLAUSE_KEYWORDS.has(token)) {
+      clauses.push([token])
+      continue
+    }
+    const current = clauses.at(-1)
+    if (current === undefined) {
+      throw new UsageError(`apply: expected a clause keyword (put/append/rm/mv), got: ${token}`)
+    }
+    current.push(token)
+  }
+  if (clauses.length === 0) throw new UsageError("apply requires at least one clause (put/append/rm/mv)")
+  return clauses
+}
+
+/**
+ * Parse one clause's tokens (its kind keyword plus that clause's own args and
+ * flags) into the `Edit` it names. A `<path>`/`<file>` literally spelled
+ * `put`/`append`/`rm`/`mv` would be misread by {@link splitClauses} as
+ * starting a new clause — not handled here, since the grammar has no
+ * escaping for it.
+ */
+async function parseClause(
+  tokens: readonly string[],
+  snapshot: Snapshot,
+  stdin: CliStdin,
+  address: string,
+): Promise<Edit> {
+  const keyword = tokens.at(0)
+  const rest = tokens.slice(1)
+  switch (keyword) {
+    case "put":
+      return await parsePutClause(rest, snapshot, stdin)
+    case "append":
+      return await parseAppendClause(rest, stdin)
+    case "rm":
+      return await parseRmClause(rest, snapshot, address)
+    case "mv":
+      return await parseMvClause(rest, snapshot, address)
+    default:
+      // Unreachable: splitClauses only ever starts a group with one of these keywords.
+      throw new UsageError(`apply: expected a clause keyword (put/append/rm/mv), got: ${JSON.stringify(keyword)}`)
+  }
+}
+
+async function parsePutClause(tokens: readonly string[], snapshot: Snapshot, stdin: CliStdin): Promise<Edit> {
+  const { positionals, flags } = extractFlags(tokens, { "--expect": "value", "--create": "boolean" })
+  assertNoExtraPositionals(positionals, 2, "put <path> <file>")
+  const path = requirePositional(positionals, 0, "put <path>")
+  const file = requirePositional(positionals, 1, "put <path> <file>")
+  const expectFlag = optionalStringFlag(flags, "--expect")
+  const createFlag = flags.get("--create") === true
+  assertNotContradictoryPrecondition(path, expectFlag !== undefined, createFlag)
+  const content = file === "-" ? await readStdin(stdin) : await readFileContent(file)
+  const anchor = await putPrecondition(path, expectFlag, createFlag, snapshot)
+  return { kind: "put", path, content, expect: anchor }
+}
+
+async function parseAppendClause(tokens: readonly string[], stdin: CliStdin): Promise<Edit> {
+  const { positionals } = extractFlags(tokens, {})
+  assertNoExtraPositionals(positionals, 2, "append <path> <file>")
+  const path = requirePositional(positionals, 0, "append <path>")
+  const file = requirePositional(positionals, 1, "append <path> <file>")
+  const content = file === "-" ? await readStdin(stdin) : await readFileContent(file)
+  return { kind: "append", path, content }
+}
+
+async function parseRmClause(tokens: readonly string[], snapshot: Snapshot, address: string): Promise<Edit> {
+  const { positionals, flags } = extractFlags(tokens, { "--expect": "value" })
+  assertNoExtraPositionals(positionals, 1, "rm <path>")
+  const path = requirePositional(positionals, 0, "rm <path>")
+  const anchor = await removalPrecondition(path, optionalStringFlag(flags, "--expect"), snapshot)
+  if (anchor === undefined) throw new Error(`path not found, cannot remove: ${JSON.stringify(path)} at ${address}`)
+  return { kind: "rm", path, expect: anchor }
+}
+
+async function parseMvClause(tokens: readonly string[], snapshot: Snapshot, address: string): Promise<Edit> {
+  const { positionals, flags } = extractFlags(tokens, { "--expect": "value" })
+  assertNoExtraPositionals(positionals, 2, "mv <from> <to>")
+  const from = requirePositional(positionals, 0, "mv <from>")
+  const to = requirePositional(positionals, 1, "mv <from> <to>")
+  const anchor = await removalPrecondition(from, optionalStringFlag(flags, "--expect"), snapshot)
+  if (anchor === undefined) throw new Error(`source path not found: ${JSON.stringify(from)} at ${address}`)
+  return { kind: "mv", from, to, expect: anchor }
+}
+
+/** A clause must consume every positional it's given — an extra one signals a missing clause keyword or a typo, not a silent no-op. */
+function assertNoExtraPositionals(positionals: readonly string[], expected: number, clause: string): void {
+  if (positionals.length > expected) {
+    throw new UsageError(
+      `apply: ${clause} takes ${expected} argument(s); got extra: ${positionals.slice(expected).join(" ")}`,
+    )
+  }
 }
 
 type PathFilePair = { path: string; file: string }
@@ -300,15 +494,65 @@ function parseExpectPairs(raw: readonly string[]): ReadonlyMap<string, Oid> {
   return result
 }
 
-/** A `--expect` naming a path this invocation is not touching is a usage mistake, not a silent no-op. */
-function assertExpectTargetsKnown(
-  expect: ReadonlyMap<string, Oid>,
+/** A flag naming a path this invocation is not touching is a usage mistake, not a silent no-op. */
+function assertTargetsKnown(
+  flag: string,
+  targets: Iterable<string>,
   knownPaths: ReadonlySet<string>,
   action: string,
 ): void {
-  for (const path of expect.keys()) {
-    if (!knownPaths.has(path)) throw new UsageError(`--expect names a path not being ${action}: ${path}`)
+  for (const path of targets) {
+    if (!knownPaths.has(path)) throw new UsageError(`${flag} names a path not being ${action}: ${path}`)
   }
+}
+
+/** Parse repeated single-value flags (like `--create <path>`) into a set, failing loudly on a repeated path. */
+function parseUniquePaths(flag: string, raw: readonly string[]): ReadonlySet<string> {
+  const result = new Set<string>()
+  for (const path of raw) {
+    if (result.has(path)) throw new UsageError(`${flag} given twice for the same path: ${path}`)
+    result.add(path)
+  }
+  return result
+}
+
+/** A path cannot claim both "must already hold this oid" (`--expect`) and "must be strictly absent" (`--create`). */
+function assertNotContradictoryPrecondition(path: string, hasExpect: boolean, hasCreate: boolean): void {
+  if (hasExpect && hasCreate) throw new UsageError(`--create and --expect both given for the same path: ${path}`)
+}
+
+/**
+ * `put`'s precondition for one path — shared by `write` and `apply`'s `put`
+ * clause: an explicit oid wins, else a strict `--create` is `null` (refuses
+ * if the path turns out to be present), else auto-read the path's own
+ * current oid at the base the moment the command started — present means
+ * "replace exactly that", absent means a create. Race-safe like `rm`/`mv`'s
+ * auto-read below: `apply`'s CAS replay re-checks this same precondition
+ * against whatever tree the commit actually attempts.
+ */
+async function putPrecondition(
+  path: string,
+  explicitExpect: Oid | undefined,
+  strictCreate: boolean,
+  snapshot: Snapshot,
+): Promise<Oid | null> {
+  if (explicitExpect !== undefined) return explicitExpect
+  if (strictCreate) return null
+  return (await snapshot.oid(path)) ?? null
+}
+
+/**
+ * `rm`/`mv`'s precondition for one path — shared by both verbs and `apply`'s
+ * `rm`/`mv` clauses: an explicit oid wins, else auto-read the path's own
+ * current oid. `undefined` means the path is genuinely absent, which the
+ * caller must reject — unlike `put`, `rm`/`mv` require the path to exist.
+ */
+async function removalPrecondition(
+  path: string,
+  explicitExpect: Oid | undefined,
+  snapshot: Snapshot,
+): Promise<Oid | undefined> {
+  return explicitExpect ?? (await snapshot.oid(path))
 }
 
 // --- argument parsing ------------------------------------------------------
