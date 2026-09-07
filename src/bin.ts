@@ -264,8 +264,9 @@ async function runLog(
           `scan exhausted after 1024 commits for ${scope}; found ${commits.length} of ${limit} requested matches, root not reached`,
         )
       }
-      if (commits.length === 0) {
-        stderr.write(`gitomic: log: no matches for ${scope}; reached root after ${history.length} commits\n`)
+      if (commits.length < limit) {
+        const result = commits.length === 0 ? "no matches" : `returned ${commits.length} of ${limit} requested matches`
+        stderr.write(`gitomic: log: ${result} for ${scope}; reached root after ${history.length} commits\n`)
       }
     }
     stdout.write(

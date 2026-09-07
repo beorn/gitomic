@@ -215,6 +215,29 @@ describe("gitomic CLI — history reads", () => {
     expect(filtered).toMatchObject({ code: 0, stderr: "" })
     expect((JSON.parse(filtered.stdout) as CommitMeta[]).map(({ oid }) => oid)).toEqual([second.oid, first.oid])
 
+    // A root-complete short result is success, with explicit completeness context.
+    for (const json of [false, true]) {
+      const short = await run(backend, [
+        "log",
+        ADDRESS,
+        "dir/*.txt",
+        "--at",
+        second.oid,
+        "-n",
+        "3",
+        ...(json ? ["--json"] : []),
+      ])
+      expect(short.code).toBe(0)
+      expect(short.stdout).toBe(
+        json
+          ? `${JSON.stringify([records[0], records[1]])}\n`
+          : `${second.oid} history: second\n${first.oid} history: first\n`,
+      )
+      for (const fact of [ADDRESS, second.oid, "dir/*.txt", "2 of 3", "root after 3", "first-parent", "mode-only"]) {
+        expect(short.stderr).toContain(fact)
+      }
+    }
+
     const diffArgs = ["diff", ADDRESS, "--base", first.oid, "--at", second.oid]
     expect(await run(backend, diffArgs)).toEqual({ code: 0, stdout: "A\ta.md\nM\tb.md\nD\tdir/gone.txt\n", stderr: "" })
     const diff = await run(backend, [...diffArgs, "--json"])
@@ -299,7 +322,8 @@ describe("gitomic CLI — history reads", () => {
       const root = await git(fixture.repo, "commit-tree", tree, "-m", "binary root")
       const backend = createShellBackend()
       const log = await run(backend, ["log", fixture.repo, "*.bin", "--at", root, "--json"])
-      expect(log).toMatchObject({ code: 0, stderr: "" })
+      expect(log.code).toBe(0)
+      expect(log.stderr).toContain("1 of 50")
       expect(JSON.parse(log.stdout)).toEqual([
         {
           oid: root,
@@ -515,6 +539,7 @@ describe("gitomic CLI — write", () => {
     const backend = createMemBackend()
     const result = await writeOne(backend, "a.md", "one\n", ["--writer", "cli-test"])
     expect(result.code).toBe(0)
+    expect((await backend.readCommit("repo", result.stdout.trim())).writer).toBe("cli-test")
   })
 
   test("--expect naming a path not being written is a usage error", async () => {
