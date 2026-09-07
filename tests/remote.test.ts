@@ -2,12 +2,14 @@
 // @level l1
 // @consumer remote-arbitrated gitomic writers
 
-import { describe, expect, test } from "vitest"
+import { describe, expect, test, vi } from "vitest"
+import fs from "node:fs"
 import { chmod, readFile, writeFile } from "node:fs/promises"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
+import { pathToFileURL } from "node:url"
 
-import { open } from "../src/index.js"
-import { createRemoteRepos, git } from "./helpers/git.js"
+import { open, openReader, openRemoteRepository } from "../src/index.js"
+import { createBareRepo, createRemoteRepos, git } from "./helpers/git.js"
 
 type TraceEvent = {
   event?: string
@@ -21,6 +23,91 @@ function deferred(): { promise: Promise<void>; resolve(): void } {
   })
   return { promise, resolve }
 }
+
+describe("owned remote repositories", () => {
+  test.each(["URL", "path"])("opens a %s in private storage shared by readers and writers", async (kind) => {
+    const fixture = await createBareRepo()
+    try {
+      const source = kind === "URL" ? pathToFileURL(fixture.repo).href : fixture.repo
+      const repository = openRemoteRepository(source)
+      const parent = dirname(repository.repo)
+      try {
+        expect(repository.repo).not.toBe(fixture.repo)
+        expect(repository.remote).toBe("origin")
+        expect(await git(repository.repo, "rev-parse", "--is-bare-repository")).toBe("true")
+        const options = { ...repository, ref: "main" }
+        const store = await open(options)
+        const result = await store.transact(async (map) => map.set("note.md", "remote-owned\n"), "write")
+        const reader = await openReader(options)
+        expect(await reader.at(result.oid).get("note.md")).toBe("remote-owned\n")
+        expect(await git(fixture.repo, "show", "main:note.md")).toBe("remote-owned")
+      } finally {
+        repository[Symbol.dispose]()
+      }
+      expect(fs.existsSync(parent)).toBe(false)
+      expect(() => repository[Symbol.dispose]()).not.toThrow()
+      expect(fs.existsSync(fixture.repo)).toBe(true)
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  test("failed clone cleans its allocation and preserves a simultaneous cleanup failure", async () => {
+    const fixture = await createBareRepo()
+    const source = pathToFileURL(join(fixture.repo, "missing.git")).href
+    const remove = vi.spyOn(fs, "rmSync")
+    try {
+      expect(() => openRemoteRepository(source)).toThrow(/git clone/)
+      const firstParent = String(remove.mock.calls[0]?.[0])
+      expect(firstParent).not.toBe("undefined")
+      expect(fs.existsSync(firstParent)).toBe(false)
+
+      const cleanupFailure = new Error("cleanup permission denied")
+      remove.mockImplementationOnce(() => {
+        throw cleanupFailure
+      })
+      let observed: unknown
+      try {
+        openRemoteRepository(source)
+      } catch (error) {
+        observed = error
+      }
+      expect(observed).toBeInstanceOf(AggregateError)
+      const errors = (observed as AggregateError).errors as Error[]
+      expect(errors).toHaveLength(2)
+      expect(errors[0]?.message).toContain(source)
+      expect(errors[0]?.message).toContain("git clone")
+      expect(errors[0]?.message).toMatch(/exit \d+/)
+      expect(errors[1]).toBe(cleanupFailure)
+    } finally {
+      const parents = remove.mock.calls.map(([path]) => path)
+      remove.mockRestore()
+      for (const parent of parents) fs.rmSync(parent, { recursive: true, force: true })
+      await fixture.cleanup()
+    }
+  })
+
+  test("failed disposal stays observable and can be retried", async () => {
+    const fixture = await createBareRepo()
+    try {
+      const repository = openRemoteRepository(fixture.repo)
+      const parent = dirname(repository.repo)
+      const remove = vi.spyOn(fs, "rmSync").mockImplementationOnce(() => {
+        throw new Error("cleanup denied")
+      })
+      try {
+        expect(() => repository[Symbol.dispose]()).toThrow("cleanup denied")
+        expect(fs.existsSync(parent)).toBe(true)
+      } finally {
+        remove.mockRestore()
+        repository[Symbol.dispose]()
+      }
+      expect(fs.existsSync(parent)).toBe(false)
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+})
 
 describe("remote arbitration", () => {
   test("fetches through a transaction-private ref instead of shared FETCH_HEAD", async () => {

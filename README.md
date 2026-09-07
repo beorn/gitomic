@@ -168,6 +168,21 @@ const changes = await reader.diff(olderRevision, revision)
 
 **`remote`:** origin becomes the decider. Every write is one fetch/push cycle under the remote's ref lock; the push is a compare-and-swap (`--force-with-lease`), never a history rewrite, so it either fast-forwards or triggers a re-run. The local ref is then a cache of origin: reads stay local and lag until the next fetch, and an unpushed local-only tip may be replaced by origin's tip. Do not point it at a ref that carries unrelated local work. Origin is, honestly, your server; leave it out for purely local stores.
 
+**Opening from a URL.** `openRemoteRepository(source)` synchronously creates a temporary bare clone through native Git. A filesystem source is also cloned; calling this function explicitly requests remote isolation.
+
+```ts
+import { open, openReader, openRemoteRepository } from "gitomic"
+
+using repository = openRemoteRepository("file:///srv/state.git")
+const options = { ...repository, ref: "main" }
+const store = await open(options)
+const result = await store.transact(async (map) => map.set("note.md", "hello\n"), "write note")
+const reader = await openReader(options)
+console.log(await reader.at(result.oid).get("note.md"))
+```
+
+The owner returns `{ repo, remote: "origin" }` plus disposal. Keep it alive until every Store, Reader and receipt check using it finishes. Disposal removes only its allocated parent directory; it never removes the source. The returned `repo` is temporary storage, so do not save it as a repository identity. Existing local repositories still go directly to `open` or `openReader` and remain caller-owned. This opener requires native Git, a writable temp directory and a reachable source; it does not use injected backends. Failed opening throws with the source and native error. Cleanup errors also throw; simultaneous opening and cleanup failures retain both errors.
+
 **Sharing `main` with a delivery queue** needs a strict path partition: gitomic owns its declared state paths and the queue owns code paths; neither writes the other's. The ref only fast-forwards. The queue never rebases or rewrites already-published gitomic commits — if its candidate is stale, it must rebuild on the current tip. Without all three, use a separate ref.
 
 ### The map
@@ -302,6 +317,8 @@ $ gitomic apply 'repo#main' -m batch  put new.md ./new.txt  rm old.md
 
 **Address.** One argument, `<repo>#<ref>` — a repo path or URL, then the ref (default `main` with no `#`). QUOTE it in the shell: `#` is a glob operator under zsh's `extended_glob`, and `?` (a legal ref character) is one in every POSIX shell.
 
+URL and scp-style addresses use `openRemoteRepository` for the command's lifetime. Explicit relative paths (`./` or `../`), absolute paths and drive paths stay local. A local-open failure never falls back to a remote. For example, `gitomic read 'file:///srv/state.git#main' note.md` needs no checkout in the current directory. Native Git handles the selected transport and its credentials. Cleanup failures produce a nonzero exit and diagnostics; a write may already have published, in which case its stdout receipt still identifies the landed commit.
+
 **Read verbs** open an immutable snapshot, pinned at `--at <oid>` or the tip:
 
 | verb                                                      | prints                                                               |
@@ -400,6 +417,6 @@ Three backends ship in v1:
 
 Run `bun run bench` to measure locally. On the development host the hardened 20-commit benchmark measured 9.56 commits/s for `shell` and 71.63 for `iso` (7.49×); absolute numbers depend heavily on filesystem and process-spawn cost.
 
-Planned: offline queue with replay on reconnect · field-level claims · multi-ref transactions · remote-only stores — open a URL, no local repo; the git wire protocol already does lazy reads (partial fetch) and CAS writes (push is old→new under the server's ref lock).
+Planned: offline queue with replay on reconnect · field-level claims · multi-ref transactions · lazy remote object fetching (URL opening currently creates a full bare clone).
 
 MIT © Bjørn Stabell

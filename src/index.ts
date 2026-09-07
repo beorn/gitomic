@@ -37,6 +37,7 @@ export { applyEdits } from "./edits.js"
 export type { Edit } from "./edits.js"
 export { matchGlob } from "./glob.js"
 export { createShellBackend } from "./shell.js"
+export { openRemoteRepository, type OpenedRemoteRepository } from "./repository.js"
 export { parseOwnershipManifest } from "./ownership-manifest.js"
 export type {
   BlobValue,

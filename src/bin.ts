@@ -9,16 +9,14 @@ import {
   matchGlob,
   open,
   openReader,
+  openRemoteRepository,
   type Committed,
   type CommitMeta,
   type Edit,
   type GitomicBackend,
   type Oid,
   type OpenOptions,
-  type OpenReaderOptions,
-  type Reader,
   type Snapshot,
-  type Store,
 } from "./index.js"
 import { decodeUtf8 } from "./utf8.js"
 
@@ -173,7 +171,8 @@ async function runRead(args: string[], stdout: CliWriter, backend: GitomicBacken
   const address = requirePositional(positionals, 0, "<address>")
   const path = requirePositional(positionals, 1, "<path>")
   const at: Oid | undefined = optionalStringFlag(flags, "--at")
-  const reader = await openReaderFor(address, backend)
+  using repository = openAddressFor(address, backend)
+  const reader = await openReader(repository)
   const value = await reader.at(at).get(path)
   if (value === undefined) throw new Error(`path not found: ${JSON.stringify(path)} at ${describeAddress(address, at)}`)
   stdout.write(value)
@@ -185,7 +184,8 @@ async function runLs(args: string[], stdout: CliWriter, backend: GitomicBackend 
   const address = requirePositional(positionals, 0, "<address>")
   const glob = positionals.at(1)
   const at: Oid | undefined = optionalStringFlag(flags, "--at")
-  const reader = await openReaderFor(address, backend)
+  using repository = openAddressFor(address, backend)
+  const reader = await openReader(repository)
   for (const key of await matchingKeys(reader.at(at), glob)) stdout.write(`${key}\n`)
   return OK
 }
@@ -202,7 +202,8 @@ async function runGrep(
   const glob = positionals.at(2)
   const at: Oid | undefined = optionalStringFlag(flags, "--at")
   const regex = compilePattern(pattern)
-  const reader = await openReaderFor(address, backend)
+  using repository = openAddressFor(address, backend)
+  const reader = await openReader(repository)
   const snapshot = reader.at(at)
   for (const path of await matchingKeys(snapshot, glob)) {
     let content: string | undefined
@@ -244,7 +245,8 @@ async function runLog(
     throw new UsageError("-n must be a positive integer no greater than 1024")
   }
   try {
-    const reader = await openReaderFor(address, backend)
+    using repository = openAddressFor(address, backend)
+    const reader = await openReader(repository)
     from ??= await reader.head()
     const history = await reader.log({ from, limit: glob === undefined ? limit : HISTORY_SCAN_LIMIT })
     let commits: CommitMeta[] = history
@@ -293,7 +295,8 @@ async function runDiff(args: string[], stdout: CliWriter, backend: GitomicBacken
   if (base === undefined) throw new UsageError("missing --base <oid>")
   let to = historyOidFlag(flags, "--at")
   try {
-    const reader = await openReaderFor(address, backend)
+    using repository = openAddressFor(address, backend)
+    const reader = await openReader(repository)
     to ??= await reader.head()
     const changes = (await reader.diff(base, to)).filter(({ path }) => glob === undefined || matchGlob(glob, path))
     stdout.write(
@@ -364,7 +367,8 @@ async function runWrite(
   assertTargetsKnown("--create", create, knownPaths, "written")
   for (const path of create) assertNotContradictoryPrecondition(path, expect.has(path), true)
 
-  const store = await openStoreFor(address, backend, writer)
+  using repository = openAddressFor(address, backend)
+  const store = await open({ ...repository, ...(writer === undefined ? {} : { writer }) })
   const base = await store.head()
   const snapshot = store.at(base)
   const edits: Edit[] = []
@@ -399,7 +403,8 @@ async function runRm(args: string[], stdout: CliWriter, backend: GitomicBackend 
   const expect = parseExpectPairs(repeated.get("--expect") ?? [])
   assertTargetsKnown("--expect", expect.keys(), seen, "removed")
 
-  const store = await openStoreFor(address, backend, writer)
+  using repository = openAddressFor(address, backend)
+  const store = await open({ ...repository, ...(writer === undefined ? {} : { writer }) })
   const base = await store.head()
   const snapshot = store.at(base)
   const edits: Edit[] = []
@@ -421,7 +426,8 @@ async function runMv(args: string[], stdout: CliWriter, backend: GitomicBackend 
   const message = requireStringFlag(flags, "-m", "-m <message>")
   const writer = optionalStringFlag(flags, "--writer")
 
-  const store = await openStoreFor(address, backend, writer)
+  using repository = openAddressFor(address, backend)
+  const store = await open({ ...repository, ...(writer === undefined ? {} : { writer }) })
   const base = await store.head()
   const expect = await store.at(base).oid(from)
   if (expect === undefined) throw new Error(`source path not found: ${JSON.stringify(from)} at ${address}`)
@@ -471,7 +477,8 @@ async function runApply(
   }
   if (message === undefined) throw new UsageError("missing -m <message>")
 
-  const store = await openStoreFor(address, backend, writer)
+  using repository = openAddressFor(address, backend)
+  const store = await open({ ...repository, ...(writer === undefined ? {} : { writer }) })
   const startBase = base ?? (await store.head())
   const snapshot = store.at(startBase)
   const edits: Edit[] = []
@@ -804,23 +811,16 @@ async function readFileContent(file: string): Promise<string> {
 
 // --- opening the address ---------------------------------------------------
 
-async function openReaderFor(address: string, backend: GitomicBackend | undefined): Promise<Reader> {
+/** One CLI selection point; a failed local open never selects a remote. */
+function openAddressFor(address: string, backend: GitomicBackend | undefined): OpenOptions & Disposable {
   const { repo, ref } = parseAddressOrUsageError(address)
-  const options: OpenReaderOptions = { repo, ref }
-  if (backend !== undefined) options.backend = backend
-  return openReader(options)
-}
-
-async function openStoreFor(
-  address: string,
-  backend: GitomicBackend | undefined,
-  writer: string | undefined,
-): Promise<Store> {
-  const { repo, ref } = parseAddressOrUsageError(address)
-  const options: OpenOptions = { repo, ref }
-  if (backend !== undefined) options.backend = backend
-  if (writer !== undefined) options.writer = writer
-  return open(options)
+  const local = { repo, ref, ...(backend === undefined ? {} : { backend }), [Symbol.dispose]() {} }
+  if (backend !== undefined) return local
+  const drivePath = /^[A-Za-z]:[\\\\/]/.test(repo)
+  const remote = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(repo) || (!drivePath && /^[^/\\\\:]+:/.test(repo))
+  if (!remote) return local
+  const repository = openRemoteRepository(repo)
+  return { ...repository, ref, [Symbol.dispose]: () => repository[Symbol.dispose]() }
 }
 
 function parseAddressOrUsageError(address: string): Address {
@@ -849,6 +849,24 @@ function formatEditDoesNotApply(error: EditDoesNotApply): string {
   )
 }
 
+/** Preserve the standard combined-error shapes, including contextual history wrappers. */
+function describeFailure(error: unknown): string {
+  if (!(error instanceof Error)) return String(error)
+  if (error instanceof AggregateError) return [error.message, ...error.errors.map(describeFailure)].join("\n")
+  // TypeScript can supply a SuppressedError polyfill on Node versions without
+  // the global constructor, so use its standard Error shape rather than instanceof.
+  if (error.name === "SuppressedError" && "error" in error && "suppressed" in error) {
+    return [error.message, describeFailure(error.error), describeFailure(error.suppressed)].join("\n")
+  }
+  if (
+    error.cause instanceof Error &&
+    (error.cause instanceof AggregateError || error.cause.name === "SuppressedError")
+  ) {
+    return `${error.message}\n${describeFailure(error.cause)}`
+  }
+  return error.message
+}
+
 function reportError(error: unknown, stderr: CliWriter): number {
   if (error instanceof UsageError) {
     stderr.write(`gitomic: ${error.message}\n`)
@@ -858,7 +876,7 @@ function reportError(error: unknown, stderr: CliWriter): number {
     stderr.write(formatEditDoesNotApply(error))
     return PRECONDITION_REFUSED
   }
-  stderr.write(`gitomic: ${error instanceof Error ? error.message : String(error)}\n`)
+  stderr.write(`gitomic: ${describeFailure(error)}\n`)
   return RUNTIME_ERROR
 }
 

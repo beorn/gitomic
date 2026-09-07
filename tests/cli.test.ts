@@ -3,11 +3,15 @@
 // @consumer file-level-door CLI users — any agent or script reading and writing one repo by address, with no checkout
 
 import { Buffer } from "node:buffer"
+import childProcess, { execFile } from "node:child_process"
+import fs from "node:fs"
 import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { fileURLToPath, pathToFileURL } from "node:url"
+import { promisify } from "node:util"
 
-import { afterEach, beforeEach, describe, expect, test } from "vitest"
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest"
 
 import { main } from "../src/bin.js"
 import { objectOid } from "../src/git-object.js"
@@ -67,6 +71,115 @@ async function writeOne(
   const file = await fileWith(path.replaceAll("/", "_"), content)
   return run(backend, ["write", ADDRESS, "-m", `write ${path}`, ...extra, `${path}=${file}`])
 }
+
+describe("gitomic CLI — remote opening", () => {
+  test("writes and reads from an unrelated process cwd using only a file URL", async () => {
+    const fixture = await createBareRepo()
+    try {
+      const address = `${pathToFileURL(fixture.repo).href}#main`
+      const file = await fileWith("input.md", "from a URL\n")
+      const scratch = join(workdir, "owned-tmp")
+      fs.mkdirSync(scratch)
+      // Exercise the source CLI with its TypeScript runtime, independently of
+      // whether the enclosing Vitest process runs on Node or Bun.
+      const invoke = (args: string[]) =>
+        promisify(execFile)("bun", [fileURLToPath(new URL("../src/bin.ts", import.meta.url)), ...args], {
+          cwd: workdir,
+          env: { ...process.env, TMPDIR: scratch, GIT_TERMINAL_PROMPT: "0" },
+          encoding: "utf8",
+        })
+      const write = await invoke(["write", address, "-m", "URL write", "--json", `note.md=${file}`])
+      expect(write.stderr).toBe("")
+      expect(JSON.parse(write.stdout)).toMatchObject({ oid: await git(fixture.repo, "rev-parse", "main"), retries: 0 })
+      expect(await invoke(["read", address, "note.md"])).toMatchObject({ stdout: "from a URL\n", stderr: "" })
+      expect(fs.readdirSync(scratch)).toEqual([])
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  test("an injected backend owns even URL-shaped repository names", async () => {
+    const backend = createMemBackend()
+    const address = "file:///must-not-be-cloned#main"
+    const store = await open({ repo: "file:///must-not-be-cloned", ref: "main", backend })
+    await store.transact(async (map) => map.set("note", "virtual"), "seed")
+    expect(await run(backend, ["read", address, "note"])).toEqual({ code: 0, stdout: "virtual", stderr: "" })
+  })
+
+  test("both clone and cleanup failures reach stderr and a nonzero exit", async () => {
+    const source = pathToFileURL(join(workdir, "missing.git")).href
+    const stdout = capture()
+    const stderr = capture()
+    const remove = vi.spyOn(fs, "rmSync").mockImplementationOnce(() => {
+      throw new Error("cleanup denied")
+    })
+    try {
+      const code = await main(["read", `${source}#main`, "note"], { stdout, stderr })
+      expect(code).toBe(1)
+      expect(stdout.text()).toBe("")
+      for (const fact of [source, "git clone", "cleanup denied"]) expect(stderr.text()).toContain(fact)
+    } finally {
+      const parents = remove.mock.calls.map(([path]) => path)
+      remove.mockRestore()
+      for (const parent of parents) fs.rmSync(parent, { recursive: true, force: true })
+    }
+  })
+
+  test("an operation failure and disposal failure both survive using and history context", async () => {
+    const fixture = await createBareRepo()
+    const source = pathToFileURL(fixture.repo).href
+    try {
+      for (const args of [
+        ["read", source, "missing-note"],
+        ["log", source, "--at", "0".repeat(40)],
+      ]) {
+        const stdout = capture()
+        const stderr = capture()
+        const remove = vi.spyOn(fs, "rmSync").mockImplementationOnce(() => {
+          throw new Error("cleanup denied")
+        })
+        try {
+          expect(await main(args, { stdout, stderr })).toBe(1)
+          expect(stdout.text()).toBe("")
+          expect(stderr.text()).toContain(args[0] === "read" ? "missing-note" : "0".repeat(40))
+          expect(stderr.text()).toContain("cleanup denied")
+        } finally {
+          const parents = remove.mock.calls.map(([path]) => path)
+          remove.mockRestore()
+          for (const parent of parents) fs.rmSync(parent, { recursive: true, force: true })
+        }
+      }
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  test.each([
+    ["file:///absent/repo", true],
+    ["https://example.invalid/repo", true],
+    ["git@example.invalid:repo", true],
+    ["host:repo", true],
+    ["./host:repo", false],
+    ["../host:repo", false],
+    ["/absent/host:repo", false],
+    ["C:\\absent\\repo", false],
+    ["C:/absent/repo", false],
+    ["absent/repo", false],
+  ] as const)("address %s selects remote=%s by syntax alone", async (address, remote) => {
+    const clone = vi.spyOn(childProcess, "execFileSync").mockImplementation(() => {
+      throw new Error("selected clone")
+    })
+    const stdout = capture()
+    const stderr = capture()
+    try {
+      expect(await main(["read", address, "note"], { stdout, stderr })).toBe(1)
+      expect(clone.mock.calls.some(([, args]) => Array.isArray(args) && args.includes("clone"))).toBe(remote)
+      expect(stdout.text()).toBe("")
+    } finally {
+      clone.mockRestore()
+    }
+  })
+})
 
 describe("gitomic CLI — read verbs", () => {
   test("read prints a path's exact content", async () => {
