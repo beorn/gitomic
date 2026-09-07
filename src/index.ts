@@ -236,13 +236,15 @@ function makeSnapshot(
   commit?: Oid,
   resolveCurrent: () => Promise<Oid> = async () => backendOid(await context.backend.head(context.repo, context.ref)),
 ): Snapshot {
-  const pinned = commit === undefined ? resolveCurrent().then(backendOid) : Promise.resolve(validateOid(commit))
+  const pinned = (commit === undefined ? resolveCurrent().then(backendOid) : Promise.resolve(validateOid(commit))).then(
+    (oid) => ({ oid, algorithm: oid.length === 64 ? ("sha256" as const) : ("sha1" as const) }),
+  )
   const loads = new Map<string, Promise<ReadonlyMap<string, BlobValue>>>()
   const load = (prefix: string): Promise<ReadonlyMap<string, BlobValue>> => {
     for (const [loadedPrefix, files] of loads) {
       if (prefix.startsWith(loadedPrefix)) return files
     }
-    const files = pinned.then(async (oid) => {
+    const files = pinned.then(async ({ oid }) => {
       try {
         const scoped = checkedFiles(
           await context.backend.readFiles(context.repo, oid, prefix === "" ? undefined : prefix),
@@ -275,7 +277,11 @@ function makeSnapshot(
       // readValue — so it answers for a binary blob `get` would refuse to
       // decode. A string round-trips to its UTF-8 bytes (gitomic's write
       // guarantee), which is exactly the blob `apply`'s `expect` compares.
-      return objectOid("blob", typeof value === "string" ? Buffer.from(value, "utf8") : Buffer.from(value))
+      return objectOid(
+        "blob",
+        typeof value === "string" ? Buffer.from(value, "utf8") : Buffer.from(value),
+        (await pinned).algorithm,
+      )
     },
     async has(path) {
       const normalized = normalizePath(path)

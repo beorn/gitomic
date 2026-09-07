@@ -19,9 +19,9 @@ export type GitTreeObjectEntry = {
   oid: Oid
 }
 
-export function objectOid(type: GitObject["type"], content: Buffer): Oid {
+export function objectOid(type: GitObject["type"], content: Buffer, algorithm: "sha1" | "sha256" = "sha1"): Oid {
   const header = Buffer.from(`${type} ${content.length}\0`, "utf8")
-  return createHash("sha1").update(header).update(content).digest("hex")
+  return createHash(algorithm).update(header).update(content).digest("hex")
 }
 
 export function encodeBlob(content: Buffer): GitObject {

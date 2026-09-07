@@ -9,10 +9,10 @@ import { delimiter, join } from "node:path"
 
 import { describe, expect, test } from "vitest"
 
-import { createShellBackend, open } from "../src/index.js"
+import { apply, createShellBackend, open } from "../src/index.js"
 import type { GitomicBackend } from "../src/index.js"
 import { isRemoteCompareAndSwapRejection } from "../src/shell.js"
-import { appendEmptyHistory, createBareRepo, git } from "./helpers/git.js"
+import { appendEmptyHistory, createBareRepo, git, gitWithInput } from "./helpers/git.js"
 
 const TRANSACTION_SEARCH_LIMIT = 1_024
 const gitInitHelp = spawnSync("git", ["init", "-h"], { encoding: "utf8" })
@@ -197,6 +197,86 @@ describe.sequential("shell backend failure boundaries", () => {
       const removed = await store.transact(async (map) => map.delete("value"), "delete SHA-256 state")
       expect(removed.oid).toMatch(/^[0-9a-f]{64}$/)
       expect(await store.at().has("value")).toBe(false)
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  test.each(["sha1", "sha256"] as const)(
+    "snapshot oids match native %s Git for text and binary bytes",
+    async (objectFormat) => {
+      const fixture = await createBareRepo({ objectFormat })
+      try {
+        // Native Git supplies the independent identity oracle, including bytes
+        // that Snapshot.get cannot decode. The mem-only oid tests cannot prove it.
+        const textOid = await gitWithInput(fixture.repo, "native text\n", "hash-object", "-w", "--stdin")
+        const binaryOid = await gitWithInput(
+          fixture.repo,
+          Uint8Array.of(0xff, 0xfe, 0x00, 0x80),
+          "hash-object",
+          "-w",
+          "--stdin",
+        )
+        const tree = await gitWithInput(
+          fixture.repo,
+          `100644 blob ${textOid}\ttext\n100644 blob ${binaryOid}\tbinary\n`,
+          "mktree",
+        )
+        const commit = await git(fixture.repo, "commit-tree", tree, "-p", fixture.initial, "-m", "native blobs")
+        const store = await open({ repo: fixture.repo, ref: "main", writer: "native-oids" })
+        const snapshot = store.at(commit)
+
+        expect.soft(await snapshot.oid("text")).toBe(textOid)
+        expect.soft(await snapshot.oid("binary")).toBe(binaryOid)
+        await expect(snapshot.get("binary")).rejects.toThrow("valid UTF-8")
+        expect(await snapshot.oid("missing")).toBeUndefined()
+      } finally {
+        await fixture.cleanup()
+      }
+    },
+  )
+
+  test.each(["sha1", "sha256"] as const)("apply accepts native %s anchors for put, mv and rm", async (objectFormat) => {
+    const fixture = await createBareRepo({ objectFormat })
+    try {
+      const store = await open({ repo: fixture.repo, ref: "main", writer: "native-apply" })
+      const written = await store.transact(async (map) => map.set("value", "before\n"), "seed native anchor")
+      const beforeOid = await git(fixture.repo, "rev-parse", `${written.oid}:value`)
+      // The attempted head selects the hash, never the expectation's format.
+      await expect(
+        apply(
+          store,
+          written.oid,
+          [{ kind: "put", path: "value", content: "wrong\n", expect: "0".repeat(objectFormat === "sha256" ? 40 : 64) }],
+          "refuse wrong-format anchor",
+        ),
+      ).rejects.toMatchObject({ code: "edit-does-not-apply", actual: beforeOid, head: written.oid })
+      expect(await store.head()).toBe(written.oid)
+      // A native anchor must work independently of Snapshot.oid; matching
+      // read-side and write-side mistakes must not make this control green.
+      const replaced = await apply(
+        store,
+        written.oid,
+        [{ kind: "put", path: "value", content: "after\n", expect: beforeOid }],
+        "replace native anchor",
+      )
+      expect(await store.at(replaced.oid).get("value")).toBe("after\n")
+      const afterOid = await git(fixture.repo, "rev-parse", `${replaced.oid}:value`)
+      const moved = await apply(
+        store,
+        replaced.oid,
+        [{ kind: "mv", from: "value", to: "moved", expect: afterOid }],
+        "move native anchor",
+      )
+      expect(await git(fixture.repo, "rev-parse", `${moved.oid}:moved`)).toBe(afterOid)
+      expect(await store.at(moved.oid).has("value")).toBe(false)
+      const removed = await apply(
+        store,
+        moved.oid,
+        [{ kind: "rm", path: "moved", expect: afterOid }],
+        "remove native anchor",
+      )
+      expect(await store.at(removed.oid).has("moved")).toBe(false)
     } finally {
       await fixture.cleanup()
     }

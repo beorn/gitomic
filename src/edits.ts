@@ -1,4 +1,4 @@
-import { objectOid } from "./git-object.js"
+import { objectOid, validateOid } from "./git-object.js"
 import { EditDoesNotApply } from "./errors.js"
 import type { GitMap, Oid } from "./types.js"
 
@@ -18,8 +18,8 @@ export type Edit =
   | { readonly kind: "mv"; readonly from: string; readonly to: string; readonly expect: Oid }
 
 /** The git blob oid of some content, or `null` when the path is absent. */
-function blobOid(content: string | undefined): Oid | null {
-  return content === undefined ? null : objectOid("blob", Buffer.from(content, "utf8"))
+function blobOid(content: string | undefined, algorithm: "sha1" | "sha256"): Oid | null {
+  return content === undefined ? null : objectOid("blob", Buffer.from(content, "utf8"), algorithm)
 }
 
 /**
@@ -36,6 +36,7 @@ function blobOid(content: string | undefined): Oid | null {
  * holding and both writers land.
  */
 export async function applyEdits(map: GitMap, base: Oid, head: Oid, edits: readonly Edit[]): Promise<void> {
+  const algorithm = validateOid(head).length === 64 ? "sha256" : "sha1"
   for (const [index, edit] of edits.entries()) {
     switch (edit.kind) {
       case "append": {
@@ -44,7 +45,7 @@ export async function applyEdits(map: GitMap, base: Oid, head: Oid, edits: reado
         break
       }
       case "put": {
-        const current = blobOid(await map.get(edit.path))
+        const current = blobOid(await map.get(edit.path), algorithm)
         if (current !== edit.expect) {
           throw new EditDoesNotApply(
             index,
@@ -62,7 +63,7 @@ export async function applyEdits(map: GitMap, base: Oid, head: Oid, edits: reado
         break
       }
       case "rm": {
-        const current = blobOid(await map.get(edit.path))
+        const current = blobOid(await map.get(edit.path), algorithm)
         if (current !== edit.expect) {
           throw new EditDoesNotApply(
             index,
@@ -81,7 +82,7 @@ export async function applyEdits(map: GitMap, base: Oid, head: Oid, edits: reado
       }
       case "mv": {
         const source = await map.get(edit.from)
-        const sourceOid = blobOid(source)
+        const sourceOid = blobOid(source, algorithm)
         if (sourceOid !== edit.expect) {
           throw new EditDoesNotApply(
             index,
@@ -95,7 +96,7 @@ export async function applyEdits(map: GitMap, base: Oid, head: Oid, edits: reado
             head,
           )
         }
-        const destinationOid = blobOid(await map.get(edit.to))
+        const destinationOid = blobOid(await map.get(edit.to), algorithm)
         if (destinationOid !== null) {
           throw new EditDoesNotApply(
             index,
