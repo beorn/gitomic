@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto"
 
 import { applyEdits, type Edit } from "./edits.js"
 import { Conflict, EditDoesNotApply, RetriesExhausted } from "./errors.js"
-import { objectOid, validateOid } from "./git-object.js"
+import { cloneCommitProvenance, objectOid, validateOid } from "./git-object.js"
 import {
   assertGitPrefixMatched,
   assertTreeShape,
@@ -15,6 +15,7 @@ import { createShellBackend } from "./shell.js"
 import type {
   BlobValue,
   Change,
+  CommitProvenance,
   CommitMeta,
   Committed,
   GitMap,
@@ -43,6 +44,7 @@ export { parseOwnershipManifest } from "./ownership-manifest.js"
 export type {
   BlobValue,
   Change,
+  CommitProvenance,
   CommitMeta,
   Committed,
   CommitInput,
@@ -66,7 +68,17 @@ export async function open(options: OpenOptions): Promise<Store> {
   return {
     head: async () => backendOid(await context.backend.head(context.repo, context.ref)),
     at: (commit) => makeSnapshot(context, commit),
-    transact: (update, message) => enqueue(async () => transact(context, update, message)),
+    transact: (update, message, options) => {
+      // Capture the per-call scalar before enqueueing: a later transaction can
+      // otherwise observe an options object the caller mutated after submit.
+      let provenance: CommitProvenance | undefined
+      try {
+        provenance = cloneCommitProvenance(options?.provenance)
+      } catch (error) {
+        return Promise.reject(error)
+      }
+      return enqueue(async () => transact(context, update, message, provenance))
+    },
   }
 }
 
@@ -208,7 +220,12 @@ async function prepareReader(options: OpenReaderOptions): Promise<ReaderContext>
   return { repo, ref, backend, refresh }
 }
 
-async function transact(context: StoreContext, update: Update, message: string): Promise<Committed> {
+async function transact(
+  context: StoreContext,
+  update: Update,
+  message: string,
+  provenance?: CommitProvenance,
+): Promise<Committed> {
   if (typeof message !== "string" || message.trim().length === 0) {
     throw new TypeError("message must say why this transaction exists")
   }
@@ -242,6 +259,7 @@ async function transact(context: StoreContext, update: Update, message: string):
         writer: context.writer,
         instance: context.instance,
         seq,
+        ...(provenance === undefined ? {} : { provenance }),
       }),
     )
     if (await context.publish(next, parent)) return { oid: next, retries }

@@ -156,7 +156,7 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
       tree,
       parent: input.parent,
       timestamp,
-      message: formatCommitMessage(input.writer, input.instance, input.message, input.seq),
+      message: formatCommitMessage(input.writer, input.instance, input.message, input.seq, input.provenance),
     })
     objects.set(commit.oid, commit)
     // Durably written but unreferenced until the publish adopts it. No pin ref

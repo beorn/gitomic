@@ -332,7 +332,7 @@ async function writeCommit(repo: string, input: CommitInput): Promise<Oid> {
     return text(
       await gitWrite(repo, ["commit-tree", tree, "-p", input.parent], {
         env: identityEnv,
-        input: formatCommitMessage(input.writer, input.instance, input.message, input.seq),
+        input: formatCommitMessage(input.writer, input.instance, input.message, input.seq, input.provenance),
       }),
     )
   } finally {

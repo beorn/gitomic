@@ -85,7 +85,7 @@ export function createMemBackend(): GitomicBackend {
       tree: tree.oid,
       parent: parent.oid,
       timestamp,
-      message: formatCommitMessage(input.writer, input.instance, input.message, input.seq),
+      message: formatCommitMessage(input.writer, input.instance, input.message, input.seq, input.provenance),
     })
     repo.commits.set(commit.oid, {
       oid: commit.oid,

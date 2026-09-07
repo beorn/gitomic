@@ -91,13 +91,16 @@ const store = await open({
 
 type Update = (map: GitMap, base: string) => Promise<void>
 type Committed = { oid: string; retries: number }
+type CommitProvenance = { readonly actor: string; readonly session: string; readonly generation: number; readonly run?: string }
 
 store.head(): Promise<string>            // newest commit id
 store.at(commit?: string): Snapshot      // read-only view there — lazy
-store.transact(fn: Update, message: string): Promise<Committed>
+store.transact(fn: Update, message: string, options?: { readonly provenance?: CommitProvenance }): Promise<Committed>
 ```
 
 `transact` runs your update function and lands its writes as one commit, re-running it if another writer got there first. `message` is required — it becomes the commit message; say why, not what. The update function's second argument, `base`, is the commit oid it is running against on this attempt — a fresh tip on every re-run — so a precondition check can name the exact commit it refused on.
+
+Callers with independently verified original attribution may provide it as per-call `provenance`. Gitomic records its scalar fields in commit trailers, fixed through every retry; it never infers them from a writer label, process, environment, or store. This metadata is an audit record, never authority to write.
 
 ### Who wrote it
 

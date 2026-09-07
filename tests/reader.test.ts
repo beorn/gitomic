@@ -91,6 +91,7 @@ describe("read-only reader", () => {
         writer: null,
         instance: null,
         seq: null,
+        provenance: null,
         timestamp: 946_684_800,
       },
     ])

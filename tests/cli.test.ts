@@ -307,6 +307,7 @@ describe("gitomic CLI — history reads", () => {
       writer: "history",
       instance: expect.any(String),
       seq: 0,
+      provenance: null,
       timestamp: 946_684_801,
       message: expect.stringMatching(/^history: first\n\nfull body\n\nGitomic-Writer: history\n/),
     })
@@ -316,6 +317,7 @@ describe("gitomic CLI — history reads", () => {
       writer: null,
       instance: null,
       seq: null,
+      provenance: null,
       message: "initial\n",
       timestamp: 946_684_800,
     })
@@ -445,6 +447,7 @@ describe("gitomic CLI — history reads", () => {
           writer: null,
           instance: null,
           seq: null,
+          provenance: null,
           timestamp: 946_684_800,
         },
       ])
