@@ -5,17 +5,19 @@
 // @consumer concurrent agents applying edits to the same repo with no checkout
 
 import { execFile } from "node:child_process"
+import { once } from "node:events"
 import { mkdtemp, readdir, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { fileURLToPath } from "node:url"
+import { fileURLToPath, pathToFileURL } from "node:url"
+import { createInterface } from "node:readline"
 import { Buffer } from "node:buffer"
 import { performance } from "node:perf_hooks"
 import { promisify } from "node:util"
 
 import { describe, expect, test } from "vitest"
 
-import { apply, EditDoesNotApply, open } from "../src/index.js"
+import { apply, EditDoesNotApply, open, openRemoteRepository } from "../src/index.js"
 import type { Committed } from "../src/index.js"
 import { objectOid } from "../src/git-object.js"
 import { createIsoBackend } from "../src/iso.js"
@@ -341,16 +343,114 @@ describe("apply with no checkout (K1)", () => {
   })
 })
 
+describe("apply from separate processes (K2)", () => {
+  test("two URL-only processes publish disjoint edits from one base through separately owned object repos", async () => {
+    const fixture = await createBareRepo()
+    const dirs: string[] = []
+    const jobs: ReturnType<typeof execFileAsync>[] = []
+    try {
+      const url = pathToFileURL(fixture.repo).href
+      const indexPath = fileURLToPath(new URL("../src/index.ts", import.meta.url))
+      dirs.push(...(await Promise.all(["a", "b"].map(() => mkdtemp(join(tmpdir(), "gitomic-k2-process-"))))))
+      const ready = []
+      for (const [index, name] of ["a", "b"].entries()) {
+        const cwd = dirs[index]!
+        const script = [
+          `const { open, apply, openRemoteRepository } = await import(${JSON.stringify(indexPath)})`,
+          `using repository = openRemoteRepository(${JSON.stringify(url)})`,
+          `const store = await open({ ...repository, ref: "main", writer: ${JSON.stringify(name)} })`,
+          "const base = await store.head()",
+          'process.stdout.write(JSON.stringify({ pid: process.pid, repo: repository.repo, cwd: process.cwd(), base }) + "\\n")',
+          'await new Promise(resolve => process.stdin.once("data", resolve))',
+          "process.stdin.destroy()",
+          "const startedAt = Date.now()",
+          `const committed = await apply(store, base, [{ kind: "put", path: "${name}.md", content: "from ${name}\\n", expect: null }], "K2 writer ${name}")`,
+          'process.stdout.write(JSON.stringify({ oid: committed.oid, retries: committed.retries, startedAt }) + "\\n")',
+        ].join("\n")
+        const job = execFileAsync("bun", ["-e", script], {
+          cwd,
+          encoding: "utf8",
+          env: { ...process.env, TMPDIR: cwd },
+          timeout: 30_000,
+        })
+        jobs.push(job)
+        if (job.child.stdout === null) throw new Error("K2 child stdout is missing")
+        const lines = createInterface({ input: job.child.stdout })
+        ready.push(
+          Promise.race([
+            once(lines, "line").then(
+              ([line]) =>
+                JSON.parse(String(line)) as {
+                  pid: number
+                  repo: string
+                  cwd: string
+                  base: string
+                },
+            ),
+            job.then(() => {
+              throw new Error(`K2 writer ${name} exited without its ready witness`)
+            }),
+          ]).finally(() => lines.close()),
+        )
+      }
+
+      // Both processes have read the same remote base before either may write.
+      // This start barrier coordinates only the experiment, never publication.
+      const witnesses = await Promise.all(ready)
+      expect(witnesses.map((witness) => witness.base)).toEqual([fixture.initial, fixture.initial])
+      expect(witnesses.map((witness) => witness.cwd)).toEqual(dirs)
+      expect(new Set(witnesses.map((witness) => witness.pid))).toHaveLength(2)
+      expect(witnesses.every((witness) => witness.pid !== process.pid)).toBe(true)
+      expect(new Set(witnesses.map((witness) => witness.repo))).toHaveLength(2)
+      for (const witness of witnesses) {
+        expect(witness.repo).not.toBe(fixture.repo)
+        expect(await git(witness.repo, "rev-parse", "--is-bare-repository")).toBe("true")
+      }
+      for (const job of jobs) {
+        if (job.child.stdin === null) throw new Error("K2 child stdin is missing")
+        job.child.stdin.end("start\n")
+      }
+      const results = await Promise.all(jobs)
+      const commits = results.map(({ stdout }) => {
+        const lines = stdout.toString().trim().split("\n")
+        expect(lines).toHaveLength(2)
+        return JSON.parse(lines[1]!) as { oid: string; retries: number; startedAt: number }
+      })
+      expect(Math.abs(commits[0]!.startedAt - commits[1]!.startedAt)).toBeLessThan(1000)
+
+      // Native remote facts are independent of each process's local receipt.
+      const history = (await git(fixture.repo, "rev-list", "--parents", "main")).split("\n")
+      expect(history).toHaveLength(3)
+      expect(new Set(commits.map((commit) => commit.oid))).toHaveLength(2)
+      expect(new Set(history.slice(0, 2).map((line) => line.split(" ")[0]))).toEqual(
+        new Set(commits.map((commit) => commit.oid)),
+      )
+      expect(history[0]!.split(" ")[1]).toBe(history[1]!.split(" ")[0])
+      expect(history[1]!.split(" ")[1]).toBe(fixture.initial)
+      expect(history[2]).toBe(fixture.initial)
+      assertStrictlyLinear(history.join("\n"))
+      expect(await git(fixture.repo, "show", "main:a.md")).toBe("from a")
+      expect(await git(fixture.repo, "show", "main:b.md")).toBe("from b")
+      expect(await git(fixture.repo, "show", `${commits[0]!.oid}:a.md`)).toBe("from a")
+      expect(await git(fixture.repo, "show", `${commits[1]!.oid}:b.md`)).toBe("from b")
+      for (const witness of witnesses) await expect(readdir(witness.repo)).rejects.toMatchObject({ code: "ENOENT" })
+      for (const cwd of dirs) expect(await readdir(cwd)).toEqual([])
+      console.log(`K2 processes: ${JSON.stringify({ witnesses, commits })}`)
+    } finally {
+      for (const job of jobs) if (job.child.exitCode === null) job.child.kill()
+      await Promise.allSettled(jobs)
+      for (const cwd of dirs) await rm(cwd, { recursive: true, force: true })
+      await fixture.cleanup()
+    }
+  }, 40_000)
+})
+
 describe("apply at scale (K2 at fleet scale, F14)", () => {
   test("fifty concurrent disjoint-path writers each land exactly once, in one strictly-linear history, none lost", async () => {
     const fixture = await createBareRepo()
     try {
       const writerCount = 50
-      const writers = await Promise.all(
-        Array.from({ length: writerCount }, (_, index) =>
-          open({ repo: fixture.repo, ref: "main", writer: `scale-${index}` }),
-        ),
-      )
+      const url = pathToFileURL(fixture.repo).href
 
       // transact owns contention now — a time budget, not a counter — so there is
       // NO outer retry loop: each writer applies exactly once and transact keeps
@@ -359,9 +459,11 @@ describe("apply at scale (K2 at fleet scale, F14)", () => {
       // disjoint blob-absent preconditions hold on whatever tip each attempt sees,
       // so all fifty land.
       const started = performance.now()
-      const results = await Promise.all(
-        writers.map((store, index) =>
-          apply(
+      const settled = await Promise.allSettled(
+        Array.from({ length: writerCount }, async (_, index) => {
+          using repository = openRemoteRepository(url)
+          const store = await open({ ...repository, ref: "main", writer: `scale-${index}` })
+          return await apply(
             store,
             fixture.initial,
             [
@@ -373,14 +475,25 @@ describe("apply at scale (K2 at fleet scale, F14)", () => {
               },
             ],
             `writer ${index} lands`,
-          ),
-        ),
+          )
+        }),
       )
+      const failures = settled.filter((result) => result.status === "rejected")
+      if (failures.length > 0) {
+        throw new AggregateError(
+          failures.map((result) => result.reason),
+          "K2 remote writers failed",
+        )
+      }
+      const results = settled.map((result) => {
+        if (result.status !== "fulfilled") throw new Error("K2 settlement unexpectedly missing a commit")
+        return result.value
+      })
       const elapsedMs = performance.now() - started
       const maxRetries = Math.max(...results.map((committed) => committed.retries))
       // Published per the design's F14 scale line: the observed numbers, not asserted.
       console.log(
-        `K2 at scale: ${writerCount} concurrent disjoint-path writers landed in ${elapsedMs.toFixed(0)}ms ` +
+        `K2 remote scale: ${writerCount} concurrent URL-owned writers opened, landed and disposed in ${elapsedMs.toFixed(0)}ms ` +
           `(max ${maxRetries} CAS retries on one writer)`,
       )
 
