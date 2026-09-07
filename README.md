@@ -168,6 +168,8 @@ const changes = await reader.diff(olderRevision, revision)
 
 **`remote`:** origin becomes the decider. Every write is one fetch/push cycle under the remote's ref lock; the push is a compare-and-swap (`--force-with-lease`), never a history rewrite, so it either fast-forwards or triggers a re-run. The local ref is then a cache of origin: reads stay local and lag until the next fetch, and an unpushed local-only tip may be replaced by origin's tip. Do not point it at a ref that carries unrelated local work. Origin is, honestly, your server; leave it out for purely local stores.
 
+**Parsing an address.** `parseAddress("repo#ref")` returns an `Address` containing `{ repo, ref }`, splitting at the first `#`. Without `#`, the ref defaults to `main` (or the optional second argument); empty halves throw. Parsing performs no I/O or transport validation.
+
 **Opening from a URL.** `openRemoteRepository(source)` synchronously creates a temporary bare clone through native Git. A filesystem source is also cloned; calling this function explicitly requests remote isolation.
 
 ```ts

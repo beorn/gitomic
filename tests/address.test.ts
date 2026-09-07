@@ -4,9 +4,16 @@
 
 import { describe, expect, test } from "vitest"
 
-import { parseAddress } from "../src/address.js"
+import { parseAddress, type Address } from "gitomic"
+import { parseAddress as canonicalParser } from "../src/address.js"
 
 describe("parseAddress — <repo>#<ref>", () => {
+  test("the public package exports the canonical parser and Address contract", () => {
+    expect(parseAddress).toBe(canonicalParser)
+    const address: Address = parseAddress("repo#main")
+    expect(address).toEqual({ repo: "repo", ref: "main" })
+  })
+
   test("splits a repo and ref on the first #", () => {
     expect(parseAddress("repo#ref")).toEqual({ repo: "repo", ref: "ref" })
     expect(parseAddress("/hh/pm#main")).toEqual({ repo: "/hh/pm", ref: "main" })
