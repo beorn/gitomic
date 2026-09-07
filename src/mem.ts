@@ -3,14 +3,17 @@ import {
   encodeFiles,
   formatCommitMessage,
   INITIAL_TIMESTAMP,
+  parseCommit,
   TRANSACTION_SEARCH_LIMIT,
   transactionLookupExceeded,
+  validateOid,
 } from "./git-object.js"
 import type { CommitInput, GitomicBackend, Oid } from "./types.js"
 import { assertGitPrefixMatched, normalizePrefix } from "./path.js"
 
 type MemCommit = {
   oid: Oid
+  content: Uint8Array
   parent?: Oid
   timestamp: number
   instance?: string
@@ -29,6 +32,7 @@ function createInitialCommit(): MemCommit {
   const commit = encodeCommit({ tree: tree.oid, timestamp: INITIAL_TIMESTAMP, message: "initial\n" })
   return {
     oid: commit.oid,
+    content: commit.content,
     timestamp: INITIAL_TIMESTAMP,
     files,
   }
@@ -85,6 +89,7 @@ export function createMemBackend(): GitomicBackend {
     })
     repo.commits.set(commit.oid, {
       oid: commit.oid,
+      content: commit.content,
       parent: parent.oid,
       timestamp,
       instance: input.instance,
@@ -126,6 +131,12 @@ export function createMemBackend(): GitomicBackend {
 
   const backend: GitomicBackend = {
     head,
+    readCommit: async (name, oid) => {
+      validateOid(oid)
+      const found = getRepo(name).commits.get(oid)
+      if (found === undefined) throw new Error(`cannot read commit ${oid} in ${JSON.stringify(name)}: unknown commit`)
+      return parseCommit(oid, found.content)
+    },
     readFiles,
     writeCommit,
     compareAndSwap,

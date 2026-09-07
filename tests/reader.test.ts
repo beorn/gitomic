@@ -28,13 +28,105 @@ describe("read-only reader", () => {
 
     const reader = await openReader({ repo: "reader-snapshot", ref: "main", backend: readerBackend })
     const snapshot = reader.at(first.oid)
-    await writer.transact(async (map) => map.set("notes/two.md", "two\n"), "write two")
+    const second = await writer.transact(async (map) => map.set("notes/two.md", "two\n"), "write two")
 
     expect(mutations).toBe(0)
     expect(await snapshot.keys()).toEqual(["notes/one.md"])
     expect(await snapshot.get("notes/one.md")).toBe("one\n")
     expect(await snapshot.get("notes/two.md")).toBeUndefined()
     expect(await reader.at().keys()).toEqual(["notes/one.md", "notes/two.md"])
+    expect((await reader.log({ from: second.oid, limit: 2 })).map(({ oid }) => oid)).toEqual([second.oid, first.oid])
+    expect(await reader.diff(first.oid, second.oid)).toEqual([
+      { path: "notes/two.md", from: null, to: await writer.at(second.oid).oid("notes/two.md") },
+    ])
+    expect(mutations).toBe(0)
+  })
+
+  test("pins one log start, defaults to fifty and reads only the requested first-parent range", async () => {
+    const mem = createMemBackend()
+    const repo = "reader-history"
+    const writer = await open({ repo, ref: "main", backend: mem })
+    const initial = await writer.head()
+    const commits: string[] = []
+    for (let index = 0; index < 55; index += 1) {
+      commits.push((await writer.transact(async (map) => map.set("count", `${index}`), `write ${index}`)).oid)
+    }
+    let heads = 0
+    const reads: string[] = []
+    let advance = true
+    const backend: GitomicBackend = {
+      ...mem,
+      head: async (name, ref) => {
+        heads += 1
+        return mem.head(name, ref)
+      },
+      readCommit: async (name, oid) => {
+        reads.push(oid)
+        if (advance) {
+          advance = false
+          await writer.transact(async (map) => map.set("late", "not in pinned history"), "advance during log")
+        }
+        return mem.readCommit(name, oid)
+      },
+    }
+    const reader = await openReader({ repo, backend })
+    heads = 0
+
+    const recent = await reader.log()
+    expect(recent.map(({ oid }) => oid)).toEqual(commits.slice(-50).reverse())
+    expect(reads).toEqual(commits.slice(-50).reverse())
+    expect(heads).toBe(1)
+    reads.length = 0
+    expect((await reader.log({ from: commits[2] as string, limit: 2 })).map(({ oid }) => oid)).toEqual([
+      commits[2],
+      commits[1],
+    ])
+    expect(reads).toEqual([commits[2], commits[1]])
+    expect(heads).toBe(1)
+    expect(await reader.log({ from: initial, limit: 1_024 })).toEqual([
+      {
+        oid: initial,
+        parent: null,
+        message: "initial\n",
+        writer: null,
+        instance: null,
+        seq: null,
+        timestamp: 946_684_800,
+      },
+    ])
+  })
+
+  test("diff sorts add/remove/modify identities and respects the backend file projection", async () => {
+    const mem = createMemBackend()
+    const repo = "reader-projected-diff"
+    const writer = await open({ repo, ref: "main", backend: mem })
+    const first = await writer.transact(async (map) => {
+      map.set("visible/remove", "gone")
+      map.set("visible/change", "before")
+      map.set("hidden/noise", "before")
+    }, "before")
+    const second = await writer.transact(async (map) => {
+      map.delete("visible/remove")
+      map.set("visible/change", "after")
+      map.set("visible/add", "new")
+      map.set("hidden/noise", "after")
+    }, "after")
+    const readFiles = vi.fn(
+      async (name: string, oid: string, prefix?: string) =>
+        new Map([...(await mem.readFiles(name, oid, prefix))].filter(([path]) => path.startsWith("visible/"))),
+    )
+    const reader = await openReader({ repo, backend: { ...mem, readFiles } })
+    expect(await reader.diff(first.oid, second.oid)).toEqual([
+      { path: "visible/add", from: null, to: await writer.at(second.oid).oid("visible/add") },
+      {
+        path: "visible/change",
+        from: await writer.at(first.oid).oid("visible/change"),
+        to: await writer.at(second.oid).oid("visible/change"),
+      },
+      { path: "visible/remove", from: await writer.at(first.oid).oid("visible/remove"), to: null },
+    ])
+    expect(readFiles).toHaveBeenCalledTimes(2)
+    expect(await reader.diff(second.oid, second.oid)).toEqual([])
   })
 
   test("defaults to main and validates refs before invoking the backend", async () => {

@@ -83,6 +83,24 @@ describe("iso backend", () => {
 
       expect(new Set(second)).toHaveLength(1)
       for (const { repo, backend } of targets) {
+        // Same canonical bytes must yield the same public metadata, not just oid.
+        expect(await backend.readCommit(repo, shellFixture.initial)).toEqual({
+          oid: shellFixture.initial,
+          parent: null,
+          message: "initial\n",
+          writer: null,
+          instance: null,
+          seq: null,
+          timestamp: 946_684_800,
+        })
+        expect(await backend.readCommit(repo, second[0] as Oid)).toEqual({
+          oid: second[0],
+          parent: first[0],
+          message: `same-writer: second\n\nGitomic-Writer: same-writer\nGitomic-Instance: ${identity.instance}\nGitomic-Seq: 1\n`,
+          ...identity,
+          seq: 1,
+          timestamp: 946_684_802,
+        })
         const files = await backend.readFiles(repo, second[0] as Oid)
         expect([...files.keys()].sort()).toEqual(["nested/deeper/b.txt", "root.txt"])
         expect(files.get("nested/deeper/b.txt")).toBe("b\nchanged\n")

@@ -55,8 +55,25 @@ export type CommitInput = {
   seq: number
 }
 
+export type CommitMeta = {
+  oid: Oid
+  /** The first parent; ordinary root commits have none. */
+  parent: Oid | null
+  /** The complete stored message, including its trailers and trailing newlines. */
+  message: string
+  writer: string | null
+  instance: string | null
+  seq: number | null
+  /** Git committer time in seconds since the Unix epoch. */
+  timestamp: number
+}
+
+/** A changed projected blob identity; mode-only changes are not represented. */
+export type Change = { path: string; from: Oid | null; to: Oid | null }
+
 export type GitomicBackend = {
   head(repo: string, ref: string): Promise<Oid>
+  readCommit(repo: string, oid: Oid): Promise<CommitMeta>
   /**
    * Read the whole tree, or only paths matching a non-empty string prefix.
    *
@@ -125,6 +142,9 @@ export type RefTipWatchOptions = {
 export type Reader = {
   head(): Promise<Oid>
   at(commit?: Oid): Snapshot
+  /** Newest-first first-parent history, pinned once; default 50, maximum 1024. */
+  log(options?: { from?: Oid; limit?: number }): Promise<CommitMeta[]>
+  diff(from: Oid, to: Oid): Promise<Change[]>
   watch(options: RefTipWatchOptions): AsyncIterable<RefTipChange>
 }
 

@@ -8,6 +8,7 @@ import {
   formatCommitMessage,
   GITOMIC_EMAIL,
   GITOMIC_NAME,
+  parseCommit,
   TRANSACTION_SEARCH_LIMIT,
   transactionLookupExceeded,
   transactionMatches,
@@ -67,6 +68,25 @@ export function createShellRuntime(): {
   }
   const backend: GitomicBackend = {
     head: async (repo, ref) => head(await resolveGitDir(repo), ref),
+    readCommit: async (repo, oid) => {
+      validateOid(oid)
+      const output = await git(await resolveGitDir(repo), ["cat-file", "--batch"], { input: `${oid}\n` })
+      const newline = output.indexOf(0x0a)
+      const header = output.toString("utf8", 0, newline < 0 ? output.length : newline)
+      const match = /^([0-9a-f]+) commit (\d+)$/.exec(header)
+      const size = match === null ? NaN : Number(match[2])
+      if (
+        match?.[1] !== oid ||
+        !Number.isSafeInteger(size) ||
+        output.length !== newline + size + 2 ||
+        output.at(-1) !== 0x0a
+      ) {
+        throw new Error(
+          `cannot read commit ${oid} in ${JSON.stringify(repo)}: unexpected cat-file result ${JSON.stringify(header)}`,
+        )
+      }
+      return parseCommit(oid, output.subarray(newline + 1, newline + 1 + size))
+    },
     readFiles: async (repo, commit, prefix) => readFiles(await resolveGitDir(repo), commit, prefix),
     // A completed commit is unreferenced until the compare-and-swap below adopts
     // it. Gitomic writes NO ref to protect that window: Git's default gc grace

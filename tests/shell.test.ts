@@ -9,7 +9,7 @@ import { delimiter, join } from "node:path"
 
 import { describe, expect, test } from "vitest"
 
-import { apply, createShellBackend, open } from "../src/index.js"
+import { apply, createShellBackend, open, openReader } from "../src/index.js"
 import type { GitomicBackend } from "../src/index.js"
 import { isRemoteCompareAndSwapRejection } from "../src/shell.js"
 import { appendEmptyHistory, createBareRepo, git, gitWithInput } from "./helpers/git.js"
@@ -277,6 +277,78 @@ describe.sequential("shell backend failure boundaries", () => {
         "remove native anchor",
       )
       expect(await store.at(removed.oid).has("moved")).toBe(false)
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  test("reads ordinary/root metadata and walks the first parent of a real merge", async () => {
+    const fixture = await createBareRepo()
+    try {
+      const tree = await git(fixture.repo, "rev-parse", `${fixture.initial}^{tree}`)
+      const message = "ordinary subject\n\nfull body with ünicode\n\n"
+      // Distinct clocks make using author time instead of committer time fail.
+      const first = await gitWithInput(
+        fixture.repo,
+        `tree ${tree}\nparent ${fixture.initial}\nauthor Author <author@example.invalid> 946684801 +0000\ncommitter Committer <committer@example.invalid> 946684900 +0000\n\n${message}`,
+        "hash-object",
+        "-t",
+        "commit",
+        "-w",
+        "--stdin",
+      )
+      const side = await git(fixture.repo, "commit-tree", tree, "-p", fixture.initial, "-m", "side")
+      const merge = await git(fixture.repo, "commit-tree", tree, "-p", first, "-p", side, "-m", "merge")
+      const backend = createShellBackend()
+      const reader = await openReader({ repo: fixture.repo, backend })
+      const history = await reader.log({ from: merge })
+      expect(history.map(({ oid }) => oid)).toEqual([merge, first, fixture.initial])
+      expect(history[1]).toEqual({
+        oid: first,
+        parent: fixture.initial,
+        message,
+        writer: null,
+        instance: null,
+        seq: null,
+        timestamp: 946_684_900,
+      })
+      expect(history[2]).toEqual({
+        oid: fixture.initial,
+        parent: null,
+        message: "initial\n",
+        writer: null,
+        instance: null,
+        seq: null,
+        timestamp: 946_684_800,
+      })
+      const partialMessage = "partial\n\nGitomic-Writer: ordinary-writer\n"
+      const partial = await gitWithInput(fixture.repo, partialMessage, "commit-tree", tree, "-p", first)
+      expect(await backend.readCommit(fixture.repo, partial)).toMatchObject({
+        message: partialMessage,
+        writer: "ordinary-writer",
+        instance: null,
+        seq: null,
+      })
+      // Missing fields are null; recognized present values must not be silently lost.
+      for (const trailer of [
+        "Gitomic-Seq: nope",
+        "Gitomic-Seq: -1",
+        "Gitomic-Seq: 9007199254740992",
+        "Gitomic-Instance: ",
+        "Gitomic-Writer: a\nGitomic-Writer: b",
+      ]) {
+        const malformed = await gitWithInput(
+          fixture.repo,
+          `bad metadata\n\n${trailer}\n`,
+          "commit-tree",
+          tree,
+          "-p",
+          first,
+        )
+        await expect(backend.readCommit(fixture.repo, malformed)).rejects.toThrow("Gitomic-")
+      }
+      await expect(backend.readCommit(fixture.repo, "f".repeat(40))).rejects.toThrow()
+      await expect(backend.readCommit(fixture.repo, tree)).rejects.toThrow()
     } finally {
       await fixture.cleanup()
     }

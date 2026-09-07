@@ -4,7 +4,7 @@
 
 import { describe, expect, test } from "vitest"
 
-import { open, RetriesExhausted } from "../src/index.js"
+import { open, openReader, RetriesExhausted } from "../src/index.js"
 import type { CommitInput, GitomicBackend } from "../src/index.js"
 import { createMemBackend } from "../src/mem.js"
 import { createBareRepo } from "./helpers/git.js"
@@ -213,5 +213,39 @@ describe("public contract guards", () => {
     await expect(open({ repo: "invalid-head", ref: "main", writer: "worker", backend: invalidHead })).rejects.toThrow(
       "backend returned an invalid Git object id",
     )
+  })
+
+  test("history validates ids and bounded limits before reads, and missing equal diff endpoints still fail", async () => {
+    const mem = createMemBackend()
+    const repo = "history-guards"
+    let reads = 0
+    const backend: GitomicBackend = {
+      ...mem,
+      head: async (name, ref) => {
+        reads += 1
+        return mem.head(name, ref)
+      },
+      readCommit: async (name, oid) => {
+        reads += 1
+        return mem.readCommit(name, oid)
+      },
+      readFiles: async (name, oid, prefix) => {
+        reads += 1
+        return mem.readFiles(name, oid, prefix)
+      },
+    }
+    const reader = await openReader({ repo, backend })
+    const valid = await reader.head()
+    reads = 0
+    for (const limit of [0, -1, 1.5, 1_025, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity]) {
+      await expect(reader.log({ limit })).rejects.toThrow("limit")
+    }
+    await expect(reader.log({ from: "--invalid" })).rejects.toThrow("invalid Git object id")
+    await expect(reader.diff("--invalid", valid)).rejects.toThrow("invalid Git object id")
+    await expect(reader.diff(valid, "--invalid")).rejects.toThrow("invalid Git object id")
+    expect(reads).toBe(0)
+    const missing = "f".repeat(40)
+    await expect(reader.log({ from: missing })).rejects.toThrow(missing)
+    await expect(reader.diff(missing, missing)).rejects.toThrow(missing)
   })
 })

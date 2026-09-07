@@ -14,6 +14,8 @@ import {
 import { createShellBackend } from "./shell.js"
 import type {
   BlobValue,
+  Change,
+  CommitMeta,
   Committed,
   GitMap,
   GitomicBackend,
@@ -38,6 +40,8 @@ export { createShellBackend } from "./shell.js"
 export { parseOwnershipManifest } from "./ownership-manifest.js"
 export type {
   BlobValue,
+  Change,
+  CommitMeta,
   Committed,
   CommitInput,
   GitMap,
@@ -86,6 +90,32 @@ export async function openReader(options: OpenReaderOptions): Promise<Reader> {
   return {
     head: context.refresh,
     at: (commit) => makeSnapshot(context, commit, context.refresh),
+    async log({ from, limit = 50 } = {}) {
+      if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 1_024) {
+        throw new TypeError("log limit must be a positive safe integer no greater than 1024")
+      }
+      let oid: Oid | null = from === undefined ? await context.refresh() : validateOid(from)
+      const commits: CommitMeta[] = []
+      while (oid !== null && commits.length < limit) {
+        const commit = await context.backend.readCommit(context.repo, oid)
+        commits.push(commit)
+        oid = commit.parent
+      }
+      return commits
+    },
+    async diff(from, to) {
+      validateOid(from)
+      validateOid(to)
+      const before = makeSnapshot(context, from)
+      const after = makeSnapshot(context, to)
+      const [beforePaths, afterPaths] = await Promise.all([before.keys(), after.keys()])
+      const changes: Change[] = []
+      for (const path of [...new Set([...beforePaths, ...afterPaths])].sort()) {
+        const [beforeOid, afterOid] = await Promise.all([before.oid(path), after.oid(path)])
+        if (beforeOid !== afterOid) changes.push({ path, from: beforeOid ?? null, to: afterOid ?? null })
+      }
+      return changes
+    },
     watch: (watchOptions) => watchRef(context, watchOptions),
   }
 }

@@ -1,6 +1,6 @@
 import * as nodeFs from "node:fs"
 
-import { readBlob, readCommit, readTree, resolveRef } from "isomorphic-git"
+import { readBlob, readCommit, readObject, readTree, resolveRef } from "isomorphic-git"
 import type { FsClient } from "isomorphic-git"
 
 import {
@@ -8,9 +8,11 @@ import {
   encodeCommit,
   encodeTreeEntries,
   formatCommitMessage,
+  parseCommit,
   TRANSACTION_SEARCH_LIMIT,
   transactionLookupExceeded,
   transactionMatches,
+  validateOid,
 } from "./git-object.js"
 import type { GitObject, GitTreeObjectEntry } from "./git-object.js"
 import { createDurableObjectWriter } from "./iso-durable.js"
@@ -192,6 +194,15 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
       return (await refStorage(repo)) === "files" ? resolveRef({ fs, gitdir, ref }) : shell.head(repo, ref)
     },
     readFiles,
+    readCommit: async (repo, oid) => {
+      validateOid(oid)
+      const gitdir = await resolveGitDir(repo)
+      const result = await readObject({ fs, gitdir, oid, format: "content", cache })
+      if (result.type !== "commit" || !(result.object instanceof Uint8Array)) {
+        throw new Error(`cannot read commit ${oid} in ${JSON.stringify(repo)}: object is not a commit`)
+      }
+      return parseCommit(oid, result.object)
+    },
     writeCommit,
     findTransaction,
   }

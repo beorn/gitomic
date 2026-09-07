@@ -129,6 +129,36 @@ describe.each(backends)("binary blobs ride through the $name backend", ({ name, 
     }
   })
 
+  test("diff reports changed binary identities without decoding their values", async () => {
+    const fixture = await createMixedRepo()
+    try {
+      const changedOid = await gitWithInput(
+        fixture.repo,
+        Uint8Array.of(0xff, 0x00, 0xfe),
+        "hash-object",
+        "-w",
+        "--stdin",
+      )
+      const assets = await gitWithInput(fixture.repo, `100644 blob ${changedOid}\tscreenshot.png\0`, "mktree", "-z")
+      const notes = await git(fixture.repo, "rev-parse", `${fixture.initial}:notes`)
+      const tree = await gitWithInput(
+        fixture.repo,
+        `040000 tree ${assets}\tassets\0` + `040000 tree ${notes}\tnotes\0`,
+        "mktree",
+        "-z",
+      )
+      const next = await git(fixture.repo, "commit-tree", tree, "-p", fixture.initial, "-m", "change image")
+      const reader = await openReader({ repo: fixture.repo, ...(backend === undefined ? {} : { backend }) })
+
+      expect(await reader.diff(fixture.initial, next)).toEqual([
+        { path: "assets/screenshot.png", from: fixture.binaryOid, to: changedOid },
+      ])
+      await expect(reader.at(next).get("assets/screenshot.png")).rejects.toThrow("valid UTF-8")
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
   test("the image can be deleted, and replacing it with text is a real change", async () => {
     const fixture = await createMixedRepo()
     try {

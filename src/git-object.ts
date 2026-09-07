@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto"
 
-import type { Oid } from "./types.js"
+import type { CommitMeta, Oid } from "./types.js"
+import { decodeUtf8 } from "./utf8.js"
 
 export const GITOMIC_NAME = "gitomic"
 export const GITOMIC_EMAIL = "gitomic@localhost"
@@ -48,6 +49,55 @@ export function validateOid(value: unknown, label = "invalid Git object id"): Oi
     throw new TypeError(`${label}: ${JSON.stringify(value)}; expected a full 40- or 64-character lowercase hex id`)
   }
   return value
+}
+
+/** Decode the same stored commit bytes in every backend; metadata is not inferred from its subject. */
+export function parseCommit(oid: Oid, content: Uint8Array): CommitMeta {
+  validateOid(oid)
+  const raw = decodeUtf8(content, `Git commit ${oid}`)
+  const separator = raw.indexOf("\n\n")
+  if (separator < 0) throw new Error(`invalid Git commit ${oid}: missing message separator`)
+  const headers = raw.slice(0, separator).split("\n")
+  const parents = headers.filter((line) => line.startsWith("parent ")).map((line) => validateOid(line.slice(7)))
+  const committers = headers.filter((line) => line.startsWith("committer "))
+  const time = committers.length === 1 ? / (-?\d+) [+-]\d{4}$/.exec(committers[0] ?? "") : null
+  const timestamp = time === null ? NaN : Number(time[1])
+  if (!Number.isSafeInteger(timestamp)) throw new Error(`invalid Git commit ${oid}: invalid committer timestamp`)
+  const message = raw.slice(separator + 2)
+  const trailers = new Map<string, string>()
+  const finalParagraph =
+    message
+      .trimEnd()
+      .split(/\n[ \t]*\n/)
+      .at(-1) ?? ""
+  for (const line of finalParagraph.split("\n")) {
+    const match = /^(Gitomic-(?:Writer|Instance|Seq)):(.*)$/.exec(line)
+    if (match === null) continue
+    const key = match[1] as string
+    const value = (match[2] ?? "").trim()
+    const hasControlCharacter = [...value].some((character) => {
+      const codePoint = character.codePointAt(0) ?? 0
+      return codePoint <= 0x1f || codePoint === 0x7f
+    })
+    if (trailers.has(key) || value.length === 0 || hasControlCharacter) {
+      throw new Error(`invalid Git commit ${oid}: malformed or duplicate ${key} trailer`)
+    }
+    trailers.set(key, value)
+  }
+  const rawSeq = trailers.get("Gitomic-Seq")
+  const seq = rawSeq === undefined ? null : Number(rawSeq)
+  if (rawSeq !== undefined && (!/^\d+$/.test(rawSeq) || !Number.isSafeInteger(seq))) {
+    throw new Error(`invalid Git commit ${oid}: malformed Gitomic-Seq trailer`)
+  }
+  return {
+    oid,
+    parent: parents[0] ?? null,
+    message,
+    writer: trailers.get("Gitomic-Writer") ?? null,
+    instance: trailers.get("Gitomic-Instance") ?? null,
+    seq,
+    timestamp,
+  }
 }
 
 /**
