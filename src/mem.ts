@@ -131,12 +131,13 @@ export function createMemBackend(): GitomicBackend {
 
   const backend: GitomicBackend = {
     head,
-    readCommit: async (name, oid) => {
-      validateOid(oid)
-      const found = getRepo(name).commits.get(oid)
-      if (found === undefined) throw new Error(`cannot read commit ${oid} in ${JSON.stringify(name)}: unknown commit`)
-      return parseCommit(oid, found.content)
-    },
+    readCommit: (name, oid) =>
+      Promise.resolve().then(() => {
+        validateOid(oid)
+        const found = getRepo(name).commits.get(oid)
+        if (found === undefined) throw new Error(`cannot read commit ${oid} in ${JSON.stringify(name)}: unknown commit`)
+        return parseCommit(oid, found.content)
+      }),
     readFiles,
     writeCommit,
     compareAndSwap,

@@ -1,6 +1,6 @@
-// @failure Shell plumbing could scan all history, depend on localized porcelain, or hide a real ref-update failure as contention.
+// @failure Git plumbing could scan all history, normalize commit metadata, or hide a real ref-update failure as contention.
 // @level l1
-// @consumer default shell-backend users
+// @consumer default shell-backend users and optional iso reader users
 
 import { spawnSync } from "node:child_process"
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
@@ -11,6 +11,7 @@ import { describe, expect, test } from "vitest"
 
 import { apply, createShellBackend, open, openReader } from "../src/index.js"
 import type { GitomicBackend } from "../src/index.js"
+import { createIsoBackend } from "../src/iso.js"
 import { isRemoteCompareAndSwapRejection } from "../src/shell.js"
 import { appendEmptyHistory, createBareRepo, git, gitWithInput } from "./helpers/git.js"
 
@@ -282,7 +283,10 @@ describe.sequential("shell backend failure boundaries", () => {
     }
   })
 
-  test("reads ordinary/root metadata and walks the first parent of a real merge", async () => {
+  test.each([
+    { name: "shell", createBackend: createShellBackend },
+    { name: "iso", createBackend: createIsoBackend },
+  ])("$name reads ordinary/root metadata and walks the first parent of a real merge", async ({ createBackend }) => {
     const fixture = await createBareRepo()
     try {
       const tree = await git(fixture.repo, "rev-parse", `${fixture.initial}^{tree}`)
@@ -299,7 +303,7 @@ describe.sequential("shell backend failure boundaries", () => {
       )
       const side = await git(fixture.repo, "commit-tree", tree, "-p", fixture.initial, "-m", "side")
       const merge = await git(fixture.repo, "commit-tree", tree, "-p", first, "-p", side, "-m", "merge")
-      const backend = createShellBackend()
+      const backend = createBackend()
       const reader = await openReader({ repo: fixture.repo, backend })
       const history = await reader.log({ from: merge })
       expect(history.map(({ oid }) => oid)).toEqual([merge, first, fixture.initial])

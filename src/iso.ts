@@ -197,6 +197,12 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
     readCommit: async (repo, oid) => {
       validateOid(oid)
       const gitdir = await resolveGitDir(repo)
+      // Require original bytes. Verified at isomorphic-git 1.38.10, index.cjs:
+      // :4292 decodes UTF-8 non-fatally, :4409 normalizes payload, :5934 peels
+      // tags, :5961 returns parsed metadata/signing payload, not original bytes.
+      // tests/shell.test.ts's "reads ordinary/root metadata and walks the first
+      // parent of a real merge" parity journey fails with typed readCommit.
+      // oxlint-disable-next-line typescript/no-deprecated -- the typed reader cannot preserve this contract
       const result = await readObject({ fs, gitdir, oid, format: "content", cache })
       if (result.type !== "commit" || !(result.object instanceof Uint8Array)) {
         throw new Error(`cannot read commit ${oid} in ${JSON.stringify(repo)}: object is not a commit`)
