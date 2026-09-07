@@ -11,8 +11,9 @@ import { afterEach, beforeEach, describe, expect, test } from "vitest"
 
 import { main } from "../src/bin.js"
 import { objectOid } from "../src/git-object.js"
-import type { GitomicBackend } from "../src/index.js"
+import { createShellBackend, open, type CommitMeta, type GitomicBackend } from "../src/index.js"
 import { createMemBackend } from "../src/mem.js"
+import { createBareRepo, git, gitWithInput } from "./helpers/git.js"
 
 const ADDRESS = "repo#main"
 
@@ -154,6 +155,246 @@ describe("gitomic CLI — read verbs", () => {
     const result = await run(backend, ["grep", ADDRESS, "("])
     expect(result.code).toBe(2)
     expect(result.stderr).toContain("grep")
+  })
+})
+
+/** A real, one-path mem history; size includes its empty initial commit. */
+async function historyOfSize(size: number) {
+  const backend = createMemBackend()
+  const store = await open({ repo: "repo", ref: "main", backend, writer: "history" })
+  for (let index = 1; index < size; index += 1) {
+    await store.transact(async (map) => map.set("counter", String(index)), `step ${index}`)
+  }
+  return { backend, store, tip: await store.head() }
+}
+
+describe("gitomic CLI — history reads", () => {
+  test("log and diff expose anchored metadata and sorted blob changes in plain and JSON modes", async () => {
+    const backend = createMemBackend()
+    const store = await open({ repo: "repo", ref: "main", backend, writer: "history" })
+    const initial = await store.head()
+    const first = await store.transact(async (map) => {
+      map.set("b.md", "before")
+      map.set("dir/gone.txt", "gone")
+    }, "first\n\nfull body")
+    const second = await store.transact(async (map) => {
+      map.set("b.md", "after")
+      map.set("a.md", "added")
+      map.delete("dir/gone.txt")
+    }, "second")
+    await store.transact(async (map) => map.set("noise", "later"), "third")
+
+    const log = await run(backend, ["log", ADDRESS, "--at", second.oid, "--json"])
+    expect(log).toMatchObject({ code: 0, stderr: "" })
+    const records = JSON.parse(log.stdout) as CommitMeta[]
+    expect(records.map(({ oid }) => oid)).toEqual([second.oid, first.oid, initial])
+    expect(records[1]).toEqual({
+      oid: first.oid,
+      parent: initial,
+      writer: "history",
+      instance: expect.any(String),
+      seq: 0,
+      timestamp: 946_684_801,
+      message: expect.stringMatching(/^history: first\n\nfull body\n\nGitomic-Writer: history\n/),
+    })
+    expect(records[2]).toEqual({
+      oid: initial,
+      parent: null,
+      writer: null,
+      instance: null,
+      seq: null,
+      message: "initial\n",
+      timestamp: 946_684_800,
+    })
+    expect(await run(backend, ["log", ADDRESS, "--at", first.oid, "-n", "1"])).toEqual({
+      code: 0,
+      stdout: `${first.oid} history: first\n`,
+      stderr: "",
+    })
+    const filtered = await run(backend, ["log", ADDRESS, "dir/*.txt", "-n", "2", "--json"])
+    expect(filtered).toMatchObject({ code: 0, stderr: "" })
+    expect((JSON.parse(filtered.stdout) as CommitMeta[]).map(({ oid }) => oid)).toEqual([second.oid, first.oid])
+
+    const diffArgs = ["diff", ADDRESS, "--base", first.oid, "--at", second.oid]
+    expect(await run(backend, diffArgs)).toEqual({ code: 0, stdout: "A\ta.md\nM\tb.md\nD\tdir/gone.txt\n", stderr: "" })
+    const diff = await run(backend, [...diffArgs, "--json"])
+    expect(diff).toMatchObject({ code: 0, stderr: "" })
+    expect(JSON.parse(diff.stdout)).toEqual([
+      { path: "a.md", from: null, to: oidOf("added") },
+      { path: "b.md", from: oidOf("before"), to: oidOf("after") },
+      { path: "dir/gone.txt", from: oidOf("gone"), to: null },
+    ])
+    expect(await run(backend, [...diffArgs, "dir/**"])).toEqual({ code: 0, stdout: "D\tdir/gone.txt\n", stderr: "" })
+    expect(await run(backend, ["diff", ADDRESS, "--base", second.oid, "noise"])).toEqual({
+      code: 0,
+      stdout: "A\tnoise\n",
+      stderr: "",
+    })
+    expect(await run(backend, ["diff", ADDRESS, "--base", second.oid, "--at", second.oid, "--json"])).toEqual({
+      code: 0,
+      stdout: "[]\n",
+      stderr: "",
+    })
+  })
+
+  test("default log pins its start and requests fifty metadata reads, while -n requests only its count", async () => {
+    const { backend, store, tip } = await historyOfSize(53)
+    let reads = 0
+    const observed: GitomicBackend = {
+      ...backend,
+      readCommit: async (repo, oid) => {
+        reads += 1
+        if (reads === 1) await store.transact(async (map) => map.set("late", "excluded"), "advance during log")
+        return backend.readCommit(repo, oid)
+      },
+    }
+    const result = await run(observed, ["log", ADDRESS, "--json"])
+    expect(result).toMatchObject({ code: 0, stderr: "" })
+    const records = JSON.parse(result.stdout) as CommitMeta[]
+    expect(records).toHaveLength(50)
+    expect(records[0]?.oid).toBe(tip)
+    expect(reads).toBe(50)
+    reads = 0
+    const short = await run(observed, ["log", ADDRESS, "--at", tip, "-n", "2", "--json"])
+    expect(short.code).toBe(0)
+    expect((JSON.parse(short.stdout) as CommitMeta[]).map(({ oid }) => oid)).toEqual([tip, records[1]?.oid])
+    expect(reads).toBe(2)
+  })
+
+  test("exactly 1024 records ending at parent=null succeeds and explains the empty filtered scope", async () => {
+    const { backend, tip } = await historyOfSize(1_024)
+    const result = await run(backend, ["log", ADDRESS, "absent/**", "-n", "1", "--json"])
+    expect(result).toMatchObject({ code: 0, stdout: "[]\n" })
+    for (const fact of [ADDRESS, tip, "absent/**", "root", "first-parent", "mode-only"]) {
+      expect(result.stderr).toContain(fact)
+    }
+  })
+
+  test("exactly 1024 records with a remaining parent fails before stdout unless the requested matches were found", async () => {
+    const { backend, tip } = await historyOfSize(1_025)
+    for (const json of [[], ["--json"]]) {
+      const result = await run(backend, ["log", ADDRESS, "absent/**", "-n", "1", ...json])
+      expect(result).toMatchObject({ code: 1, stdout: "" })
+      for (const fact of [ADDRESS, tip, "absent/**", "1024", "first-parent"]) expect(result.stderr).toContain(fact)
+    }
+    let reads = 0
+    const observed: GitomicBackend = {
+      ...backend,
+      readCommit: async (repo, oid) => {
+        reads += 1
+        return backend.readCommit(repo, oid)
+      },
+    }
+    const matched = await run(observed, ["log", ADDRESS, "counter", "-n", "1", "--json"])
+    expect(matched).toMatchObject({ code: 0, stderr: "" })
+    expect((JSON.parse(matched.stdout) as CommitMeta[]).map(({ oid }) => oid)).toEqual([tip])
+    expect(reads).toBe(1_024)
+  })
+
+  test("native root history and binary diff preserve object identity without decoding values", async () => {
+    const fixture = await createBareRepo()
+    try {
+      const blob = await gitWithInput(fixture.repo, Uint8Array.of(0xff, 0x00, 0xfe), "hash-object", "-w", "--stdin")
+      const tree = await gitWithInput(fixture.repo, `100644 blob ${blob}\timage.bin\0`, "mktree", "-z")
+      const root = await git(fixture.repo, "commit-tree", tree, "-m", "binary root")
+      const backend = createShellBackend()
+      const log = await run(backend, ["log", fixture.repo, "*.bin", "--at", root, "--json"])
+      expect(log).toMatchObject({ code: 0, stderr: "" })
+      expect(JSON.parse(log.stdout)).toEqual([
+        {
+          oid: root,
+          parent: null,
+          message: "binary root\n",
+          writer: null,
+          instance: null,
+          seq: null,
+          timestamp: 946_684_800,
+        },
+      ])
+      const diff = await run(backend, ["diff", fixture.repo, "--base", fixture.initial, "--at", root, "--json"])
+      expect(diff).toMatchObject({ code: 0, stderr: "" })
+      expect(JSON.parse(diff.stdout)).toEqual([{ path: "image.bin", from: null, to: blob }])
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  test.each([false, true])("history usage errors leave stdout empty before backend reads (json=%s)", async (asJson) => {
+    const oid = "a".repeat(40)
+    const cases: Array<[string[], string]> = [
+      [["log"], "address"],
+      [["log", ADDRESS, "--at"], "--at"],
+      [["log", ADDRESS, "--at", "short"], "--at"],
+      [["log", ADDRESS, "--at", "A".repeat(40)], "--at"],
+      [["log", ADDRESS, "-n"], "-n"],
+      [["log", ADDRESS, "-n", "0"], "-n"],
+      [["log", ADDRESS, "-n", "-1"], "-n"],
+      [["log", ADDRESS, "-n", "1.5"], "-n"],
+      [["log", ADDRESS, "-n", "1025"], "-n"],
+      [["log", ADDRESS, "-n", "9007199254740992"], "-n"],
+      [["log", ADDRESS, "-n", "nope"], "-n"],
+      [["log", ADDRESS, "one", "two"], "extra"],
+      [["log", ADDRESS, "--bogus"], "--bogus"],
+      [["log", "repo#"], "ref"],
+      [["diff", ADDRESS], "--base"],
+      [["diff", ADDRESS, "--base"], "--base"],
+      [["diff", ADDRESS, "--base", "short"], "--base"],
+      [["diff", ADDRESS, "--base", oid, "--at", "short"], "--at"],
+      [["diff", ADDRESS, "--base", oid, "one", "two"], "extra"],
+      [["diff", ADDRESS, "--base", oid, "-n", "1"], "-n"],
+    ]
+    let reads = 0
+    const mem = createMemBackend()
+    const backend: GitomicBackend = {
+      ...mem,
+      head: async (repo, ref) => {
+        reads += 1
+        return mem.head(repo, ref)
+      },
+    }
+    for (const [args, fact] of cases) {
+      const result = await run(backend, [...args, ...(asJson ? ["--json"] : [])])
+      expect(result, args.join(" ")).toMatchObject({ code: 2, stdout: "" })
+      expect(result.stderr, args.join(" ")).toContain(fact)
+    }
+    expect(reads).toBe(0)
+  })
+
+  test.each([false, true])("late history failures never publish partial records (json=%s)", async (asJson) => {
+    const { backend, tip } = await historyOfSize(4)
+    const json = asJson ? ["--json"] : []
+    let metadata = 0
+    const failingLog: GitomicBackend = {
+      ...backend,
+      readCommit: async (repo, oid) => {
+        if (++metadata === 2) throw new Error("later metadata unavailable")
+        return backend.readCommit(repo, oid)
+      },
+    }
+    const log = await run(failingLog, ["log", ADDRESS, "-n", "3", ...json])
+    expect(log).toMatchObject({ code: 1, stdout: "" })
+    expect(log.stderr).toContain("later metadata unavailable")
+    let files = 0
+    const failingFilter: GitomicBackend = {
+      ...backend,
+      readFiles: async (repo, oid, prefix) => {
+        if (++files === 3) throw new Error("later tree unavailable")
+        return backend.readFiles(repo, oid, prefix)
+      },
+    }
+    const filtered = await run(failingFilter, ["log", ADDRESS, "counter", "-n", "2", ...json])
+    expect(filtered).toMatchObject({ code: 1, stdout: "" })
+    expect(filtered.stderr).toContain("later tree unavailable")
+    const missing = "f".repeat(40)
+    for (const args of [
+      ["log", ADDRESS, "--at", missing],
+      ["diff", ADDRESS, "--base", tip, "--at", missing],
+      ["diff", ADDRESS, "--base", missing, "--at", missing],
+    ]) {
+      const failed = await run(backend, [...args, ...json])
+      expect(failed).toMatchObject({ code: 1, stdout: "" })
+      expect(failed.stderr).toContain(missing)
+    }
   })
 })
 

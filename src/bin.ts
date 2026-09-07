@@ -2,6 +2,7 @@
 import { readFile } from "node:fs/promises"
 
 import { type Address, parseAddress } from "./address.js"
+import { validateOid } from "./git-object.js"
 import {
   apply,
   EditDoesNotApply,
@@ -9,6 +10,7 @@ import {
   open,
   openReader,
   type Committed,
+  type CommitMeta,
   type Edit,
   type GitomicBackend,
   type Oid,
@@ -37,6 +39,13 @@ import { decodeUtf8 } from "./utf8.js"
  *   line in every matching path whose content matches the (JS) regex `pattern`.
  *   A path that is not valid UTF-8 is skipped with a note on stderr rather than
  *   failing the whole scan.
+ * - `log <addr> [<glob>] [--at <oid>] [-n <count>] [--json]` — newest-first
+ *   first-parent history, default 50 commits, maximum 1024. A glob counts
+ *   matching commits, not inspected commits; it may read 1024 metadata objects
+ *   even when an early commit matches. An insufficient bounded scan fails.
+ * - `diff <addr> --base <oid> [--at <oid>] [<glob>] [--json]` — sorted blob
+ *   identity changes, not text, rename or mode-only changes. `--at` defaults
+ *   to one pinned tip. Both history commands buffer output until success.
  *
  * Write verbs (open + apply, one commit per invocation). Every `--expect`
  * or clause anchor is the git BLOB oid `ls`/a prior write's own commit
@@ -87,8 +96,8 @@ import { decodeUtf8 } from "./utf8.js"
  * Every write verb prints the landed commit oid to stdout on success — or,
  * with `--json`, a one-line `{"oid":<oid>,"retries":<n>}` receipt of the oid
  * and how many CAS retries the landing took (the output contract for an agent
- * scripting the door). Read verbs take no `--json`, and a refusal is unchanged
- * by it. Product output (content, paths, matches, the oid or receipt) goes to
+ * scripting the door). `log`/`diff` support `--json` arrays; `read`/`ls`/`grep`
+ * do not, and a write refusal is unchanged by it. Product output goes to
  * stdout; narration and errors go to stderr.
  *
  * Exit codes — the only four, nothing else is a success:
@@ -101,7 +110,7 @@ import { decodeUtf8 } from "./utf8.js"
  *   facts only on stderr — never an owner, role, or remediation.
  *
  * Deliberately not built here (need new grammar or library plumbing this CLI
- * does not add): `log`, `diff`, `read --log`, `commit <checkout>`.
+ * does not add): `read --log`, `commit <checkout>`.
  */
 export async function main(argv: string[], io: CliIo = {}): Promise<number> {
   const stdout = io.stdout ?? process.stdout
@@ -119,6 +128,10 @@ export async function main(argv: string[], io: CliIo = {}): Promise<number> {
         return await runLs(args, stdout, backend)
       case "grep":
         return await runGrep(args, stdout, stderr, backend)
+      case "log":
+        return await runLog(args, stdout, stderr, backend)
+      case "diff":
+        return await runDiff(args, stdout, backend)
       case "write":
         return await runWrite(args, stdin, stdout, backend)
       case "rm":
@@ -145,12 +158,13 @@ export type CliIo = {
   backend?: GitomicBackend
 }
 
-const VERBS = ["read", "ls", "grep", "write", "rm", "mv", "apply"] as const
+const VERBS = ["read", "ls", "grep", "log", "diff", "write", "rm", "mv", "apply"] as const
 
 const OK = 0
 const RUNTIME_ERROR = 1
 const USAGE_ERROR = 2
 const PRECONDITION_REFUSED = 3
+const HISTORY_SCAN_LIMIT = 1_024
 
 // --- read verbs --------------------------------------------------------
 
@@ -206,6 +220,107 @@ async function runGrep(
     }
   }
   return OK
+}
+
+async function runLog(
+  args: string[],
+  stdout: CliWriter,
+  stderr: CliWriter,
+  backend: GitomicBackend | undefined,
+): Promise<number> {
+  const { positionals, flags } = extractFlags(args, { "--at": "value", "-n": "value", "--json": "boolean" })
+  const address = requirePositional(positionals, 0, "<address>")
+  assertNoExtraPositionals(positionals, 2, "<addr> [glob]", "log")
+  const glob = positionals.at(1)
+  let from = historyOidFlag(flags, "--at")
+  const rawLimit = optionalStringFlag(flags, "-n")
+  const limit = rawLimit === undefined ? 50 : Number(rawLimit)
+  if (
+    (rawLimit !== undefined && !/^\d+$/.test(rawLimit)) ||
+    !Number.isSafeInteger(limit) ||
+    limit < 1 ||
+    limit > HISTORY_SCAN_LIMIT
+  ) {
+    throw new UsageError("-n must be a positive integer no greater than 1024")
+  }
+  try {
+    const reader = await openReaderFor(address, backend)
+    from ??= await reader.head()
+    const history = await reader.log({ from, limit: glob === undefined ? limit : HISTORY_SCAN_LIMIT })
+    let commits: CommitMeta[] = history
+    if (glob !== undefined) {
+      commits = []
+      for (const commit of history) {
+        const paths =
+          commit.parent === null
+            ? await reader.at(commit.oid).keys()
+            : (await reader.diff(commit.parent, commit.oid)).map(({ path }) => path)
+        if (paths.some((path) => matchGlob(glob, path))) commits.push(commit)
+        if (commits.length === limit) break
+      }
+      const scope = `${describeAddress(address, from)} filter=${JSON.stringify(glob)}; first-parent blob changes (mode-only changes excluded)`
+      if (commits.length < limit && history.length === HISTORY_SCAN_LIMIT && history.at(-1)?.parent !== null) {
+        throw new Error(
+          `scan exhausted after 1024 commits for ${scope}; found ${commits.length} of ${limit} requested matches, root not reached`,
+        )
+      }
+      if (commits.length === 0) {
+        stderr.write(`gitomic: log: no matches for ${scope}; reached root after ${history.length} commits\n`)
+      }
+    }
+    stdout.write(
+      flags.has("--json")
+        ? `${JSON.stringify(commits)}\n`
+        : commits.map((commit) => `${commit.oid} ${commit.message.split("\n", 1)[0]}\n`).join(""),
+    )
+    return OK
+  } catch (error) {
+    if (error instanceof UsageError) throw error
+    throw new Error(
+      `log ${describeAddress(address, from)}: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    )
+  }
+}
+
+async function runDiff(args: string[], stdout: CliWriter, backend: GitomicBackend | undefined): Promise<number> {
+  const { positionals, flags } = extractFlags(args, { "--base": "value", "--at": "value", "--json": "boolean" })
+  const address = requirePositional(positionals, 0, "<address>")
+  assertNoExtraPositionals(positionals, 2, "<addr> [glob]", "diff")
+  const glob = positionals.at(1)
+  const base = historyOidFlag(flags, "--base")
+  if (base === undefined) throw new UsageError("missing --base <oid>")
+  let to = historyOidFlag(flags, "--at")
+  try {
+    const reader = await openReaderFor(address, backend)
+    to ??= await reader.head()
+    const changes = (await reader.diff(base, to)).filter(({ path }) => glob === undefined || matchGlob(glob, path))
+    stdout.write(
+      flags.has("--json")
+        ? `${JSON.stringify(changes)}\n`
+        : changes
+            .map(({ path, from, to: after }) => `${from === null ? "A" : after === null ? "D" : "M"}\t${path}\n`)
+            .join(""),
+    )
+    return OK
+  } catch (error) {
+    if (error instanceof UsageError) throw error
+    throw new Error(
+      `diff ${describeAddress(address, to)} base=${base}: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    )
+  }
+}
+
+/** Only input validation becomes usage failure; backend/data errors retain exit 1. */
+function historyOidFlag(flags: FlagValues, flag: string): Oid | undefined {
+  const value = optionalStringFlag(flags, flag)
+  if (value === undefined) return undefined
+  try {
+    return validateOid(value, `invalid ${flag}`)
+  } catch (error) {
+    throw new UsageError(error instanceof Error ? error.message : String(error))
+  }
 }
 
 /** The keys of `snapshot`, optionally narrowed to a glob — shared by `ls` and `grep`. */
@@ -408,13 +523,13 @@ async function parseClause(
   const rest = tokens.slice(1)
   switch (keyword) {
     case "put":
-      return await parsePutClause(rest, snapshot, stdin)
+      return parsePutClause(rest, snapshot, stdin)
     case "append":
-      return await parseAppendClause(rest, stdin)
+      return parseAppendClause(rest, stdin)
     case "rm":
-      return await parseRmClause(rest, snapshot, address)
+      return parseRmClause(rest, snapshot, address)
     case "mv":
-      return await parseMvClause(rest, snapshot, address)
+      return parseMvClause(rest, snapshot, address)
     default:
       // Unreachable: splitClauses only ever starts a group with one of these keywords.
       throw new UsageError(`apply: expected a clause keyword (put/append/rm/mv), got: ${JSON.stringify(keyword)}`)
@@ -476,10 +591,15 @@ async function parseMvClause(tokens: readonly string[], snapshot: Snapshot, addr
 }
 
 /** A clause must consume every positional it's given — an extra one signals a missing clause keyword or a typo, not a silent no-op. */
-function assertNoExtraPositionals(positionals: readonly string[], expected: number, clause: string): void {
+function assertNoExtraPositionals(
+  positionals: readonly string[],
+  expected: number,
+  clause: string,
+  verb = "apply",
+): void {
   if (positionals.length > expected) {
     throw new UsageError(
-      `apply: ${clause} takes ${expected} argument(s); got extra: ${positionals.slice(expected).join(" ")}`,
+      `${verb}: ${clause} takes ${expected} argument(s); got extra: ${positionals.slice(expected).join(" ")}`,
     )
   }
 }

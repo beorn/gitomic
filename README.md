@@ -153,6 +153,17 @@ for await (const change of reader.watch({
 
 Snapshot reads are scoped by path prefix through the one backend read path, so unrelated binary blobs are never decoded. A backend prefix read that matches nothing throws `GitPrefixNotFoundError` naming the prefix, repository, and commit; Snapshot turns that into its usual `undefined` / `false` / empty-array answers. Transactions never pass a prefix — they stay whole-tree strict.
 
+**History.** The same reader provides bounded history and blob-identity changes:
+
+```ts
+const commits = await reader.log({ from: revision, limit: 50 })
+const changes = await reader.diff(olderRevision, revision)
+```
+
+`log({ from?, limit? })` returns newest-first, first-parent `CommitMeta` records. It pins one tip when `from` is omitted; `limit` defaults to 50 and must be a positive safe integer no greater than 1,024. Each record contains `oid`, `parent` (`null` at the root), the full `message`, and the committer's `timestamp` in seconds. Gitomic's own timestamps preserve order, not wall-clock time. The `writer`, `instance`, and `seq` audit trailers are each `null` when absent; malformed or duplicate trailers fail loudly. These are recorded labels, not verified authorship.
+
+`diff(from, to)` returns sorted `{ path, from, to }` records, with blob ids on either side and `null` for an absent path. Both commit endpoints must exist, even when they are equal. It compares the backend's file projection without decoding values, so binary changes work too; it does not report mode-only changes, text hunks, or inferred renames.
+
 ### Remote
 
 **`remote`:** origin becomes the decider. Every write is one fetch/push cycle under the remote's ref lock; the push is a compare-and-swap (`--force-with-lease`), never a history rewrite, so it either fast-forwards or triggers a re-run. The local ref is then a cache of origin: reads stay local and lag until the next fetch, and an unpushed local-only tip may be replaced by origin's tip. Do not point it at a ref that carries unrelated local work. Origin is, honestly, your server; leave it out for purely local stores.
@@ -273,7 +284,7 @@ const test = await open({ repo: "my-test", ref: "main", writer: "test", backend:
 
 `iso` reads objects through `isomorphic-git`, then builds and durably writes canonical objects in-process, keeping ref CAS native. `mem` builds canonical git objects entirely in memory and needs neither a repository nor the `git` program.
 
-A custom backend implements `GitomicBackend`: `head`, `readFiles`, `writeCommit`, `compareAndSwap`, `findTransaction`, plus the optional remote pair. `writeCommit` receives your `writer` label and the store's `instance` and `seq`, and must record all three so `findTransaction` can recognize `(instance, seq)` later. A backend that wraps a built-in one keeps every contract by spreading it and overriding only what it owns.
+A custom backend implements `GitomicBackend`: `head`, `readFiles`, `readCommit`, `writeCommit`, `compareAndSwap`, `findTransaction`, plus the optional remote pair. `readCommit` supplies the `CommitMeta` record described above. `writeCommit` receives your `writer` label and the store's `instance` and `seq`, and must record all three so `findTransaction` can recognize `(instance, seq)` later. A backend that wraps a built-in one keeps every contract by spreading it and overriding only what it owns.
 
 ## Command line
 
@@ -293,13 +304,21 @@ $ gitomic apply 'repo#main' -m batch  put new.md ./new.txt  rm old.md
 
 **Read verbs** open an immutable snapshot, pinned at `--at <oid>` or the tip:
 
-| verb                                          | prints                                                     |
-| --------------------------------------------- | ---------------------------------------------------------- |
-| `read <addr> <path> [--at <oid>]`             | the path's exact content                                   |
-| `ls <addr> [<glob>] [--at <oid>]`             | matching paths, sorted, one per line                       |
-| `grep <addr> <pattern> [<glob>] [--at <oid>]` | `path:line` for every line matching the JS regex `pattern` |
+| verb                                                      | prints                                                               |
+| --------------------------------------------------------- | -------------------------------------------------------------------- |
+| `read <addr> <path> [--at <oid>]`                         | the path's exact content                                             |
+| `ls <addr> [<glob>] [--at <oid>]`                         | matching paths, sorted, one per line                                 |
+| `grep <addr> <pattern> [<glob>] [--at <oid>]`             | `path:line` for every line matching the JS regex `pattern`           |
+| `log <addr> [<glob>] [--at <oid>] [-n <count>] [--json]`  | full commit id and first message line; JSON: `CommitMeta[]`          |
+| `diff <addr> --base <oid> [--at <oid>] [<glob>] [--json]` | `A`, `D`, or `M`, a tab, then the path; JSON: `{ path, from, to }[]` |
 
 `read` on an absent path fails loudly (exit 1); `ls`/`grep` matching nothing print nothing and exit 0; `grep` skips a non-UTF-8 blob with a note on stderr rather than failing the whole scan.
+
+For `log`, `--at` selects the starting commit; `-n` defaults to 50 and accepts 1–1,024. A glob counts matching commits, using first-parent blob changes and all paths at a root commit. The filtered scan loads up to 1,024 metadata records even when an early commit matches. Reaching the root with fewer than `-n` matches succeeds; reaching the cap with a parent still remaining and too few matches fails with exit 1 and empty stdout. A root-complete scan with no matches names the address, starting commit, filter, inspected count, and exclusions on stderr.
+
+For `diff`, `--base` is required and `--at` selects the other endpoint, defaulting to one pinned tip. The optional glob narrows the blob-identity changes described under Reading. No changed paths means success with empty plain output or `[]` in JSON, but a missing endpoint is an error, including when both ids are equal.
+
+Both commands calculate their complete result before writing stdout. Use `--json` for full commit messages and lossless paths. Malformed arguments exit 2; backend or history-data failures exit 1, with context on stderr and no partial result on stdout.
 
 **Write verbs** open the store and land ONE commit per invocation:
 
@@ -328,7 +347,7 @@ Product output — content, paths, matches, the oid or receipt — goes to stdou
 | `2`  | a usage error — unknown verb, a missing or malformed argument or flag, a bad address                                                                                              |
 | `3`  | a CAS precondition refusal (`EditDoesNotApply`), reported facts-only on stderr: the kind, path, expected and actual oids, and both commits — never an owner, role, or remediation |
 
-`log`, `diff`, and `read --log` are not in this version.
+`read --log` and `commit <checkout>` are not in this version.
 
 ## When to use it
 
