@@ -1,6 +1,6 @@
 import { TextDecoder } from "node:util"
 
-const decoder = new TextDecoder("utf-8", { fatal: true })
+const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true })
 
 export function decodeUtf8(data: Uint8Array, label: string): string {
   try {

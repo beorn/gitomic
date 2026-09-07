@@ -4,7 +4,7 @@
 
 import { describe, expect, test } from "vitest"
 
-import { open, openReader } from "../src/index.js"
+import { apply, open, openReader } from "../src/index.js"
 import { createIsoBackend } from "../src/iso.js"
 import { createBareRepo, git, gitWithInput } from "./helpers/git.js"
 
@@ -124,6 +124,61 @@ describe.each(backends)("binary blobs ride through the $name backend", ({ name, 
       await expect(snapshot.get("assets/screenshot.png")).rejects.toThrow("valid UTF-8")
       expect(await snapshot.oid("assets/screenshot.png")).toBe(fixture.binaryOid)
       expect(await snapshot.oid("assets/missing.png")).toBeUndefined()
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  test("native valid-UTF-8 BOM blobs retain every BOM byte through get, oid, and native-anchor apply", async () => {
+    const fixture = await createBareRepo()
+    try {
+      // Native Git is the oracle: one and two leading BOMs are both valid UTF-8
+      // content, and every stored U+FEFF must survive the read/write boundary.
+      const singleBom = "\uFEFFone leading BOM\n"
+      const doubleBom = "\uFEFF\uFEFFtwo leading BOMs\n"
+      const singleBomOid = await gitWithInput(fixture.repo, singleBom, "hash-object", "-w", "--stdin")
+      const doubleBomOid = await gitWithInput(fixture.repo, doubleBom, "hash-object", "-w", "--stdin")
+      const tree = await gitWithInput(
+        fixture.repo,
+        `100644 blob ${singleBomOid}\tsingle-bom.txt\0` + `100644 blob ${doubleBomOid}\tdouble-bom.txt\0`,
+        "mktree",
+        "-z",
+      )
+      const base = await git(fixture.repo, "commit-tree", tree, "-p", fixture.initial, "-m", "native valid UTF-8 BOMs")
+      await git(fixture.repo, "update-ref", "refs/heads/main", base, fixture.initial)
+      const store = await open({
+        repo: fixture.repo,
+        ref: "main",
+        writer: `bom-native-${name}`,
+        ...(backend === undefined ? {} : { backend }),
+      })
+      const snapshot = store.at(base)
+
+      expect.soft(await snapshot.get("single-bom.txt")).toBe(singleBom)
+      expect.soft(await snapshot.get("double-bom.txt")).toBe(doubleBom)
+      expect.soft(await snapshot.oid("single-bom.txt")).toBe(singleBomOid)
+      expect.soft(await snapshot.oid("double-bom.txt")).toBe(doubleBomOid)
+
+      const singleReplacement = "\uFEFFreplacement with one leading BOM\n"
+      const doubleReplacement = "\uFEFF\uFEFFreplacement with two leading BOMs\n"
+      const singleReplacementOid = await gitWithInput(fixture.repo, singleReplacement, "hash-object", "-w", "--stdin")
+      const doubleReplacementOid = await gitWithInput(fixture.repo, doubleReplacement, "hash-object", "-w", "--stdin")
+      const replaced = await apply(
+        store,
+        base,
+        [
+          { kind: "put", path: "single-bom.txt", content: singleReplacement, expect: singleBomOid },
+          { kind: "put", path: "double-bom.txt", content: doubleReplacement, expect: doubleBomOid },
+        ],
+        "replace native valid UTF-8 BOM content",
+      )
+
+      expect(await store.at(replaced.oid).get("single-bom.txt")).toBe(singleReplacement)
+      expect(await store.at(replaced.oid).get("double-bom.txt")).toBe(doubleReplacement)
+      expect(await store.at(replaced.oid).oid("single-bom.txt")).toBe(singleReplacementOid)
+      expect(await store.at(replaced.oid).oid("double-bom.txt")).toBe(doubleReplacementOid)
+      expect(await git(fixture.repo, "rev-parse", `${replaced.oid}:single-bom.txt`)).toBe(singleReplacementOid)
+      expect(await git(fixture.repo, "rev-parse", `${replaced.oid}:double-bom.txt`)).toBe(doubleReplacementOid)
     } finally {
       await fixture.cleanup()
     }
