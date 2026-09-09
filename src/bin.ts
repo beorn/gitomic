@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 import { readFile } from "node:fs/promises"
 
 import { type Address, parseAddress } from "./address.js"
