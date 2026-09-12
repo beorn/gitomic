@@ -53,6 +53,12 @@ describe("iso backend", () => {
         { repo: "three-backend-equivalence", backend: createMemBackend() },
       ]
       const identity = { writer: "same-writer", instance: "3f9d1c02-5b7a-4e18-9c44-0a2b6d8e1f30" }
+      const provenance = {
+        actor: "original-actor",
+        session: "0198b5e8-cdd2-7a63-8a81-2fdc8144e6a4",
+        generation: 7,
+        run: "run-0198b5e8",
+      }
       expect(
         new Set(
           await Promise.all(targets.map(async ({ repo, backend }) => await backend.head(repo, "refs/heads/main"))),
@@ -61,6 +67,7 @@ describe("iso backend", () => {
 
       const first = await publishEverywhere(targets, {
         ...identity,
+        provenance,
         seq: 0,
         message: "first",
         changes: new Map([
@@ -73,6 +80,7 @@ describe("iso backend", () => {
 
       const second = await publishEverywhere(targets, {
         ...identity,
+        provenance,
         seq: 1,
         message: "second",
         changes: new Map([
@@ -91,14 +99,16 @@ describe("iso backend", () => {
           writer: null,
           instance: null,
           seq: null,
+          provenance: null,
           timestamp: 946_684_800,
         })
         expect(await backend.readCommit(repo, second[0] as Oid)).toEqual({
           oid: second[0],
           parent: first[0],
-          message: `same-writer: second\n\nGitomic-Writer: same-writer\nGitomic-Instance: ${identity.instance}\nGitomic-Seq: 1\n`,
+          message: `same-writer: second\n\nGitomic-Writer: same-writer\nGitomic-Actor: ${provenance.actor}\nGitomic-Actor-Session: ${provenance.session}\nGitomic-Actor-Generation: ${provenance.generation}\nGitomic-Actor-Run: ${provenance.run}\nGitomic-Instance: ${identity.instance}\nGitomic-Seq: 1\n`,
           ...identity,
           seq: 1,
+          provenance,
           timestamp: 946_684_802,
         })
         const files = await backend.readFiles(repo, second[0] as Oid)

@@ -314,6 +314,7 @@ describe.sequential("shell backend failure boundaries", () => {
         writer: null,
         instance: null,
         seq: null,
+        provenance: null,
         timestamp: 946_684_900,
       })
       expect(history[2]).toEqual({
@@ -323,6 +324,7 @@ describe.sequential("shell backend failure boundaries", () => {
         writer: null,
         instance: null,
         seq: null,
+        provenance: null,
         timestamp: 946_684_800,
       })
       const partialMessage = "partial\n\nGitomic-Writer: ordinary-writer\n"
@@ -332,6 +334,18 @@ describe.sequential("shell backend failure boundaries", () => {
         writer: "ordinary-writer",
         instance: null,
         seq: null,
+        provenance: null,
+      })
+      const provenanceMessage =
+        "provenance\n\nGitomic-Actor: original-actor\nGitomic-Actor-Session: 0198b5e8-cdd2-7a63-8a81-2fdc8144e6a4\nGitomic-Actor-Generation: 7\nGitomic-Actor-Run: run-0198b5e8\n"
+      const provenanceCommit = await gitWithInput(fixture.repo, provenanceMessage, "commit-tree", tree, "-p", first)
+      await expect(backend.readCommit(fixture.repo, provenanceCommit)).resolves.toMatchObject({
+        provenance: {
+          actor: "original-actor",
+          session: "0198b5e8-cdd2-7a63-8a81-2fdc8144e6a4",
+          generation: 7,
+          run: "run-0198b5e8",
+        },
       })
       // Missing fields are null; recognized present values must not be silently lost.
       for (const trailer of [
@@ -340,6 +354,12 @@ describe.sequential("shell backend failure boundaries", () => {
         "Gitomic-Seq: 9007199254740992",
         "Gitomic-Instance: ",
         "Gitomic-Writer: a\nGitomic-Writer: b",
+        "Gitomic-Actor: original-actor",
+        "Gitomic-Actor: original-actor\nGitomic-Actor-Session: session\nGitomic-Actor-Generation: -1",
+        "Gitomic-Actor: original-actor\nGitomic-Actor-Session: session\nGitomic-Actor-Generation: nope",
+        "Gitomic-Actor: original-actor\nGitomic-Actor-Session: session\nGitomic-Actor-Generation: 9007199254740992",
+        "Gitomic-Actor: original-actor\nGitomic-Actor-Session: session\nGitomic-Actor-Generation: 1\nGitomic-Actor: another-actor",
+        "Gitomic-Actor: original-actor\nGitomic-Actor-Session: session\nGitomic-Actor-Generation: 1\nGitomic-Actor-Run: \u0001",
       ]) {
         const malformed = await gitWithInput(
           fixture.repo,

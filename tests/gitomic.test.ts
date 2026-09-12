@@ -7,7 +7,7 @@ import { join } from "node:path"
 
 import { describe, expect, test } from "vitest"
 
-import { open } from "../src/index.js"
+import { createShellBackend, open } from "../src/index.js"
 import { createBareRepo, git } from "./helpers/git.js"
 
 describe("gitomic public transaction contract", () => {
@@ -56,6 +56,103 @@ describe("gitomic public transaction contract", () => {
 
       expect(result).toEqual({ oid: fixture.initial, retries: 0 })
       expect(await git(fixture.repo, "rev-list", "--count", "main")).toBe("1")
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  test("records each explicit per-call provenance on one reused store", async () => {
+    const fixture = await createBareRepo()
+    try {
+      const store = await open({ repo: fixture.repo, ref: "main", writer: "executor" })
+      const first = await store.transact(async (map) => map.set("first", "1"), "first original actor", {
+        provenance: {
+          actor: "actor-a",
+          session: "0198b5e8-cdd2-7a63-8a81-2fdc8144e6a4",
+          generation: 7,
+          run: "run-a",
+        },
+      })
+      const second = await store.transact(async (map) => map.set("second", "2"), "second original actor", {
+        provenance: {
+          actor: "actor-b",
+          session: "0198b5e8-cdd2-7a63-8a81-2fdc8144e6a5",
+          generation: 8,
+        },
+      })
+      const backend = createShellBackend()
+      const unchanged = await store.transact(async () => {}, "inspect without changing attribution", {
+        provenance: { actor: "inspector", session: "inspection-session", generation: 9 },
+      })
+      expect(unchanged).toEqual({ oid: second.oid, retries: 0 })
+      expect(await git(fixture.repo, "rev-list", "--count", "main")).toBe("3")
+
+      await expect(backend.readCommit(fixture.repo, first.oid)).resolves.toMatchObject({
+        writer: "executor",
+        provenance: {
+          actor: "actor-a",
+          session: "0198b5e8-cdd2-7a63-8a81-2fdc8144e6a4",
+          generation: 7,
+          run: "run-a",
+        },
+      })
+      await expect(backend.readCommit(fixture.repo, second.oid)).resolves.toMatchObject({
+        writer: "executor",
+        provenance: {
+          actor: "actor-b",
+          session: "0198b5e8-cdd2-7a63-8a81-2fdc8144e6a5",
+          generation: 8,
+        },
+      })
+      const unmanaged = await store.transact(async (map) => map.set("third", "3"), "unmanaged call on the same store")
+      await expect(backend.readCommit(fixture.repo, unmanaged.oid)).resolves.toMatchObject({
+        writer: "executor",
+        provenance: null,
+      })
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  test("captures queued-call provenance when the public transaction is submitted", async () => {
+    const fixture = await createBareRepo()
+    try {
+      const store = await open({ repo: fixture.repo, ref: "main", writer: "executor" })
+      let releaseFirst: (() => void) | undefined
+      let enteredFirst: (() => void) | undefined
+      const firstEntered = new Promise<void>((resolve) => {
+        enteredFirst = resolve
+      })
+      const first = store.transact(async (map) => {
+        await new Promise<void>((resolve) => {
+          releaseFirst = resolve
+          enteredFirst?.()
+        })
+        map.set("first", "1")
+      }, "hold the queue")
+      await firstEntered
+
+      const provenance = {
+        actor: "actor-a",
+        session: "0198b5e8-cdd2-7a63-8a81-2fdc8144e6a4",
+        generation: 7,
+        run: "run-a",
+      }
+      const captured = { ...provenance }
+      const options = { provenance }
+      const second = store.transact(async (map) => map.set("second", "1"), "capture at public entry", options)
+      provenance.actor = "actor-b"
+      provenance.session = "session-b"
+      provenance.generation = 8
+      provenance.run = "run-b"
+      options.provenance = { actor: "actor-c", session: "session-c", generation: 9, run: "run-c" }
+      if (releaseFirst === undefined) throw new Error("first transaction did not reach its queue barrier")
+      releaseFirst()
+
+      const [, committed] = await Promise.all([first, second])
+      await expect(createShellBackend().readCommit(fixture.repo, committed.oid)).resolves.toMatchObject({
+        provenance: captured,
+      })
     } finally {
       await fixture.cleanup()
     }

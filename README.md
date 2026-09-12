@@ -91,13 +91,16 @@ const store = await open({
 
 type Update = (map: GitMap, base: string) => Promise<void>
 type Committed = { oid: string; retries: number }
+type CommitProvenance = { readonly actor: string; readonly session: string; readonly generation: number; readonly run?: string }
 
 store.head(): Promise<string>            // newest commit id
 store.at(commit?: string): Snapshot      // read-only view there — lazy
-store.transact(fn: Update, message: string): Promise<Committed>
+store.transact(fn: Update, message: string, options?: { readonly provenance?: CommitProvenance }): Promise<Committed>
 ```
 
 `transact` runs your update function and lands its writes as one commit, re-running it if another writer got there first. `message` is required — it becomes the commit message; say why, not what. The update function's second argument, `base`, is the commit oid it is running against on this attempt — a fresh tip on every re-run — so a precondition check can name the exact commit it refused on.
+
+Callers with independently verified original attribution may provide it as per-call `provenance`. Gitomic copies and validates its scalar fields before queueing the call, then records them in commit trailers, fixed through every retry; it never infers them from a writer label, process, environment, or store. Omitting provenance leaves that call unattributed even on a reused store. An unchanged transaction returns the existing commit without recording new attribution. This metadata is an audit record, never authority to write.
 
 ### Who wrote it
 
@@ -160,7 +163,7 @@ const commits = await reader.log({ from: revision, limit: 50 })
 const changes = await reader.diff(olderRevision, revision)
 ```
 
-`log({ from?, limit? })` returns newest-first, first-parent `CommitMeta` records. It pins one tip when `from` is omitted; `limit` defaults to 50 and must be a positive safe integer no greater than 1,024. Each record contains `oid`, `parent` (`null` at the root), the full `message`, and the committer's `timestamp` in seconds. Gitomic's own timestamps preserve order, not wall-clock time. The `writer`, `instance`, and `seq` audit trailers are each `null` when absent; malformed or duplicate trailers fail loudly. These are recorded labels, not verified authorship.
+`log({ from?, limit? })` returns newest-first, first-parent `CommitMeta` records. It pins one tip when `from` is omitted; `limit` defaults to 50 and must be a positive safe integer no greater than 1,024. Each record contains `oid`, `parent` (`null` at the root), the full `message`, and the committer's `timestamp` in seconds. Gitomic's own timestamps preserve order, not wall-clock time. The `writer`, `instance`, and `seq` audit trailers are each `null` when absent; `provenance` is `null` when no attribution trailers are present. Malformed, duplicate, or partial provenance trailers fail loudly. These are recorded labels, not verified authorship.
 
 `diff(from, to)` returns sorted `{ path, from, to }` records, with blob ids on either side and `null` for an absent path. Both commit endpoints must exist, even when they are equal. It compares the backend's file projection without decoding values, so binary changes work too; it does not report mode-only changes, text hunks, or inferred renames.
 
@@ -299,7 +302,7 @@ const test = await open({ repo: "my-test", ref: "main", writer: "test", backend:
 
 `iso` reads objects through `isomorphic-git`, then builds and durably writes canonical objects in-process, keeping ref CAS native. `mem` builds canonical git objects entirely in memory and needs neither a repository nor the `git` program.
 
-A custom backend implements `GitomicBackend`: `head`, `readFiles`, `readCommit`, `writeCommit`, `compareAndSwap`, `findTransaction`, plus the optional remote pair. `readCommit` supplies the `CommitMeta` record described above. `writeCommit` receives your `writer` label and the store's `instance` and `seq`, and must record all three so `findTransaction` can recognize `(instance, seq)` later. A backend that wraps a built-in one keeps every contract by spreading it and overriding only what it owns.
+A custom backend implements `GitomicBackend`: `head`, `readFiles`, `readCommit`, `writeCommit`, `compareAndSwap`, `findTransaction`, plus the optional remote pair. `readCommit` supplies the `CommitMeta` record described above. `writeCommit` receives your `writer` label and the store's `instance` and `seq`, and must record all three so `findTransaction` can recognize `(instance, seq)` later. It also receives optional per-call `provenance`, which must be preserved in native commit metadata. A backend that wraps a built-in one keeps every contract by spreading it and overriding only what it owns.
 
 ## Command line
 

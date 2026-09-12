@@ -44,6 +44,17 @@ export type Committed = {
   retries: number
 }
 
+/**
+ * Caller-supplied original attribution recorded beside Gitomic's executor and
+ * receipt metadata. It is serialization data, never a capability or grant.
+ */
+export type CommitProvenance = {
+  readonly actor: string
+  readonly session: string
+  readonly generation: number
+  readonly run?: string
+}
+
 export type CommitInput = {
   parent: Oid
   changes: ReadonlyMap<string, string | undefined>
@@ -53,6 +64,8 @@ export type CommitInput = {
   /** The one live store that produced this commit. Unique by construction. */
   instance: string
   seq: number
+  /** Optional original attribution for this transaction only. */
+  provenance?: CommitProvenance
 }
 
 export type CommitMeta = {
@@ -64,6 +77,8 @@ export type CommitMeta = {
   writer: string | null
   instance: string | null
   seq: number | null
+  /** Original attribution, or null when absent; malformed or partial trailers are refused. */
+  provenance: CommitProvenance | null
   /** Git committer time in seconds since the Unix epoch. */
   timestamp: number
 }
@@ -151,5 +166,5 @@ export type Reader = {
 export type Store = {
   head(): Promise<Oid>
   at(commit?: Oid): Snapshot
-  transact(update: Update, message: string): Promise<Committed>
+  transact(update: Update, message: string, options?: { readonly provenance?: CommitProvenance }): Promise<Committed>
 }

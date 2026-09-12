@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto"
 
-import type { CommitMeta, Oid } from "./types.js"
-import { decodeUtf8 } from "./utf8.js"
+import type { CommitMeta, CommitProvenance, Oid } from "./types.js"
+import { assertUtf8, decodeUtf8 } from "./utf8.js"
 
 export const GITOMIC_NAME = "gitomic"
 export const GITOMIC_EMAIL = "gitomic@localhost"
@@ -71,7 +71,7 @@ export function parseCommit(oid: Oid, content: Uint8Array): CommitMeta {
       .split(/\n[ \t]*\n/)
       .at(-1) ?? ""
   for (const line of finalParagraph.split("\n")) {
-    const match = /^(Gitomic-(?:Writer|Instance|Seq)):(.*)$/.exec(line)
+    const match = /^(Gitomic-(?:Writer|Instance|Seq|Actor|Actor-Session|Actor-Generation|Actor-Run)):(.*)$/.exec(line)
     if (match === null) continue
     const key = match[1] as string
     const value = (match[2] ?? "").trim()
@@ -89,6 +89,7 @@ export function parseCommit(oid: Oid, content: Uint8Array): CommitMeta {
   if (rawSeq !== undefined && (!/^\d+$/.test(rawSeq) || !Number.isSafeInteger(seq))) {
     throw new Error(`invalid Git commit ${oid}: malformed Gitomic-Seq trailer`)
   }
+  const provenance = parseCommitProvenance(oid, trailers)
   return {
     oid,
     parent: parents[0] ?? null,
@@ -96,8 +97,62 @@ export function parseCommit(oid: Oid, content: Uint8Array): CommitMeta {
     writer: trailers.get("Gitomic-Writer") ?? null,
     instance: trailers.get("Gitomic-Instance") ?? null,
     seq,
+    provenance,
     timestamp,
   }
+}
+
+function parseCommitProvenance(oid: Oid, trailers: ReadonlyMap<string, string>): CommitProvenance | null {
+  const keys = ["Gitomic-Actor", "Gitomic-Actor-Session", "Gitomic-Actor-Generation", "Gitomic-Actor-Run"] as const
+  if (!keys.some((key) => trailers.has(key))) return null
+
+  const actor = trailers.get("Gitomic-Actor")
+  const session = trailers.get("Gitomic-Actor-Session")
+  const rawGeneration = trailers.get("Gitomic-Actor-Generation")
+  if (actor === undefined || session === undefined || rawGeneration === undefined) {
+    throw new Error(`invalid Git commit ${oid}: incomplete Gitomic-Actor provenance trailers`)
+  }
+  const generation = Number(rawGeneration)
+  if (!/^\d+$/.test(rawGeneration) || !Number.isSafeInteger(generation) || generation < 0) {
+    throw new Error(`invalid Git commit ${oid}: malformed Gitomic-Actor-Generation trailer`)
+  }
+  const run = trailers.get("Gitomic-Actor-Run")
+  return run === undefined ? { actor, session, generation } : { actor, session, generation, run }
+}
+
+/** Clone and validate untrusted per-call metadata before it can cross a replay boundary. */
+export function cloneCommitProvenance(value: CommitProvenance | undefined): CommitProvenance | undefined {
+  if (value === undefined) return undefined
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError("provenance must be an object with actor, session, generation, and optional run")
+  }
+  const source = value as Record<string, unknown>
+  for (const key of Object.keys(source)) {
+    if (!["actor", "session", "generation", "run"].includes(key)) {
+      throw new TypeError(`provenance contains an unknown field: ${JSON.stringify(key)}`)
+    }
+  }
+  const actor = assertProvenanceString(source.actor, "actor")
+  const session = assertProvenanceString(source.session, "session")
+  const generation = source.generation
+  if (typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 0) {
+    throw new TypeError("provenance.generation must be a non-negative safe integer")
+  }
+  const run = source.run === undefined ? undefined : assertProvenanceString(source.run, "run")
+  return run === undefined ? { actor, session, generation } : { actor, session, generation, run }
+}
+
+function assertProvenanceString(value: unknown, field: "actor" | "session" | "run"): string {
+  if (typeof value !== "string") throw new TypeError(`provenance.${field} must be a string`)
+  assertUtf8(value, `provenance.${field}`)
+  const hasControlCharacter = [...value].some((character) => {
+    const codePoint = character.codePointAt(0) ?? 0
+    return codePoint <= 0x1f || codePoint === 0x7f
+  })
+  if (value.length === 0 || value !== value.trim() || hasControlCharacter) {
+    throw new TypeError(`provenance.${field} must be a non-empty, single-line identifier`)
+  }
+  return value
 }
 
 /**
@@ -110,8 +165,19 @@ export function parseCommit(oid: Oid, content: Uint8Array): CommitMeta {
  * commit. The label is a name and may repeat across processes; the instance is
  * an identity and cannot, which is why `transactionMatches` keys on it.
  */
-export function formatCommitMessage(writer: string, instance: string, message: string, seq: number): string {
-  return `${writer}: ${message}\n\nGitomic-Writer: ${writer}\nGitomic-Instance: ${instance}\nGitomic-Seq: ${seq}\n`
+export function formatCommitMessage(
+  writer: string,
+  instance: string,
+  message: string,
+  seq: number,
+  provenance?: CommitProvenance,
+): string {
+  const captured = cloneCommitProvenance(provenance)
+  const provenanceTrailers =
+    captured === undefined
+      ? ""
+      : `Gitomic-Actor: ${captured.actor}\nGitomic-Actor-Session: ${captured.session}\nGitomic-Actor-Generation: ${captured.generation}\n${captured.run === undefined ? "" : `Gitomic-Actor-Run: ${captured.run}\n`}`
+  return `${writer}: ${message}\n\nGitomic-Writer: ${writer}\n${provenanceTrailers}Gitomic-Instance: ${instance}\nGitomic-Seq: ${seq}\n`
 }
 
 /**

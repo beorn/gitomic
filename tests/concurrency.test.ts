@@ -143,6 +143,58 @@ describe("semantic CAS replay", () => {
     }
   })
 
+  test("preserves per-call provenance captured before a CAS replay", async () => {
+    const fixture = await createBareRepo()
+    try {
+      const shell = createShellBackend()
+      let refuseFirstPublish = true
+      const backend: GitomicBackend = {
+        ...shell,
+        async compareAndSwap(repo, ref, next, expected) {
+          if (refuseFirstPublish) {
+            refuseFirstPublish = false
+            return false
+          }
+          return await shell.compareAndSwap(repo, ref, next, expected)
+        },
+      }
+      const store = await open({ repo: fixture.repo, ref: "main", writer: "executor", backend })
+      const provenance = {
+        actor: "original-actor",
+        session: "0198b5e8-cdd2-7a63-8a81-2fdc8144e6a4",
+        generation: 7,
+        run: "run-0198b5e8",
+      }
+      let attempts = 0
+
+      const result = await store.transact(
+        async (map) => {
+          attempts += 1
+          if (attempts === 1) {
+            provenance.actor = "mutated-after-start"
+            provenance.generation = 99
+          }
+          map.set("captured", "once")
+        },
+        "capture attribution before replay",
+        { provenance },
+      )
+
+      expect(result.retries).toBe(1)
+      expect(attempts).toBe(2)
+      await expect(shell.readCommit(fixture.repo, result.oid)).resolves.toMatchObject({
+        provenance: {
+          actor: "original-actor",
+          session: "0198b5e8-cdd2-7a63-8a81-2fdc8144e6a4",
+          generation: 7,
+          run: "run-0198b5e8",
+        },
+      })
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
   test("carries an unpublished commit through a default gc without writing a ref to protect it", async () => {
     const fixture = await createBareRepo()
     try {
