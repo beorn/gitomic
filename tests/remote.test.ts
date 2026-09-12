@@ -4,11 +4,12 @@
 
 import { describe, expect, test, vi } from "vitest"
 import fs from "node:fs"
-import { chmod, readFile, writeFile } from "node:fs/promises"
+import { chmod, readFile, unlink, writeFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
 import { pathToFileURL } from "node:url"
 
-import { open, openReader, openRemoteRepository } from "../src/index.js"
+import { createShellBackend, open, openReader, openRemoteRepository, RetriesExhausted } from "../src/index.js"
+import type { GitMap, GitomicBackend } from "../src/index.js"
 import { createBareRepo, createRemoteRepos, git } from "./helpers/git.js"
 
 type TraceEvent = {
@@ -110,6 +111,194 @@ describe("owned remote repositories", () => {
 })
 
 describe("remote arbitration", () => {
+  // AC2: mocked remote reads cannot detect shell.fetchRemote rewinding an ahead application ref.
+  test.each(["caller-owned", "URL-owned"])(
+    "reader preserves an unpublished %s branch while observing origin",
+    async (kind) => {
+      const fixture = await createRemoteRepos()
+      const repository = kind === "URL-owned" ? openRemoteRepository(pathToFileURL(fixture.remote).href) : undefined
+      const repo = repository?.repo ?? fixture.left
+      try {
+        const local = await open({ repo, ref: "main" })
+        const ahead = await local.transact(async (map) => map.set("unpublished", "keep"), "local only")
+        const reader = await openReader({ repo, ref: "main", remote: "origin" })
+        expect(await git(repo, "rev-parse", "main")).toBe(ahead.oid)
+        expect(await reader.head()).toBe(fixture.initial)
+        const pinned = reader.at()
+        expect(await pinned.has("published")).toBe(false)
+
+        const writer = await open({ repo: fixture.right, ref: "main", remote: "origin" })
+        const published = await writer.transact(async (map) => map.set("published", "remote"), "advance origin")
+        expect(await reader.head()).toBe(published.oid)
+        expect(await reader.at().get("published")).toBe("remote")
+        expect((await reader.log()).map((commit) => commit.oid)).toEqual([published.oid, fixture.initial])
+        const controller = new AbortController()
+        const changes = reader.watch({ after: fixture.initial, signal: controller.signal })[Symbol.asyncIterator]()
+        try {
+          expect(await changes.next()).toEqual({ done: false, value: { from: fixture.initial, to: published.oid } })
+        } finally {
+          controller.abort()
+          await changes.return?.()
+        }
+        expect(await pinned.has("published")).toBe(false)
+        expect(await reader.at(ahead.oid).get("unpublished")).toBe("keep")
+        expect(await git(repo, "rev-parse", "main")).toBe(ahead.oid)
+        expect(await git(fixture.remote, "rev-parse", "main")).toBe(published.oid)
+        expect(await git(repo, "for-each-ref", "refs/gitomic/fetch")).toBe("")
+
+        // Store retains the documented origin-cache replacement, including ahead local tips.
+        const store = await open({ repo, ref: "main", remote: "origin" })
+        expect(await store.head()).toBe(published.oid)
+        expect(await store.at().get("published")).toBe("remote")
+      } finally {
+        repository?.[Symbol.dispose]()
+        await fixture.cleanup()
+      }
+    },
+  )
+
+  // AC3/4: real accepted pushes, a non-idempotent update and a later winner expose replay or wrong receipt identity.
+  test.each([
+    { acknowledgement: "false", contention: false },
+    { acknowledgement: "throw", contention: false },
+    { acknowledgement: "false", contention: true },
+    { acknowledgement: "throw", contention: true },
+  ])(
+    "recovers $acknowledgement acknowledgement with prior contention=$contention",
+    async ({ acknowledgement, contention }) => {
+      const fixture = await createRemoteRepos()
+      try {
+        const shell = createShellBackend()
+        const other = await open({ repo: fixture.right, ref: "main", remote: "origin" })
+        let publishes = 0
+        let landedOid: string | undefined
+        const findTransaction = vi.fn(shell.findTransaction)
+        const backend: GitomicBackend = {
+          ...shell,
+          findTransaction,
+          async compareAndSwapRemote(repo, ref, next, expected, remote) {
+            publishes += 1
+            if (contention && publishes === 1) {
+              await other.transact(async (map) => map.set("earlier", "winner"), "win first race")
+            }
+            const landed = await shell.compareAndSwapRemote!(repo, ref, next, expected, remote)
+            if (!landed) return false
+            landedOid = next
+            await other.transact(async (map) => map.set("later", "winner"), "advance after receipt")
+            if (acknowledgement === "throw") throw new Error("accepted; acknowledgement lost")
+            return false
+          },
+        }
+        const store = await open({ repo: fixture.left, ref: "main", remote: "origin", backend })
+        let updates = 0
+        const result = await store.transact(async (map) => {
+          updates += 1
+          map.set("count", String(Number((await map.get("count")) ?? "0") + 1))
+        }, "increment once")
+
+        expect(result.oid).toBe(landedOid)
+        expect(result.oid).not.toBe(await git(fixture.remote, "rev-parse", "main"))
+        expect(result.retries).toBe(Number(contention) + Number(acknowledgement === "false"))
+        expect(updates).toBe(1 + Number(contention))
+        expect(publishes).toBe(updates)
+        expect(findTransaction).toHaveBeenCalledTimes(publishes)
+        expect(await git(fixture.remote, "show", "main:count")).toBe("1")
+        expect(await store.at(result.oid).has("later")).toBe(false)
+        expect(await git(fixture.remote, "rev-list", "--count", "main")).toBe(String(3 + Number(contention)))
+      } finally {
+        await fixture.cleanup()
+      }
+    },
+  )
+
+  // AC3: a real post-push cache failure is also an uncertain publish, not just an injected lost acknowledgement.
+  test("recovers a remote publication when its local cache update throws", async () => {
+    const fixture = await createRemoteRepos()
+    try {
+      const shell = createShellBackend()
+      const hook = join(fixture.left, "hooks", "reference-transaction")
+      let cacheFailure: unknown
+      const backend: GitomicBackend = {
+        ...shell,
+        async compareAndSwapRemote(...args) {
+          await writeFile(
+            hook,
+            '#!/bin/sh\nwhile read old new ref; do\n  if [ "$ref" = refs/heads/main ]; then echo "cache update denied" >&2; exit 1; fi\ndone\n',
+            { flag: "wx", mode: 0o755 },
+          )
+          try {
+            return await shell.compareAndSwapRemote!(...args)
+          } catch (error) {
+            cacheFailure = error
+            throw error
+          } finally {
+            await unlink(hook)
+          }
+        },
+      }
+      const store = await open({ repo: fixture.left, ref: "main", remote: "origin", backend })
+      const update = vi.fn(async (map: GitMap) => {
+        map.set("count", String(Number((await map.get("count")) ?? "0") + 1))
+      })
+      const result = await store.transact(update, "increment despite cache failure")
+      expect(cacheFailure).toBeInstanceOf(Error)
+      expect((cacheFailure as Error).message).toContain("cache update denied")
+      expect(result).toEqual({ oid: await git(fixture.remote, "rev-parse", "main"), retries: 0 })
+      expect(update).toHaveBeenCalledTimes(1)
+      expect(await store.head()).toBe(result.oid)
+      expect(await store.at().get("count")).toBe("1")
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  // AC3: absence of a receipt is uncertainty, and verification failure must not erase the publication cause.
+  test.each(["no receipt", "refresh failure", "lookup failure", "undefined cause"])(
+    "does not replay an uncertain publication: %s",
+    async (failure) => {
+      const fixture = await createRemoteRepos()
+      try {
+        const shell = createShellBackend()
+        const publicationError = failure === "undefined cause" ? undefined : new Error("publication connection lost")
+        const verificationError = new Error("receipt verification unavailable")
+        let published = false
+        const backend: GitomicBackend = {
+          ...shell,
+          async compareAndSwapRemote() {
+            published = true
+            throw publicationError
+          },
+          async fetchRemote(repo, ref, remote) {
+            if (published && failure === "refresh failure") throw verificationError
+            return shell.fetchRemote!(repo, ref, remote)
+          },
+          async findTransaction(...args) {
+            if (failure === "lookup failure") throw verificationError
+            return shell.findTransaction(...args)
+          },
+        }
+        const store = await open({ repo: fixture.left, ref: "main", remote: "origin", backend })
+        const update = vi.fn(async (map: GitMap) => {
+          map.set("count", String(Number((await map.get("count")) ?? "0") + 1))
+        })
+        const outcome = store.transact(update, "uncertain increment")
+        await expect(outcome).rejects.toThrow(/publication.*unknown/i)
+        await expect(outcome).rejects.toThrow(/do not blindly retry/i)
+        await expect(outcome).rejects.not.toBeInstanceOf(RetriesExhausted)
+        if (failure === "refresh failure" || failure === "lookup failure") {
+          await expect(outcome).rejects.toBeInstanceOf(AggregateError)
+          await expect(outcome).rejects.toHaveProperty("errors", [publicationError, verificationError])
+        } else {
+          await expect(outcome).rejects.toHaveProperty("cause", publicationError)
+        }
+        expect(update).toHaveBeenCalledTimes(1)
+        expect(await git(fixture.remote, "rev-parse", "main")).toBe(fixture.initial)
+      } finally {
+        await fixture.cleanup()
+      }
+    },
+  )
+
   test("fetches through a transaction-private ref instead of shared FETCH_HEAD", async () => {
     const fixture = await createRemoteRepos()
     const previousTrace = process.env.GIT_TRACE2_EVENT

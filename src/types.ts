@@ -96,6 +96,11 @@ export type GitomicBackend = {
    * `base` is genuinely ambiguous and must throw rather than answer.
    */
   findTransaction(repo: string, head: Oid, base: Oid, instance: string, seq: number): Promise<Oid | undefined>
+  /**
+   * Fetch and return the remote tip without moving the selected application ref.
+   * Object downloads and private temporary fetch refs are allowed. Readers rely
+   * on this contract; Store refresh separately updates its local cache ref.
+   */
   fetchRemote?(repo: string, ref: string, remote: string): Promise<Oid>
   compareAndSwapRemote?(repo: string, ref: string, next: Oid, expected: Oid, remote: string): Promise<boolean>
 }

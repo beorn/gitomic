@@ -107,41 +107,50 @@ describe("semantic CAS replay", () => {
     }
   })
 
-  test("recognizes an acknowledged transaction when the CAS result is lost", async () => {
-    const fixture = await createBareRepo()
-    try {
-      const shell = createShellBackend()
-      let hideFirstAcknowledgement = true
-      const backend: GitomicBackend = {
-        ...shell,
-        async compareAndSwap(repo, ref, next, expected) {
-          const landed = await shell.compareAndSwap(repo, ref, next, expected)
-          if (landed && hideFirstAcknowledgement) {
-            hideFirstAcknowledgement = false
-            return false
-          }
-          return landed
-        },
+  test.each(["false", "throw"])(
+    "recognizes a landed local transaction after a %s acknowledgement",
+    async (acknowledgement) => {
+      const fixture = await createBareRepo()
+      try {
+        const shell = createShellBackend()
+        let hideFirstAcknowledgement = true
+        const backend: GitomicBackend = {
+          ...shell,
+          async compareAndSwap(repo, ref, next, expected) {
+            const landed = await shell.compareAndSwap(repo, ref, next, expected)
+            if (landed && hideFirstAcknowledgement) {
+              hideFirstAcknowledgement = false
+              if (acknowledgement === "throw") throw new Error("local CAS acknowledgement lost")
+              return false
+            }
+            return landed
+          },
+        }
+        const store = await open({
+          repo: fixture.repo,
+          ref: "main",
+          writer: "writer-a",
+          backend,
+        })
+
+        let updates = 0
+        const result = await store.transact(async (map) => {
+          updates += 1
+          map.set("count", String(Number((await map.get("count")) ?? "0") + 1))
+        }, "deduplicate me")
+
+        expect(result.retries).toBe(acknowledgement === "false" ? 1 : 0)
+        expect(result.oid).toBe(await store.head())
+        expect(updates).toBe(1)
+        expect(await store.at().get("count")).toBe("1")
+        expect(await git(fixture.repo, "rev-list", "--count", "main")).toBe("2")
+        const operations = await git(fixture.repo, "log", "--format=%(trailers:key=Gitomic-Seq,valueonly)", "main")
+        expect(operations.split("\n").filter((line) => line === "0")).toHaveLength(1)
+      } finally {
+        await fixture.cleanup()
       }
-      const store = await open({
-        repo: fixture.repo,
-        ref: "main",
-        writer: "writer-a",
-        backend,
-      })
-
-      const result = await store.transact(async (map) => map.set("once", "only once"), "deduplicate me")
-
-      expect(result.retries).toBe(1)
-      expect(result.oid).toBe(await store.head())
-      expect(await store.at().get("once")).toBe("only once")
-      expect(await git(fixture.repo, "rev-list", "--count", "main")).toBe("2")
-      const operations = await git(fixture.repo, "log", "--format=%(trailers:key=Gitomic-Seq,valueonly)", "main")
-      expect(operations.split("\n").filter((line) => line === "0")).toHaveLength(1)
-    } finally {
-      await fixture.cleanup()
-    }
-  })
+    },
+  )
 
   test("carries an unpublished commit through a default gc without writing a ref to protect it", async () => {
     const fixture = await createBareRepo()

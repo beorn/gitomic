@@ -445,8 +445,6 @@ async function fetchRemote(repo: string, ref: string, remote: string): Promise<O
   try {
     await gitWrite(repo, ["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", remote, `${ref}:${scratch}`])
     fetched = await head(repo, scratch)
-    const local = await head(repo, ref)
-    if (local !== fetched) await compareAndSwap(repo, ref, fetched, local)
     return fetched
   } finally {
     const temporary = fetched ?? (await optionalRef(repo, scratch))

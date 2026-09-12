@@ -173,7 +173,12 @@ async function prepareStore(options: OpenOptions): Promise<StoreContext> {
     if (fetchRemote === undefined || compareAndSwapRemote === undefined) {
       throw new TypeError("this backend cannot arbitrate remotely; omit remote or use the shell/iso backend")
     }
-    refresh = async () => backendOid(await fetchRemote(repo, ref, remote))
+    refresh = async () => {
+      const fetched = backendOid(await fetchRemote(repo, ref, remote))
+      const local = backendOid(await backend.head(repo, ref))
+      if (local !== fetched) await backend.compareAndSwap(repo, ref, fetched, local)
+      return fetched
+    }
     publish = async (next, expected) => compareAndSwapRemote(repo, ref, next, expected, remote)
   }
   await refresh()
@@ -243,17 +248,36 @@ async function transact(context: StoreContext, update: Update, message: string):
         seq,
       }),
     )
-    if (await context.publish(next, parent)) return { oid: next, retries }
+    let publicationFailure: { cause: unknown; message: string } | undefined
+    try {
+      if (await context.publish(next, parent)) return { oid: next, retries }
+    } catch (cause) {
+      publicationFailure = {
+        cause,
+        message: `Transaction publication to ${context.repo} ${context.ref} is unknown; do not blindly retry. ${cause instanceof Error ? cause.message : String(cause)}`,
+      }
+    }
 
-    retries += 1
-    // A refused publish is usually plain contention, but an acknowledgement can
-    // also be lost after the write landed. Look for this exact receipt before
+    if (publicationFailure === undefined) retries += 1
+    // A false publish is usually contention; false or throw can also mean an
+    // acknowledgement was lost after landing. Look for this exact receipt before
     // replaying: replaying a landed transaction would apply it twice. The scan
     // stops at `parent`, so it reads only the commits that arrived during this
     // attempt.
-    const winner = await context.refresh()
-    const landed = await context.backend.findTransaction(context.repo, winner, parent, context.instance, seq)
-    if (landed !== undefined) return { oid: backendOid(landed), retries }
+    let winner: Oid
+    try {
+      winner = await context.refresh()
+      const landed = await context.backend.findTransaction(context.repo, winner, parent, context.instance, seq)
+      if (landed !== undefined) return { oid: backendOid(landed), retries }
+    } catch (verificationError) {
+      if (publicationFailure !== undefined) {
+        throw new AggregateError([publicationFailure.cause, verificationError], publicationFailure.message)
+      }
+      throw verificationError
+    }
+    if (publicationFailure !== undefined) {
+      throw new Error(publicationFailure.message, { cause: publicationFailure.cause })
+    }
     // The ref advanced under us: a writer landed this round, so the race is
     // making progress — extend the budget rather than abandon a healthy burst.
     if (winner !== parent) deadline = Date.now() + context.retryBudgetMs

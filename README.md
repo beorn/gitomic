@@ -122,7 +122,7 @@ Gitomic-Seq: 0
 
 ### Reading
 
-Readers get the same exact snapshots, and write nothing at all:
+Readers get the same exact snapshots without moving the selected application branch, including an unpublished local tip:
 
 ```ts
 import { openReader } from "gitomic"
@@ -146,6 +146,7 @@ for await (const change of reader.watch({
 
 - `openReader` defaults `ref` to `main` and takes the same optional `remote` and `backend` as `open`.
 - `head()` re-reads the chosen local or remote ref.
+- Remote reads download objects through a private temporary fetch ref, which is removed after fetching. `head()`, unpinned `at()`, `log()` and `watch()` observe origin directly while preserving the local branch.
 - `at(oid)` is a fixed, lazy snapshot. Leave the id out to pin the tip as of the moment you call it.
 - `at(...).oid(path)` returns the git blob id of the content there, or `undefined` if absent — the natural `--expect` anchor for a later precondition write, and it answers even for a binary blob whose value cannot be decoded.
 - `matchGlob(pattern, path)` filters `keys()` output by a pattern: `*` and `?` stay within one segment, `**` crosses directories, and everything else — `.`, `+`, `@` — is literal. It follows git's `:(glob)` pathspec rules, NFC-normalizing both sides.
@@ -166,7 +167,11 @@ const changes = await reader.diff(olderRevision, revision)
 
 ### Remote
 
-**`remote`:** origin becomes the decider. Every write is one fetch/push cycle under the remote's ref lock; the push is a compare-and-swap (`--force-with-lease`), never a history rewrite, so it either fast-forwards or triggers a re-run. The local ref is then a cache of origin: reads stay local and lag until the next fetch, and an unpushed local-only tip may be replaced by origin's tip. Do not point it at a ref that carries unrelated local work. Origin is, honestly, your server; leave it out for purely local stores.
+**`remote`:** origin becomes the decider. Every write is one fetch/push cycle under the remote's ref lock; the push is a compare-and-swap (`--force-with-lease`), never a history rewrite, so it either fast-forwards or triggers a re-run. A remote Store uses its local ref as a cache of origin: Store reads stay local and lag until the next Store refresh, and an unpushed local-only tip may be replaced by origin's tip. Do not point a remote Store at a ref that carries unrelated local work. Remote Readers preserve that branch. Origin is, honestly, your server; leave it out for purely local stores.
+
+**Uncertain publication.** If publishing returns `false` or throws, Gitomic checks this transaction's `(instance, seq)` receipt before doing anything again. A match returns the landed commit's id even if another writer has since advanced the tip. A recovered throw adds no retries; earlier contention still counts. A `false` result retains the existing contention count and replay behavior.
+
+If publishing throws and no receipt is found, the outcome remains unknown: the update is not replayed, and the error preserves the publication cause with explicit guidance not to blindly retry. If receipt refresh or lookup also fails, an `AggregateError` preserves both causes. These errors are not `RetriesExhausted`. A separate `transact` call has a new receipt and can apply the write twice; establish the prior outcome before issuing it again.
 
 **Opening from a URL.** `openRemoteRepository(source)` synchronously creates a temporary bare clone through native Git. A filesystem source is also cloned; calling this function explicitly requests remote isolation.
 
@@ -208,7 +213,7 @@ Paths are git tree paths — forward slashes, no leading slash:
 - Values are strict UTF-8 strings in v1 — there is no binary value mode. A tree holding a blob that is _not_ valid UTF-8 still works: the entry counts for `keys` and `has`, and a transaction that never touches it carries it into the next commit as the same blob. Only reading that one value fails, and it names the path.
 - Unpaired JavaScript surrogates always fail on write.
 - `at()` takes only a full lowercase 40- or 64-hex commit id and pins it when called. A well-formed but missing id throws on first read.
-- `refs/gitomic/` and the `.gitomic/` tree path are reserved. gitomic writes nothing to either, and refuses to let you.
+- `refs/gitomic/` and the `.gitomic/` tree path are reserved. Gitomic uses only temporary remote-fetch refs under the former, writes nothing under the latter, and refuses application writes to either.
 
 ### The `apply` door — edits with preconditions
 
@@ -299,7 +304,7 @@ const test = await open({ repo: "my-test", ref: "main", writer: "test", backend:
 
 `iso` reads objects through `isomorphic-git`, then builds and durably writes canonical objects in-process, keeping ref CAS native. `mem` builds canonical git objects entirely in memory and needs neither a repository nor the `git` program.
 
-A custom backend implements `GitomicBackend`: `head`, `readFiles`, `readCommit`, `writeCommit`, `compareAndSwap`, `findTransaction`, plus the optional remote pair. `readCommit` supplies the `CommitMeta` record described above. `writeCommit` receives your `writer` label and the store's `instance` and `seq`, and must record all three so `findTransaction` can recognize `(instance, seq)` later. A backend that wraps a built-in one keeps every contract by spreading it and overriding only what it owns.
+A custom backend implements `GitomicBackend`: `head`, `readFiles`, `readCommit`, `writeCommit`, `compareAndSwap`, `findTransaction`, plus the optional remote pair. `readCommit` supplies the `CommitMeta` record described above. `writeCommit` receives your `writer` label and the store's `instance` and `seq`, and must record all three so `findTransaction` can recognize `(instance, seq)` later. `fetchRemote` must return the remote OID without moving the selected application ref; downloads and private temporary fetch refs are permitted. Store refresh updates the cache separately. Custom implementations must honor this behavior even though the method signature is unchanged.
 
 ## Command line
 
