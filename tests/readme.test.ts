@@ -52,7 +52,7 @@ describe("README example", () => {
       "refs/gitomic/fetch/<uuid>",
       "gc.pruneExpire",
       "residual risk",
-      "local ref is then a cache",
+      "Store uses its local ref as a cache",
       "path partition",
       "never rebases",
       "trusted perimeter",
