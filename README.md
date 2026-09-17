@@ -176,12 +176,12 @@ const changes = await reader.diff(olderRevision, revision)
 
 If publishing throws and no receipt is found, the outcome remains unknown: the update is not replayed, and the error preserves the publication cause with explicit guidance not to blindly retry. If receipt refresh or lookup also fails, an `AggregateError` preserves both causes. These errors are not `RetriesExhausted`. A separate `transact` call has a new receipt and can apply the write twice; establish the prior outcome before issuing it again.
 
-**Opening from a URL.** `openRemoteRepository(source)` synchronously creates a temporary bare clone through native Git. A filesystem source is also cloned; calling this function explicitly requests remote isolation.
+**Opening from a URL.** `await openRemoteRepository(source, options?)` opens a bare repository that native Git builds by cloning `source`. A filesystem source is also cloned; calling this function explicitly requests remote isolation.
 
 ```ts
 import { open, openReader, openRemoteRepository } from "gitomic"
 
-using repository = openRemoteRepository("file:///srv/state.git")
+using repository = await openRemoteRepository("file:///srv/state.git")
 const options = { ...repository, ref: "main" }
 const store = await open(options)
 const result = await store.transact(async (map) => map.set("note.md", "hello\n"), "write note")
@@ -189,7 +189,13 @@ const reader = await openReader(options)
 console.log(await reader.at(result.oid).get("note.md"))
 ```
 
-The owner returns `{ repo, remote: "origin" }` plus disposal. Keep it alive until every Store, Reader and receipt check using it finishes. Disposal removes only its allocated parent directory; it never removes the source. The returned `repo` is temporary storage, so do not save it as a repository identity. Existing local repositories still go directly to `open` or `openReader` and remain caller-owned. This opener requires native Git, a writable temp directory and a reachable source; it does not use injected backends. Failed opening throws with the source and native error. Cleanup errors also throw; simultaneous opening and cleanup failures retain both errors.
+The owner returns `{ repo, remote: "origin" }` plus disposal. Keep it alive until every Store, Reader and receipt check using it finishes. Existing local repositories still go directly to `open` or `openReader` and remain caller-owned. This opener requires native Git and a writable directory; it does not use injected backends. Failed opening rejects with the source and native error. Cleanup errors also reject; simultaneous opening and cleanup failures retain both errors.
+
+- **Without `cacheDir`** each open makes a temporary clone. Disposal removes only its allocated parent directory; it never removes the source. The returned `repo` is temporary storage, so do not save it as a repository identity.
+- **With `cacheDir`** one bare repository per source is kept at `<cacheDir>/<sha256 of source>.git` and reused by every later open, so the source is cloned once rather than per open, and each Store or Reader refresh fetches only what changed. Disposal leaves it in place. It is built in a sibling `.tmp-<pid>-*` directory and renamed into place; an open that loses that race discards its own build, and the next open removes builds whose process no longer exists. A kept repository that records a different origin is refused, naming the origin it records.
+- **`seed`** names a local repository whose objects build the repository (`git clone --local`), so building does not contact the source; the first refresh fetches whatever the seed lacks.
+
+**Limits.** Every Git command that can wait on a remote is bounded: `timeoutMs` bounds the build (default 120 000), and `createShellBackend({ remoteTimeoutMs })` bounds each fetch and push (default 20 000). A bounded command leads its own process group. Past its limit the whole group gets SIGTERM, then SIGKILL after 2 s, a failed build's directory is removed, and the call rejects with `GitTimeout`, which names the command and the limit. A push that times out is an unknown publication like any other thrown push: its receipt is checked and it is never blindly replayed. While a bounded group runs, SIGINT, SIGTERM and SIGHUP sent to this process are forwarded to it. A process killed with SIGKILL forwards nothing, so its Git helpers can outlive it; a kept repository's abandoned build is removed by the next open. `runGit(args, { timeoutMs })` is the same bounded runner, for callers that run their own Git commands.
 
 **Sharing `main` with a delivery queue** needs a strict path partition: gitomic owns its declared state paths and the queue owns code paths; neither writes the other's. The ref only fast-forwards. The queue never rebases or rewrites already-published gitomic commits — if its candidate is stale, it must rebuild on the current tip. Without all three, use a separate ref.
 

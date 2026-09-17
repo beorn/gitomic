@@ -1,9 +1,10 @@
-import { spawn } from "node:child_process"
+import childProcess, { type ChildProcess } from "node:child_process"
 import { randomUUID } from "node:crypto"
 import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 
+import { GitTimeout } from "./errors.js"
 import {
   formatCommitMessage,
   GITOMIC_EMAIL,
@@ -18,7 +19,8 @@ import { assertGitPrefixMatched, assertRegularBlob, normalizePrefix } from "./pa
 import type { BlobValue, CommitInput, GitomicBackend, Oid } from "./types.js"
 import { decodeBlob, decodeUtf8 } from "./utf8.js"
 
-type GitResult = {
+/** The complete output of one native Git command. */
+export type GitResult = {
   stdout: Buffer
   stderr: Buffer
   code: number
@@ -27,20 +29,40 @@ type GitResult = {
 type GitOptions = {
   env?: NodeJS.ProcessEnv
   input?: string | Buffer
+  /** Stop the command, and every process it started, after this many milliseconds. */
+  timeoutMs?: number
 }
+
+/** Options for {@link runGit}. */
+export type RunGitOptions = GitOptions
+
+/** Options for {@link createShellBackend}. */
+export type ShellBackendOptions = {
+  /**
+   * Limit, in milliseconds, for each fetch from and push to a remote. A command
+   * past it rejects with `GitTimeout`. Defaults to 20 000.
+   */
+  remoteTimeoutMs?: number
+}
+
+/** The default limit for one fetch or push to a remote. */
+export const DEFAULT_REMOTE_TIMEOUT_MS = 20_000
+/** How long a stopped process group gets between SIGTERM and SIGKILL. */
+const GROUP_STOP_GRACE_MS = 2_000
 
 const DURABLE_GIT_CONFIG = ["-c", "core.fsync=loose-object,reference", "-c", "core.fsyncMethod=fsync"] as const
 
-export function createShellBackend(): GitomicBackend {
-  return createShellRuntime().backend
+export function createShellBackend(options: ShellBackendOptions = {}): GitomicBackend {
+  return createShellRuntime(options).backend
 }
 
-export function createShellRuntime(): {
+export function createShellRuntime(options: ShellBackendOptions = {}): {
   backend: GitomicBackend
   resolveGitDir(repo: string): Promise<string>
   refStorage(repo: string): Promise<"files" | "native">
   objectFormat(repo: string): Promise<"sha1" | "sha256">
 } {
+  const remoteTimeoutMs = normalizeTimeoutMs(options.remoteTimeoutMs ?? DEFAULT_REMOTE_TIMEOUT_MS, "remoteTimeoutMs")
   const resolveGitDir = createGitDirResolver()
   const refStorages = new Map<string, Promise<"files" | "native">>()
   const objectFormats = new Map<string, Promise<"sha1" | "sha256">>()
@@ -106,9 +128,9 @@ export function createShellRuntime(): {
     compareAndSwap: async (repo, ref, next, expected) => compareAndSwap(await resolveGitDir(repo), ref, next, expected),
     findTransaction: async (repo, tip, base, instance, seq) =>
       findTransaction(await resolveGitDir(repo), tip, base, instance, seq),
-    fetchRemote: async (repo, ref, remote) => fetchRemote(await resolveGitDir(repo), ref, remote),
+    fetchRemote: async (repo, ref, remote) => fetchRemote(await resolveGitDir(repo), ref, remote, remoteTimeoutMs),
     compareAndSwapRemote: async (repo, ref, next, expected, remote) =>
-      compareAndSwapRemote(await resolveGitDir(repo), ref, next, expected, remote),
+      compareAndSwapRemote(await resolveGitDir(repo), ref, next, expected, remote, remoteTimeoutMs),
   }
   return { backend, resolveGitDir, refStorage, objectFormat }
 }
@@ -123,26 +145,166 @@ async function optionalRef(repo: string, ref: string): Promise<Oid | undefined> 
   return validateOid(text(result.stdout), `ref ${ref} points to an invalid Git object id`)
 }
 
+/**
+ * Run one native Git command and collect its output. The one bounded runner in
+ * Gitomic: with `timeoutMs`, the command leads its own process group, and past
+ * the limit the whole group gets SIGTERM, then SIGKILL after a grace period, and
+ * the call rejects with {@link GitTimeout}. A command that exits inside the limit
+ * resolves by the limit even when a helper it started still holds its output.
+ * A non-zero exit resolves with its code; the caller decides what that means.
+ */
+export async function runGit(args: readonly string[], options: RunGitOptions = {}): Promise<GitResult> {
+  return run("git", args, options)
+}
+
 async function run(command: string, args: readonly string[], options: GitOptions = {}): Promise<GitResult> {
+  const timeoutMs = options.timeoutMs === undefined ? undefined : normalizeTimeoutMs(options.timeoutMs, "timeoutMs")
   return new Promise((resolveResult, reject) => {
-    const child = spawn(command, args, {
+    const bounded = timeoutMs !== undefined && process.platform !== "win32"
+    const child = childProcess.spawn(command, args, {
       env: { ...process.env, ...options.env, GIT_TERMINAL_PROMPT: "0", LC_ALL: "C" },
       stdio: ["pipe", "pipe", "pipe"],
+      // A bounded command leads its own process group, so the limit reaches
+      // the helpers Git starts (ssh, index-pack) and not only Git itself.
+      detached: bounded,
     })
     const stdout: Buffer[] = []
     const stderr: Buffer[] = []
+    let settled = false
+    let timedOut = false
+    let exitCode: number | null | undefined
+    let limit: ReturnType<typeof setTimeout> | undefined
+    let escalation: ReturnType<typeof setTimeout> | undefined
+    const release = bounded && child.pid !== undefined ? holdGroup(child.pid) : () => {}
+    const settle = (finish: () => void): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(limit)
+      clearTimeout(escalation)
+      release()
+      finish()
+    }
+    const result = (code: number | null): GitResult => ({
+      stdout: Buffer.concat(stdout),
+      stderr: Buffer.concat(stderr),
+      code: code ?? 1,
+    })
+    // Stops what is left of a bounded command's group and stops reading pipes a
+    // helper that left the group could otherwise hold open indefinitely.
+    const abandonHelpers = (): void => {
+      stopProcess(child, "SIGKILL", bounded)
+      child.stdout.destroy()
+      child.stderr.destroy()
+    }
+    if (timeoutMs !== undefined) {
+      limit = setTimeout(() => {
+        const exited = exitCode
+        if (exited !== undefined) {
+          // The command finished inside its limit; only a helper it started
+          // still holds the output pipes, so the command's own result stands.
+          abandonHelpers()
+          settle(() => resolveResult(result(exited)))
+          return
+        }
+        timedOut = true
+        stopProcess(child, "SIGTERM", bounded)
+        escalation = setTimeout(() => stopProcess(child, "SIGKILL", bounded), GROUP_STOP_GRACE_MS)
+      }, timeoutMs)
+    }
     child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk))
     child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk))
-    child.once("error", reject)
+    child.once("error", (error) => settle(() => reject(error)))
+    // A stopped command settles when its own process exits, not when its pipes close.
+    child.once("exit", (code) => {
+      exitCode = code
+      if (!timedOut) return
+      abandonHelpers()
+      settle(() => reject(new GitTimeout(describeGitCommand(command, args), timeoutMs ?? 0)))
+    })
     child.once("close", (code) => {
-      resolveResult({
-        stdout: Buffer.concat(stdout),
-        stderr: Buffer.concat(stderr),
-        code: code ?? 1,
-      })
+      if (timedOut) return
+      settle(() => resolveResult(result(code)))
+    })
+    child.stdin.on("error", (error) => {
+      // A command stopped at its limit closes stdin under a pending write; the
+      // limit is then the reported outcome. Any other stdin failure is the result.
+      if (!timedOut) settle(() => reject(error))
     })
     child.stdin.end(options.input)
   })
+}
+
+function normalizeTimeoutMs(value: number, name: string): number {
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new TypeError(`${name} must be a positive number of milliseconds`)
+  }
+  return value
+}
+
+/** `git <subcommand>` and what it acts on, without global options such as `--git-dir` or `-c`. */
+function describeGitCommand(command: string, args: readonly string[]): string {
+  const rest = [...args]
+  while (rest.length > 0) {
+    const option = rest[0]!
+    if (option === "--git-dir" || option === "-C" || option === "-c") {
+      rest.splice(0, 2)
+    } else if (option.startsWith("--git-dir=")) {
+      rest.splice(0, 1)
+    } else {
+      break
+    }
+  }
+  const [subcommand, ...operands] = rest
+  const target = operands.filter((operand) => !operand.startsWith("-")).join(" ")
+  return [command, subcommand, target].filter((part) => part !== undefined && part !== "").join(" ")
+}
+
+function stopProcess(child: ChildProcess, signal: NodeJS.Signals, group: boolean): void {
+  const pid = child.pid
+  if (pid === undefined) return
+  try {
+    if (group) process.kill(-pid, signal)
+    else child.kill(signal)
+  } catch (error) {
+    // ESRCH: the group has already exited, which is the outcome this call wants.
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error
+  }
+}
+
+/**
+ * Process groups this process leads right now. A group does not receive the
+ * terminal's SIGINT or the SIGTERM sent to this process, so while any is held
+ * those signals are forwarded to it; when this process has no other handler
+ * for the signal, it is raised again after forwarding so the default exit
+ * still happens.
+ */
+const heldGroups = new Set<number>()
+const forwardedSignals = ["SIGINT", "SIGTERM", "SIGHUP"] as const
+
+function forwardSignal(signal: NodeJS.Signals): void {
+  for (const pid of heldGroups) {
+    try {
+      process.kill(-pid, signal)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error
+    }
+  }
+  for (const forwarded of forwardedSignals) process.removeListener(forwarded, forwardSignal)
+  heldGroups.clear()
+  if (process.listenerCount(signal) === 0) process.kill(process.pid, signal)
+}
+
+function holdGroup(pid: number): () => void {
+  if (heldGroups.size === 0) {
+    for (const signal of forwardedSignals) process.on(signal, forwardSignal)
+  }
+  heldGroups.add(pid)
+  return () => {
+    heldGroups.delete(pid)
+    if (heldGroups.size === 0) {
+      for (const signal of forwardedSignals) process.removeListener(signal, forwardSignal)
+    }
+  }
 }
 
 function gitArgs(repo: string, args: readonly string[]): string[] {
@@ -439,11 +601,13 @@ function parseTransactionHistory(output: Buffer): Array<{ oid: Oid; message: str
   return commits
 }
 
-async function fetchRemote(repo: string, ref: string, remote: string): Promise<Oid> {
+async function fetchRemote(repo: string, ref: string, remote: string, timeoutMs: number): Promise<Oid> {
   const scratch = `refs/gitomic/fetch/${randomUUID()}`
   let fetched: Oid | undefined
   try {
-    await gitWrite(repo, ["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", remote, `${ref}:${scratch}`])
+    await gitWrite(repo, ["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", remote, `${ref}:${scratch}`], {
+      timeoutMs,
+    })
     fetched = await head(repo, scratch)
     return fetched
   } finally {
@@ -460,10 +624,12 @@ async function compareAndSwapRemote(
   next: Oid,
   expected: Oid,
   remote: string,
+  timeoutMs: number,
 ): Promise<boolean> {
   const result = await run(
     "git",
     durableGitArgs(repo, ["push", "--porcelain", `--force-with-lease=${ref}:${expected}`, remote, `${next}:${ref}`]),
+    { timeoutMs },
   )
   if (result.code !== 0) {
     const detail = `${result.stdout.toString("utf8")}\n${result.stderr.toString("utf8")}`.trim()

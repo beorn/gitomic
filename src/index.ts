@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto"
 
 import { applyEdits, type Edit } from "./edits.js"
-import { Conflict, EditDoesNotApply, RetriesExhausted } from "./errors.js"
+import { Conflict, EditDoesNotApply, GitTimeout, RetriesExhausted } from "./errors.js"
 import { cloneCommitProvenance, objectOid, validateOid } from "./git-object.js"
 import {
   assertGitPrefixMatched,
@@ -32,13 +32,13 @@ import type {
 } from "./types.js"
 import { assertUtf8, decodeUtf8 } from "./utf8.js"
 
-export { Conflict, EditDoesNotApply, RetriesExhausted }
+export { Conflict, EditDoesNotApply, GitTimeout, RetriesExhausted }
 export type { EditKind, PreconditionType } from "./errors.js"
 export { applyEdits } from "./edits.js"
 export type { Edit } from "./edits.js"
 export { matchGlob } from "./glob.js"
-export { createShellBackend } from "./shell.js"
-export { openRemoteRepository, type OpenedRemoteRepository } from "./repository.js"
+export { createShellBackend, runGit, type GitResult, type RunGitOptions, type ShellBackendOptions } from "./shell.js"
+export { openRemoteRepository, type OpenedRemoteRepository, type OpenRemoteRepositoryOptions } from "./repository.js"
 export { parseOwnershipManifest } from "./ownership-manifest.js"
 export type {
   BlobValue,

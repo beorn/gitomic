@@ -74,3 +74,22 @@ export class EditDoesNotApply extends Error {
     )
   }
 }
+
+/**
+ * A native Git command outlived its time limit. The command led its own process
+ * group, and the whole group was stopped, so helpers Git started (ssh,
+ * index-pack) do not outlive it. Facts only: the command and the limit.
+ */
+export class GitTimeout extends Error {
+  override readonly name = "GitTimeout"
+
+  constructor(
+    /** The Git command that was stopped, as `git <subcommand>` plus its target. */
+    readonly command: string,
+    /** The limit it exceeded, in milliseconds. */
+    readonly timeoutMs: number,
+    options?: ErrorOptions,
+  ) {
+    super(`${command} did not finish within its ${timeoutMs} ms limit; its process group was stopped`, options)
+  }
+}

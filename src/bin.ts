@@ -171,7 +171,7 @@ async function runRead(args: string[], stdout: CliWriter, backend: GitomicBacken
   const address = requirePositional(positionals, 0, "<address>")
   const path = requirePositional(positionals, 1, "<path>")
   const at: Oid | undefined = optionalStringFlag(flags, "--at")
-  using repository = openAddressFor(address, backend)
+  using repository = await openAddressFor(address, backend)
   const reader = await openReader(repository)
   const value = await reader.at(at).get(path)
   if (value === undefined) throw new Error(`path not found: ${JSON.stringify(path)} at ${describeAddress(address, at)}`)
@@ -184,7 +184,7 @@ async function runLs(args: string[], stdout: CliWriter, backend: GitomicBackend 
   const address = requirePositional(positionals, 0, "<address>")
   const glob = positionals.at(1)
   const at: Oid | undefined = optionalStringFlag(flags, "--at")
-  using repository = openAddressFor(address, backend)
+  using repository = await openAddressFor(address, backend)
   const reader = await openReader(repository)
   for (const key of await matchingKeys(reader.at(at), glob)) stdout.write(`${key}\n`)
   return OK
@@ -202,7 +202,7 @@ async function runGrep(
   const glob = positionals.at(2)
   const at: Oid | undefined = optionalStringFlag(flags, "--at")
   const regex = compilePattern(pattern)
-  using repository = openAddressFor(address, backend)
+  using repository = await openAddressFor(address, backend)
   const reader = await openReader(repository)
   const snapshot = reader.at(at)
   for (const path of await matchingKeys(snapshot, glob)) {
@@ -245,7 +245,7 @@ async function runLog(
     throw new UsageError("-n must be a positive integer no greater than 1024")
   }
   try {
-    using repository = openAddressFor(address, backend)
+    using repository = await openAddressFor(address, backend)
     const reader = await openReader(repository)
     from ??= await reader.head()
     const history = await reader.log({ from, limit: glob === undefined ? limit : HISTORY_SCAN_LIMIT })
@@ -295,7 +295,7 @@ async function runDiff(args: string[], stdout: CliWriter, backend: GitomicBacken
   if (base === undefined) throw new UsageError("missing --base <oid>")
   let to = historyOidFlag(flags, "--at")
   try {
-    using repository = openAddressFor(address, backend)
+    using repository = await openAddressFor(address, backend)
     const reader = await openReader(repository)
     to ??= await reader.head()
     const changes = (await reader.diff(base, to)).filter(({ path }) => glob === undefined || matchGlob(glob, path))
@@ -367,7 +367,7 @@ async function runWrite(
   assertTargetsKnown("--create", create, knownPaths, "written")
   for (const path of create) assertNotContradictoryPrecondition(path, expect.has(path), true)
 
-  using repository = openAddressFor(address, backend)
+  using repository = await openAddressFor(address, backend)
   const store = await open({ ...repository, ...(writer === undefined ? {} : { writer }) })
   const base = await store.head()
   const snapshot = store.at(base)
@@ -403,7 +403,7 @@ async function runRm(args: string[], stdout: CliWriter, backend: GitomicBackend 
   const expect = parseExpectPairs(repeated.get("--expect") ?? [])
   assertTargetsKnown("--expect", expect.keys(), seen, "removed")
 
-  using repository = openAddressFor(address, backend)
+  using repository = await openAddressFor(address, backend)
   const store = await open({ ...repository, ...(writer === undefined ? {} : { writer }) })
   const base = await store.head()
   const snapshot = store.at(base)
@@ -426,7 +426,7 @@ async function runMv(args: string[], stdout: CliWriter, backend: GitomicBackend 
   const message = requireStringFlag(flags, "-m", "-m <message>")
   const writer = optionalStringFlag(flags, "--writer")
 
-  using repository = openAddressFor(address, backend)
+  using repository = await openAddressFor(address, backend)
   const store = await open({ ...repository, ...(writer === undefined ? {} : { writer }) })
   const base = await store.head()
   const expect = await store.at(base).oid(from)
@@ -477,7 +477,7 @@ async function runApply(
   }
   if (message === undefined) throw new UsageError("missing -m <message>")
 
-  using repository = openAddressFor(address, backend)
+  using repository = await openAddressFor(address, backend)
   const store = await open({ ...repository, ...(writer === undefined ? {} : { writer }) })
   const startBase = base ?? (await store.head())
   const snapshot = store.at(startBase)
@@ -812,14 +812,14 @@ async function readFileContent(file: string): Promise<string> {
 // --- opening the address ---------------------------------------------------
 
 /** One CLI selection point; a failed local open never selects a remote. */
-function openAddressFor(address: string, backend: GitomicBackend | undefined): OpenOptions & Disposable {
+async function openAddressFor(address: string, backend: GitomicBackend | undefined): Promise<OpenOptions & Disposable> {
   const { repo, ref } = parseAddressOrUsageError(address)
   const local = { repo, ref, ...(backend === undefined ? {} : { backend }), [Symbol.dispose]() {} }
   if (backend !== undefined) return local
   const drivePath = /^[A-Za-z]:[\\\\/]/.test(repo)
   const remote = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(repo) || (!drivePath && /^[^/\\\\:]+:/.test(repo))
   if (!remote) return local
-  const repository = openRemoteRepository(repo)
+  const repository = await openRemoteRepository(repo)
   return { ...repository, ref, [Symbol.dispose]: () => repository[Symbol.dispose]() }
 }
 

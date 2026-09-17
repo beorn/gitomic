@@ -3,7 +3,7 @@
 // @level l1
 // @consumer km's STATE rail in the km daemon, which must keep answering while a write waits on its remote
 
-import { execFile } from "node:child_process"
+import { execFile, spawnSync } from "node:child_process"
 import { createHash } from "node:crypto"
 import { chmod, mkdir, mkdtemp, readdir, readFile, rename, rm, writeFile } from "node:fs/promises"
 import fs from "node:fs"
@@ -12,7 +12,7 @@ import { join } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import { afterEach, describe, expect, test, vi } from "vitest"
 
-import { createShellBackend, open, openRemoteRepository } from "../src/index.js"
+import { createShellBackend, open, openRemoteRepository, runGit } from "../src/index.js"
 import { createBareRepo, createRemoteRepos, createWorktreeRepo, git, gitFrom } from "./helpers/git.js"
 
 const INDEX = fileURLToPath(new URL("../src/index.ts", import.meta.url))
@@ -54,13 +54,16 @@ async function createStallingSsh(): Promise<StallingSsh> {
   }
 }
 
+/**
+ * Whether `pid` is a running process. A stopped helper whose new parent has not
+ * reaped it yet is a zombie: it still answers `kill(pid, 0)` but runs nothing,
+ * so the process state decides, not the signal probe.
+ */
 function alive(pid: number): boolean {
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM"
-  }
+  const state = spawnSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8" })
+  if (state.error !== undefined) throw state.error
+  const stat = state.stdout.trim()
+  return stat !== "" && !stat.startsWith("Z")
 }
 
 /** Every stalled process is gone, allowing a moment for the killed group to be reaped. */
@@ -212,6 +215,19 @@ describe("a remote that stalls", () => {
       await stall.cleanup()
       await fixture.cleanup()
     }
+  }, 10_000)
+})
+
+describe("a bounded command", () => {
+  test("settles by its limit with its own result when a helper it started still holds the output pipes", async () => {
+    const startedAt = Date.now()
+
+    // The alias's shell exits at once, leaving a background sleep holding stdout and stderr.
+    const result = await runGit(["-c", "alias.linger=!sleep 3600 & echo $!", "linger"], { timeoutMs: 500 })
+
+    expect(result.code).toBe(0)
+    expect(Date.now() - startedAt).toBeLessThan(4_500)
+    expect(await survivors([Number(result.stdout.toString("utf8").trim())])).toEqual([])
   }, 10_000)
 })
 

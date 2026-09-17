@@ -357,7 +357,7 @@ describe("apply from separate processes (K2)", () => {
         const cwd = dirs[index]!
         const script = [
           `const { open, apply, openRemoteRepository } = await import(${JSON.stringify(indexPath)})`,
-          `using repository = openRemoteRepository(${JSON.stringify(url)})`,
+          `using repository = await openRemoteRepository(${JSON.stringify(url)})`,
           `const store = await open({ ...repository, ref: "main", writer: ${JSON.stringify(name)} })`,
           "const base = await store.head()",
           'process.stdout.write(JSON.stringify({ pid: process.pid, repo: repository.repo, cwd: process.cwd(), base }) + "\\n")',
@@ -461,7 +461,7 @@ describe("apply at scale (K2 at fleet scale, F14)", () => {
       const started = performance.now()
       const settled = await Promise.allSettled(
         Array.from({ length: writerCount }, async (_, index) => {
-          using repository = openRemoteRepository(url)
+          using repository = await openRemoteRepository(url)
           const store = await open({ ...repository, ref: "main", writer: `scale-${index}` })
           return await apply(
             store,

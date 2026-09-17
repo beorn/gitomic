@@ -30,7 +30,7 @@ describe("owned remote repositories", () => {
     const fixture = await createBareRepo()
     try {
       const source = kind === "URL" ? pathToFileURL(fixture.repo).href : fixture.repo
-      const repository = openRemoteRepository(source)
+      const repository = await openRemoteRepository(source)
       const parent = dirname(repository.repo)
       try {
         expect(repository.repo).not.toBe(fixture.repo)
@@ -58,7 +58,7 @@ describe("owned remote repositories", () => {
     const source = pathToFileURL(join(fixture.repo, "missing.git")).href
     const remove = vi.spyOn(fs, "rmSync")
     try {
-      expect(() => openRemoteRepository(source)).toThrow(/git clone/)
+      await expect(openRemoteRepository(source)).rejects.toThrow(/git clone/)
       const firstParent = String(remove.mock.calls[0]?.[0])
       expect(firstParent).not.toBe("undefined")
       expect(fs.existsSync(firstParent)).toBe(false)
@@ -69,7 +69,7 @@ describe("owned remote repositories", () => {
       })
       let observed: unknown
       try {
-        openRemoteRepository(source)
+        await openRemoteRepository(source)
       } catch (error) {
         observed = error
       }
@@ -91,7 +91,7 @@ describe("owned remote repositories", () => {
   test("failed disposal stays observable and can be retried", async () => {
     const fixture = await createBareRepo()
     try {
-      const repository = openRemoteRepository(fixture.repo)
+      const repository = await openRemoteRepository(fixture.repo)
       const parent = dirname(repository.repo)
       const remove = vi.spyOn(fs, "rmSync").mockImplementationOnce(() => {
         throw new Error("cleanup denied")
@@ -116,7 +116,8 @@ describe("remote arbitration", () => {
     "reader preserves an unpublished %s branch while observing origin",
     async (kind) => {
       const fixture = await createRemoteRepos()
-      const repository = kind === "URL-owned" ? openRemoteRepository(pathToFileURL(fixture.remote).href) : undefined
+      const repository =
+        kind === "URL-owned" ? await openRemoteRepository(pathToFileURL(fixture.remote).href) : undefined
       const repo = repository?.repo ?? fixture.left
       try {
         const local = await open({ repo, ref: "main" })

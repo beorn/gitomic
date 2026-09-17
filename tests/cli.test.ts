@@ -166,7 +166,7 @@ describe("gitomic CLI — remote opening", () => {
     ["C:/absent/repo", false],
     ["absent/repo", false],
   ] as const)("address %s selects remote=%s by syntax alone", async (address, remote) => {
-    const clone = vi.spyOn(childProcess, "execFileSync").mockImplementation(() => {
+    const clone = vi.spyOn(childProcess, "spawn").mockImplementation(() => {
       throw new Error("selected clone")
     })
     const stdout = capture()
