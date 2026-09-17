@@ -37,7 +37,14 @@ export type { EditKind, PreconditionType } from "./errors.js"
 export { applyEdits } from "./edits.js"
 export type { Edit } from "./edits.js"
 export { matchGlob } from "./glob.js"
-export { createShellBackend, runGit, type GitResult, type RunGitOptions, type ShellBackendOptions } from "./shell.js"
+export {
+  createShellBackend,
+  DEFAULT_REMOTE_TIMEOUT_MS,
+  runGit,
+  type GitResult,
+  type RunGitOptions,
+  type ShellBackendOptions,
+} from "./shell.js"
 export { openRemoteRepository, type OpenedRemoteRepository, type OpenRemoteRepositoryOptions } from "./repository.js"
 export { parseOwnershipManifest } from "./ownership-manifest.js"
 export type {
