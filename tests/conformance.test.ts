@@ -15,7 +15,7 @@ import { Buffer } from "node:buffer"
 import { performance } from "node:perf_hooks"
 import { promisify } from "node:util"
 
-import { beforeEach, describe, expect, test, vi } from "vitest"
+import { describe, expect, test } from "vitest"
 
 import { apply, EditDoesNotApply, open, openRemoteRepository } from "../src/index.js"
 import type { Committed } from "../src/index.js"
@@ -53,10 +53,6 @@ function assertStrictlyLinear(parentsLog: string): void {
   expect(lines.slice(0, -1).every((line) => line.split(" ").length === 2)).toBe(true)
   expect(lines.at(-1)?.split(" ")).toHaveLength(1)
 }
-
-beforeEach(() => {
-  vi.spyOn(console, "log").mockImplementation(() => {})
-})
 
 const backends = [
   { name: "shell", backend: undefined },
@@ -348,7 +344,7 @@ describe("apply with no checkout (K1)", () => {
 })
 
 describe("apply from separate processes (K2)", () => {
-  test("two URL-only processes publish disjoint edits from one base through separately owned object repos", async () => {
+  test("two URL-only processes publish disjoint edits from one base through separately owned object repos", async (context) => {
     const fixture = await createBareRepo()
     const dirs: string[] = []
     const jobs: ReturnType<typeof execFileAsync>[] = []
@@ -439,7 +435,7 @@ describe("apply from separate processes (K2)", () => {
       expect(await git(fixture.repo, "show", `${commits[1]!.oid}:b.md`)).toBe("from b")
       for (const witness of witnesses) await expect(readdir(witness.repo)).rejects.toMatchObject({ code: "ENOENT" })
       for (const cwd of dirs) expect(await readdir(cwd)).toEqual([])
-      console.log(`K2 processes: ${JSON.stringify({ witnesses, commits })}`)
+      await context.annotate(`K2 processes: ${JSON.stringify({ witnesses, commits })}`, "info")
     } finally {
       for (const job of jobs) if (job.child.exitCode === null) job.child.kill()
       await Promise.allSettled(jobs)
@@ -450,7 +446,7 @@ describe("apply from separate processes (K2)", () => {
 })
 
 describe("apply at scale (K2 at fleet scale, F14)", () => {
-  test("fifty concurrent disjoint-path writers each land exactly once, in one strictly-linear history, none lost", async () => {
+  test("fifty concurrent disjoint-path writers each land exactly once, in one strictly-linear history, none lost", async (context) => {
     const fixture = await createBareRepo()
     try {
       const writerCount = 50
@@ -496,9 +492,10 @@ describe("apply at scale (K2 at fleet scale, F14)", () => {
       const elapsedMs = performance.now() - started
       const maxRetries = Math.max(...results.map((committed) => committed.retries))
       // Published per the design's F14 scale line: the observed numbers, not asserted.
-      console.log(
+      await context.annotate(
         `K2 remote scale: ${writerCount} concurrent URL-owned writers opened, landed and disposed in ${elapsedMs.toFixed(0)}ms ` +
           `(max ${maxRetries} CAS retries on one writer)`,
+        "info",
       )
 
       // Every writer landed its own real commit — none lost, none duplicated.
@@ -522,7 +519,7 @@ describe("apply at scale (K2 at fleet scale, F14)", () => {
 })
 
 describe("apply latency", () => {
-  test("a single apply round-trip against a real bare repo (shell backend) lands well under the 2s latency gate", async () => {
+  test("a single apply round-trip against a real bare repo (shell backend) lands well under the 2s latency gate", async (context) => {
     const fixture = await createBareRepo()
     try {
       const store = await open({ repo: fixture.repo, ref: "main", writer: "latency-gate" })
@@ -533,7 +530,7 @@ describe("apply latency", () => {
       const elapsedMs = performance.now() - started
       // Published per the brief: the measured number, not just the pass/fail —
       // this is a gate, not a target, so a slow number is reported, not hidden.
-      console.log(`apply latency: ${elapsedMs.toFixed(2)}ms (gate: < 2000ms)`)
+      await context.annotate(`apply latency: ${elapsedMs.toFixed(2)}ms (gate: < 2000ms)`, "info")
 
       // A real `git` subprocess round-trip (read tree, write blob/tree/commit
       // objects, update-ref) lands in tens of milliseconds locally; 2000ms is a
