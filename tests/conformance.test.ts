@@ -15,7 +15,7 @@ import { Buffer } from "node:buffer"
 import { performance } from "node:perf_hooks"
 import { promisify } from "node:util"
 
-import { describe, expect, test } from "vitest"
+import { beforeEach, describe, expect, test, vi } from "vitest"
 
 import { apply, EditDoesNotApply, open, openRemoteRepository } from "../src/index.js"
 import type { Committed } from "../src/index.js"
@@ -53,6 +53,10 @@ function assertStrictlyLinear(parentsLog: string): void {
   expect(lines.slice(0, -1).every((line) => line.split(" ").length === 2)).toBe(true)
   expect(lines.at(-1)?.split(" ")).toHaveLength(1)
 }
+
+beforeEach(() => {
+  vi.spyOn(console, "log").mockImplementation(() => {})
+})
 
 const backends = [
   { name: "shell", backend: undefined },
