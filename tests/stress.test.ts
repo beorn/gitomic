@@ -3,11 +3,13 @@
 // @consumer shell backend CI acceptance
 
 import { execFile } from "node:child_process"
-import { fileURLToPath } from "node:url"
+import { performance } from "node:perf_hooks"
+import { fileURLToPath, pathToFileURL } from "node:url"
 import { promisify } from "node:util"
 
 import { describe, expect, test } from "vitest"
 
+import { apply, open, openRemoteRepository } from "../src/index.js"
 import type { Committed } from "../src/index.js"
 import { createBareRepo, git } from "./helpers/git.js"
 
@@ -73,4 +75,81 @@ describe("shell contention acceptance", () => {
   test("absorbs a 12-writer burst without duplicates, merges, or lost state", async () => {
     await expectLinearContention(12, 25)
   }, 300_000)
+})
+
+describe("apply at scale (K2 at fleet scale, F14)", () => {
+  test("fifty concurrent disjoint-path writers each land exactly once, in one strictly-linear history, none lost", async (context) => {
+    const fixture = await createBareRepo()
+    try {
+      const writerCount = 50
+      const url = pathToFileURL(fixture.repo).href
+
+      // transact owns contention now — a time budget, not a counter — so there is
+      // NO outer retry loop: each writer applies exactly once and transact keeps
+      // racing until it lands within its budget (the budget resets on every observed
+      // landing, so a burst that keeps making progress is never abandoned). The
+      // disjoint blob-absent preconditions hold on whatever tip each attempt sees,
+      // so all fifty land.
+      const started = performance.now()
+      const settled = await Promise.allSettled(
+        Array.from({ length: writerCount }, async (_, index) => {
+          using repository = await openRemoteRepository(url)
+          const store = await open({ ...repository, ref: "main", writer: `scale-${index}` })
+          return await apply(
+            store,
+            fixture.initial,
+            [
+              {
+                kind: "put",
+                path: `scale/writer-${String(index).padStart(2, "0")}.md`,
+                content: `writer ${index}\n`,
+                expect: null,
+              },
+            ],
+            `writer ${index} lands`,
+          )
+        }),
+      )
+      const failures = settled.filter((result) => result.status === "rejected")
+      if (failures.length > 0) {
+        throw new AggregateError(
+          failures.map((result) => result.reason),
+          "K2 remote writers failed",
+        )
+      }
+      const results = settled.map((result) => {
+        if (result.status !== "fulfilled") throw new Error("K2 settlement unexpectedly missing a commit")
+        return result.value
+      })
+      const elapsedMs = performance.now() - started
+      const maxRetries = Math.max(...results.map((committed) => committed.retries))
+      // Published per the design's F14 scale line: the observed numbers, not asserted.
+      await context.annotate(
+        `K2 remote scale: ${writerCount} concurrent URL-owned writers opened, landed and disposed in ${elapsedMs.toFixed(0)}ms ` +
+          `(max ${maxRetries} CAS retries on one writer)`,
+        "info",
+      )
+
+      // Every writer landed its own real commit — none lost, none duplicated.
+      expect(results).toHaveLength(writerCount)
+      expect(new Set(results.map((committed) => committed.oid))).toHaveLength(writerCount)
+      expect(await git(fixture.repo, "rev-list", "--count", "main")).toBe(String(writerCount + 1))
+      const parents = (await git(fixture.repo, "rev-list", "--parents", "main")).split("\n")
+      expect(parents.slice(0, -1).every((line) => line.split(" ").length === 2)).toBe(true)
+      expect(parents.at(-1)?.split(" ")).toHaveLength(1)
+
+      const verifier = await open({ repo: fixture.repo, ref: "main", writer: "scale-verify" })
+      const tip = await verifier.head()
+      await Promise.all(
+        Array.from({ length: writerCount }, async (_, index) => {
+          const path = `scale/writer-${String(index).padStart(2, "0")}.md`
+          expect(await verifier.at(tip).get(path)).toBe(`writer ${index}\n`)
+        }),
+      )
+    } finally {
+      await fixture.cleanup()
+    }
+    // Hosted runners measured 45 to 60 s for this burst; it lives in the stress
+    // lane, run by CI after the check, and three times the observed time bounds it.
+  }, 180_000)
 })
