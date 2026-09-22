@@ -284,23 +284,23 @@ commit (`initial`, time 946684800) that is byte-identical on every backend.
 That keeps a first-parent walk on the chain instead of wandering into a kept
 commit's history. An absent ref reads as `head() === null` and no events.
 
-The message is `writer: title`, then the content paragraphs, then one trailer
+The message is `writer: title` (the title defaults to the type), then the content paragraphs, then one trailer
 block: your `props` in order (duplicates kept), then `Event: <type>`, then
 gitomic's own `Gitomic-*` trailers. gitomic reads and writes those keys but
 never interprets your values: it has no fold, no status and no kinds.
 `Event` and `Gitomic-*` are reserved: a prop spelled either way is refused,
 never silently overwritten.
 
-| Call                                                                    | Does                                                                                                                  |
-| ----------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| `openEvents({ repo, ref, writer?, remote?, backend?, retryBudgetMs? })` | Open one chain.                                                                                                       |
-| `head()`                                                                | The tip, or `null` when the chain does not exist.                                                                     |
-| `events({ from?, limit?, order? })`                                     | Events after `from`, oldest first by default; `limit` defaults to 50, at most 1024.                                   |
-| `transact(decide, message)`                                             | Read the chain, decide what to append, write it, compare-and-swap; on a race, re-run `decide` on the winner's events. |
-| `append(inputs, { expect })`                                            | Write at exactly `expect`; a moved tip throws `Conflict`.                                                             |
-| `watch({ signal, pollIntervalMs? })`                                    | Yield each batch of new events.                                                                                       |
-| `listRefs(prefix, { repo, remote? })`                                   | Every ref under a prefix and its tip: `for-each-ref`, or `ls-remote --refs` against a remote.                         |
-| `chainsUnder(prefix, { repo, limit? })`                                 | Every chain under a prefix, read in one walk.                                                                         |
+| Call                                                                    | Does                                                                                                                                                                         |
+| ----------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `openEvents({ repo, ref, writer?, remote?, backend?, retryBudgetMs? })` | Open one chain.                                                                                                                                                              |
+| `head()`                                                                | The tip, or `null` when the chain does not exist.                                                                                                                            |
+| `events({ from?, limit?, order? })`                                     | Events after `from`, oldest first by default; `limit` defaults to 50, at most 1024.                                                                                          |
+| `transact(decide, message)`                                             | Read the chain, decide what to append, write it, compare-and-swap; on a race, re-run `decide` on the winner's events. Over 1024 events it throws rather than decide on part. |
+| `append(inputs, { expect })`                                            | Write at exactly `expect`; a moved tip throws `Conflict`.                                                                                                                    |
+| `watch({ signal, pollIntervalMs? })`                                    | Yield each batch of new events; a jump of over 1024 throws.                                                                                                                  |
+| `listRefs(prefix, { repo, remote? })`                                   | Every ref under a prefix and its tip: `for-each-ref`, or `ls-remote --refs` against a remote.                                                                                |
+| `chainsUnder(prefix, { repo, limit? })`                                 | Every chain under a prefix, read in one walk.                                                                                                                                |
 
 **Reads are batched.** On the shell backend, reading a 50-event chain takes
 two git processes, every chain under a prefix takes two with exactly one

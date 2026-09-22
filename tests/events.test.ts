@@ -439,6 +439,93 @@ describe("readHistory returns exactly what readCommit returns (ruling C: Reader.
   })
 })
 
+describe("reads that must reach a boundary refuse loudly when they do not (CTO verdict number 1)", () => {
+  const many = (count: number): EventInput[] => Array.from({ length: count }, (_, index) => ({ type: `e${index}` }))
+
+  test("transact on a chain longer than 1024 events throws naming the ref and the bound; 1024 still works", async () => {
+    const backend = createMemBackend()
+    const full = await openEvents({ repo: "events-bound-full", ref: CHAIN, backend })
+    await full.append(many(1_024), { expect: null })
+    const seen: number[] = []
+    await full.transact((events) => {
+      seen.push(events.length)
+      return []
+    }, "count a full chain")
+    expect(seen).toEqual([1_024])
+
+    const over = await openEvents({ repo: "events-bound-over", ref: CHAIN, backend })
+    await over.append(many(1_025), { expect: null })
+    let decided = false
+    const refused = over.transact(() => {
+      decided = true
+      return [{ type: "never" }]
+    }, "decide on a truncated chain")
+    await expect(refused).rejects.toThrow(CHAIN)
+    await expect(refused).rejects.toThrow("1024")
+    expect(decided).toBe(false)
+    expect((await over.events({ limit: 1, order: "newest-first" }))[0]?.type).toBe("e1024")
+  })
+
+  test("watch refuses a tip that moved more than 1024 events past the last one it saw", async () => {
+    const backend = createMemBackend()
+    const events = await openEvents({ repo: "events-bound-watch", ref: CHAIN, backend })
+    const first = await events.append([{ type: "start" }], { expect: null })
+    const controller = new AbortController()
+    const changes = events.watch({ signal: controller.signal, pollIntervalMs: 1 })[Symbol.asyncIterator]()
+    const pending = changes.next()
+    await events.append(many(1_025), { expect: first.head })
+    await expect(pending).rejects.toThrow(CHAIN)
+    controller.abort()
+  })
+})
+
+describe("an event's subject defaults to its type (CTO verdict number 2)", () => {
+  test("append and transact write '<writer>: <type>' when no title is given", async () => {
+    const backend = createMemBackend()
+    const repo = "events-default-title"
+    const events = await openEvents({ repo, ref: CHAIN, writer: "queue", backend })
+    const appended = await events.append([{ type: "queued" }], { expect: null })
+    const transacted = await events.transact(() => [{ type: "admitted" }], "admit the change")
+    const subject = async (oid: Oid) => (await backend.readCommit(repo, oid)).message.split("\n")[0]
+    expect(await subject(appended.events[0]?.id as Oid)).toBe("queue: queued")
+    expect(await subject(transacted.events[0]?.id as Oid)).toBe("queue: admitted")
+    expect((await events.events()).map((event) => event.title)).toEqual(["queued", "admitted"])
+  })
+})
+
+describe("the genesis commit is one object on every backend (CTO verdict number 3)", () => {
+  test("writeGenesis returns the same oid on shell, iso and mem", async () => {
+    const oids: string[] = []
+    await withTargets(async (target) => {
+      const genesis = await target.backend.writeGenesis?.(target.repo)
+      expect(genesis, target.name).toMatch(/^[0-9a-f]{40}$/)
+      oids.push(genesis as string)
+    })
+    expect(new Set(oids).size).toBe(1)
+  })
+
+  test("a chain written by one backend reads identically on another", async () => {
+    const fixture = await createBareRepo()
+    try {
+      const shell = createShellBackend()
+      const iso = createIsoBackend()
+      const byShell = await openEvents({ repo: fixture.repo, ref: CHAIN, writer: "shell", backend: shell })
+      const first = await byShell.append([{ type: "opened", props: [["Amount", "1"]] }], { expect: null })
+      const byIso = await openEvents({ repo: fixture.repo, ref: CHAIN, writer: "iso", backend: iso })
+      await byIso.append([{ type: "paid", content: "by iso" }], { expect: first.head })
+      const readByShell = await byShell.events()
+      expect(readByShell.map((event) => [event.type, event.writer])).toEqual([
+        ["opened", "shell"],
+        ["paid", "iso"],
+      ])
+      expect(readByShell[0]?.parent).toBeNull()
+      expect(await byIso.events()).toEqual(readByShell)
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+})
+
 describe("the README events example runs as written", () => {
   test("appends, transacts once, and reads back", async () => {
     const readme = await readFile(fileURLToPath(new URL("../README.md", import.meta.url)), "utf8")

@@ -34,6 +34,7 @@ export type Prop = Trailer
 export type EventInput = {
   /** The caller's event type. gitomic stores it and never interprets it. */
   readonly type: string
+  /** The commit subject after `writer: `. Defaults to the type. */
   readonly title?: string
   readonly content?: string
   readonly props?: readonly Prop[]
@@ -89,6 +90,10 @@ export type Events = {
   /** The chain tip, or null when the ref does not exist yet. */
   head(): Promise<Oid | null>
   events(options?: EventsRead): Promise<Event[]>
+  /**
+   * Read every event, decide, append, and replay on a lost race. `message` names
+   * the transaction in errors. A chain over 1024 events is refused, not truncated.
+   */
   transact(decide: Decide, message: string): Promise<Appended>
   /** Append at exactly `expect` (null = the chain must not exist); throws Conflict on a moved tip. */
   append(inputs: readonly EventInput[], options: { expect: Oid | null }): Promise<Appended>
@@ -146,9 +151,10 @@ function assertLine(value: string, field: string): string {
 }
 
 /** Validate one input and shape its commit: body text, trailers and parents. */
-function shapeInput(input: EventInput, defaultTitle: string) {
+function shapeInput(input: EventInput) {
   const type = assertLine(input.type, "event type")
-  const title = assertLine(input.title ?? defaultTitle, "event title")
+  // A reader of `git log --oneline` sees `writer: <type>`, never a generic word.
+  const title = assertLine(input.title ?? type, "event title")
   const content = input.content ?? ""
   if (typeof content !== "string") throw new TypeError("event content must be a string")
   assertUtf8(content, "event content")
@@ -260,6 +266,33 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
   }
 
   /**
+   * Read EVERY event from `at` back to a boundary: `from` when given, else the
+   * genesis. transact's decide and watch's batches must see the whole span, so a
+   * span longer than the bound is refused rather than handed over truncated as if
+   * it were whole. Paging through a long chain is `events({ from, limit })`.
+   */
+  const readWhole = async (at: Oid, from?: Oid) => {
+    const history = await backend.readHistory(repo, [at], {
+      ...(from === undefined ? {} : { exclude: [from] }),
+      // The genesis is one commit beyond the bound's worth of events.
+      limit: MAX_LIMIT + 1,
+    })
+    const oldest = history.at(-1)
+    const reached =
+      from === undefined
+        ? oldest !== undefined && oldest.parents.length === 0
+        : oldest === undefined || (oldest.parents[0] === from && history.length <= MAX_LIMIT)
+    if (!reached) {
+      const boundary = from === undefined ? "its genesis" : `event ${from}`
+      throw new Error(
+        `${ref} at ${at} does not reach ${boundary} within ${MAX_LIMIT} events; refusing a partial read. ` +
+          `Page through it with events({ from, limit }) instead.`,
+      )
+    }
+    return toEvents(history, ref)
+  }
+
+  /**
    * Write `inputs` as a run of empty-tree commits on `base`. `reserved` keeps
    * each position's seq across replays, so a replayed transaction reuses its
    * receipts instead of minting new ones.
@@ -269,10 +302,9 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
     /** True when `base` is the genesis: the chain did not exist, so event 1 has no parent. */
     newChain: boolean,
     inputs: readonly EventInput[],
-    defaultTitle: string,
     reserved: number[],
   ): Promise<{ next: Oid; written: Event[]; lastSeq: number }> => {
-    const shaped = inputs.map((input) => shapeInput(input, defaultTitle))
+    const shaped = inputs.map(shapeInput)
     let previous = base
     const written: Event[] = []
     for (const [position, input] of shaped.entries()) {
@@ -329,17 +361,19 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
       const why = assertLine(typeof message === "string" ? message.trim() : message, "message")
       const reserved: number[] = []
       return runCasLoop<Oid | null, Appended>({
-        label,
+        // `message` names the transaction in the loop's errors; each event's own
+        // subject comes from its type or title.
+        label: `${label} (${why})`,
         retryBudgetMs,
         refresh: tip,
         publish,
         findTransaction,
         attempt: async (at, retries) => {
-          const current = at === null ? [] : (await readChain(at, { limit: MAX_LIMIT })).events.reverse()
+          const current = at === null ? [] : (await readWhole(at)).events.reverse()
           const inputs = await decide(current)
           if (inputs.length === 0) return { kind: "noop", result: { head: at, events: [], retries } }
           const base = at ?? (await genesisOf())
-          const { next, written, lastSeq } = await writeRun(base, at === null, inputs, why, reserved)
+          const { next, written, lastSeq } = await writeRun(base, at === null, inputs, reserved)
           return {
             kind: "write",
             next,
@@ -379,7 +413,7 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
             throw new Conflict(`${label} is at ${at ?? "nothing"}, not the expected ${expected ?? "nothing"}`)
           }
           const base = at ?? (await genesisOf())
-          const { next, written, lastSeq } = await writeRun(base, at === null, inputs, "event", reserved)
+          const { next, written, lastSeq } = await writeRun(base, at === null, inputs, reserved)
           return {
             kind: "write",
             next,
@@ -399,10 +433,7 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
         const next = await untilAborted(tip(), watchOptions.signal)
         if (next === undefined) return
         if (next !== null && next !== previous) {
-          const { events } = await readChain(next, {
-            ...(previous === null ? {} : { from: previous }),
-            limit: MAX_LIMIT,
-          })
+          const { events } = await readWhole(next, previous ?? undefined)
           previous = next
           yield events.reverse()
           continue
