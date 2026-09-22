@@ -5,7 +5,8 @@
 // @consumer yrd's submit (branch head plus opened event in one push) and runner tick (every
 // chain under a queue in one fetch), 25040 3b
 //
-// Acceptance of @i/10-yrd/25055 (3a.1: MULTI and batched fetch).
+// Acceptance of @i/10-yrd/25055 (3a.1: MULTI and batched fetch) and @i/10-yrd/25056 (3a.2: a
+// leased delete in the same publish, for 3b's drop: the cancelled event and the branch delete).
 
 import childProcess from "node:child_process"
 
@@ -435,7 +436,7 @@ describe("remote: one atomic push, one fetch", () => {
       )
       expect(gitSpawns(spy)).toBe(1)
 
-      // (e) the local failure path costs at most three: transaction, rev-parse, re-run.
+      // (e) the local failure path costs at most three: transaction, for-each-ref, re-run.
       const two = await workCommit(pair.local.repo, backend, "two")
       spy.mockClear()
       await publish(pair.local.repo, [
@@ -543,6 +544,169 @@ describe("remote: one atomic push, one fetch", () => {
   })
 })
 
+describe("a leased delete rides the same atomic publish (oid null)", () => {
+  test("(a) an append whose `also` deletes the branch lands atomically; the kept commit stays readable", async () => {
+    await withTargets(async ({ name, repo, backend }) => {
+      const work = await workCommit(repo, backend, "work")
+      const publish = backend.publish as NonNullable<GitomicBackend["publish"]>
+      await publish(repo, [{ ref: BRANCH, expect: ZERO, oid: work }])
+      const events = await openEvents({ repo, ref: CHAIN, backend })
+      const appended = await events.append([{ type: "cancelled", keeps: [work] }], {
+        expect: null,
+        also: [{ ref: BRANCH, expect: work, oid: null }],
+      })
+      expect(await events.head(), name).toBe(appended.head)
+      expect(await tipOf(repo, backend, BRANCH), name).toBeUndefined()
+      // The event keeps the branch's last head, so the commit outlives the branch.
+      expect((await events.events()).at(-1)?.keeps, name).toEqual([work])
+      expect((await backend.readCommit(repo, work)).oid, name).toBe(work)
+      if (name !== "mem") await git(repo, "cat-file", "-e", `${work}^{commit}`)
+    })
+  })
+
+  test("(b) a stale delete lease is a Conflict naming the observed tip; the event and the branch do not move", async () => {
+    await withTargets(async ({ name, repo, backend }) => {
+      const work = await workCommit(repo, backend, "work")
+      const rival = await workCommit(repo, backend, "rival")
+      const publish = backend.publish as NonNullable<GitomicBackend["publish"]>
+      await publish(repo, [{ ref: BRANCH, expect: ZERO, oid: rival }])
+      const events = await openEvents({ repo, ref: CHAIN, backend })
+      const refused = events.append([{ type: "cancelled", keeps: [work] }], {
+        expect: null,
+        also: [{ ref: BRANCH, expect: work, oid: null }],
+      })
+      await expect(refused, name).rejects.toBeInstanceOf(Conflict)
+      await expect(refused, name).rejects.toMatchObject({ refs: [BRANCH] })
+      await expect(refused, name).rejects.toThrow(`${BRANCH} is at ${rival}, not ${work}`)
+      expect(await events.head(), name).toBeNull()
+      expect(await tipOf(repo, backend, BRANCH), name).toBe(rival)
+    })
+  })
+
+  test("(c) deleting an absent ref is a Conflict observed absent, never unchanged", async () => {
+    await withTargets(async ({ name, repo, backend }) => {
+      const work = await workCommit(repo, backend, "work")
+      const publish = backend.publish as NonNullable<GitomicBackend["publish"]>
+      const refused = publish(repo, [
+        { ref: "refs/heads/kept", expect: ZERO, oid: work },
+        { ref: BRANCH, expect: work, oid: null },
+      ])
+      await expect(refused, name).rejects.toBeInstanceOf(Conflict)
+      await expect(refused, name).rejects.toMatchObject({ refs: [BRANCH] })
+      await expect(refused, name).rejects.toThrow(`${BRANCH} is at absent, not ${work}`)
+      expect(await tipOf(repo, backend, "refs/heads/kept"), name).toBeUndefined()
+    })
+  })
+
+  test("(d) a delete with a zero expect is a caller mistake, refused before anything is written", async () => {
+    await withTargets(async ({ name, repo, backend }) => {
+      const publish = backend.publish as NonNullable<GitomicBackend["publish"]>
+      await expect(publish(repo, [{ ref: BRANCH, expect: ZERO, oid: null }]), name).rejects.toBeInstanceOf(TypeError)
+      const events = await openEvents({ repo, ref: CHAIN, backend })
+      await expect(
+        events.append([{ type: "x" }], { expect: null, also: [{ ref: BRANCH, expect: null, oid: null }] }),
+        name,
+      ).rejects.toBeInstanceOf(TypeError)
+      expect(await events.head(), name).toBeNull()
+      expect(await tipOf(repo, backend, BRANCH), name).toBeUndefined()
+    })
+  })
+
+  test("(e) one update and one delete in a single publish: outcomes [updated, deleted]", async () => {
+    await withTargets(async ({ name, repo, backend }) => {
+      const work = await workCommit(repo, backend, "work")
+      const event = await workCommit(repo, backend, "event")
+      const publish = backend.publish as NonNullable<GitomicBackend["publish"]>
+      await publish(repo, [{ ref: BRANCH, expect: ZERO, oid: work }])
+      expect(
+        await publish(repo, [
+          { ref: "refs/events/e", expect: ZERO, oid: event },
+          { ref: BRANCH, expect: work, oid: null },
+        ]),
+        name,
+      ).toEqual({
+        outcomes: [
+          { ref: "refs/events/e", outcome: "updated" },
+          { ref: BRANCH, outcome: "deleted" },
+        ],
+      })
+      expect(await tipOf(repo, backend, "refs/events/e"), name).toBe(event)
+      expect(await tipOf(repo, backend, BRANCH), name).toBeUndefined()
+    })
+  })
+
+  test("remotely: (e) update plus delete in one push, (a) through `also`, (b) stale and (c) absent are Conflicts", async () => {
+    const origin = await createBareRepo()
+    const local = await createBareRepo()
+    try {
+      await git(local.repo, "remote", "add", "origin", origin.repo)
+      const backend = createShellBackend()
+      const work = await workCommit(local.repo, backend, "work")
+      const event = await workCommit(local.repo, backend, "event")
+      const rival = await workCommit(local.repo, backend, "rival")
+      const publish = backend.publish as NonNullable<GitomicBackend["publish"]>
+      await publish(
+        local.repo,
+        [
+          { ref: BRANCH, expect: ZERO, oid: work },
+          { ref: "refs/heads/other", expect: ZERO, oid: work },
+        ],
+        "origin",
+      )
+
+      // (e) one push: an update and a delete, each from git's own porcelain.
+      const spy = vi.spyOn(childProcess, "spawn")
+      expect(
+        await publish(
+          local.repo,
+          [
+            { ref: "refs/events/e", expect: ZERO, oid: event },
+            { ref: BRANCH, expect: work, oid: null },
+          ],
+          "origin",
+        ),
+      ).toEqual({
+        outcomes: [
+          { ref: "refs/events/e", outcome: "updated" },
+          { ref: BRANCH, outcome: "deleted" },
+        ],
+      })
+      expect(gitSpawns(spy)).toBe(1)
+      spy.mockRestore()
+      expect(await tipOf(origin.repo, backend, BRANCH)).toBeUndefined()
+
+      // (c) the branch is gone now: deleting it again is a Conflict observed absent.
+      const absent = publish(local.repo, [{ ref: BRANCH, expect: work, oid: null }], "origin")
+      await expect(absent).rejects.toBeInstanceOf(Conflict)
+      await expect(absent).rejects.toThrow(`${BRANCH} is at absent, not ${work}`)
+
+      // (b) a rival moved the other branch: the delete lease is stale, nothing lands.
+      await git(origin.repo, "update-ref", "refs/heads/other", rival)
+      const events = await openEvents({ repo: local.repo, ref: CHAIN, remote: "origin", backend })
+      const stale = events.append([{ type: "cancelled", keeps: [work] }], {
+        expect: null,
+        also: [{ ref: "refs/heads/other", expect: work, oid: null }],
+      })
+      await expect(stale).rejects.toBeInstanceOf(Conflict)
+      await expect(stale).rejects.toThrow(`refs/heads/other is at ${rival}, not ${work}`)
+      expect(await tipOf(origin.repo, backend, CHAIN)).toBeUndefined()
+      expect(await tipOf(origin.repo, backend, "refs/heads/other")).toBe(rival)
+
+      // (a) with the right lease the cancelled event and the delete land together.
+      const landed = await events.append([{ type: "cancelled", keeps: [rival] }], {
+        expect: null,
+        also: [{ ref: "refs/heads/other", expect: rival, oid: null }],
+      })
+      expect(await tipOf(origin.repo, backend, CHAIN)).toBe(landed.head)
+      expect(await tipOf(origin.repo, backend, "refs/heads/other")).toBeUndefined()
+      await git(origin.repo, "cat-file", "-e", `${rival}^{commit}`)
+    } finally {
+      await origin.cleanup()
+      await local.cleanup()
+    }
+  })
+})
+
 describe("the README and CHANGELOG document MULTI and the batched fetch", () => {
   test("MULTI is no longer planned, and the private namespace and its prune are stated", async () => {
     const { readFile } = await import("node:fs/promises")
@@ -555,7 +719,9 @@ describe("the README and CHANGELOG document MULTI and the batched fetch", () => 
     expect(readme).toMatch(/never\s+an application ref/)
     expect(readme).toMatch(/`expect` is a lease, not an\s+assertion/)
     expect(readme).toMatch(/as advertised at push time, not\s+locked/)
+    expect(readme).toMatch(/`updated`, `unchanged` or\s+`deleted`/)
     expect(changelog).toContain("GitomicBackend.publish")
     expect(changelog).toContain("GitomicBackend.fetchRefs")
+    expect(changelog).toMatch(/leased delete/)
   })
 })
