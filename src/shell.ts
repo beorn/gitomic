@@ -792,27 +792,42 @@ async function compareAndSwapRemote(
  * value under the ref locks before committing any of them, so either every ref
  * moves or none does. A lost expectation names its ref in git's own words; any
  * other failure is an error carrying git's text.
+ *
+ * A ref already at its target satisfies its update, as `push --atomic` treats it
+ * remotely, so every backend agrees. Git names the first ref it could not lock
+ * and the value it found; when that value IS the target, the transaction runs
+ * again with that line as `verify <ref> <target>`, which keeps it atomic. The
+ * success path is one process; each such ref costs one more on the failure path.
  */
 async function publishLocal(repo: string, updates: readonly RefUpdate[]): Promise<PublishResult> {
-  const input = [
-    "start",
-    ...updates.map(({ ref, expect, oid }) => `update ${ref} ${oid} ${expect}`),
-    "prepare",
-    "commit",
-    "",
-  ]
-  const result = await run("git", durableGitArgs(repo, ["update-ref", "--stdin"]), { input: input.join("\n") })
-  if (result.code === 0) return { landed: true }
-  const detail = result.stderr.toString("utf8").trim()
-  const stale = [
-    ...detail.matchAll(
-      /cannot lock ref '([^']+)': (?:is at [0-9a-f]+ but expected [0-9a-f]+|reference already exists|reference is missing but expected [0-9a-f]+)/g,
-    ),
-  ].map((match) => match[1] as string)
-  if (stale.length > 0) return { landed: false, stale }
-  // Another writer held a ref lock for an instant: nothing moved, nothing is stale.
-  if (isTransientRefLockContention(detail)) return { landed: false, stale: [] }
-  throw new Error(`git update-ref --stdin failed (${result.code})${detail ? `: ${detail}` : ""}`)
+  const satisfied = new Set<string>()
+  for (let round = 0; round <= updates.length; round += 1) {
+    const lines = updates.map(({ ref, expect, oid }) =>
+      satisfied.has(ref) ? `verify ${ref} ${oid}` : `update ${ref} ${oid} ${expect}`,
+    )
+    const result = await run("git", durableGitArgs(repo, ["update-ref", "--stdin"]), {
+      input: ["start", ...lines, "prepare", "commit", ""].join("\n"),
+    })
+    if (result.code === 0) return { landed: true }
+    const detail = result.stderr.toString("utf8").trim()
+    const lost =
+      /cannot lock ref '([^']+)': (?:is at ([0-9a-f]+) but expected [0-9a-f]+|reference already exists|reference is missing but expected [0-9a-f]+)/.exec(
+        detail,
+      )
+    if (lost === null) {
+      // Another writer held a ref lock for an instant: nothing moved, nothing is stale.
+      if (isTransientRefLockContention(detail)) return { landed: false, stale: [] }
+      throw new Error(`git update-ref --stdin failed (${result.code})${detail ? `: ${detail}` : ""}`)
+    }
+    const ref = lost[1] as string
+    const update = updates.find((candidate) => candidate.ref === ref)
+    if (update === undefined) throw new Error(`git update-ref named a ref this publish did not touch: ${ref}`)
+    // "already exists" prints no value; read it, on this failure path only.
+    const found = lost[0].includes("already exists") ? await optionalRef(repo, ref) : lost[2]
+    if (found !== update.oid || satisfied.has(ref)) return { landed: false, stale: [ref] }
+    satisfied.add(ref)
+  }
+  throw new Error(`git update-ref --stdin did not settle ${updates.length} ref(s) in ${updates.length + 1} rounds`)
 }
 
 /**

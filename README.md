@@ -317,7 +317,9 @@ Locally that is one `update-ref --stdin` transaction; against a remote, one
 lands, and git's own per-ref report says which: a moved `also` ref throws
 `Conflict` naming it and is never retried; a moved chain is the usual race. A
 failure that is not a per-ref rejection (network, auth, a missing remote) is an
-ordinary error, never a `Conflict`. The backend method is `publish(repo,
+ordinary error, never a `Conflict`. A ref already at its target satisfies its
+update whatever its expectation said, on every backend, because that is how
+git's atomic push treats it: the end state is the one you asked for. The backend method is `publish(repo,
 updates, remote?)`.
 
 **Remote reads never use a local ref as a cache.** In remote mode, reads go

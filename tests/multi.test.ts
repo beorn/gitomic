@@ -89,6 +89,37 @@ describe("MULTI: the backend publishes many refs atomically, all or none", () =>
     })
   })
 
+  test("a ref already at its target satisfies its update, as git's atomic push treats it, on every backend", async () => {
+    await withTargets(async ({ name, repo, backend }) => {
+      const a = await workCommit(repo, backend, "a")
+      const b = await workCommit(repo, backend, "b")
+      const event = await workCommit(repo, backend, "event")
+      const publish = backend.publish as NonNullable<GitomicBackend["publish"]>
+      expect(await publish(repo, [{ ref: BRANCH, expect: ZERO, oid: b }]), name).toEqual({ landed: true })
+      // Stale expectation (a), but the branch is already at its target (b): satisfied.
+      expect(
+        await publish(repo, [
+          { ref: "refs/events/e", expect: ZERO, oid: event },
+          { ref: BRANCH, expect: a, oid: b },
+        ]),
+        name,
+      ).toEqual({ landed: true })
+      expect(await tipOf(repo, backend, "refs/events/e"), name).toBe(event)
+      expect(await tipOf(repo, backend, BRANCH), name).toBe(b)
+      // Absent expected, already at target: satisfied too.
+      expect(await publish(repo, [{ ref: BRANCH, expect: ZERO, oid: b }]), name).toEqual({ landed: true })
+      // Truly stale (the ref is at neither expect nor target): refused, nothing lands.
+      expect(
+        await publish(repo, [
+          { ref: "refs/events/f", expect: ZERO, oid: event },
+          { ref: BRANCH, expect: event, oid: a },
+        ]),
+        name,
+      ).toEqual({ landed: false, stale: [BRANCH] })
+      expect(await tipOf(repo, backend, "refs/events/f"), name).toBeUndefined()
+    })
+  })
+
   test("a malformed publish is refused before anything is written", async () => {
     await withTargets(async ({ name, repo, backend }) => {
       const one = await workCommit(repo, backend, "one")
@@ -168,8 +199,10 @@ describe("events: append and transact publish `also` refs in the same atomic pub
     expect(outcome.retries).toBeGreaterThanOrEqual(1)
     expect(await tipOf(repo, backend, BRANCH)).toBe(work)
 
+    // The branch is at `work`; asking it to go from absent to `other` is stale.
+    const other = await workCommit(repo, backend, "other")
     await expect(
-      mine.transact(() => [{ type: "again" }], "stale branch", { also: [{ ref: BRANCH, expect: null, oid: work }] }),
+      mine.transact(() => [{ type: "again" }], "stale branch", { also: [{ ref: BRANCH, expect: null, oid: other }] }),
     ).rejects.toThrow(BRANCH)
     expect((await mine.events()).map((event) => event.type)).toEqual(["rival", "admitted"])
   })
@@ -231,6 +264,34 @@ describe("remote: one atomic push, one fetch", () => {
       })
       expect(await tipOf(pair.origin.repo, backend, CHAIN)).toBe(landed.head)
       expect(await tipOf(pair.origin.repo, backend, BRANCH)).toBe(work)
+    } finally {
+      await pair.cleanup()
+    }
+  })
+
+  test("remotely, a ref already at its target satisfies its update and the rest lands", async () => {
+    const pair = await remotePair()
+    try {
+      const backend = createShellBackend()
+      const a = await workCommit(pair.local.repo, backend, "a")
+      const b = await workCommit(pair.local.repo, backend, "b")
+      const event = await workCommit(pair.local.repo, backend, "event")
+      const publish = backend.publish as NonNullable<GitomicBackend["publish"]>
+      expect(await publish(pair.local.repo, [{ ref: BRANCH, expect: ZERO, oid: b }], "origin")).toEqual({
+        landed: true,
+      })
+      expect(
+        await publish(
+          pair.local.repo,
+          [
+            { ref: "refs/events/e", expect: ZERO, oid: event },
+            { ref: BRANCH, expect: a, oid: b },
+          ],
+          "origin",
+        ),
+      ).toEqual({ landed: true })
+      expect(await tipOf(pair.origin.repo, backend, "refs/events/e")).toBe(event)
+      expect(await tipOf(pair.origin.repo, backend, BRANCH)).toBe(b)
     } finally {
       await pair.cleanup()
     }

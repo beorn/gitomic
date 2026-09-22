@@ -29,7 +29,8 @@
   lease per ref remotely, check-all-then-set on mem. It reports the refs git
   named as stale; any other failure throws. `append` and `transact` take
   `also: [{ ref, expect, oid }]` to publish more refs with the event, and a lost
-  `also` ref is a `Conflict` naming it, never a retry.
+  `also` ref is a `Conflict` naming it, never a retry. A ref already at its
+  target satisfies its update on every backend, as `git push --atomic` treats it.
 - `fetchRefs(prefixOrRefs, { repo, remote })` and `GitomicBackend.fetchRefs`:
   every ref under a prefix, or the named refs, in ONE `git fetch`, into the
   private namespace `refs/gitomic/fetched/<remote>/`. `chainsUnder` now reads a

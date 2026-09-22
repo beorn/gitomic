@@ -136,8 +136,10 @@ export function createMemBackend(): GitomicBackend {
     const checked = assertRefUpdates(updates)
     const repo = getRepo(name)
     const stale = checked
-      .filter(({ ref, expect }) => {
+      .filter(({ ref, expect, oid }) => {
         const current = repo.refs.get(ref)
+        // A ref already at its target satisfies its update, as git's atomic push treats it.
+        if (current === oid) return false
         return isZeroOid(expect) ? current !== undefined : current !== expect
       })
       .map(({ ref }) => ref)
