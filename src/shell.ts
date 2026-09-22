@@ -799,7 +799,12 @@ function outcomesOf(updates: readonly RefUpdate[], unchanged: ReadonlySet<string
   return {
     outcomes: updates.map(({ ref, expect, oid }) => ({
       ref,
-      outcome: unchanged.has(ref) || expect === oid ? ("unchanged" as const) : ("updated" as const),
+      outcome:
+        oid === null
+          ? ("deleted" as const)
+          : unchanged.has(ref) || expect === oid
+            ? ("unchanged" as const)
+            : ("updated" as const),
     })),
   }
 }
@@ -816,6 +821,7 @@ function outcomesOf(updates: readonly RefUpdate[], unchanged: ReadonlySet<string
  * output:
  * - at oid: `verify <ref> <oid>` (unchanged);
  * - at expect, or absent for a create: keep `update`;
+ * - a delete keeps its `delete` line only at expect;
  * - at neither: Conflict naming the ref, expect and observed value, with no
  *   re-run.
  * With no Conflict, the whole transaction runs ONCE more with the rewritten
@@ -828,7 +834,11 @@ async function publishLocal(repo: string, updates: readonly RefUpdate[]): Promis
       input: [
         "start",
         ...updates.map(({ ref, expect, oid }) =>
-          unchanged.has(ref) ? `verify ${ref} ${oid}` : `update ${ref} ${oid} ${expect}`,
+          oid === null
+            ? `delete ${ref} ${expect}`
+            : unchanged.has(ref)
+              ? `verify ${ref} ${oid}`
+              : `update ${ref} ${oid} ${expect}`,
         ),
         "prepare",
         "commit",
@@ -858,7 +868,9 @@ async function publishLocal(repo: string, updates: readonly RefUpdate[]): Promis
   )
   const lost = updates
     .map(({ ref, expect, oid }) => ({ ref, expect, oid, tip: current.get(ref) }))
-    .filter(({ expect, oid, tip }) => tip !== oid && (isZeroOid(expect) ? tip !== undefined : tip !== expect))
+    .filter(({ expect, oid, tip }) =>
+      oid === null ? tip !== expect : tip !== oid && (isZeroOid(expect) ? tip !== undefined : tip !== expect),
+    )
   if (lost.length > 0) {
     throw leaseConflict(lost.map(({ ref, expect, tip }) => ({ ref, expect, observed: tip ?? "absent" })))
   }
@@ -897,9 +909,12 @@ async function readExactRefs(repo: string, refs: readonly string[]): Promise<Rea
  * MULTI, remotely: ONE `push --atomic`, a lease per ref, exactly as git does it:
  * no pre-read, and no local ref touched (in remote mode reads go through
  * {@link fetchRefs}, so no local ref is a cache of the remote). Porcelain names
- * each ref's fate: "=" unchanged; "*", " " and "+" updated; "[rejected] (stale
- * info)" a lost lease, whose tip git does not report. Anything that is not a
- * per-ref rejection (network, auth, a missing remote) is an Error with git's text.
+ * each ref's fate: "=" unchanged; "*", " " and "+" updated; "-" deleted;
+ * "[rejected] (stale info)" a lost lease, a missing ref's delete included. git
+ * does not report the tip it saw, so a lost lease costs ONE `ls-remote` of the
+ * lost refs to name it; that read comes after git's decision, never instead of
+ * it. Anything that is not a per-ref rejection (network, auth, a missing
+ * remote) is an Error with git's text.
  */
 async function publishRemote(
   repo: string,
@@ -913,7 +928,7 @@ async function publishRemote(
     "--porcelain",
     ...updates.map(({ ref, expect }) => `--force-with-lease=${ref}:${expect}`),
     remote,
-    ...updates.map(({ ref, oid }) => `${oid}:${ref}`),
+    ...updates.map(({ ref, oid }) => (oid === null ? `:${ref}` : `${oid}:${ref}`)),
   ]
   const result = await run("git", durableGitArgs(repo, args), { timeoutMs })
   const detail = `${result.stdout.toString("utf8")}\n${result.stderr.toString("utf8")}`.trim()
@@ -933,16 +948,51 @@ async function publishRemote(
       )
     })
     if (stale.length === 0) throw new Error(`git push failed (${result.code})${detail ? `: ${detail}` : ""}`)
-    throw leaseConflict(stale.map(({ ref, expect }) => ({ ref, expect, observed: "a tip the remote did not report" })))
+    const observed = await observeRemote(
+      repo,
+      remote,
+      stale.map(({ ref }) => ref),
+      timeoutMs,
+    )
+    throw leaseConflict(stale.map(({ ref, expect }) => ({ ref, expect, observed: observed(ref) })))
   }
   return {
-    outcomes: updates.map(({ ref }) => {
+    outcomes: updates.map(({ ref, oid }) => {
       const flag = fates.get(ref)?.flag
+      if (oid === null) {
+        if (flag === "-") return { ref, outcome: "deleted" as const }
+        throw new Error(`git push succeeded without reporting ${ref} as deleted: ${detail}`)
+      }
       if (flag === "=") return { ref, outcome: "unchanged" as const }
       if (flag === "*" || flag === " " || flag === "+") return { ref, outcome: "updated" as const }
       throw new Error(`git push succeeded without reporting ${ref} as updated or up to date: ${detail}`)
     }),
   }
+}
+
+/**
+ * What the remote holds at these refs, read by ONE `ls-remote` after git refused
+ * their leases, for the Conflict message only: "absent" for a missing ref. A read
+ * that fails says so in the observed value; git's refusal stands either way.
+ */
+async function observeRemote(
+  repo: string,
+  remote: string,
+  refs: readonly string[],
+  timeoutMs: number,
+): Promise<(ref: string) => string> {
+  const result = await run("git", durableGitArgs(repo, ["ls-remote", remote, ...refs]), { timeoutMs })
+  if (result.code !== 0) {
+    const reason = `unread: git ls-remote failed (${result.code}): ${result.stderr.toString("utf8").trim()}`
+    return () => reason
+  }
+  const tips = new Map<string, string>()
+  for (const line of result.stdout.toString("utf8").split("\n")) {
+    const [oid, name] = line.split("\t")
+    // A pattern also matches refs ending in it; keep only the exact names asked for.
+    if (oid !== undefined && name !== undefined && refs.includes(name)) tips.set(name, oid)
+  }
+  return (ref) => tips.get(ref) ?? "absent"
 }
 
 /**
@@ -952,7 +1002,10 @@ async function publishRemote(
  */
 export function fetchedNamespace(remote: string): string {
   const key =
-    /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(remote) && !remote.endsWith(".lock") && !remote.includes("..")
+    /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(remote) &&
+    !remote.endsWith(".lock") &&
+    !remote.endsWith(".") &&
+    !remote.includes("..")
       ? remote
       : `url-${Buffer.from(remote, "utf8").toString("base64url")}`
   return `refs/gitomic/fetched/${key}/`

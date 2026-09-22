@@ -16,7 +16,7 @@ import { chainsUnder, listRefs, openEvents } from "../src/events.js"
 import { Conflict, open } from "../src/index.js"
 import { createIsoBackend } from "../src/iso.js"
 import { createMemBackend } from "../src/mem.js"
-import { createShellBackend } from "../src/shell.js"
+import { createShellBackend, fetchedNamespace } from "../src/shell.js"
 import type { GitomicBackend, Oid } from "../src/types.js"
 import { createBareRepo, git } from "./helpers/git.js"
 
@@ -536,6 +536,20 @@ describe("remote: one atomic push, one fetch", () => {
     }
   })
 
+  test("the private namespace keeps a ref-safe remote name and encodes anything else, always a valid ref", async () => {
+    const fixture = await createBareRepo()
+    try {
+      expect(fetchedNamespace("origin")).toBe("refs/gitomic/fetched/origin/")
+      for (const remote of ["origin.", "a..b", "x.lock", "/srv/git/q.git", "https://host/q.git"]) {
+        const namespace = fetchedNamespace(remote)
+        expect(namespace, remote).toMatch(/^refs\/gitomic\/fetched\/url-[A-Za-z0-9_-]+\/$/)
+        await git(fixture.repo, "check-ref-format", `${namespace}refs/heads/x`)
+      }
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
   test("mem has no remote and says so", async () => {
     const backend = createMemBackend()
     await expect(
@@ -558,7 +572,7 @@ describe("a leased delete rides the same atomic publish (oid null)", () => {
       expect(await events.head(), name).toBe(appended.head)
       expect(await tipOf(repo, backend, BRANCH), name).toBeUndefined()
       // The event keeps the branch's last head, so the commit outlives the branch.
-      expect((await events.events()).at(-1)?.keeps, name).toEqual([work])
+      expect((await events.events()).at(-1)?.links, name).toEqual([work])
       expect((await backend.readCommit(repo, work)).oid, name).toBe(work)
       if (name !== "mem") await git(repo, "cat-file", "-e", `${work}^{commit}`)
     })
@@ -650,6 +664,8 @@ describe("a leased delete rides the same atomic publish (oid null)", () => {
         [
           { ref: BRANCH, expect: ZERO, oid: work },
           { ref: "refs/heads/other", expect: ZERO, oid: work },
+          // The rival commit must exist on the remote for a rival to move a ref there.
+          { ref: "refs/heads/rival", expect: ZERO, oid: rival },
         ],
         "origin",
       )

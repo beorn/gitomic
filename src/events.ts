@@ -103,13 +103,14 @@ export type Events = {
 /**
  * Another ref to move in the SAME atomic publish as the event: from `expect`
  * (null: absent) to `oid`. A branch head beside the event that names it, say.
+ * A null `oid` deletes the ref at `expect`, which must then be a real id.
  * If it lost its expectation, nothing lands and the append or transact throws
  * Conflict naming it; it is never retried.
  */
 export type AlsoRef = {
   readonly ref: string
   readonly expect: Oid | null
-  readonly oid: Oid
+  readonly oid: Oid | null
 }
 
 export type ListRefsOptions = {
@@ -289,7 +290,15 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
       if (alsoRef === ref) throw new TypeError(`an also ref cannot be the chain itself: ${ref}`)
       if (seen.has(alsoRef)) throw new TypeError(`also names ${alsoRef} more than once`)
       seen.add(alsoRef)
-      const oid = validateOid(update.oid, `also oid for ${alsoRef} must be a commit id`)
+      if (update.oid === null) {
+        if (update.expect === null) throw new TypeError(`an also delete of ${alsoRef} needs the tip it removes`)
+        return {
+          ref: alsoRef,
+          expect: validateOid(update.expect, `also expect for ${alsoRef} must be a commit id`),
+          oid: null,
+        }
+      }
+      const oid = validateOid(update.oid, `also oid for ${alsoRef} must be a commit id or null`)
       const expect =
         update.expect === null
           ? zeroOid(oid)

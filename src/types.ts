@@ -171,6 +171,10 @@ export type GitomicBackend = {
    * `expect` means create: a ref already at oid is unchanged, at another oid a
    * Conflict. Publishing the same list twice succeeds twice.
    *
+   * A null `oid` deletes the ref, leased at `expect`, which must be a real id.
+   * A delete is strict: deleted (was at expect, now gone), else Conflict, with
+   * the observed value "absent" when the ref is missing. It has no unchanged.
+   *
    * With `remote` it is ONE `git push --atomic` and never touches a local ref;
    * remote unchanged is "as advertised at push time, not locked". Without, it is
    * one local ref transaction, where unchanged is verified inside it. Each
@@ -187,15 +191,18 @@ export type GitomicBackend = {
   fetchRefs?(repo: string, refs: string | readonly string[], remote: string): Promise<ReadonlyMap<string, Oid>>
 }
 
-/** One ref of a MULTI publish: move `ref` from `expect` (all-zero: absent) to `oid`. */
+/**
+ * One ref of a MULTI publish: move `ref` from `expect` (all-zero: absent) to
+ * `oid`, or, with a null `oid`, delete it at `expect`.
+ */
 export type RefUpdate = {
   readonly ref: string
   readonly expect: Oid
-  readonly oid: Oid
+  readonly oid: Oid | null
 }
 
 /** One ref's outcome in a MULTI publish that landed. */
-export type RefOutcome = { readonly ref: string; readonly outcome: "updated" | "unchanged" }
+export type RefOutcome = { readonly ref: string; readonly outcome: "updated" | "unchanged" | "deleted" }
 
 /** A MULTI publish that landed: every ref's outcome, in the order given. */
 export type PublishResult = { readonly outcomes: readonly RefOutcome[] }

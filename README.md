@@ -327,6 +327,18 @@ rejection (network, auth, a missing remote) is an ordinary error, never a
 `Conflict`. Remote unchanged is "as advertised at push time, not locked"; local
 unchanged is verified inside the transaction.
 
+**A null `oid` deletes.** `{ ref, expect, oid: null }` removes `ref` in the same
+atomic publish, leased at `expect`, which must be a real id. A delete is strict:
+the ref must be at `expect`, and absent or anywhere else is a `Conflict` naming
+the observed value (`absent` when missing). There is no unchanged delete; a
+caller that may have deleted already asks its own state first. So each landed
+ref reports `updated`, `unchanged` or `deleted`. Dropping a branch while an
+event keeps its last head is one publish: `append([{ type: "cancelled", keeps:
+[head] }], { expect, also: [{ ref, expect: head, oid: null }] })`, and the kept
+commit stays readable after the branch is gone. Remotely, git does not report
+the tip behind a refused lease, so a lost lease costs one `ls-remote` to name
+it, after git's refusal and never instead of it.
+
 **Remote reads never use a local ref as a cache.** In remote mode, reads go
 through `fetchRefs`: one `git fetch` into gitomic's private namespace
 `refs/gitomic/fetched/<remote>/` (the remote's name, or `url-` and the URL in

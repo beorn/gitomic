@@ -132,7 +132,7 @@ export function createMemBackend(): GitomicBackend {
 
   // MULTI: check every lease first, then set every ref; nothing awaits in
   // between, so no other mem operation can interleave. A ref already at its
-  // target is unchanged, as git's atomic push treats it.
+  // target is unchanged, as git's atomic push treats it; a delete is strict.
   const publish = async (name: string, updates: readonly RefUpdate[], remote?: string): Promise<PublishResult> => {
     if (remote !== undefined) throw new TypeError("the mem backend has no remotes; omit remote")
     const checked = assertRefUpdates(updates)
@@ -140,19 +140,33 @@ export function createMemBackend(): GitomicBackend {
     const lost = checked
       .map(({ ref, expect, oid }) => ({ ref, expect, oid, current: repo.refs.get(ref) }))
       .filter(({ expect, oid, current }) =>
-        current === oid ? false : isZeroOid(expect) ? current !== undefined : current !== expect,
+        oid === null
+          ? current !== expect
+          : current === oid
+            ? false
+            : isZeroOid(expect)
+              ? current !== undefined
+              : current !== expect,
       )
     if (lost.length > 0) {
       throw leaseConflict(lost.map(({ ref, expect, current }) => ({ ref, expect, observed: current ?? "absent" })))
     }
     for (const { oid } of checked) {
-      if (!repo.commits.has(oid)) throw new Error(`unknown commit to publish: ${oid}`)
+      if (oid !== null && !repo.commits.has(oid)) throw new Error(`unknown commit to publish: ${oid}`)
     }
     const outcomes = checked.map(({ ref, oid }) => ({
       ref,
-      outcome: repo.refs.get(ref) === oid ? ("unchanged" as const) : ("updated" as const),
+      outcome:
+        oid === null
+          ? ("deleted" as const)
+          : repo.refs.get(ref) === oid
+            ? ("unchanged" as const)
+            : ("updated" as const),
     }))
-    for (const { ref, oid } of checked) repo.refs.set(ref, oid)
+    for (const { ref, oid } of checked) {
+      if (oid === null) repo.refs.delete(ref)
+      else repo.refs.set(ref, oid)
+    }
     return { outcomes }
   }
 

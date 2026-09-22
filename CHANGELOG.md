@@ -36,6 +36,12 @@
   every ref under a prefix, or the named refs, in ONE `git fetch`, into the
   private namespace `refs/gitomic/fetched/<remote>/`. `chainsUnder` now reads a
   remote prefix: one fetch, then one walk.
+- A leased delete in MULTI: `RefUpdate.oid` and `AlsoRef.oid` accept `null`,
+  which deletes the ref at `expect` (a real id; a zero expect is a
+  `TypeError`) in the same atomic publish, with the outcome `deleted`. A delete
+  is strict: absent or elsewhere is a `Conflict` naming the observed value.
+  Locally a `delete <ref> <expect>` line, remotely `:<ref>` with a lease; a
+  lost remote lease costs one `ls-remote` to name the tip git did not report.
 - An all-zero `expected` passed to `compareAndSwap` now means the ref must be
   absent (create-if-absent) on every backend. A remote swap that creates a ref
   missing locally no longer fails after the push has landed.

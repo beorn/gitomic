@@ -318,9 +318,15 @@ export function assertRefUpdates(updates: readonly RefUpdate[]): readonly RefUpd
     }
     if (seen.has(ref)) throw new TypeError(`publish names ${ref} more than once`)
     seen.add(ref)
+    const expect = validateOid(update.expect, `publish expect for ${ref} is not a Git object id`)
+    if (update.oid === null) {
+      // A delete is leased by the tip it removes; there is no absent to lease from.
+      if (isZeroOid(expect)) throw new TypeError(`publish cannot delete ${ref} at an all-zero expect`)
+      return { ref, expect, oid: null }
+    }
     const oid = validateOid(update.oid, `publish oid for ${ref} is not a Git object id`)
-    if (isZeroOid(oid)) throw new TypeError(`publish cannot delete ${ref}: its oid is all zeros`)
-    return { ref, expect: validateOid(update.expect, `publish expect for ${ref} is not a Git object id`), oid }
+    if (isZeroOid(oid)) throw new TypeError(`publish cannot write zeros to ${ref}; a null oid deletes it`)
+    return { ref, expect, oid }
   })
 }
 
