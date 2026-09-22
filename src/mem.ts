@@ -4,6 +4,7 @@ import {
   commitParents,
   encodeCommit,
   encodeFiles,
+  commitIdents,
   formatCommitMessage,
   GENESIS_MESSAGE,
   INITIAL_TIMESTAMP,
@@ -99,6 +100,7 @@ export function createMemBackend(): GitomicBackend {
       tree: tree.oid,
       parents,
       timestamp,
+      ...commitIdents(input),
       message: formatCommitMessage(
         input.writer,
         input.instance,

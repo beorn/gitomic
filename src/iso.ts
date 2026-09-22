@@ -8,6 +8,7 @@ import {
   encodeBlob,
   encodeCommit,
   encodeTreeEntries,
+  commitIdents,
   formatCommitMessage,
   GENESIS_MESSAGE,
   INITIAL_TIMESTAMP,
@@ -163,6 +164,7 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
       tree,
       parents,
       timestamp,
+      ...commitIdents(input),
       message: formatCommitMessage(
         input.writer,
         input.instance,

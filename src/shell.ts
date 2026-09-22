@@ -10,10 +10,10 @@ import {
   leaseConflict,
   commitMeta,
   commitParents,
+  commitIdents,
   formatCommitMessage,
   GENESIS_MESSAGE,
-  GITOMIC_EMAIL,
-  GITOMIC_NAME,
+  GITOMIC_IDENT,
   INITIAL_TIMESTAMP,
   isZeroOid,
   objectOid,
@@ -25,7 +25,16 @@ import {
   validateOid,
 } from "./git-object.js"
 import { assertGitPrefixMatched, assertRegularBlob, normalizePrefix } from "./path.js"
-import type { BlobValue, CommitInput, CommitMeta, GitomicBackend, Oid, PublishResult, RefUpdate } from "./types.js"
+import type {
+  BlobValue,
+  CommitInput,
+  CommitMeta,
+  GitomicBackend,
+  Ident,
+  Oid,
+  PublishResult,
+  RefUpdate,
+} from "./types.js"
 import { decodeBlob, decodeUtf8 } from "./utf8.js"
 
 /** The complete output of one native Git command. */
@@ -467,6 +476,7 @@ function parseBatch(
 
 async function writeCommit(repo: string, input: CommitInput): Promise<Oid> {
   const parents = commitParents(input)
+  const idents = commitIdents(input)
   const message = formatCommitMessage(
     input.writer,
     input.instance,
@@ -480,7 +490,7 @@ async function writeCommit(repo: string, input: CommitInput): Promise<Oid> {
   // lands the same object the index path would have built.
   if (input.changes.size === 0) {
     const [tree, parentTime] = text(await git(repo, ["show", "-s", "--format=%T%x00%ct", input.parent])).split("\0")
-    return commitTree(repo, validateOid(tree, "invalid parent tree id"), parents, Number(parentTime), message)
+    return commitTree(repo, validateOid(tree, "invalid parent tree id"), parents, Number(parentTime), message, idents)
   }
   const indexDir = await mkdtemp(join(tmpdir(), "gitomic-index-"))
   const index = join(indexDir, "index")
@@ -527,32 +537,44 @@ async function writeCommit(repo: string, input: CommitInput): Promise<Oid> {
     })
     const tree = text(await gitWrite(repo, ["write-tree"], { env: indexEnv }))
     const parentTime = Number(text(await git(repo, ["show", "-s", "--format=%ct", input.parent])))
-    return commitTree(repo, tree, parents, parentTime, message)
+    return commitTree(repo, tree, parents, parentTime, message, idents)
   } finally {
     await rm(indexDir, { recursive: true, force: true })
   }
 }
 
-/** Write one commit with gitomic's identity, one second after its first parent. */
+/** Write one commit as the given author and committer, one second after its first parent. */
 async function commitTree(
   repo: string,
   tree: Oid,
   parents: readonly Oid[],
   parentTime: number,
   message: string,
+  idents: { readonly author: Ident; readonly committer: Ident },
 ): Promise<Oid> {
   const timestamp = Number.isFinite(parentTime) ? parentTime + 1 : 1
   const args = ["commit-tree", tree]
   for (const parent of parents) args.push("-p", parent)
-  return text(await gitWrite(repo, args, { env: identityEnv(timestamp), input: message }))
+  return text(await gitWrite(repo, args, { env: identityEnv(timestamp, idents), input: message }))
 }
 
-function identityEnv(timestamp: number): NodeJS.ProcessEnv {
+/**
+ * Explicit identity for one `commit-tree`. It overrides the caller's
+ * environment and git config, so gitomic never records an ident it was not
+ * handed (hab's GIT_AUTHOR_* included).
+ */
+function identityEnv(
+  timestamp: number,
+  { author, committer }: { readonly author: Ident; readonly committer: Ident } = {
+    author: GITOMIC_IDENT,
+    committer: GITOMIC_IDENT,
+  },
+): NodeJS.ProcessEnv {
   return {
-    GIT_AUTHOR_NAME: GITOMIC_NAME,
-    GIT_AUTHOR_EMAIL: GITOMIC_EMAIL,
-    GIT_COMMITTER_NAME: GITOMIC_NAME,
-    GIT_COMMITTER_EMAIL: GITOMIC_EMAIL,
+    GIT_AUTHOR_NAME: author.name,
+    GIT_AUTHOR_EMAIL: author.email,
+    GIT_COMMITTER_NAME: committer.name,
+    GIT_COMMITTER_EMAIL: committer.email,
     GIT_AUTHOR_DATE: `@${timestamp} +0000`,
     GIT_COMMITTER_DATE: `@${timestamp} +0000`,
   }
@@ -611,6 +633,9 @@ async function listRefs(
  * and the body is never split on lines, so a message holding blank lines or a
  * NUL-free "Key: value" line cannot shift the parse.
  */
+/** One `readHistory` record: oid, parents, time, author name and email, committer name and email, body. */
+const HISTORY_FIELDS = 8
+
 async function readHistory(
   repo: string,
   tips: readonly Oid[],
@@ -625,22 +650,24 @@ async function readHistory(
     "--first-parent",
     ...limit,
     "--no-commit-header",
-    "--format=%H%x00%P%x00%ct%x00%B%x00",
+    "--format=%H%x00%P%x00%ct%x00%an%x00%ae%x00%cn%x00%ce%x00%B%x00",
     ...tips,
     ...exclude,
   ])
   const fields = decodeUtf8(output, "git rev-list history").split("\0")
   const trailing = fields.pop()
   if (trailing?.trim()) throw new Error("git rev-list returned trailing history data")
-  if (fields.length % 4 !== 0) throw new Error("git rev-list returned a malformed history record")
+  if (fields.length % HISTORY_FIELDS !== 0) throw new Error("git rev-list returned a malformed history record")
   const commits: CommitMeta[] = []
-  for (let index = 0; index < fields.length; index += 4) {
+  for (let index = 0; index < fields.length; index += HISTORY_FIELDS) {
     const oid = validateOid(fields[index]?.replace(/^\n/, ""), "git rev-list returned a malformed history id")
     const rawParents = fields[index + 1] ?? ""
     const parents = rawParents === "" ? [] : rawParents.split(" ").map((parent) => validateOid(parent))
     const timestamp = Number(fields[index + 2])
     if (!Number.isSafeInteger(timestamp)) throw new Error(`git rev-list returned an invalid time for ${oid}`)
-    commits.push(commitMeta(oid, parents, timestamp, fields[index + 3] ?? ""))
+    const author = { name: fields[index + 3] ?? "", email: fields[index + 4] ?? "" }
+    const committer = { name: fields[index + 5] ?? "", email: fields[index + 6] ?? "" }
+    commits.push(commitMeta(oid, parents, timestamp, fields[index + 7] ?? "", { author, committer }))
   }
   return commits
 }

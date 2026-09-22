@@ -55,6 +55,12 @@ export type CommitProvenance = {
   readonly run?: string
 }
 
+/**
+ * A git identity, exactly as git records it in an author or committer line.
+ * It is recorded, never verified: see `identProblem` for what is refused.
+ */
+export type Ident = { readonly name: string; readonly email: string }
+
 /** One trailer: key, then value. Order and duplicates are kept. */
 export type Trailer = readonly [key: string, value: string]
 
@@ -86,6 +92,10 @@ export type CommitInput = {
   seq: number
   /** Optional original attribution for this transaction only. */
   provenance?: CommitProvenance
+  /** Git's author: who this commit acts for. Omitted, it is the committer. */
+  author?: Ident
+  /** Git's committer: who applied it. Omitted, it is gitomic <gitomic@localhost>. */
+  committer?: Ident
 }
 
 export type CommitMeta = {
@@ -103,6 +113,10 @@ export type CommitMeta = {
   seq: number | null
   /** Original attribution, or null when absent; malformed or partial trailers are refused. */
   provenance: CommitProvenance | null
+  /** Git's author, from the commit header. */
+  author: Ident
+  /** Git's committer, from the commit header. */
+  committer: Ident
   /** Git committer time in seconds since the Unix epoch. */
   timestamp: number
 }
@@ -216,6 +230,12 @@ export type OpenOptions = {
    * `open` mints its own unique identity underneath.
    */
   writer?: string
+  /**
+   * Who applies this store's commits: git's committer. Each transaction may
+   * name its own author; one that names none has this committer as author.
+   * Defaults to gitomic <gitomic@localhost>.
+   */
+  committer?: Ident
   remote?: string
   backend?: GitomicBackend
   /**
@@ -255,8 +275,14 @@ export type Reader = {
   watch(options: RefTipWatchOptions): AsyncIterable<RefTipChange>
 }
 
+export type TransactOptions = {
+  readonly provenance?: CommitProvenance
+  /** Git's author for this one transaction. Defaults to the store's committer. */
+  readonly author?: Ident
+}
+
 export type Store = {
   head(): Promise<Oid>
   at(commit?: Oid): Snapshot
-  transact(update: Update, message: string, options?: { readonly provenance?: CommitProvenance }): Promise<Committed>
+  transact(update: Update, message: string, options?: TransactOptions): Promise<Committed>
 }

@@ -97,6 +97,8 @@ describe("read-only reader", () => {
         instance: null,
         seq: null,
         provenance: null,
+        author: { name: "gitomic", email: "gitomic@localhost" },
+        committer: { name: "gitomic", email: "gitomic@localhost" },
         timestamp: 946_684_800,
       },
     ])

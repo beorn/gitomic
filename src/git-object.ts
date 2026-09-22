@@ -1,11 +1,12 @@
 import { createHash } from "node:crypto"
 
-import type { CommitInput, CommitMeta, CommitProvenance, Oid, RefUpdate, Trailer } from "./types.js"
+import type { CommitInput, CommitMeta, CommitProvenance, Ident, Oid, RefUpdate, Trailer } from "./types.js"
 import { Conflict } from "./errors.js"
 import { assertUtf8, decodeUtf8 } from "./utf8.js"
 
 export const GITOMIC_NAME = "gitomic"
 export const GITOMIC_EMAIL = "gitomic@localhost"
+export const GITOMIC_IDENT: Ident = Object.freeze({ name: GITOMIC_NAME, email: GITOMIC_EMAIL })
 export const INITIAL_TIMESTAMP = 946_684_800
 export const TRANSACTION_SEARCH_LIMIT = 1_024
 
@@ -65,7 +66,21 @@ export function parseCommit(oid: Oid, content: Uint8Array): CommitMeta {
   const timestamp = time === null ? NaN : Number(time[1])
   if (!Number.isSafeInteger(timestamp)) throw new Error(`invalid Git commit ${oid}: invalid committer timestamp`)
   const message = raw.slice(separator + 2)
-  return commitMeta(oid, parents, timestamp, message)
+  const author = headerIdent(oid, headers, "author")
+  const committer = headerIdent(oid, headers, "committer")
+  return commitMeta(oid, parents, timestamp, message, { author, committer })
+}
+
+/**
+ * Read one author or committer line as it was stored. This is the read side, so
+ * it is lenient about what a name holds (history written by other tools is
+ * still history) and strict only about the line's shape.
+ */
+function headerIdent(oid: Oid, headers: readonly string[], role: "author" | "committer"): Ident {
+  const lines = headers.filter((line) => line.startsWith(`${role} `))
+  const match = lines.length === 1 ? /^\S+ (.*?) ?<([^<>]*)> -?\d+ [+-]\d{4}$/.exec(lines[0] ?? "") : null
+  if (match === null) throw new Error(`invalid Git commit ${oid}: missing, duplicate or malformed ${role} line`)
+  return { name: match[1] ?? "", email: match[2] ?? "" }
 }
 
 /**
@@ -73,7 +88,13 @@ export function parseCommit(oid: Oid, content: Uint8Array): CommitMeta {
  * one raw object; batched history reads feed it the fields of one walk record,
  * so both paths validate trailers and provenance identically.
  */
-export function commitMeta(oid: Oid, parents: readonly Oid[], timestamp: number, message: string): CommitMeta {
+export function commitMeta(
+  oid: Oid,
+  parents: readonly Oid[],
+  timestamp: number,
+  message: string,
+  idents: { readonly author: Ident; readonly committer: Ident },
+): CommitMeta {
   const trailers = new Map<string, string>()
   const finalParagraph =
     message
@@ -110,6 +131,8 @@ export function commitMeta(oid: Oid, parents: readonly Oid[], timestamp: number,
     instance: trailers.get("Gitomic-Instance") ?? null,
     seq,
     provenance,
+    author: idents.author,
+    committer: idents.committer,
     timestamp,
   }
 }
@@ -152,6 +175,76 @@ function parseCommitProvenance(oid: Oid, trailers: ReadonlyMap<string, string>):
   }
   const run = trailers.get("Gitomic-Actor-Run")
   return run === undefined ? { actor, session, generation } : { actor, session, generation, run }
+}
+
+/**
+ * Git's "crud": what `commit-tree` silently strips from either end of a name or
+ * email (ident.c). Stripping would give the shell backend a different commit
+ * than mem and iso for the same input, so gitomic refuses these instead. The
+ * "." is kept by git 2.55 but stripped by older releases in the supported
+ * range, so it is refused too: the commit never depends on the git version.
+ */
+function isCrud(character: string): boolean {
+  const code = character.codePointAt(0) ?? 0
+  return code <= 0x20 || ".,:;<>\"\\'".includes(character)
+}
+
+function identFieldProblem(value: unknown, field: "name" | "email"): string | undefined {
+  if (typeof value !== "string") return `${field} must be a string`
+  try {
+    assertUtf8(value, field)
+  } catch {
+    return `${field} must be valid UTF-8`
+  }
+  if (value.length === 0) return `${field} must not be empty`
+  for (const character of value) {
+    const code = character.codePointAt(0) ?? 0
+    if (code < 0x20 || code === 0x7f) return `${field} must not contain a control character, newline or NUL`
+    if (character === "<" || character === ">") return `${field} must not contain < or >`
+  }
+  if (isCrud(value[0] as string) || isCrud(value.at(-1) as string)) {
+    return `${field} must not begin or end with a space or any of . , : ; < > " \\ ' (git would strip it)`
+  }
+  return undefined
+}
+
+/**
+ * Why git would not record `ident` byte for byte, or `undefined` when it would.
+ * This is the one predicate every refusal uses, exported so a caller can check
+ * an ident it did not choose (a user's git config) and fall back instead of
+ * failing the write.
+ */
+export function identProblem(ident: unknown): string | undefined {
+  if (ident === null || typeof ident !== "object" || Array.isArray(ident)) {
+    return "must be an object with name and email"
+  }
+  for (const key of Object.keys(ident)) {
+    if (key !== "name" && key !== "email") return `contains an unknown field: ${JSON.stringify(key)}`
+  }
+  const source = ident as Record<string, unknown>
+  return identFieldProblem(source.name, "name") ?? identFieldProblem(source.email, "email")
+}
+
+/** Validate and copy an ident before it can cross a replay boundary; `role` names it in the refusal. */
+export function cloneIdent(value: Ident | undefined, role: "author" | "committer"): Ident | undefined {
+  if (value === undefined) return undefined
+  const problem = identProblem(value)
+  if (problem !== undefined) throw new TypeError(`${role} ${problem}`)
+  return Object.freeze({ name: value.name, email: value.email })
+}
+
+/**
+ * The author and committer one commit records: validated, with the committer
+ * defaulting to gitomic's identity and the author to the committer. Every
+ * backend resolves them here, so a direct backend caller is held to the same
+ * rule as a store.
+ */
+export function commitIdents(input: Pick<CommitInput, "author" | "committer">): {
+  readonly author: Ident
+  readonly committer: Ident
+} {
+  const committer = cloneIdent(input.committer, "committer") ?? GITOMIC_IDENT
+  return { author: cloneIdent(input.author, "author") ?? committer, committer }
 }
 
 /** Clone and validate untrusted per-call metadata before it can cross a replay boundary. */
@@ -352,12 +445,18 @@ export function encodeCommit(input: {
   parents?: readonly Oid[]
   timestamp: number
   message: string
+  /** Omitted, the committer. */
+  author?: Ident
+  /** Omitted, gitomic's own identity. */
+  committer?: Ident
 }): GitObject {
   const parents = input.parents ?? (input.parent === undefined ? [] : [input.parent])
   const parent = parents.map((oid) => `parent ${oid}\n`).join("")
-  const identity = `${GITOMIC_NAME} <${GITOMIC_EMAIL}> ${input.timestamp} +0000`
+  const committer = input.committer ?? GITOMIC_IDENT
+  const author = input.author ?? committer
+  const line = ({ name, email }: Ident) => `${name} <${email}> ${input.timestamp} +0000`
   const content = Buffer.from(
-    `tree ${input.tree}\n${parent}author ${identity}\ncommitter ${identity}\n\n${input.message}`,
+    `tree ${input.tree}\n${parent}author ${line(author)}\ncommitter ${line(committer)}\n\n${input.message}`,
     "utf8",
   )
   return { type: "commit", content, oid: objectOid("commit", content) }

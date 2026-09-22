@@ -310,6 +310,8 @@ describe("gitomic CLI — history reads", () => {
       instance: expect.any(String),
       seq: 0,
       provenance: null,
+      author: { name: "gitomic", email: "gitomic@localhost" },
+      committer: { name: "gitomic", email: "gitomic@localhost" },
       timestamp: 946_684_801,
       message: expect.stringMatching(/^history: first\n\nfull body\n\nGitomic-Writer: history\n/),
     })
@@ -322,6 +324,8 @@ describe("gitomic CLI — history reads", () => {
       instance: null,
       seq: null,
       provenance: null,
+      author: { name: "gitomic", email: "gitomic@localhost" },
+      committer: { name: "gitomic", email: "gitomic@localhost" },
       message: "initial\n",
       timestamp: 946_684_800,
     })
@@ -454,6 +458,8 @@ describe("gitomic CLI — history reads", () => {
           instance: null,
           seq: null,
           provenance: null,
+          author: { name: "gitomic", email: "gitomic@localhost" },
+          committer: { name: "gitomic", email: "gitomic@localhost" },
           timestamp: 946_684_800,
         },
       ])
