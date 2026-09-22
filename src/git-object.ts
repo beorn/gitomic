@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto"
 
-import type { CommitMeta, CommitProvenance, Oid } from "./types.js"
+import type { CommitMeta, CommitProvenance, Oid, Trailer } from "./types.js"
 import { assertUtf8, decodeUtf8 } from "./utf8.js"
 
 export const GITOMIC_NAME = "gitomic"
@@ -93,6 +93,8 @@ export function parseCommit(oid: Oid, content: Uint8Array): CommitMeta {
   return {
     oid,
     parent: parents[0] ?? null,
+    parents,
+    trailers: callerTrailers(message),
     message,
     writer: trailers.get("Gitomic-Writer") ?? null,
     instance: trailers.get("Gitomic-Instance") ?? null,
@@ -100,6 +102,28 @@ export function parseCommit(oid: Oid, content: Uint8Array): CommitMeta {
     provenance,
     timestamp,
   }
+}
+
+/**
+ * The caller trailers of a commit message: the final paragraph, when it is not
+ * the subject paragraph and every one of its lines is `Key: value`. gitomic's
+ * own `Gitomic-*` trailers are excluded; they surface as typed fields instead.
+ * Mirrors git's rule closely enough that an ordinary `fix: x` subject is never
+ * read as a trailer.
+ */
+function callerTrailers(message: string): Trailer[] {
+  const paragraphs = message.trimEnd().split(/\n[ \t]*\n/)
+  if (paragraphs.length < 2) return []
+  const lines = (paragraphs.at(-1) ?? "").split("\n")
+  const parsed: Trailer[] = []
+  for (const line of lines) {
+    const match = /^([A-Za-z0-9][A-Za-z0-9-]*):[ \t]?(.*)$/.exec(line)
+    if (match === null) return []
+    const key = match[1] as string
+    if (key.startsWith("Gitomic-")) continue
+    parsed.push([key, match[2] ?? ""])
+  }
+  return parsed
 }
 
 function parseCommitProvenance(oid: Oid, trailers: ReadonlyMap<string, string>): CommitProvenance | null {

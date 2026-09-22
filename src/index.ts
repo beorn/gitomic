@@ -27,6 +27,7 @@ import type {
   RefTipChange,
   RefTipWatchOptions,
   Snapshot,
+  Trailer,
   Store,
   Update,
 } from "./types.js"
@@ -63,6 +64,7 @@ export type {
   RefTipChange,
   RefTipWatchOptions,
   Snapshot,
+  Trailer,
   Store,
   Update,
 } from "./types.js"

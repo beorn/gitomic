@@ -55,8 +55,28 @@ export type CommitProvenance = {
   readonly run?: string
 }
 
+/** One trailer: key, then value. Order and duplicates are kept. */
+export type Trailer = readonly [key: string, value: string]
+
 export type CommitInput = {
   parent: Oid
+  /**
+   * The complete parent list, when the commit has more than one. The first
+   * entry must equal `parent`; the rest are commits this one keeps (an event
+   * keeps the commit it is about). Omitted, the commit has `parent` alone.
+   */
+  parents?: readonly Oid[]
+  /**
+   * Land the commit even when `changes` leaves the tree unchanged. Opt-in and
+   * used by gitomic/events only: `transact` and `apply` still treat an unchanged
+   * tree as a no-op and never set it.
+   */
+  allowEmpty?: boolean
+  /**
+   * Caller trailers, written into the final trailer block ahead of gitomic's
+   * own. Opaque to gitomic: it neither interprets nor reorders them.
+   */
+  trailers?: readonly Trailer[]
   changes: ReadonlyMap<string, string | undefined>
   message: string
   /** The caller's human-readable label. Not an identity: it may repeat. */
@@ -72,6 +92,10 @@ export type CommitMeta = {
   oid: Oid
   /** The first parent; ordinary root commits have none. */
   parent: Oid | null
+  /** Every parent in order; `parents[0]` is `parent`. Empty for a root commit. */
+  parents: readonly Oid[]
+  /** The caller trailers of the final paragraph, in order; gitomic's own are excluded. */
+  trailers: readonly Trailer[]
   /** The complete stored message, including its trailers and trailing newlines. */
   message: string
   writer: string | null
@@ -117,6 +141,21 @@ export type GitomicBackend = {
    * on this contract; Store refresh separately updates its local cache ref.
    */
   fetchRemote?(repo: string, ref: string, remote: string): Promise<Oid>
+  /**
+   * Every ref under `prefix` and its tip, in ref-name order: `for-each-ref`
+   * locally, `ls-remote --refs` against `remote`. Never moves a ref.
+   */
+  listRefs?(repo: string, prefix: string, remote?: string): Promise<ReadonlyMap<string, Oid>>
+  /**
+   * Newest-first first-parent history of every tip in ONE read, stopping at any
+   * `exclude` commit. Commits reachable from several tips are returned once.
+   * This is what keeps chain reads to a single git process.
+   */
+  readHistory?(
+    repo: string,
+    tips: readonly Oid[],
+    options?: { readonly exclude?: readonly Oid[]; readonly limit?: number },
+  ): Promise<CommitMeta[]>
   compareAndSwapRemote?(repo: string, ref: string, next: Oid, expected: Oid, remote: string): Promise<boolean>
 }
 
