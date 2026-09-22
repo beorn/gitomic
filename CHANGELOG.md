@@ -24,13 +24,14 @@
   batched first-parent read over many tips; the second writes the canonical
   empty root an event chain starts from.
 - MULTI: `GitomicBackend.publish(repo, updates, remote?)` moves many refs
-  atomically, all or none, each on its own compare-and-swap: one
-  `update-ref --stdin` transaction locally, one `git push --atomic` with a
-  lease per ref remotely, check-all-then-set on mem. It reports the refs git
-  named as stale; any other failure throws. `append` and `transact` take
-  `also: [{ ref, expect, oid }]` to publish more refs with the event, and a lost
-  `also` ref is a `Conflict` naming it, never a retry. A ref already at its
-  target satisfies its update on every backend, as `git push --atomic` treats it.
+  atomically, all or none: one `update-ref --stdin` transaction locally, one
+  `git push --atomic` with a lease per ref remotely, check-all-then-set on mem.
+  `expect` is a lease, not an assertion: each ref is updated, unchanged
+  (already at oid) or a `Conflict` naming the ref, expect and observed tip, and
+  the result lists every ref's outcome from git's per-ref report. `Conflict`
+  gains `refs`, the refs whose lease was lost. `append` and `transact` take
+  `also: [{ ref, expect, oid }]` to publish more refs with the event; a lost
+  `also` lease is a `Conflict`, never a retry.
 - `fetchRefs(prefixOrRefs, { repo, remote })` and `GitomicBackend.fetchRefs`:
   every ref under a prefix, or the named refs, in ONE `git fetch`, into the
   private namespace `refs/gitomic/fetched/<remote>/`. `chainsUnder` now reads a

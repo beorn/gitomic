@@ -164,11 +164,18 @@ export type GitomicBackend = {
   ): Promise<CommitMeta[]>
   compareAndSwapRemote?(repo: string, ref: string, next: Oid, expected: Oid, remote: string): Promise<boolean>
   /**
-   * MULTI: move every ref in `updates`, or none. Each update is a compare-and-
-   * swap on its own old value; an all-zero `expect` means the ref must be
-   * absent. With `remote` it is ONE atomic push that never touches a local ref;
-   * without, one local ref transaction. A lost expectation is a result naming
-   * the refs the tool reported stale; any other failure throws.
+   * MULTI: move every ref in `updates`, or none. `expect` is a lease, not an
+   * assertion. Per ref, three outcomes: updated (was at expect, now at oid),
+   * unchanged (already at oid; not touched, not locked), Conflict (at neither;
+   * the message names the ref, expect and the observed tip). An all-zero
+   * `expect` means create: a ref already at oid is unchanged, at another oid a
+   * Conflict. Publishing the same list twice succeeds twice.
+   *
+   * With `remote` it is ONE `git push --atomic` and never touches a local ref;
+   * remote unchanged is "as advertised at push time, not locked". Without, it is
+   * one local ref transaction, where unchanged is verified inside it. Each
+   * outcome comes from the tool's own per-ref report, never from a re-read. A
+   * lost lease throws Conflict with `refs`; any other failure throws Error.
    */
   publish?(repo: string, updates: readonly RefUpdate[], remote?: string): Promise<PublishResult>
   /**
@@ -187,8 +194,11 @@ export type RefUpdate = {
   readonly oid: Oid
 }
 
-/** All refs landed, or none did and `stale` names the refs whose expectation was lost. */
-export type PublishResult = { readonly landed: true } | { readonly landed: false; readonly stale: readonly string[] }
+/** One ref's outcome in a MULTI publish that landed. */
+export type RefOutcome = { readonly ref: string; readonly outcome: "updated" | "unchanged" }
+
+/** A MULTI publish that landed: every ref's outcome, in the order given. */
+export type PublishResult = { readonly outcomes: readonly RefOutcome[] }
 
 export type OpenOptions = {
   repo: string

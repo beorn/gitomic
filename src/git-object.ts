@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto"
 
 import type { CommitInput, CommitMeta, CommitProvenance, Oid, RefUpdate, Trailer } from "./types.js"
+import { Conflict } from "./errors.js"
 import { assertUtf8, decodeUtf8 } from "./utf8.js"
 
 export const GITOMIC_NAME = "gitomic"
@@ -320,6 +321,18 @@ export function assertRefUpdates(updates: readonly RefUpdate[]): readonly RefUpd
     const oid = validateOid(update.oid, `publish oid for ${ref} is not a Git object id`)
     if (isZeroOid(oid)) throw new TypeError(`publish cannot delete ${ref}: its oid is all zeros`)
     return { ref, expect: validateOid(update.expect, `publish expect for ${ref} is not a Git object id`), oid }
+  })
+}
+
+/** One ref whose lease was lost: what the caller expected and what the tool saw there. */
+export type LostLease = { readonly ref: string; readonly expect: Oid; readonly observed: string }
+
+/** The Conflict for lost leases, naming each ref, its expected value and its observed tip. */
+export function leaseConflict(lost: readonly LostLease[]): Conflict {
+  const describe = ({ ref, expect, observed }: LostLease) =>
+    `${ref} is at ${observed}, not ${isZeroOid(expect) ? "absent" : expect}`
+  return new Conflict(`lease lost, nothing published: ${lost.map(describe).join("; ")}`, {
+    refs: lost.map(({ ref }) => ref),
   })
 }
 

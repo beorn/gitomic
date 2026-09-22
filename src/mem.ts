@@ -1,5 +1,6 @@
 import {
   assertRefUpdates,
+  leaseConflict,
   commitParents,
   encodeCommit,
   encodeFiles,
@@ -129,26 +130,30 @@ export function createMemBackend(): GitomicBackend {
     return true
   }
 
-  // MULTI: check every expectation first, then set every ref; nothing awaits in
-  // between, so no other mem operation can interleave.
+  // MULTI: check every lease first, then set every ref; nothing awaits in
+  // between, so no other mem operation can interleave. A ref already at its
+  // target is unchanged, as git's atomic push treats it.
   const publish = async (name: string, updates: readonly RefUpdate[], remote?: string): Promise<PublishResult> => {
     if (remote !== undefined) throw new TypeError("the mem backend has no remotes; omit remote")
     const checked = assertRefUpdates(updates)
     const repo = getRepo(name)
-    const stale = checked
-      .filter(({ ref, expect, oid }) => {
-        const current = repo.refs.get(ref)
-        // A ref already at its target satisfies its update, as git's atomic push treats it.
-        if (current === oid) return false
-        return isZeroOid(expect) ? current !== undefined : current !== expect
-      })
-      .map(({ ref }) => ref)
-    if (stale.length > 0) return { landed: false, stale }
+    const lost = checked
+      .map(({ ref, expect, oid }) => ({ ref, expect, oid, current: repo.refs.get(ref) }))
+      .filter(({ expect, oid, current }) =>
+        current === oid ? false : isZeroOid(expect) ? current !== undefined : current !== expect,
+      )
+    if (lost.length > 0) {
+      throw leaseConflict(lost.map(({ ref, expect, current }) => ({ ref, expect, observed: current ?? "absent" })))
+    }
     for (const { oid } of checked) {
       if (!repo.commits.has(oid)) throw new Error(`unknown commit to publish: ${oid}`)
     }
+    const outcomes = checked.map(({ ref, oid }) => ({
+      ref,
+      outcome: repo.refs.get(ref) === oid ? ("unchanged" as const) : ("updated" as const),
+    }))
     for (const { ref, oid } of checked) repo.refs.set(ref, oid)
-    return { landed: true }
+    return { outcomes }
   }
 
   const findTransaction = async (

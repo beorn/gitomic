@@ -265,25 +265,22 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
   }
 
   /**
-   * One atomic publish of the event ref plus every `also` ref. The tool names
-   * each ref that lost its expectation: an `also` ref is a Conflict now (a retry
-   * would find it just as stale); the event ref alone is contention, returned as
-   * false for the loop to handle. Any other failure is thrown by the backend.
+   * One atomic publish of the event ref plus every `also` ref. A lost `also`
+   * lease is a Conflict now; the event ref alone is contention, returned as false
+   * for the loop to handle. Any other failure is the backend's Error.
    */
   const publishWith =
     (also: readonly RefUpdate[]) =>
     async (next: Oid, expected: Oid | null): Promise<boolean> => {
-      const result = await backend.publish(
-        repo,
-        [{ ref, expect: expected ?? zeroOid(next), oid: next }, ...also],
-        remote,
-      )
-      if (result.landed) return true
-      const lostAlso = result.stale.filter((stale) => stale !== ref)
-      if (lostAlso.length > 0) {
-        throw new Conflict(`${lostAlso.join(", ")} moved: nothing published, not even ${ref}`)
+      try {
+        await backend.publish(repo, [{ ref, expect: expected ?? zeroOid(next), oid: next }, ...also], remote)
+        return true
+      } catch (error) {
+        // The tool named each lost lease. A lost `also` ref is final: a retry
+        // would find it just as stale. The chain alone is the usual race.
+        if (error instanceof Conflict && error.refs.length > 0 && error.refs.every((lost) => lost === ref)) return false
+        throw error
       }
-      return false
     }
   const shapeAlso = (also: readonly AlsoRef[] | undefined): RefUpdate[] => {
     const seen = new Set<string>([ref])

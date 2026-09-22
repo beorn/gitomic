@@ -7,6 +7,7 @@ import { join, resolve } from "node:path"
 import { GitTimeout } from "./errors.js"
 import {
   assertRefUpdates,
+  leaseConflict,
   commitMeta,
   commitParents,
   formatCommitMessage,
@@ -787,55 +788,118 @@ async function compareAndSwapRemote(
   return true
 }
 
-/**
- * MULTI, locally: ONE `update-ref --stdin` transaction. Git verifies every old
- * value under the ref locks before committing any of them, so either every ref
- * moves or none does. A lost expectation names its ref in git's own words; any
- * other failure is an error carrying git's text.
- *
- * A ref already at its target satisfies its update, as `push --atomic` treats it
- * remotely, so every backend agrees. Git names the first ref it could not lock
- * and the value it found; when that value IS the target, the transaction runs
- * again with that line as `verify <ref> <target>`, which keeps it atomic. The
- * success path is one process; each such ref costs one more on the failure path.
- */
-async function publishLocal(repo: string, updates: readonly RefUpdate[]): Promise<PublishResult> {
-  const satisfied = new Set<string>()
-  for (let round = 0; round <= updates.length; round += 1) {
-    const lines = updates.map(({ ref, expect, oid }) =>
-      satisfied.has(ref) ? `verify ${ref} ${oid}` : `update ${ref} ${oid} ${expect}`,
-    )
-    const result = await run("git", durableGitArgs(repo, ["update-ref", "--stdin"]), {
-      input: ["start", ...lines, "prepare", "commit", ""].join("\n"),
-    })
-    if (result.code === 0) return { landed: true }
-    const detail = result.stderr.toString("utf8").trim()
-    const lost =
-      /cannot lock ref '([^']+)': (?:is at ([0-9a-f]+) but expected [0-9a-f]+|reference already exists|reference is missing but expected [0-9a-f]+)/.exec(
-        detail,
-      )
-    if (lost === null) {
-      // Another writer held a ref lock for an instant: nothing moved, nothing is stale.
-      if (isTransientRefLockContention(detail)) return { landed: false, stale: [] }
-      throw new Error(`git update-ref --stdin failed (${result.code})${detail ? `: ${detail}` : ""}`)
-    }
-    const ref = lost[1] as string
-    const update = updates.find((candidate) => candidate.ref === ref)
-    if (update === undefined) throw new Error(`git update-ref named a ref this publish did not touch: ${ref}`)
-    // "already exists" prints no value; read it, on this failure path only.
-    const found = lost[0].includes("already exists") ? await optionalRef(repo, ref) : lost[2]
-    if (found !== update.oid || satisfied.has(ref)) return { landed: false, stale: [ref] }
-    satisfied.add(ref)
+/** git's update-ref report of the ref it could not lock, one anchored shape per case. */
+const LOST_AT =
+  /^fatal: (?:\w+: )?cannot lock ref '([^']+)': is at ([0-9a-f]{40}|[0-9a-f]{64}) but expected (?:[0-9a-f]{40}|[0-9a-f]{64})$/m
+const LOST_EXISTS = /^fatal: (?:\w+: )?cannot lock ref '([^']+)': reference already exists$/m
+const LOST_MISSING =
+  /^fatal: (?:\w+: )?cannot lock ref '([^']+)': reference is missing but expected (?:[0-9a-f]{40}|[0-9a-f]{64})$/m
+
+type LockFailure = { readonly ref: string; readonly observed: Oid | "absent" | undefined }
+
+/** The ref update-ref named and what it found there, or undefined for any other failure. */
+function lockFailure(detail: string): LockFailure | undefined {
+  const at = LOST_AT.exec(detail)
+  if (at !== null) return { ref: at[1] as string, observed: at[2] as Oid }
+  const exists = LOST_EXISTS.exec(detail)
+  // "already exists" prints no value; the caller reads it if it must decide.
+  if (exists !== null) return { ref: exists[1] as string, observed: undefined }
+  const missing = LOST_MISSING.exec(detail)
+  if (missing !== null) return { ref: missing[1] as string, observed: "absent" }
+  return undefined
+}
+
+function outcomesOf(updates: readonly RefUpdate[], unchanged: ReadonlySet<string>): PublishResult {
+  return {
+    outcomes: updates.map(({ ref, expect, oid }) => ({
+      ref,
+      outcome: unchanged.has(ref) || expect === oid ? ("unchanged" as const) : ("updated" as const),
+    })),
   }
-  throw new Error(`git update-ref --stdin did not settle ${updates.length} ref(s) in ${updates.length + 1} rounds`)
 }
 
 /**
- * MULTI, remotely: ONE `push --atomic`, a lease per ref. The server applies all
- * of it or none of it. It never touches a local ref: in remote mode reads go
- * through {@link fetchRefs}, so no local ref is a cache of the remote. Porcelain
- * output names each ref's fate; a lost lease is `stale`, and anything that is not
- * a per-ref rejection (network, auth, a missing remote) throws with git's text.
+ * MULTI, locally: ONE `update-ref --stdin` transaction. Git checks every lease
+ * under the ref locks before committing any of them, so either every ref moves
+ * or none does.
+ *
+ * A ref already at its target is unchanged, as `push --atomic` treats it. When
+ * the transaction fails with one of git's lock-failure shapes, ONE
+ * `for-each-ref` reads every ref this publish names. That read happens on the
+ * failure path only, and it decides between verify and Conflict. A ref at
+ * neither its lease nor its target is a Conflict naming the ref, the lease and
+ * the tip. Otherwise the transaction runs ONCE more, with each ref already at
+ * its target as `verify <ref> <oid>`, so the unchanged refs are verified inside
+ * it. The re-run's failure is final and it never loops. That is one process on
+ * success and at most three on failure. A failure that is not a lock failure of
+ * those shapes is an Error carrying git's text.
+ */
+async function publishLocal(repo: string, updates: readonly RefUpdate[]): Promise<PublishResult> {
+  const attempt = (unchanged: ReadonlySet<string>) =>
+    run("git", durableGitArgs(repo, ["update-ref", "--stdin"]), {
+      input: [
+        "start",
+        ...updates.map(({ ref, expect, oid }) =>
+          unchanged.has(ref) ? `verify ${ref} ${oid}` : `update ${ref} ${oid} ${expect}`,
+        ),
+        "prepare",
+        "commit",
+        "",
+      ].join("\n"),
+    })
+  const failed = (code: number | null, detail: string) =>
+    new Error(`git update-ref --stdin failed (${code})${detail ? `: ${detail}` : ""}`)
+
+  const first = await attempt(new Set())
+  if (first.code === 0) return outcomesOf(updates, new Set())
+  const firstDetail = first.stderr.toString("utf8").trim()
+  if (lockFailure(firstDetail) === undefined) throw failed(first.code, firstDetail)
+
+  const current = await readExactRefs(
+    repo,
+    updates.map(({ ref }) => ref),
+  )
+  const lost = updates
+    .map(({ ref, expect, oid }) => ({ ref, expect, oid, tip: current.get(ref) }))
+    .filter(({ expect, oid, tip }) => tip !== oid && (isZeroOid(expect) ? tip !== undefined : tip !== expect))
+  if (lost.length > 0) {
+    throw leaseConflict(lost.map(({ ref, expect, tip }) => ({ ref, expect, observed: tip ?? "absent" })))
+  }
+  const unchanged = new Set(updates.filter(({ ref, oid }) => current.get(ref) === oid).map(({ ref }) => ref))
+  if (unchanged.size === 0) throw failed(first.code, firstDetail)
+
+  const second = await attempt(unchanged)
+  if (second.code === 0) return outcomesOf(updates, unchanged)
+  const secondDetail = second.stderr.toString("utf8").trim()
+  const lostAgain = lockFailure(secondDetail)
+  if (lostAgain === undefined) throw failed(second.code, secondDetail)
+  const update = updates.find(({ ref }) => ref === lostAgain.ref)
+  if (update === undefined) throw failed(second.code, secondDetail)
+  throw leaseConflict([{ ref: lostAgain.ref, expect: update.expect, observed: lostAgain.observed ?? "present" }])
+}
+
+/** Exactly these refs and their tips, in ONE `for-each-ref`; an absent ref is simply missing. */
+async function readExactRefs(repo: string, refs: readonly string[]): Promise<ReadonlyMap<string, Oid>> {
+  const output = await git(repo, ["for-each-ref", "--format=%(objectname) %(refname)", ...refs])
+  const wanted = new Set(refs)
+  const tips = new Map<string, Oid>()
+  for (const line of decodeUtf8(output, "git for-each-ref").split("\n")) {
+    if (line === "") continue
+    const space = line.indexOf(" ")
+    const ref = line.slice(space + 1)
+    // A pattern also matches refs below it; keep only the exact names asked for.
+    if (wanted.has(ref)) tips.set(ref, validateOid(line.slice(0, space), "git for-each-ref returned a malformed id"))
+  }
+  return tips
+}
+
+/**
+ * MULTI, remotely: ONE `push --atomic`, a lease per ref, exactly as git does it:
+ * no pre-read, and no local ref touched (in remote mode reads go through
+ * {@link fetchRefs}, so no local ref is a cache of the remote). Porcelain names
+ * each ref's fate: "=" unchanged; "*", " " and "+" updated; "[rejected] (stale
+ * info)" a lost lease, whose tip git does not report. Anything that is not a
+ * per-ref rejection (network, auth, a missing remote) is an Error with git's text.
  */
 async function publishRemote(
   repo: string,
@@ -852,18 +916,33 @@ async function publishRemote(
     ...updates.map(({ ref, oid }) => `${oid}:${ref}`),
   ]
   const result = await run("git", durableGitArgs(repo, args), { timeoutMs })
-  if (result.code === 0) return { landed: true }
   const detail = `${result.stdout.toString("utf8")}\n${result.stderr.toString("utf8")}`.trim()
-  const stale: string[] = []
-  for (const line of detail.split("\n")) {
+  const fates = new Map<string, { flag: string; summary: string }>()
+  for (const line of result.stdout.toString("utf8").split("\n")) {
     const [flag, spec, summary] = line.split("\t")
-    if (flag !== "!" || spec === undefined) continue
-    if (summary === "[rejected] (stale info)" || summary === "[remote rejected] (incorrect old value provided)") {
-      stale.push(spec.slice(spec.indexOf(":") + 1))
-    }
+    if (flag === undefined || spec === undefined || flag.length !== 1) continue
+    fates.set(spec.slice(spec.indexOf(":") + 1), { flag, summary: summary ?? "" })
   }
-  if (stale.length > 0) return { landed: false, stale }
-  throw new Error(`git push failed (${result.code})${detail ? `: ${detail}` : ""}`)
+  if (result.code !== 0) {
+    const stale = updates.filter(({ ref }) => {
+      const fate = fates.get(ref)
+      return (
+        fate?.flag === "!" &&
+        (fate.summary === "[rejected] (stale info)" ||
+          fate.summary === "[remote rejected] (incorrect old value provided)")
+      )
+    })
+    if (stale.length === 0) throw new Error(`git push failed (${result.code})${detail ? `: ${detail}` : ""}`)
+    throw leaseConflict(stale.map(({ ref, expect }) => ({ ref, expect, observed: "a tip the remote did not report" })))
+  }
+  return {
+    outcomes: updates.map(({ ref }) => {
+      const flag = fates.get(ref)?.flag
+      if (flag === "=") return { ref, outcome: "unchanged" as const }
+      if (flag === "*" || flag === " " || flag === "+") return { ref, outcome: "updated" as const }
+      throw new Error(`git push succeeded without reporting ${ref} as updated or up to date: ${detail}`)
+    }),
+  }
 }
 
 /**

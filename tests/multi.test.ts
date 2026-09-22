@@ -65,7 +65,7 @@ afterEach(() => {
 })
 
 describe("MULTI: the backend publishes many refs atomically, all or none", () => {
-  test("every ref lands when every expectation holds; one stale expectation lands none, and names it", async () => {
+  test("every ref lands when every lease holds; one lost lease lands none, and names the ref, expect and tip", async () => {
     await withTargets(async ({ name, repo, backend }) => {
       const one = await workCommit(repo, backend, "one")
       const two = await workCommit(repo, backend, "two")
@@ -76,47 +76,104 @@ describe("MULTI: the backend publishes many refs atomically, all or none", () =>
           { ref: "refs/heads/b", expect: ZERO, oid: one },
         ]),
         name,
-      ).toEqual({ landed: true })
+      ).toEqual({
+        outcomes: [
+          { ref: "refs/heads/a", outcome: "updated" },
+          { ref: "refs/heads/b", outcome: "updated" },
+        ],
+      })
 
-      const stale = await publish(repo, [
+      const lost = publish(repo, [
         { ref: "refs/heads/a", expect: one, oid: two },
         { ref: "refs/heads/b", expect: two, oid: two },
       ])
-      expect(stale, name).toEqual({ landed: false, stale: ["refs/heads/b"] })
-      // Atomic: a, whose expectation held, did not move either.
+      await expect(lost, name).rejects.toBeInstanceOf(Conflict)
+      await expect(lost, name).rejects.toMatchObject({ refs: ["refs/heads/b"] })
+      // Atomic: a, whose lease held, did not move either.
       expect(await tipOf(repo, backend, "refs/heads/a"), name).toBe(one)
       expect(await tipOf(repo, backend, "refs/heads/b"), name).toBe(one)
     })
   })
 
-  test("a ref already at its target satisfies its update, as git's atomic push treats it, on every backend", async () => {
+  test("(a) a same-oid ref with a stale lease plus a real update: success, outcomes [unchanged, updated]", async () => {
     await withTargets(async ({ name, repo, backend }) => {
       const a = await workCommit(repo, backend, "a")
       const b = await workCommit(repo, backend, "b")
       const event = await workCommit(repo, backend, "event")
       const publish = backend.publish as NonNullable<GitomicBackend["publish"]>
-      expect(await publish(repo, [{ ref: BRANCH, expect: ZERO, oid: b }]), name).toEqual({ landed: true })
-      // Stale expectation (a), but the branch is already at its target (b): satisfied.
+      await publish(repo, [{ ref: BRANCH, expect: ZERO, oid: b }])
       expect(
         await publish(repo, [
-          { ref: "refs/events/e", expect: ZERO, oid: event },
           { ref: BRANCH, expect: a, oid: b },
+          { ref: "refs/events/e", expect: ZERO, oid: event },
         ]),
         name,
-      ).toEqual({ landed: true })
+      ).toEqual({
+        outcomes: [
+          { ref: BRANCH, outcome: "unchanged" },
+          { ref: "refs/events/e", outcome: "updated" },
+        ],
+      })
       expect(await tipOf(repo, backend, "refs/events/e"), name).toBe(event)
       expect(await tipOf(repo, backend, BRANCH), name).toBe(b)
-      // Absent expected, already at target: satisfied too.
-      expect(await publish(repo, [{ ref: BRANCH, expect: ZERO, oid: b }]), name).toEqual({ landed: true })
-      // Truly stale (the ref is at neither expect nor target): refused, nothing lands.
+    })
+  })
+
+  test("(b) a same-oid ref plus a real update whose lease is stale: Conflict naming the second ref, nothing moved", async () => {
+    await withTargets(async ({ name, repo, backend }) => {
+      const a = await workCommit(repo, backend, "a")
+      const b = await workCommit(repo, backend, "b")
+      const c = await workCommit(repo, backend, "c")
+      const publish = backend.publish as NonNullable<GitomicBackend["publish"]>
+      await publish(repo, [
+        { ref: BRANCH, expect: ZERO, oid: b },
+        { ref: "refs/heads/other", expect: ZERO, oid: a },
+      ])
+      const refused = publish(repo, [
+        { ref: BRANCH, expect: a, oid: b },
+        { ref: "refs/heads/other", expect: b, oid: c },
+      ])
+      await expect(refused, name).rejects.toBeInstanceOf(Conflict)
+      await expect(refused, name).rejects.toMatchObject({ refs: ["refs/heads/other"] })
+      await expect(refused, name).rejects.toThrow(`refs/heads/other is at ${a}, not ${b}`)
+      expect(await tipOf(repo, backend, BRANCH), name).toBe(b)
+      expect(await tipOf(repo, backend, "refs/heads/other"), name).toBe(a)
+    })
+  })
+
+  test("(c) create of a ref already at oid is unchanged; at another oid it is a Conflict", async () => {
+    await withTargets(async ({ name, repo, backend }) => {
+      const a = await workCommit(repo, backend, "a")
+      const b = await workCommit(repo, backend, "b")
+      const publish = backend.publish as NonNullable<GitomicBackend["publish"]>
+      await publish(repo, [{ ref: BRANCH, expect: ZERO, oid: a }])
+      expect(await publish(repo, [{ ref: BRANCH, expect: ZERO, oid: a }]), name).toEqual({
+        outcomes: [{ ref: BRANCH, outcome: "unchanged" }],
+      })
+      const refused = publish(repo, [{ ref: BRANCH, expect: ZERO, oid: b }])
+      await expect(refused, name).rejects.toMatchObject({ refs: [BRANCH] })
+      await expect(refused, name).rejects.toThrow(`${BRANCH} is at ${a}, not absent`)
+      expect(await tipOf(repo, backend, BRANCH), name).toBe(a)
+    })
+  })
+
+  test("(d) an all-unchanged publish is a success, and publishing the same list twice succeeds twice", async () => {
+    await withTargets(async ({ name, repo, backend }) => {
+      const a = await workCommit(repo, backend, "a")
+      const b = await workCommit(repo, backend, "b")
+      const publish = backend.publish as NonNullable<GitomicBackend["publish"]>
+      const list = [
+        { ref: "refs/heads/x", expect: ZERO, oid: a },
+        { ref: "refs/heads/y", expect: ZERO, oid: b },
+      ]
       expect(
-        await publish(repo, [
-          { ref: "refs/events/f", expect: ZERO, oid: event },
-          { ref: BRANCH, expect: event, oid: a },
-        ]),
+        (await publish(repo, list)).outcomes.map(({ outcome }) => outcome),
         name,
-      ).toEqual({ landed: false, stale: [BRANCH] })
-      expect(await tipOf(repo, backend, "refs/events/f"), name).toBeUndefined()
+      ).toEqual(["updated", "updated"])
+      expect(
+        (await publish(repo, list)).outcomes.map(({ outcome }) => outcome),
+        name,
+      ).toEqual(["unchanged", "unchanged"])
     })
   })
 
@@ -156,7 +213,7 @@ describe("events: append and transact publish `also` refs in the same atomic pub
       const work = await workCommit(repo, backend, "work")
       const rival = await workCommit(repo, backend, "rival")
       const publish = backend.publish as NonNullable<GitomicBackend["publish"]>
-      expect(await publish(repo, [{ ref: BRANCH, expect: ZERO, oid: rival }]), name).toEqual({ landed: true })
+      await publish(repo, [{ ref: BRANCH, expect: ZERO, oid: rival }])
 
       const events = await openEvents({ repo, ref: CHAIN, backend })
       const refused = events.append([{ type: "opened" }], {
@@ -269,29 +326,50 @@ describe("remote: one atomic push, one fetch", () => {
     }
   })
 
-  test("remotely, a ref already at its target satisfies its update and the rest lands", async () => {
+  test("remotely, (a) a same-oid stale lease reads unchanged and the rest lands; (b) a real stale lease refuses all", async () => {
     const pair = await remotePair()
     try {
       const backend = createShellBackend()
       const a = await workCommit(pair.local.repo, backend, "a")
       const b = await workCommit(pair.local.repo, backend, "b")
+      const c = await workCommit(pair.local.repo, backend, "c")
       const event = await workCommit(pair.local.repo, backend, "event")
       const publish = backend.publish as NonNullable<GitomicBackend["publish"]>
-      expect(await publish(pair.local.repo, [{ ref: BRANCH, expect: ZERO, oid: b }], "origin")).toEqual({
-        landed: true,
-      })
+      await publish(pair.local.repo, [{ ref: BRANCH, expect: ZERO, oid: b }], "origin")
       expect(
         await publish(
           pair.local.repo,
           [
-            { ref: "refs/events/e", expect: ZERO, oid: event },
             { ref: BRANCH, expect: a, oid: b },
+            { ref: "refs/events/e", expect: ZERO, oid: event },
           ],
           "origin",
         ),
-      ).toEqual({ landed: true })
+      ).toEqual({
+        outcomes: [
+          { ref: BRANCH, outcome: "unchanged" },
+          { ref: "refs/events/e", outcome: "updated" },
+        ],
+      })
       expect(await tipOf(pair.origin.repo, backend, "refs/events/e")).toBe(event)
+
+      const refused = publish(
+        pair.local.repo,
+        [
+          { ref: "refs/events/f", expect: ZERO, oid: event },
+          { ref: BRANCH, expect: a, oid: c },
+        ],
+        "origin",
+      )
+      await expect(refused).rejects.toBeInstanceOf(Conflict)
+      await expect(refused).rejects.toMatchObject({ refs: [BRANCH] })
+      expect(await tipOf(pair.origin.repo, backend, "refs/events/f")).toBeUndefined()
       expect(await tipOf(pair.origin.repo, backend, BRANCH)).toBe(b)
+      // Publishing the same list twice succeeds twice, remotely too.
+      const again = [{ ref: "refs/events/e", expect: ZERO, oid: event }]
+      expect(await publish(pair.local.repo, again, "origin")).toEqual({
+        outcomes: [{ ref: "refs/events/e", outcome: "unchanged" }],
+      })
     } finally {
       await pair.cleanup()
     }
@@ -323,6 +401,20 @@ describe("remote: one atomic push, one fetch", () => {
         "origin",
       )
       expect(gitSpawns(spy)).toBe(1)
+
+      // (e) the local failure path costs at most three: transaction, rev-parse, re-run.
+      const two = await workCommit(pair.local.repo, backend, "two")
+      spy.mockClear()
+      await publish(pair.local.repo, [
+        { ref: "refs/heads/a", expect: ZERO, oid: one },
+        { ref: "refs/heads/c", expect: ZERO, oid: two },
+      ])
+      expect(gitSpawns(spy)).toBeLessThanOrEqual(3)
+      spy.mockClear()
+      await expect(publish(pair.local.repo, [{ ref: "refs/heads/a", expect: ZERO, oid: two }])).rejects.toBeInstanceOf(
+        Conflict,
+      )
+      expect(gitSpawns(spy)).toBeLessThanOrEqual(3)
     } finally {
       await pair.cleanup()
     }
@@ -428,6 +520,8 @@ describe("the README and CHANGELOG document MULTI and the batched fetch", () => 
     expect(readme).not.toContain("(planned)")
     expect(readme).toContain("refs/gitomic/fetched/")
     expect(readme).toMatch(/never\s+an application ref/)
+    expect(readme).toMatch(/`expect` is a lease, not an\s+assertion/)
+    expect(readme).toMatch(/as advertised at push time, not\s+locked/)
     expect(changelog).toContain("GitomicBackend.publish")
     expect(changelog).toContain("GitomicBackend.fetchRefs")
   })

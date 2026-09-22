@@ -311,16 +311,21 @@ is one; `chainsUnder` against a remote is two, a fetch and a walk.
 
 **MULTI: many refs, all or none.** `append` and `transact` take
 `also: [{ ref, expect, oid }]`: more refs that land in the SAME atomic publish
-as the event, each on its own compare-and-swap (`expect: null` means absent).
-Locally that is one `update-ref --stdin` transaction; against a remote, one
-`git push --atomic` with a lease per ref. If any expectation was lost, nothing
-lands, and git's own per-ref report says which: a moved `also` ref throws
-`Conflict` naming it and is never retried; a moved chain is the usual race. A
-failure that is not a per-ref rejection (network, auth, a missing remote) is an
-ordinary error, never a `Conflict`. A ref already at its target satisfies its
-update whatever its expectation said, on every backend, because that is how
-git's atomic push treats it: the end state is the one you asked for. The backend method is `publish(repo,
-updates, remote?)`.
+as the event (`expect: null` means absent). Locally that is one
+`update-ref --stdin` transaction; against a remote, one `git push --atomic`
+with a lease per ref. The backend method is `publish(repo, updates, remote?)`.
+
+`expect` is a lease, not an assertion. Per ref, three outcomes: updated (was at
+expect, now at oid), unchanged (already at oid; not touched, not locked),
+Conflict (at neither; the message names the ref, expect and the observed tip).
+`expect` = create (absent) with the ref already at oid is unchanged; at another
+oid, Conflict. Publishing the same list twice succeeds twice. A publish that
+lands returns every ref's outcome, taken from git's own per-ref report; if any
+lease is lost, nothing lands. A lost `also` lease throws `Conflict` and is never
+retried; a lost chain lease is the usual race. A failure that is not a per-ref
+rejection (network, auth, a missing remote) is an ordinary error, never a
+`Conflict`. Remote unchanged is "as advertised at push time, not locked"; local
+unchanged is verified inside the transaction.
 
 **Remote reads never use a local ref as a cache.** In remote mode, reads go
 through `fetchRefs`: one `git fetch` into gitomic's private namespace
