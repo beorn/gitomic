@@ -296,27 +296,47 @@ never silently overwritten.
 | `openEvents({ repo, ref, writer?, remote?, backend?, retryBudgetMs? })` | Open one chain.                                                                                                                                                              |
 | `head()`                                                                | The tip, or `null` when the chain does not exist.                                                                                                                            |
 | `events({ from?, limit?, order? })`                                     | Events after `from`, oldest first by default; `limit` defaults to 50, at most 1024.                                                                                          |
-| `transact(decide, message)`                                             | Read the chain, decide what to append, write it, compare-and-swap; on a race, re-run `decide` on the winner's events. Over 1024 events it throws rather than decide on part. |
-| `append(inputs, { expect })`                                            | Write at exactly `expect`; a moved tip throws `Conflict`.                                                                                                                    |
+| `transact(decide, message, { also? })`                                  | Read the chain, decide what to append, write it, compare-and-swap; on a race, re-run `decide` on the winner's events. Over 1024 events it throws rather than decide on part. |
+| `append(inputs, { expect, also? })`                                     | Write at exactly `expect`; a moved tip throws `Conflict`.                                                                                                                    |
 | `watch({ signal, pollIntervalMs? })`                                    | Yield each batch of new events; a jump of over 1024 throws.                                                                                                                  |
 | `listRefs(prefix, { repo, remote? })`                                   | Every ref under a prefix and its tip: `for-each-ref`, or `ls-remote --refs` against a remote.                                                                                |
-| `chainsUnder(prefix, { repo, limit? })`                                 | Every chain under a prefix, read in one walk.                                                                                                                                |
+| `chainsUnder(prefix, { repo, remote?, limit? })`                        | Every chain under a prefix, read in one walk; with `remote`, one fetch first.                                                                                                |
+| `fetchRefs(prefixOrRefs, { repo, remote })`                             | Every ref under a prefix, or the named refs, with their objects, in one `git fetch`.                                                                                         |
 
 **Reads are batched.** On the shell backend, reading a 50-event chain takes
 two git processes, every chain under a prefix takes two with exactly one
 walk, and an append takes three: read the parent, write the commit, swap the
-ref. Tests count these.
+ref. Tests count these. A publish is one process, local or remote; `fetchRefs`
+is one; `chainsUnder` against a remote is two, a fetch and a walk.
+
+**MULTI: many refs, all or none.** `append` and `transact` take
+`also: [{ ref, expect, oid }]`: more refs that land in the SAME atomic publish
+as the event, each on its own compare-and-swap (`expect: null` means absent).
+Locally that is one `update-ref --stdin` transaction; against a remote, one
+`git push --atomic` with a lease per ref. If any expectation was lost, nothing
+lands, and git's own per-ref report says which: a moved `also` ref throws
+`Conflict` naming it and is never retried; a moved chain is the usual race. A
+failure that is not a per-ref rejection (network, auth, a missing remote) is an
+ordinary error, never a `Conflict`. The backend method is `publish(repo,
+updates, remote?)`.
+
+**Remote reads never use a local ref as a cache.** In remote mode, reads go
+through `fetchRefs`: one `git fetch` into gitomic's private namespace
+`refs/gitomic/fetched/<remote>/` (the remote's name, or `url-` and the URL in
+base64url). That namespace is gitomic's own bookkeeping, like a pin ref, never
+an application ref; its prune is confined to it by the refspec. A remote
+publish therefore leaves every local ref where it was.
 
 If you know Redis, this is the one screen:
 
-| Redis                   | gitomic                          |
-| ----------------------- | -------------------------------- |
-| `KEYS` / `SCAN`         | `listRefs`                       |
-| `GET` / `SET` + `WATCH` | `at` / `transact`                |
-| `XADD` / `XRANGE`       | `append` / `events`              |
-| `SUBSCRIBE`             | `watch`                          |
-| `MULTI`                 | multi-ref transactions (planned) |
-| `EXPIRE`                | none                             |
+| Redis                   | gitomic                         |
+| ----------------------- | ------------------------------- |
+| `KEYS` / `SCAN`         | `listRefs`                      |
+| `GET` / `SET` + `WATCH` | `at` / `transact`               |
+| `XADD` / `XRANGE`       | `append` / `events`             |
+| `SUBSCRIBE`             | `watch`                         |
+| `MULTI`                 | `also` on `append` / `transact` |
+| `EXPIRE`                | none                            |
 
 ## The full tour
 

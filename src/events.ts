@@ -24,7 +24,7 @@ import {
   waitForPoll,
 } from "./options.js"
 import { createShellBackend } from "./shell.js"
-import type { CommitMeta, GitomicBackend, Oid, Trailer } from "./types.js"
+import type { CommitMeta, GitomicBackend, Oid, RefUpdate, Trailer } from "./types.js"
 import { assertUtf8 } from "./utf8.js"
 
 /** One trailer as written: key, then value. Order and duplicates are kept. */
@@ -94,10 +94,22 @@ export type Events = {
    * Read every event, decide, append, and replay on a lost race. `message` names
    * the transaction in errors. A chain over 1024 events is refused, not truncated.
    */
-  transact(decide: Decide, message: string): Promise<Appended>
+  transact(decide: Decide, message: string, options?: { also?: readonly AlsoRef[] }): Promise<Appended>
   /** Append at exactly `expect` (null = the chain must not exist); throws Conflict on a moved tip. */
-  append(inputs: readonly EventInput[], options: { expect: Oid | null }): Promise<Appended>
+  append(inputs: readonly EventInput[], options: { expect: Oid | null; also?: readonly AlsoRef[] }): Promise<Appended>
   watch(options: { signal: AbortSignal; pollIntervalMs?: number }): AsyncIterable<Event[]>
+}
+
+/**
+ * Another ref to move in the SAME atomic publish as the event: from `expect`
+ * (null: absent) to `oid`. A branch head beside the event that names it, say.
+ * If it lost its expectation, nothing lands and the append or transact throws
+ * Conflict naming it; it is never retried.
+ */
+export type AlsoRef = {
+  readonly ref: string
+  readonly expect: Oid | null
+  readonly oid: Oid
 }
 
 export type ListRefsOptions = {
@@ -116,10 +128,10 @@ export const EVENT_KEY = "Event"
 const DEFAULT_LIMIT = 50
 const MAX_LIMIT = 1_024
 
-type Capable = GitomicBackend & Required<Pick<GitomicBackend, "listRefs" | "readHistory" | "writeGenesis">>
+type Capable = GitomicBackend & Required<Pick<GitomicBackend, "listRefs" | "readHistory" | "writeGenesis" | "publish">>
 
 function requireEvents(backend: GitomicBackend): Capable {
-  for (const method of ["listRefs", "readHistory", "writeGenesis"] as const) {
+  for (const method of ["listRefs", "readHistory", "writeGenesis", "publish"] as const) {
     if (typeof backend[method] !== "function") {
       throw new TypeError(
         `this backend cannot hold event chains: it has no ${method}; use the shell, iso or mem backend`,
@@ -236,23 +248,57 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
   let seq = 0
 
   let tip: () => Promise<Oid | null>
-  let publish: (next: Oid, expected: Oid | null) => Promise<boolean>
   if (remote === undefined) {
     tip = async () => (await backend.listRefs(repo, ref)).get(ref) ?? null
-    publish = async (next, expected) => backend.compareAndSwap(repo, ref, next, expected ?? zeroOid(next))
   } else {
-    const fetchRemote = backend.fetchRemote
-    const compareAndSwapRemote = backend.compareAndSwapRemote
-    if (fetchRemote === undefined || compareAndSwapRemote === undefined) {
-      throw new TypeError("this backend cannot arbitrate remotely; omit remote or use the shell/iso backend")
+    const fetchRefs = backend.fetchRefs
+    if (fetchRefs === undefined) {
+      throw new TypeError("this backend cannot read remotely; omit remote or use the shell/iso backend")
     }
     tip = async () => {
       const listed = (await backend.listRefs(repo, ref, remote)).get(ref) ?? null
-      // Bring the objects over without moving any local ref: readers never move refs.
-      if (listed !== null) await fetchRemote(repo, ref, remote)
+      // Bring the objects over into gitomic's private namespace: no application
+      // ref moves, and no local ref is treated as a cache of the remote.
+      if (listed !== null) await fetchRefs(repo, [ref], remote)
       return listed
     }
-    publish = async (next, expected) => compareAndSwapRemote(repo, ref, next, expected ?? zeroOid(next), remote)
+  }
+
+  /**
+   * One atomic publish of the event ref plus every `also` ref. The tool names
+   * each ref that lost its expectation: an `also` ref is a Conflict now (a retry
+   * would find it just as stale); the event ref alone is contention, returned as
+   * false for the loop to handle. Any other failure is thrown by the backend.
+   */
+  const publishWith =
+    (also: readonly RefUpdate[]) =>
+    async (next: Oid, expected: Oid | null): Promise<boolean> => {
+      const result = await backend.publish(
+        repo,
+        [{ ref, expect: expected ?? zeroOid(next), oid: next }, ...also],
+        remote,
+      )
+      if (result.landed) return true
+      const lostAlso = result.stale.filter((stale) => stale !== ref)
+      if (lostAlso.length > 0) {
+        throw new Conflict(`${lostAlso.join(", ")} moved: nothing published, not even ${ref}`)
+      }
+      return false
+    }
+  const shapeAlso = (also: readonly AlsoRef[] | undefined): RefUpdate[] => {
+    const seen = new Set<string>([ref])
+    return (also ?? []).map((update) => {
+      const alsoRef = normalizeRef(update.ref)
+      if (alsoRef === ref) throw new TypeError(`an also ref cannot be the chain itself: ${ref}`)
+      if (seen.has(alsoRef)) throw new TypeError(`also names ${alsoRef} more than once`)
+      seen.add(alsoRef)
+      const oid = validateOid(update.oid, `also oid for ${alsoRef} must be a commit id`)
+      const expect =
+        update.expect === null
+          ? zeroOid(oid)
+          : validateOid(update.expect, `also expect for ${alsoRef} must be a commit id or null`)
+      return { ref: alsoRef, expect, oid }
+    })
   }
 
   const readChain = async (at: Oid, options: { from?: Oid; limit: number }) => {
@@ -357,8 +403,9 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
       // The walk is newest-first.
       return read.order === "newest-first" ? events : events.reverse()
     },
-    async transact(decide, message) {
+    async transact(decide, message, transactOptions = {}) {
       const why = assertLine(typeof message === "string" ? message.trim() : message, "message")
+      const publish = publishWith(shapeAlso(transactOptions.also))
       const reserved: number[] = []
       return runCasLoop<Oid | null, Appended>({
         // `message` names the transaction in the loop's errors; each event's own
@@ -385,9 +432,10 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
         },
       })
     },
-    async append(inputs, { expect }) {
+    async append(inputs, { expect, also }) {
       if (inputs.length === 0) throw new TypeError("append needs at least one event")
       const expected = expect === null ? null : validateOid(expect, "append expect must be an event id or null")
+      const publish = publishWith(shapeAlso(also))
       const reserved: number[] = []
       // The caller names the tip and the compare-and-swap enforces it, so the
       // first attempt trusts `expect` instead of spending a process to re-read
@@ -444,6 +492,20 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
   }
 }
 
+/**
+ * Fetch every ref under `refs` (a prefix) or exactly the named refs from
+ * `remote`, with their objects, in ONE git process; return each ref's tip under
+ * its original name. Only gitomic's private namespace is written.
+ */
+export async function fetchRefs(
+  refs: string | readonly string[],
+  options: ListRefsOptions & { remote: string },
+): Promise<ReadonlyMap<string, Oid>> {
+  const backend = options.backend ?? createShellBackend()
+  if (backend.fetchRefs === undefined) throw new TypeError("this backend cannot fetch; use the shell or iso backend")
+  return backend.fetchRefs(options.repo, refs, options.remote)
+}
+
 /** Every ref under `prefix` and its tip: `for-each-ref` locally, `ls-remote --refs` remotely. */
 export async function listRefs(prefix: string, options: ListRefsOptions): Promise<ReadonlyMap<string, Oid>> {
   const backend = requireEvents(options.backend ?? createShellBackend())
@@ -459,10 +521,17 @@ export async function listRefs(prefix: string, options: ListRefsOptions): Promis
 export async function chainsUnder(prefix: string, options: ChainsUnderOptions): Promise<ReadonlyMap<string, Event[]>> {
   const limit = normalizeLimit(options.limit)
   const backend = requireEvents(options.backend ?? createShellBackend())
-  if (options.remote !== undefined) {
-    throw new TypeError("chainsUnder does not read remote chains yet; list them with listRefs({ remote })")
+  let refs: ReadonlyMap<string, Oid>
+  if (options.remote === undefined) {
+    refs = await backend.listRefs(options.repo, prefix)
+  } else {
+    // ONE fetch brings every tip under the prefix and its objects, into
+    // gitomic's private namespace; the walk below then reads them locally.
+    if (backend.fetchRefs === undefined) {
+      throw new TypeError("this backend cannot read remote chains; omit remote or use the shell/iso backend")
+    }
+    refs = await backend.fetchRefs(options.repo, prefix, options.remote)
   }
-  const refs = await backend.listRefs(options.repo, prefix)
   const tips = [...new Set(refs.values())]
   if (tips.length === 0) return new Map()
   const history = await backend.readHistory(options.repo, tips, { limit: (limit + 1) * tips.length })

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto"
 
-import type { CommitInput, CommitMeta, CommitProvenance, Oid, Trailer } from "./types.js"
+import type { CommitInput, CommitMeta, CommitProvenance, Oid, RefUpdate, Trailer } from "./types.js"
 import { assertUtf8, decodeUtf8 } from "./utf8.js"
 
 export const GITOMIC_NAME = "gitomic"
@@ -300,6 +300,27 @@ export function zeroOid(like: Oid): Oid {
 
 export function isZeroOid(oid: Oid): boolean {
   return /^0+$/.test(oid)
+}
+
+/**
+ * Validate a MULTI publish before any backend writes: at least one update, full
+ * `refs/` names, each ref once, real object ids, and never an all-zero target
+ * (a MULTI publish moves or creates refs; it does not delete them).
+ */
+export function assertRefUpdates(updates: readonly RefUpdate[]): readonly RefUpdate[] {
+  if (!Array.isArray(updates) || updates.length === 0) throw new TypeError("publish needs at least one ref update")
+  const seen = new Set<string>()
+  return updates.map((update) => {
+    const ref = update.ref
+    if (typeof ref !== "string" || !ref.startsWith("refs/") || /[\s~^:?*[\\]|\.\.|@\{/.test(ref)) {
+      throw new TypeError(`publish ref must be a full refs/ name: ${JSON.stringify(ref)}`)
+    }
+    if (seen.has(ref)) throw new TypeError(`publish names ${ref} more than once`)
+    seen.add(ref)
+    const oid = validateOid(update.oid, `publish oid for ${ref} is not a Git object id`)
+    if (isZeroOid(oid)) throw new TypeError(`publish cannot delete ${ref}: its oid is all zeros`)
+    return { ref, expect: validateOid(update.expect, `publish expect for ${ref} is not a Git object id`), oid }
+  })
 }
 
 /** The canonical empty root every chain starts from: mem's initial commit, byte for byte. */

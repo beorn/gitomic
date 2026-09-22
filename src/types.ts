@@ -163,7 +163,32 @@ export type GitomicBackend = {
     options?: { readonly exclude?: readonly Oid[]; readonly limit?: number },
   ): Promise<CommitMeta[]>
   compareAndSwapRemote?(repo: string, ref: string, next: Oid, expected: Oid, remote: string): Promise<boolean>
+  /**
+   * MULTI: move every ref in `updates`, or none. Each update is a compare-and-
+   * swap on its own old value; an all-zero `expect` means the ref must be
+   * absent. With `remote` it is ONE atomic push that never touches a local ref;
+   * without, one local ref transaction. A lost expectation is a result naming
+   * the refs the tool reported stale; any other failure throws.
+   */
+  publish?(repo: string, updates: readonly RefUpdate[], remote?: string): Promise<PublishResult>
+  /**
+   * Fetch every ref under a prefix, or exactly the named refs, from `remote` in
+   * ONE git process, and return each ref's tip under its original name. It
+   * writes only gitomic's private namespace `refs/gitomic/fetched/<remote-key>/`,
+   * never an application ref. A named ref missing on the remote throws.
+   */
+  fetchRefs?(repo: string, refs: string | readonly string[], remote: string): Promise<ReadonlyMap<string, Oid>>
 }
+
+/** One ref of a MULTI publish: move `ref` from `expect` (all-zero: absent) to `oid`. */
+export type RefUpdate = {
+  readonly ref: string
+  readonly expect: Oid
+  readonly oid: Oid
+}
+
+/** All refs landed, or none did and `stale` names the refs whose expectation was lost. */
+export type PublishResult = { readonly landed: true } | { readonly landed: false; readonly stale: readonly string[] }
 
 export type OpenOptions = {
   repo: string

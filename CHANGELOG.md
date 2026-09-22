@@ -23,6 +23,17 @@
 - `GitomicBackend.readHistory` and `writeGenesis`, both optional. The first is a
   batched first-parent read over many tips; the second writes the canonical
   empty root an event chain starts from.
+- MULTI: `GitomicBackend.publish(repo, updates, remote?)` moves many refs
+  atomically, all or none, each on its own compare-and-swap: one
+  `update-ref --stdin` transaction locally, one `git push --atomic` with a
+  lease per ref remotely, check-all-then-set on mem. It reports the refs git
+  named as stale; any other failure throws. `append` and `transact` take
+  `also: [{ ref, expect, oid }]` to publish more refs with the event, and a lost
+  `also` ref is a `Conflict` naming it, never a retry.
+- `fetchRefs(prefixOrRefs, { repo, remote })` and `GitomicBackend.fetchRefs`:
+  every ref under a prefix, or the named refs, in ONE `git fetch`, into the
+  private namespace `refs/gitomic/fetched/<remote>/`. `chainsUnder` now reads a
+  remote prefix: one fetch, then one walk.
 - An all-zero `expected` passed to `compareAndSwap` now means the ref must be
   absent (create-if-absent) on every backend. A remote swap that creates a ref
   missing locally no longer fails after the push has landed.
@@ -32,6 +43,9 @@
 - `Reader.log` reads the whole range in one process when the backend has
   `readHistory`. Without it, the per-commit walk is unchanged.
 - The CLI's `log --json` records carry the new `parents` and `trailers` fields.
+- `gitomic/events` publishes every event through `GitomicBackend.publish`, so a
+  backend needs it to hold event chains. A remote chain reads through
+  `fetchRefs` and no longer moves a local cache ref; `Store` is unchanged.
 
 ### Changed
 

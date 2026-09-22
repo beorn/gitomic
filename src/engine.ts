@@ -4,7 +4,7 @@
  * door says how to read its state and build the next commit; the loop owns
  * contention, receipts and the retry budget, so there is exactly one of each.
  */
-import { RetriesExhausted } from "./errors.js"
+import { Conflict, RetriesExhausted } from "./errors.js"
 import type { Oid } from "./types.js"
 
 /** What one attempt decided against the tip it saw. */
@@ -53,6 +53,9 @@ export async function runCasLoop<H, R>(loop: CasLoop<H, R>): Promise<R> {
     try {
       if (await loop.publish(attempt.next, tip)) return attempt.landed(attempt.next, retries)
     } catch (cause) {
+      // A Conflict is the tool naming a definite rejection: nothing landed, so
+      // there is no unknown outcome to resolve and nothing to retry.
+      if (cause instanceof Conflict) throw cause
       publicationFailure = {
         cause,
         message: `Transaction publication to ${loop.label} is unknown; do not blindly retry. ${cause instanceof Error ? cause.message : String(cause)}`,

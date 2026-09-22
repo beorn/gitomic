@@ -6,6 +6,7 @@ import { join, resolve } from "node:path"
 
 import { GitTimeout } from "./errors.js"
 import {
+  assertRefUpdates,
   commitMeta,
   commitParents,
   formatCommitMessage,
@@ -23,7 +24,7 @@ import {
   validateOid,
 } from "./git-object.js"
 import { assertGitPrefixMatched, assertRegularBlob, normalizePrefix } from "./path.js"
-import type { BlobValue, CommitInput, CommitMeta, GitomicBackend, Oid } from "./types.js"
+import type { BlobValue, CommitInput, CommitMeta, GitomicBackend, Oid, PublishResult, RefUpdate } from "./types.js"
 import { decodeBlob, decodeUtf8 } from "./utf8.js"
 
 /** The complete output of one native Git command. */
@@ -155,6 +156,11 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
     },
     compareAndSwapRemote: async (repo, ref, next, expected, remote) =>
       compareAndSwapRemote(await resolveGitDir(repo), ref, next, expected, remote, remoteTimeoutMs),
+    publish: async (repo, updates, remote) =>
+      remote === undefined
+        ? publishLocal(await resolveGitDir(repo), assertRefUpdates(updates))
+        : publishRemote(await resolveGitDir(repo), assertRefUpdates(updates), remote, remoteTimeoutMs),
+    fetchRefs: async (repo, refs, remote) => fetchRefs(await resolveGitDir(repo), refs, remote, remoteTimeoutMs),
   }
   return { backend, resolveGitDir, refStorage, objectFormat }
 }
@@ -779,6 +785,150 @@ async function compareAndSwapRemote(
     await compareAndSwap(repo, ref, next, expected)
   }
   return true
+}
+
+/**
+ * MULTI, locally: ONE `update-ref --stdin` transaction. Git verifies every old
+ * value under the ref locks before committing any of them, so either every ref
+ * moves or none does. A lost expectation names its ref in git's own words; any
+ * other failure is an error carrying git's text.
+ */
+async function publishLocal(repo: string, updates: readonly RefUpdate[]): Promise<PublishResult> {
+  const input = [
+    "start",
+    ...updates.map(({ ref, expect, oid }) => `update ${ref} ${oid} ${expect}`),
+    "prepare",
+    "commit",
+    "",
+  ]
+  const result = await run("git", durableGitArgs(repo, ["update-ref", "--stdin"]), { input: input.join("\n") })
+  if (result.code === 0) return { landed: true }
+  const detail = result.stderr.toString("utf8").trim()
+  const stale = [
+    ...detail.matchAll(
+      /cannot lock ref '([^']+)': (?:is at [0-9a-f]+ but expected [0-9a-f]+|reference already exists|reference is missing but expected [0-9a-f]+)/g,
+    ),
+  ].map((match) => match[1] as string)
+  if (stale.length > 0) return { landed: false, stale }
+  // Another writer held a ref lock for an instant: nothing moved, nothing is stale.
+  if (isTransientRefLockContention(detail)) return { landed: false, stale: [] }
+  throw new Error(`git update-ref --stdin failed (${result.code})${detail ? `: ${detail}` : ""}`)
+}
+
+/**
+ * MULTI, remotely: ONE `push --atomic`, a lease per ref. The server applies all
+ * of it or none of it. It never touches a local ref: in remote mode reads go
+ * through {@link fetchRefs}, so no local ref is a cache of the remote. Porcelain
+ * output names each ref's fate; a lost lease is `stale`, and anything that is not
+ * a per-ref rejection (network, auth, a missing remote) throws with git's text.
+ */
+async function publishRemote(
+  repo: string,
+  updates: readonly RefUpdate[],
+  remote: string,
+  timeoutMs: number,
+): Promise<PublishResult> {
+  const args = [
+    "push",
+    "--atomic",
+    "--porcelain",
+    ...updates.map(({ ref, expect }) => `--force-with-lease=${ref}:${expect}`),
+    remote,
+    ...updates.map(({ ref, oid }) => `${oid}:${ref}`),
+  ]
+  const result = await run("git", durableGitArgs(repo, args), { timeoutMs })
+  if (result.code === 0) return { landed: true }
+  const detail = `${result.stdout.toString("utf8")}\n${result.stderr.toString("utf8")}`.trim()
+  const stale: string[] = []
+  for (const line of detail.split("\n")) {
+    const [flag, spec, summary] = line.split("\t")
+    if (flag !== "!" || spec === undefined) continue
+    if (summary === "[rejected] (stale info)" || summary === "[remote rejected] (incorrect old value provided)") {
+      stale.push(spec.slice(spec.indexOf(":") + 1))
+    }
+  }
+  if (stale.length > 0) return { landed: false, stale }
+  throw new Error(`git push failed (${result.code})${detail ? `: ${detail}` : ""}`)
+}
+
+/**
+ * gitomic's private tracking namespace for one remote: the remote NAME when it is
+ * a plain name, else `url-` plus the URL in unpadded base64url, which is ref-safe
+ * and reversible. It holds only gitomic's bookkeeping, never an application ref.
+ */
+export function fetchedNamespace(remote: string): string {
+  const key =
+    /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(remote) && !remote.endsWith(".lock") && !remote.includes("..")
+      ? remote
+      : `url-${Buffer.from(remote, "utf8").toString("base64url")}`
+  return `refs/gitomic/fetched/${key}/`
+}
+
+/**
+ * ONE `git fetch --verbose --porcelain` of every ref under a prefix, or of exactly
+ * the named refs, into {@link fetchedNamespace}. Verbose porcelain prints a line
+ * for every ref it considered, unchanged ones included (`=`), so the whole tip map
+ * comes from this one process. Prefix mode prunes, and the refspec confines the
+ * prune to the private namespace. A named ref missing on the remote throws.
+ */
+async function fetchRefs(
+  repo: string,
+  refs: string | readonly string[],
+  remote: string,
+  timeoutMs: number,
+): Promise<ReadonlyMap<string, Oid>> {
+  const namespace = fetchedNamespace(remote)
+  const local = (ref: string) => `${namespace}${ref.slice("refs/".length)}`
+  const prefix = typeof refs === "string" ? refs : undefined
+  const named = typeof refs === "string" ? [] : [...refs]
+  if (prefix !== undefined && !prefix.startsWith("refs/")) {
+    throw new TypeError(`fetchRefs prefix must start with refs/: ${JSON.stringify(prefix)}`)
+  }
+  if (prefix === undefined) {
+    if (named.length === 0) throw new TypeError("fetchRefs needs a prefix or at least one ref")
+    for (const ref of named) {
+      if (typeof ref !== "string" || !ref.startsWith("refs/")) {
+        throw new TypeError(`fetchRefs ref must be a full refs/ name: ${JSON.stringify(ref)}`)
+      }
+    }
+    if (new Set(named).size !== named.length) throw new TypeError("fetchRefs names a ref more than once")
+  }
+  // `prefix*` rather than `prefix/*`, so a ref named exactly `prefix` is included,
+  // as listRefs includes it; the result is filtered by the same prefix rule.
+  const refspecs =
+    prefix === undefined ? named.map((ref) => `+${ref}:${local(ref)}`) : [`+${prefix}*:${local(prefix)}*`]
+  const output = await git(
+    repo,
+    [
+      "fetch",
+      "--verbose",
+      "--porcelain",
+      "--no-tags",
+      "--no-write-fetch-head",
+      ...(prefix === undefined ? [] : ["--prune"]),
+      remote,
+      ...refspecs,
+    ],
+    { timeoutMs },
+  )
+  const tips = new Map<string, Oid>()
+  for (const line of decodeUtf8(output, "git fetch --porcelain").split("\n")) {
+    if (line === "") continue
+    // `<flag> <old> <new> <local ref>`; the flag is one character and may be a space.
+    const flag = line[0]
+    const [, next, localRef] = line.slice(2).split(" ")
+    if (localRef === undefined || !localRef.startsWith(namespace)) {
+      throw new Error(`git fetch --porcelain returned an unexpected line: ${JSON.stringify(line)}`)
+    }
+    if (flag === "-") continue
+    if (flag === "!") throw new Error(`git fetch rejected ${localRef}: ${line}`)
+    tips.set(`refs/${localRef.slice(namespace.length)}`, validateOid(next, "git fetch returned a malformed id"))
+  }
+  for (const ref of named) {
+    if (!tips.has(ref)) throw new Error(`git fetch did not report ${ref} from ${remote}`)
+  }
+  const matching = [...tips].filter(([ref]) => prefix === undefined || refUnderPrefix(ref, prefix))
+  return new Map(matching.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
 }
 
 export function isRemoteCompareAndSwapRejection(detail: string): boolean {

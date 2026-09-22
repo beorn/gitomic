@@ -1,4 +1,5 @@
 import {
+  assertRefUpdates,
   commitParents,
   encodeCommit,
   encodeFiles,
@@ -12,7 +13,7 @@ import {
   transactionLookupExceeded,
   validateOid,
 } from "./git-object.js"
-import type { CommitInput, CommitMeta, GitomicBackend, Oid } from "./types.js"
+import type { CommitInput, CommitMeta, GitomicBackend, Oid, PublishResult, RefUpdate } from "./types.js"
 import { assertGitPrefixMatched, normalizePrefix } from "./path.js"
 
 type MemCommit = {
@@ -128,6 +129,26 @@ export function createMemBackend(): GitomicBackend {
     return true
   }
 
+  // MULTI: check every expectation first, then set every ref; nothing awaits in
+  // between, so no other mem operation can interleave.
+  const publish = async (name: string, updates: readonly RefUpdate[], remote?: string): Promise<PublishResult> => {
+    if (remote !== undefined) throw new TypeError("the mem backend has no remotes; omit remote")
+    const checked = assertRefUpdates(updates)
+    const repo = getRepo(name)
+    const stale = checked
+      .filter(({ ref, expect }) => {
+        const current = repo.refs.get(ref)
+        return isZeroOid(expect) ? current !== undefined : current !== expect
+      })
+      .map(({ ref }) => ref)
+    if (stale.length > 0) return { landed: false, stale }
+    for (const { oid } of checked) {
+      if (!repo.commits.has(oid)) throw new Error(`unknown commit to publish: ${oid}`)
+    }
+    for (const { ref, oid } of checked) repo.refs.set(ref, oid)
+    return { landed: true }
+  }
+
   const findTransaction = async (
     name: string,
     tip: Oid,
@@ -194,6 +215,10 @@ export function createMemBackend(): GitomicBackend {
     findTransaction,
     listRefs,
     readHistory,
+    publish,
+    fetchRefs: async () => {
+      throw new TypeError("the mem backend has no remotes; fetchRefs needs a remote")
+    },
     // The initial commit every mem repo already holds IS the genesis.
     writeGenesis: async (name) => {
       getRepo(name)
