@@ -177,6 +177,39 @@ describe("MULTI: the backend publishes many refs atomically, all or none", () =>
     })
   })
 
+  test("a lock held by another writer is a Conflict on that ref, observed locked; released, the publish lands", async () => {
+    const fixture = await createBareRepo()
+    try {
+      const backend = createShellBackend()
+      const one = await workCommit(fixture.repo, backend, "one")
+      const publish = backend.publish as NonNullable<GitomicBackend["publish"]>
+      const { mkdir, rm, writeFile } = await import("node:fs/promises")
+      const { join } = await import("node:path")
+      await mkdir(join(fixture.repo, "refs", "heads"), { recursive: true })
+      const lock = join(fixture.repo, "refs", "heads", "a.lock")
+      await writeFile(lock, "")
+      const held = publish(fixture.repo, [
+        { ref: "refs/heads/a", expect: ZERO, oid: one },
+        { ref: "refs/heads/b", expect: ZERO, oid: one },
+      ])
+      await expect(held).rejects.toBeInstanceOf(Conflict)
+      await expect(held).rejects.toMatchObject({ refs: ["refs/heads/a"] })
+      await expect(held).rejects.toThrow("refs/heads/a is at locked")
+      expect(await tipOf(fixture.repo, backend, "refs/heads/b")).toBeUndefined()
+      await rm(lock)
+      expect(
+        (
+          await publish(fixture.repo, [
+            { ref: "refs/heads/a", expect: ZERO, oid: one },
+            { ref: "refs/heads/b", expect: ZERO, oid: one },
+          ])
+        ).outcomes.map(({ outcome }) => outcome),
+      ).toEqual(["updated", "updated"])
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
   test("a malformed publish is refused before anything is written", async () => {
     await withTargets(async ({ name, repo, backend }) => {
       const one = await workCommit(repo, backend, "one")

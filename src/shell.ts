@@ -788,26 +788,12 @@ async function compareAndSwapRemote(
   return true
 }
 
-/** git's update-ref report of the ref it could not lock, one anchored shape per case. */
+/** A lease lost between the read and the re-run, as update-ref reports it, anchored. */
 const LOST_AT =
   /^fatal: (?:\w+: )?cannot lock ref '([^']+)': is at ([0-9a-f]{40}|[0-9a-f]{64}) but expected (?:[0-9a-f]{40}|[0-9a-f]{64})$/m
-const LOST_EXISTS = /^fatal: (?:\w+: )?cannot lock ref '([^']+)': reference already exists$/m
-const LOST_MISSING =
-  /^fatal: (?:\w+: )?cannot lock ref '([^']+)': reference is missing but expected (?:[0-9a-f]{40}|[0-9a-f]{64})$/m
 
-type LockFailure = { readonly ref: string; readonly observed: Oid | "absent" | undefined }
-
-/** The ref update-ref named and what it found there, or undefined for any other failure. */
-function lockFailure(detail: string): LockFailure | undefined {
-  const at = LOST_AT.exec(detail)
-  if (at !== null) return { ref: at[1] as string, observed: at[2] as Oid }
-  const exists = LOST_EXISTS.exec(detail)
-  // "already exists" prints no value; the caller reads it if it must decide.
-  if (exists !== null) return { ref: exists[1] as string, observed: undefined }
-  const missing = LOST_MISSING.exec(detail)
-  if (missing !== null) return { ref: missing[1] as string, observed: "absent" }
-  return undefined
-}
+/** Another writer holds this ref's lock: the one lock-failure text read, anchored. */
+const LOCK_HELD = /^fatal: (?:\w+: )?cannot lock ref '([^']+)': Unable to create '[^']*\.lock': File exists\.?$/m
 
 function outcomesOf(updates: readonly RefUpdate[], unchanged: ReadonlySet<string>): PublishResult {
   return {
@@ -823,16 +809,18 @@ function outcomesOf(updates: readonly RefUpdate[], unchanged: ReadonlySet<string
  * under the ref locks before committing any of them, so either every ref moves
  * or none does.
  *
- * A ref already at its target is unchanged, as `push --atomic` treats it. When
- * the transaction fails with one of git's lock-failure shapes, ONE
- * `for-each-ref` reads every ref this publish names. That read happens on the
- * failure path only, and it decides between verify and Conflict. A ref at
- * neither its lease nor its target is a Conflict naming the ref, the lease and
- * the tip. Otherwise the transaction runs ONCE more, with each ref already at
- * its target as `verify <ref> <oid>`, so the unchanged refs are verified inside
- * it. The re-run's failure is final and it never loops. That is one process on
- * success and at most three on failure. A failure that is not a lock failure of
- * those shapes is an Error carrying git's text.
+ * On ANY failure, the error text decides nothing, with one exception: a lock
+ * held by another writer is a Conflict on that ref, observed "locked", so a
+ * chain race retries as contention should. Otherwise ONE `for-each-ref` reads
+ * every ref in the transaction, and each is classified from that structured
+ * output:
+ * - at oid: `verify <ref> <oid>` (unchanged);
+ * - at expect, or absent for a create: keep `update`;
+ * - at neither: Conflict naming the ref, expect and observed value, with no
+ *   re-run.
+ * With no Conflict, the whole transaction runs ONCE more with the rewritten
+ * lines, and its failure is final. That is one process on success and at most
+ * three on failure.
  */
 async function publishLocal(repo: string, updates: readonly RefUpdate[]): Promise<PublishResult> {
   const attempt = (unchanged: ReadonlySet<string>) =>
@@ -847,13 +835,22 @@ async function publishLocal(repo: string, updates: readonly RefUpdate[]): Promis
         "",
       ].join("\n"),
     })
+  const lockHeld = (detail: string) => {
+    const held = LOCK_HELD.exec(detail)
+    if (held === null) return undefined
+    const ref = held[1] as string
+    const update = updates.find((candidate) => candidate.ref === ref)
+    if (update === undefined) return undefined
+    return leaseConflict([{ ref, expect: update.expect, observed: "locked" }])
+  }
   const failed = (code: number | null, detail: string) =>
     new Error(`git update-ref --stdin failed (${code})${detail ? `: ${detail}` : ""}`)
 
   const first = await attempt(new Set())
   if (first.code === 0) return outcomesOf(updates, new Set())
   const firstDetail = first.stderr.toString("utf8").trim()
-  if (lockFailure(firstDetail) === undefined) throw failed(first.code, firstDetail)
+  const firstHeld = lockHeld(firstDetail)
+  if (firstHeld !== undefined) throw firstHeld
 
   const current = await readExactRefs(
     repo,
@@ -866,16 +863,19 @@ async function publishLocal(repo: string, updates: readonly RefUpdate[]): Promis
     throw leaseConflict(lost.map(({ ref, expect, tip }) => ({ ref, expect, observed: tip ?? "absent" })))
   }
   const unchanged = new Set(updates.filter(({ ref, oid }) => current.get(ref) === oid).map(({ ref }) => ref))
-  if (unchanged.size === 0) throw failed(first.code, firstDetail)
 
   const second = await attempt(unchanged)
   if (second.code === 0) return outcomesOf(updates, unchanged)
   const secondDetail = second.stderr.toString("utf8").trim()
-  const lostAgain = lockFailure(secondDetail)
-  if (lostAgain === undefined) throw failed(second.code, secondDetail)
-  const update = updates.find(({ ref }) => ref === lostAgain.ref)
-  if (update === undefined) throw failed(second.code, secondDetail)
-  throw leaseConflict([{ ref: lostAgain.ref, expect: update.expect, observed: lostAgain.observed ?? "present" }])
+  const held = lockHeld(secondDetail)
+  if (held !== undefined) throw held
+  // A rival moved a ref between the read and the re-run: final, and a Conflict.
+  const movedAgain = LOST_AT.exec(secondDetail)
+  const movedUpdate = movedAgain === null ? undefined : updates.find(({ ref }) => ref === movedAgain[1])
+  if (movedAgain !== null && movedUpdate !== undefined) {
+    throw leaseConflict([{ ref: movedUpdate.ref, expect: movedUpdate.expect, observed: movedAgain[2] as string }])
+  }
+  throw failed(second.code, secondDetail)
 }
 
 /** Exactly these refs and their tips, in ONE `for-each-ref`; an absent ref is simply missing. */
