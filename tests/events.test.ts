@@ -133,7 +133,7 @@ describe("CAS contract: an all-zero expected means the ref must be absent (rulin
       const parent = await target.backend.head(target.repo, "refs/heads/main")
       const input = {
         parent,
-        changes: new Map(),
+        changes: new Map<string, string | undefined>(),
         message: "create",
         writer: "w",
         instance: "3f9d1c02-5b7a-4e18-9c44-0a2b6d8e1f30",
@@ -186,7 +186,7 @@ describe("the equivalence suite: parents and trailers serialize byte-identically
           parents: [parent, kept],
           seq: 1,
           message: "an event",
-          changes: new Map(),
+          changes: new Map<string, string | undefined>(),
           allowEmpty: true,
           trailers: [
             ["Commit", kept],
