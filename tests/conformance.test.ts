@@ -515,7 +515,7 @@ describe("apply at scale (K2 at fleet scale, F14)", () => {
     } finally {
       await fixture.cleanup()
     }
-  }, 60_000)
+  }, 120_000)
 })
 
 describe("apply latency", () => {

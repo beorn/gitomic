@@ -974,6 +974,10 @@ async function publishRemote(
  * What the remote holds at these refs, read by ONE `ls-remote` after git refused
  * their leases, for the Conflict message only: "absent" for a missing ref. A read
  * that fails says so in the observed value; git's refusal stands either way.
+ *
+ * Caveat: the observed value is what the remote held when read, after the
+ * refusal, so a fast rival can make it differ from the tip that caused the
+ * refusal.
  */
 async function observeRemote(
   repo: string,
