@@ -13,18 +13,19 @@ import { randomUUID } from "node:crypto"
 
 import { runCasLoop } from "./engine.js"
 import { Conflict } from "./errors.js"
-import { assertTrailers, GENESIS_MESSAGE, validateOid, zeroOid } from "./git-object.js"
+import { assertTrailers, GENESIS_MESSAGE, refUnderPrefix, validateOid, zeroOid } from "./git-object.js"
 import {
   assertWriter,
   DEFAULT_WRITER_LABEL,
   normalizePollInterval,
   normalizeRef,
   normalizeRetryBudget,
+  validateRefUpdates,
   untilAborted,
   waitForPoll,
 } from "./options.js"
 import { createShellBackend } from "./shell.js"
-import type { CommitMeta, GitomicBackend, Oid, Trailer } from "./types.js"
+import type { CommitMeta, GitomicBackend, Oid, RefUpdate, Trailer } from "./types.js"
 import { assertUtf8 } from "./utf8.js"
 
 /** One trailer as written: key, then value. Order and duplicates are kept. */
@@ -94,9 +95,9 @@ export type Events = {
    * Read every event, decide, append, and replay on a lost race. `message` names
    * the transaction in errors. A chain over 1024 events is refused, not truncated.
    */
-  transact(decide: Decide, message: string): Promise<Appended>
+  transact(decide: Decide, message: string, options?: { readonly also?: readonly RefUpdate[] }): Promise<Appended>
   /** Append at exactly `expect` (null = the chain must not exist); throws Conflict on a moved tip. */
-  append(inputs: readonly EventInput[], options: { expect: Oid | null }): Promise<Appended>
+  append(inputs: readonly EventInput[], options: { expect: Oid | null; readonly also?: readonly RefUpdate[] }): Promise<Appended>
   watch(options: { signal: AbortSignal; pollIntervalMs?: number }): AsyncIterable<Event[]>
 }
 
@@ -109,6 +110,8 @@ export type ListRefsOptions = {
 export type ChainsUnderOptions = ListRefsOptions & {
   /** Events read per chain; default 50, refused above 1024 like `Reader.log`. */
   limit?: number
+  /** Already advertised tips whose objects have been fetched into this repo. */
+  refs?: ReadonlyMap<string, Oid>
 }
 
 /** The one trailer key gitomic/events names: the envelope's `type`. Its value is opaque. */
@@ -236,10 +239,19 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
   let seq = 0
 
   let tip: () => Promise<Oid | null>
-  let publish: (next: Oid, expected: Oid | null) => Promise<boolean>
+  const checkedAlso = (also: readonly RefUpdate[]): readonly RefUpdate[] => {
+    if (also.length > 0) validateRefUpdates(also)
+    if (also.some((update) => update.ref === ref)) throw new TypeError(`also repeats event ref ${ref}`)
+    return also
+  }
+  let publish: (next: Oid, expected: Oid | null, also: readonly RefUpdate[]) => Promise<boolean>
   if (remote === undefined) {
     tip = async () => (await backend.listRefs(repo, ref)).get(ref) ?? null
-    publish = async (next, expected) => backend.compareAndSwap(repo, ref, next, expected ?? zeroOid(next))
+    publish = async (next, expected, also) => {
+      if (also.length === 0) return backend.compareAndSwap(repo, ref, next, expected ?? zeroOid(next))
+      if (backend.publish === undefined) throw new TypeError("this backend cannot publish multiple refs atomically")
+      return backend.publish(repo, [{ ref, expect: expected ?? zeroOid(next), oid: next }, ...also])
+    }
   } else {
     const fetchRemote = backend.fetchRemote
     const compareAndSwapRemote = backend.compareAndSwapRemote
@@ -252,7 +264,11 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
       if (listed !== null) await fetchRemote(repo, ref, remote)
       return listed
     }
-    publish = async (next, expected) => compareAndSwapRemote(repo, ref, next, expected ?? zeroOid(next), remote)
+    publish = async (next, expected, also) => {
+      if (also.length === 0) return compareAndSwapRemote(repo, ref, next, expected ?? zeroOid(next), remote)
+      if (backend.publish === undefined) throw new TypeError("this backend cannot publish multiple refs atomically")
+      return backend.publish(repo, [{ ref, expect: expected ?? zeroOid(next), oid: next }, ...also], { remote })
+    }
   }
 
   const readChain = async (at: Oid, options: { from?: Oid; limit: number }) => {
@@ -357,8 +373,9 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
       // The walk is newest-first.
       return read.order === "newest-first" ? events : events.reverse()
     },
-    async transact(decide, message) {
+    async transact(decide, message, options = {}) {
       const why = assertLine(typeof message === "string" ? message.trim() : message, "message")
+      const also = checkedAlso(options.also ?? [])
       const reserved: number[] = []
       return runCasLoop<Oid | null, Appended>({
         // `message` names the transaction in the loop's errors; each event's own
@@ -366,12 +383,15 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
         label: `${label} (${why})`,
         retryBudgetMs,
         refresh: tip,
-        publish,
+        publish: (next, expected) => publish(next, expected, also),
         findTransaction,
         attempt: async (at, retries) => {
           const current = at === null ? [] : (await readWhole(at)).events.reverse()
           const inputs = await decide(current)
-          if (inputs.length === 0) return { kind: "noop", result: { head: at, events: [], retries } }
+          if (inputs.length === 0) {
+            if (also.length > 0) throw new TypeError("transact with also needs an event to publish")
+            return { kind: "noop", result: { head: at, events: [], retries } }
+          }
           const base = at ?? (await genesisOf())
           const { next, written, lastSeq } = await writeRun(base, at === null, inputs, reserved)
           return {
@@ -385,8 +405,9 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
         },
       })
     },
-    async append(inputs, { expect }) {
+    async append(inputs, { expect, also: requestedAlso = [] }) {
       if (inputs.length === 0) throw new TypeError("append needs at least one event")
+      const also = checkedAlso(requestedAlso)
       const expected = expect === null ? null : validateOid(expect, "append expect must be an event id or null")
       const reserved: number[] = []
       // The caller names the tip and the compare-and-swap enforces it, so the
@@ -405,7 +426,7 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
         label,
         retryBudgetMs,
         refresh,
-        publish,
+        publish: (next, current) => publish(next, current, also),
         findTransaction,
         attempt: async (at) => {
           // XADD with an explicit id: a moved tip is a Conflict, never a replay.
@@ -450,6 +471,13 @@ export async function listRefs(prefix: string, options: ListRefsOptions): Promis
   return backend.listRefs(options.repo, prefix, options.remote)
 }
 
+/** Fetch every named ref (or every ref under a prefix) in one batch without moving application refs. */
+export async function fetchRefs(refs: readonly string[] | string, options: ListRefsOptions): Promise<void> {
+  const backend = options.backend ?? createShellBackend()
+  if (backend.fetchRefs === undefined) throw new TypeError("this backend cannot fetch refs in a batch")
+  await backend.fetchRefs(options.repo, refs, { remote: options.remote })
+}
+
 /**
  * Every chain under `prefix`, read in one walk: the tips from `listRefs`, then
  * ONE `readHistory` over all of them, with each chain rebuilt from its commits'
@@ -462,7 +490,14 @@ export async function chainsUnder(prefix: string, options: ChainsUnderOptions): 
   if (options.remote !== undefined) {
     throw new TypeError("chainsUnder does not read remote chains yet; list them with listRefs({ remote })")
   }
-  const refs = await backend.listRefs(options.repo, prefix)
+  if (typeof prefix !== "string" || !prefix.startsWith("refs/")) {
+    throw new TypeError(`chainsUnder prefix must start with refs/: ${JSON.stringify(prefix)}`)
+  }
+  const refs = options.refs ?? await backend.listRefs(options.repo, prefix)
+  for (const [ref, oid] of refs) {
+    if (!refUnderPrefix(ref, prefix)) throw new TypeError(`chain ref ${ref} is outside prefix ${prefix}`)
+    validateOid(oid, `invalid chain tip for ${ref}`)
+  }
   const tips = [...new Set(refs.values())]
   if (tips.length === 0) return new Map()
   const history = await backend.readHistory(options.repo, tips, { limit: (limit + 1) * tips.length })

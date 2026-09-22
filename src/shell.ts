@@ -23,7 +23,8 @@ import {
   validateOid,
 } from "./git-object.js"
 import { assertGitPrefixMatched, assertRegularBlob, normalizePrefix } from "./path.js"
-import type { BlobValue, CommitInput, CommitMeta, GitomicBackend, Oid } from "./types.js"
+import { normalizeRef, validateRefUpdates } from "./options.js"
+import type { BlobValue, CommitInput, CommitMeta, GitomicBackend, Oid, RefUpdate } from "./types.js"
 import { decodeBlob, decodeUtf8 } from "./utf8.js"
 
 /** The complete output of one native Git command. */
@@ -155,6 +156,10 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
     },
     compareAndSwapRemote: async (repo, ref, next, expected, remote) =>
       compareAndSwapRemote(await resolveGitDir(repo), ref, next, expected, remote, remoteTimeoutMs),
+    publish: async (repo, updates, options = {}) =>
+      publish(await resolveGitDir(repo), updates, options.remote, remoteTimeoutMs),
+    fetchRefs: async (repo, refs, options = {}) =>
+      fetchRefs(await resolveGitDir(repo), refs, options.remote, remoteTimeoutMs),
   }
   return { backend, resolveGitDir, refStorage, objectFormat }
 }
@@ -779,6 +784,45 @@ async function compareAndSwapRemote(
     await compareAndSwap(repo, ref, next, expected)
   }
   return true
+}
+
+async function publish(repo: string, updates: readonly RefUpdate[], remote: string | undefined, timeoutMs: number): Promise<boolean> {
+  validateRefUpdates(updates)
+  if (remote === undefined) {
+    const input = `start\n${updates.map(({ ref, expect, oid }) => `update ${ref} ${oid} ${expect}\n`).join("")}prepare\ncommit\n`
+    const result = await run("git", durableGitArgs(repo, ["update-ref", "--stdin"]), { input })
+    if (result.code === 0) return true
+    const detail = result.stderr.toString("utf8").trim()
+    if (isCompareAndSwapRejection(detail) || isTransientRefLockContention(detail)) return false
+    throw new Error(`git update-ref transaction failed (${result.code})${detail ? `: ${detail}` : ""}`)
+  }
+  const args = ["push", "--atomic", "--porcelain", ...updates.map(({ ref, expect }) => `--force-with-lease=${ref}:${expect}`), remote,
+    ...updates.map(({ ref, oid }) => `${oid}:${ref}`)]
+  const result = await run("git", durableGitArgs(repo, args), { timeoutMs })
+  if (result.code !== 0) {
+    const detail = `${result.stdout.toString("utf8")}\n${result.stderr.toString("utf8")}`.trim()
+    if (isRemoteCompareAndSwapRejection(detail)) return false
+    throw new Error(`git push --atomic failed (${result.code})${detail ? `: ${detail}` : ""}`)
+  }
+  // This path never advances application refs locally. A remote fetch is an
+  // explicit reader action; moving one here would make an unrelated checkout stale.
+  return true
+}
+
+async function fetchRefs(repo: string, refs: readonly string[] | string, remote: string | undefined, timeoutMs: number): Promise<void> {
+  const names = typeof refs === "string"
+    ? [...(await listRefs(repo, refs, remote, timeoutMs)).keys()]
+    : refs
+  for (const ref of names) {
+    if (normalizeRef(ref) !== ref) throw new TypeError(`fetchRefs needs a full ref: ${ref}`)
+  }
+  if (names.length === 0) return
+  if (remote === undefined) {
+    const available = await listRefs(repo, "refs/", undefined, timeoutMs)
+    for (const ref of names) if (!available.has(ref)) throw new Error(`cannot fetch missing local ref ${ref}`)
+    return
+  }
+  await git(repo, ["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", remote, ...names], { timeoutMs })
 }
 
 export function isRemoteCompareAndSwapRejection(detail: string): boolean {

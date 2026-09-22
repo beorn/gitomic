@@ -3,6 +3,8 @@
  * `openEvents`). Internal: not exported from the package.
  */
 import { assertUtf8 } from "./utf8.js"
+import { validateOid } from "./git-object.js"
+import type { RefUpdate } from "./types.js"
 
 export const DEFAULT_RETRY_BUDGET_MS = 30_000
 export const DEFAULT_READER_POLL_INTERVAL_MS = 1_000
@@ -96,6 +98,19 @@ export function normalizeRef(ref: string): string {
     throw new TypeError(`invalid Git ref: ${JSON.stringify(ref)}`)
   }
   return normalized
+}
+
+export function validateRefUpdates(updates: readonly RefUpdate[]): void {
+  if (updates.length === 0) throw new TypeError("publish needs at least one ref update")
+  const seen = new Set<string>()
+  for (const update of updates) {
+    if (normalizeRef(update.ref) !== update.ref) throw new TypeError(`publish needs a full ref: ${update.ref}`)
+    if (seen.has(update.ref)) throw new TypeError(`publish has duplicate ref: ${update.ref}`)
+    seen.add(update.ref)
+    validateOid(update.expect, `invalid expected oid for ${update.ref}`)
+    validateOid(update.oid, `invalid next oid for ${update.ref}`)
+    if (update.expect.length !== update.oid.length) throw new TypeError(`object format differs for ${update.ref}`)
+  }
 }
 
 function isInvalidRefCharacter(character: string): boolean {

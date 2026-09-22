@@ -273,6 +273,13 @@ await events.transact(
   "record the payment once",
 )
 
+// When an event records a branch publication, publish both refs in one
+// atomic, leased operation. The branch oid must already exist locally.
+await events.append([{ type: "submitted", keeps: [commitOid] }], {
+  expect: await events.head(),
+  also: [{ ref: "refs/heads/submitted", expect: previousBranchOid, oid: commitOid }],
+})
+
 for (const event of await events.events()) console.log(event.type, event.title, event.props)
 ```
 
@@ -296,11 +303,25 @@ never silently overwritten.
 | `openEvents({ repo, ref, writer?, remote?, backend?, retryBudgetMs? })` | Open one chain.                                                                                                                                                              |
 | `head()`                                                                | The tip, or `null` when the chain does not exist.                                                                                                                            |
 | `events({ from?, limit?, order? })`                                     | Events after `from`, oldest first by default; `limit` defaults to 50, at most 1024.                                                                                          |
-| `transact(decide, message)`                                             | Read the chain, decide what to append, write it, compare-and-swap; on a race, re-run `decide` on the winner's events. Over 1024 events it throws rather than decide on part. |
-| `append(inputs, { expect })`                                            | Write at exactly `expect`; a moved tip throws `Conflict`.                                                                                                                    |
+| `transact(decide, message, { also? })`                                  | Read the chain, decide what to append, write it, compare-and-swap; on a race, re-run `decide` on the winner's events. Over 1024 events it throws rather than decide on part. |
+| `append(inputs, { expect, also? })`                                     | Write at exactly `expect`; a moved tip throws `Conflict`. `also` publishes other leased refs atomically with the event.                                                      |
 | `watch({ signal, pollIntervalMs? })`                                    | Yield each batch of new events; a jump of over 1024 throws.                                                                                                                  |
 | `listRefs(prefix, { repo, remote? })`                                   | Every ref under a prefix and its tip: `for-each-ref`, or `ls-remote --refs` against a remote.                                                                                |
-| `chainsUnder(prefix, { repo, limit? })`                                 | Every chain under a prefix, read in one walk.                                                                                                                                |
+| `fetchRefs(refsOrPrefix, { repo, remote? })`                             | Download the named remote refs' objects in one fetch, without moving application refs; missing named refs fail.                                                             |
+| `chainsUnder(prefix, { repo, refs?, limit? })`                          | Every chain under a prefix, read in one walk. Pass advertised `refs` after a batch fetch to read remote chains from local objects.                                            |
+
+`GitomicBackend.publish(repo, [{ ref, expect, oid }, ...], { remote? })`
+publishes every ref in one transaction and returns `false` on a rejected
+lease. The shell backend uses `git update-ref --stdin` locally and one
+`git push --atomic` with one `--force-with-lease` per ref remotely. The mem
+backend checks all leases before changing any ref; iso uses the shell ref
+transport. `expect` is the old oid, or all zeroes for an absent ref. A call
+with no updates, duplicate refs, malformed refs or malformed oids fails.
+
+For a remote tick, list advertised tips with `listRefs(prefix, { remote })`,
+fetch changed names with `fetchRefs(names, { remote })`, then pass the advertised
+tips to `chainsUnder(prefix, { refs })`. A force move between advertisement
+and fetch can leave an old object unavailable; the chain read fails loudly.
 
 **Reads are batched.** On the shell backend, reading a 50-event chain takes
 two git processes, every chain under a prefix takes two with exactly one
@@ -315,7 +336,7 @@ If you know Redis, this is the one screen:
 | `GET` / `SET` + `WATCH` | `at` / `transact`                |
 | `XADD` / `XRANGE`       | `append` / `events`              |
 | `SUBSCRIBE`             | `watch`                          |
-| `MULTI`                 | multi-ref transactions (planned) |
+| `MULTI`                 | `publish` / event `also`          |
 | `EXPIRE`                | none                             |
 
 ## The full tour

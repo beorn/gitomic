@@ -110,6 +110,9 @@ export type CommitMeta = {
 /** A changed projected blob identity; mode-only changes are not represented. */
 export type Change = { path: string; from: Oid | null; to: Oid | null }
 
+/** One leased ref update. An all-zero expect requires the ref to be absent. */
+export type RefUpdate = { readonly ref: string; readonly expect: Oid; readonly oid: Oid }
+
 export type GitomicBackend = {
   head(repo: string, ref: string): Promise<Oid>
   readCommit(repo: string, oid: Oid): Promise<CommitMeta>
@@ -163,6 +166,10 @@ export type GitomicBackend = {
     options?: { readonly exclude?: readonly Oid[]; readonly limit?: number },
   ): Promise<CommitMeta[]>
   compareAndSwapRemote?(repo: string, ref: string, next: Oid, expected: Oid, remote: string): Promise<boolean>
+  /** Atomically publish every leased update, locally or to one remote. */
+  publish?(repo: string, updates: readonly RefUpdate[], options?: { readonly remote?: string }): Promise<boolean>
+  /** Download every named remote ref's objects in one fetch; never move application refs. */
+  fetchRefs?(repo: string, refs: readonly string[] | string, options?: { readonly remote?: string }): Promise<void>
 }
 
 export type OpenOptions = {

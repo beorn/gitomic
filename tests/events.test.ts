@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url"
 
 import { afterEach, describe, expect, test, vi } from "vitest"
 
-import { chainsUnder, listRefs, openEvents } from "../src/events.js"
+import { chainsUnder, fetchRefs, listRefs, openEvents } from "../src/events.js"
 import type { EventInput } from "../src/events.js"
 import { apply, Conflict, open } from "../src/index.js"
 import { createIsoBackend } from "../src/iso.js"
@@ -145,6 +145,147 @@ describe("CAS contract: an all-zero expected means the ref must be absent (rulin
       expect(await target.backend.compareAndSwap(target.repo, ref, next, zero), target.name).toBe(true)
       expect(await target.backend.compareAndSwap(target.repo, ref, next, zero), target.name).toBe(false)
       expect(await target.backend.compareAndSwap(target.repo, "refs/heads/main", next, zero), target.name).toBe(false)
+    })
+  })
+})
+
+describe("acceptance: MULTI publishes all refs or none", () => {
+  test("a stale second lease leaves the first ref unchanged on every backend", async () => {
+    await withTargets(async (target) => {
+      const first = "refs/events/multi/first"
+      const second = "refs/events/multi/second"
+      const base = await target.backend.head(target.repo, "refs/heads/main")
+      const next = await workCommit(target, "multi.txt")
+      const zero = "0".repeat(base.length)
+      expect(await target.backend.publish?.(target.repo, [
+        { ref: first, expect: zero, oid: next },
+        { ref: second, expect: zero, oid: next },
+      ]), target.name).toBe(true)
+      expect(await target.backend.publish?.(target.repo, [
+        { ref: first, expect: next, oid: base },
+        { ref: second, expect: zero, oid: base },
+      ]), target.name).toBe(false)
+      const refs = await target.backend.listRefs?.(target.repo, "refs/events/multi/")
+      expect([...refs ?? []], target.name).toEqual([[first, next], [second, next]])
+    })
+  })
+
+  test("append with also moves the event and branch refs together on every backend", async () => {
+    await withTargets(async (target) => {
+      const branch = "refs/heads/multi-submitted"
+      const base = await target.backend.head(target.repo, "refs/heads/main")
+      const oid = await workCommit(target, "also.txt")
+      const events = await openEvents({ repo: target.repo, ref: CHAIN, backend: target.backend })
+      await events.append([{ type: "opened", keeps: [oid] }], {
+        expect: null,
+        also: [{ ref: branch, expect: "0".repeat(base.length), oid }],
+      })
+      expect((await target.backend.listRefs?.(target.repo, branch))?.get(branch), target.name).toBe(oid)
+      expect((await events.events()).map((event) => event.type), target.name).toEqual(["opened"])
+      const next = await workCommit(target, "also-next.txt")
+      await events.transact(() => [{ type: "ready", keeps: [next] }], "ready", {
+        also: [{ ref: branch, expect: oid, oid: next }],
+      })
+      expect((await target.backend.listRefs?.(target.repo, branch))?.get(branch), target.name).toBe(next)
+      expect((await events.events()).map((event) => event.type), target.name).toEqual(["opened", "ready"])
+      await expect(events.transact(() => [], "noop", {
+        also: [{ ref: branch, expect: next, oid }],
+      }), target.name).rejects.toThrow(/needs an event/)
+    })
+  })
+
+  test("append with also publishes a branch and event in one remote atomic push", async () => {
+    const remote = await createBareRepo()
+    const local = await createBareRepo()
+    try {
+      await git(local.repo, "remote", "add", "origin", remote.repo)
+      const backend = createShellBackend()
+      const base = await backend.head(local.repo, "refs/heads/main")
+      const oid = await workCommit({ name: "shell", repo: local.repo, backend, cleanup: async () => {} }, "work.txt")
+      const events = await openEvents({ repo: local.repo, ref: CHAIN, remote: "origin", backend })
+      const spy = vi.spyOn(childProcess, "spawn")
+      await events.append([{ type: "opened", keeps: [oid] }], {
+        expect: null,
+        also: [{ ref: "refs/heads/submitted", expect: "0".repeat(base.length), oid }],
+      })
+      const pushes = spy.mock.calls.filter((call) => call[0] === "git" && (call[1] as string[]).includes("push"))
+      expect(pushes).toHaveLength(1)
+      expect((pushes[0]?.[1] as string[])).toContain("--atomic")
+      expect((await listRefs("refs/heads/submitted", { repo: local.repo, remote: "origin", backend })).get("refs/heads/submitted")).toBe(oid)
+      expect((await listRefs(CHAIN, { repo: local.repo, remote: "origin", backend })).has(CHAIN)).toBe(true)
+    } finally {
+      await local.cleanup()
+      await remote.cleanup()
+    }
+  })
+
+  test("a stale remote branch lease refuses the whole atomic push", async () => {
+    const remote = await createBareRepo()
+    const local = await createBareRepo()
+    try {
+      await git(local.repo, "remote", "add", "origin", remote.repo)
+      const backend = createShellBackend()
+      const initial = await backend.head(remote.repo, "refs/heads/main")
+      const oid = await workCommit({ name: "shell", repo: local.repo, backend, cleanup: async () => {} }, "stale.txt")
+      const moved = await backend.publish?.(local.repo, [
+        { ref: "refs/heads/submitted", expect: "0".repeat(initial.length), oid: initial },
+      ], { remote: "origin" })
+      expect(moved).toBe(true)
+      const rejected = await backend.publish?.(local.repo, [
+        { ref: CHAIN, expect: "0".repeat(initial.length), oid },
+        { ref: "refs/heads/submitted", expect: "0".repeat(initial.length), oid },
+      ], { remote: "origin" })
+      expect(rejected).toBe(false)
+      expect((await listRefs(CHAIN, { repo: local.repo, remote: "origin", backend })).has(CHAIN)).toBe(false)
+      expect((await listRefs("refs/heads/submitted", { repo: local.repo, remote: "origin", backend })).get("refs/heads/submitted")).toBe(initial)
+    } finally {
+      await local.cleanup()
+      await remote.cleanup()
+    }
+  })
+})
+
+describe("acceptance: remote refs are fetched in one batch", () => {
+  test("shell and iso fetch two chains in one git fetch and leave local refs untouched", async () => {
+    for (const backend of [createShellBackend(), createIsoBackend()]) {
+    const remote = await createBareRepo()
+    const local = await createBareRepo()
+    try {
+      for (const name of ["one", "two"]) {
+        const chain = await openEvents({ repo: remote.repo, ref: `refs/events/batch/${name}`, backend })
+        await chain.append([{ type: name }], { expect: null })
+      }
+      await git(local.repo, "remote", "add", "origin", remote.repo)
+      const refs = await listRefs("refs/events/batch/", { repo: local.repo, remote: "origin", backend })
+      const spy = vi.spyOn(childProcess, "spawn")
+      await fetchRefs([...refs.keys()], { repo: local.repo, remote: "origin", backend })
+      const fetches = spy.mock.calls.filter((call) => call[0] === "git" && (call[1] as string[]).includes("fetch"))
+      expect(fetches).toHaveLength(1)
+      expect(await backend.listRefs?.(local.repo, "refs/events/batch/")).toEqual(new Map())
+      for (const oid of refs.values()) expect((await backend.readCommit(local.repo, oid)).oid).toBe(oid)
+      const chains = await chainsUnder("refs/events/batch/", { repo: local.repo, refs, backend })
+      expect([...chains].map(([ref, events]) => [ref, events.map((event) => event.type)])).toEqual([
+        ["refs/events/batch/one", ["one"]],
+        ["refs/events/batch/two", ["two"]],
+      ])
+      spy.mockRestore()
+    } finally {
+      await local.cleanup()
+      await remote.cleanup()
+    }
+    }
+  })
+
+  test("local batch lookup is equivalent on shell, iso, and mem and missing refs fail loudly", async () => {
+    await withTargets(async (target) => {
+      const ref = "refs/events/local-batch/one"
+      const events = await openEvents({ repo: target.repo, ref, backend: target.backend })
+      await events.append([{ type: "one" }], { expect: null })
+      await fetchRefs("refs/events/local-batch/", { repo: target.repo, backend: target.backend })
+      await fetchRefs([ref], { repo: target.repo, backend: target.backend })
+      await expect(fetchRefs(["refs/events/local-batch/missing"], {
+        repo: target.repo, backend: target.backend,
+      }), target.name).rejects.toThrow(/missing local ref/)
     })
   })
 })

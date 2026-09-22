@@ -4,6 +4,11 @@
 
 ### Added
 
+- 3a.1: atomic multi-ref `GitomicBackend.publish` and event `also` updates,
+  plus one-fetch `fetchRefs` and advertised-tip `chainsUnder` reads. Shell,
+  iso and mem backends share the contract; remote shell/iso publication uses
+  one `git push --atomic` with per-ref leases.
+
 - `gitomic/events`: an append-only event chain on one ref, driven by the same
   compare-and-swap loop as `transact` (`openEvents`, `listRefs`, `chainsUnder`).
   `Store.transact` and `openEvents` now share one loop (`src/engine.ts`): one

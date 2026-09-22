@@ -14,6 +14,7 @@ import {
 } from "./git-object.js"
 import type { CommitInput, CommitMeta, GitomicBackend, Oid } from "./types.js"
 import { assertGitPrefixMatched, normalizePrefix } from "./path.js"
+import { normalizeRef, validateRefUpdates } from "./options.js"
 
 type MemCommit = {
   oid: Oid
@@ -191,6 +192,29 @@ export function createMemBackend(): GitomicBackend {
     readFiles,
     writeCommit,
     compareAndSwap,
+    publish: async (name, updates, options = {}) => {
+      if (options.remote !== undefined) throw new TypeError("the mem backend has no remotes; omit remote")
+      validateRefUpdates(updates)
+      const repo = getRepo(name)
+      for (const { ref, expect, oid } of updates) {
+        const current = repo.refs.get(ref)
+        if (isZeroOid(expect) ? current !== undefined : current !== expect) return false
+        if (!repo.commits.has(oid)) throw new Error(`unknown next commit: ${oid}`)
+      }
+      for (const { ref, oid } of updates) repo.refs.set(ref, oid)
+      return true
+    },
+    fetchRefs: async (name, refs, options = {}) => {
+      if (options.remote !== undefined) throw new TypeError("the mem backend has no remotes; omit remote")
+      const repo = getRepo(name)
+      const names = typeof refs === "string"
+        ? [...repo.refs.keys()].filter((ref) => refUnderPrefix(ref, refs))
+        : refs
+      for (const ref of names) {
+        if (normalizeRef(ref) !== ref) throw new TypeError(`fetchRefs needs a full ref: ${ref}`)
+        if (!repo.refs.has(ref)) throw new Error(`cannot fetch missing local ref ${ref}`)
+      }
+    },
     findTransaction,
     listRefs,
     readHistory,
