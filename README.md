@@ -125,7 +125,7 @@ await store.transact(update, "close 42", { author: { name: "ada", email: "ada@ex
 
 - is empty or not a valid UTF-8 string;
 - contains `<`, `>`, a newline, NUL or any other control character;
-- begins or ends with a space or any of `. , : ; < > " \ '`. git 2.55 keeps a trailing `.`, but older releases in the supported range strip it, so it is refused too.
+- begins or ends with a space or any of `. , : ; < > " \ '`. git 2.42 and later keep a trailing `.`, but 2.36 to 2.41 strip it, so it is refused while those stay supported.
 
 `identProblem(ident)` returns the same reason as a string, or `undefined` when the ident is fine. Check an ident you did not choose (a user's git config) with it first, and fall back to your program's own ident instead of failing the write.
 

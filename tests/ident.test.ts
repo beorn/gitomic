@@ -9,13 +9,13 @@ import { promisify } from "node:util"
 
 import { describe, expect, test } from "vitest"
 
-import { identProblem, open } from "../src/index.js"
+import { apply, identProblem, open } from "../src/index.js"
 import type { CommitInput, GitomicBackend, Ident } from "../src/index.js"
 import { openEvents } from "../src/events.js"
 import { createIsoBackend } from "../src/iso.js"
 import { createMemBackend } from "../src/mem.js"
 import { createShellBackend } from "../src/shell.js"
-import { appendEmptyHistory, createBareRepo, git } from "./helpers/git.js"
+import { appendEmptyHistory, createBareRepo, git, gitWithInput } from "./helpers/git.js"
 
 const execFileAsync = promisify(execFile)
 const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
@@ -152,6 +152,42 @@ describe("the store and the events API carry the idents", () => {
     }
   })
 
+  test("apply records a named author, and without one the author is the committer", async () => {
+    const backend = createMemBackend()
+    const store = await open({ repo: "apply", ref: "main", writer: "km", committer: KM, backend })
+    const named = await apply(
+      store,
+      await store.head(),
+      [{ kind: "put", path: "a.md", content: "a\n", expect: null }],
+      "named",
+      {
+        author: AGENT,
+      },
+    )
+    const unnamed = await apply(
+      store,
+      named.oid,
+      [{ kind: "put", path: "b.md", content: "b\n", expect: null }],
+      "unnamed",
+    )
+    expect((await backend.readCommit("apply", named.oid)).author).toEqual(AGENT)
+    expect((await backend.readCommit("apply", unnamed.oid)).author).toEqual(KM)
+    expect((await backend.readCommit("apply", unnamed.oid)).committer).toEqual(KM)
+  })
+
+  test("the events API refuses a bad author before writing anything", async () => {
+    const fixture = await createBareRepo()
+    try {
+      const events = await openEvents({ repo: fixture.repo, ref: "refs/events/refuse", committer: KM })
+      await expect(
+        events.append([{ type: "note" }], { expect: null, author: { name: "a<b", email: "a@b.invalid" } }),
+      ).rejects.toThrow(new TypeError(`author ${identProblem({ name: "a<b", email: "a@b.invalid" }) ?? ""}`))
+      expect(await events.head()).toBeNull()
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
   test("the author is captured at submit and survives a lost compare-and-swap", async () => {
     const backend = createMemBackend()
     const store = await open({ repo: "race", ref: "main", writer: "km", committer: KM, backend })
@@ -189,6 +225,23 @@ describe("history written before idents were data still reads", () => {
       }
       const history = await createShellBackend().readHistory?.(fixture.repo, [tip])
       expect(history?.map(({ author }) => author)).toEqual([GITOMIC, GITOMIC, GITOMIC])
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+})
+
+describe("a commit header the reader cannot trust is refused, not guessed", () => {
+  test("two author lines fail the read loudly on the object-parsing backends", async () => {
+    const fixture = await createBareRepo()
+    try {
+      const body = `tree ${EMPTY_TREE}\nparent ${fixture.initial}\nauthor a <a@b.invalid> 946684801 +0000\nauthor b <b@b.invalid> 946684801 +0000\ncommitter c <c@b.invalid> 946684801 +0000\n\ntwo authors\n`
+      const oid = await gitWithInput(fixture.repo, body, "hash-object", "-t", "commit", "-w", "--literally", "--stdin")
+      for (const backend of [createShellBackend(), createIsoBackend()]) {
+        await expect(backend.readCommit(fixture.repo, oid)).rejects.toThrow(
+          /missing, duplicate or malformed author line/,
+        )
+      }
     } finally {
       await fixture.cleanup()
     }

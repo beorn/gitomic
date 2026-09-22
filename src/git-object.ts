@@ -181,8 +181,9 @@ function parseCommitProvenance(oid: Oid, trailers: ReadonlyMap<string, string>):
  * Git's "crud": what `commit-tree` silently strips from either end of a name or
  * email (ident.c). Stripping would give the shell backend a different commit
  * than mem and iso for the same input, so gitomic refuses these instead. The
- * "." is kept by git 2.55 but stripped by older releases in the supported
- * range, so it is refused too: the commit never depends on the git version.
+ * "." stopped being crud in git 2.42 (1c04cb0744) and is stripped by 2.36 to
+ * 2.41, so it is refused too: the commit never depends on the git version.
+ * The rule can lift once the supported minimum reaches 2.42.
  */
 function isCrud(character: string): boolean {
   const code = character.codePointAt(0) ?? 0
