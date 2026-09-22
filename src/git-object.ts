@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto"
 
-import type { CommitMeta, CommitProvenance, Oid, Trailer } from "./types.js"
+import type { CommitInput, CommitMeta, CommitProvenance, Oid, Trailer } from "./types.js"
 import { assertUtf8, decodeUtf8 } from "./utf8.js"
 
 export const GITOMIC_NAME = "gitomic"
@@ -64,6 +64,15 @@ export function parseCommit(oid: Oid, content: Uint8Array): CommitMeta {
   const timestamp = time === null ? NaN : Number(time[1])
   if (!Number.isSafeInteger(timestamp)) throw new Error(`invalid Git commit ${oid}: invalid committer timestamp`)
   const message = raw.slice(separator + 2)
+  return commitMeta(oid, parents, timestamp, message)
+}
+
+/**
+ * Build `CommitMeta` from a commit's parts. `parseCommit` feeds it the fields of
+ * one raw object; batched history reads feed it the fields of one walk record,
+ * so both paths validate trailers and provenance identically.
+ */
+export function commitMeta(oid: Oid, parents: readonly Oid[], timestamp: number, message: string): CommitMeta {
   const trailers = new Map<string, string>()
   const finalParagraph =
     message
@@ -195,13 +204,51 @@ export function formatCommitMessage(
   message: string,
   seq: number,
   provenance?: CommitProvenance,
+  trailers: readonly Trailer[] = [],
 ): string {
   const captured = cloneCommitProvenance(provenance)
   const provenanceTrailers =
     captured === undefined
       ? ""
       : `Gitomic-Actor: ${captured.actor}\nGitomic-Actor-Session: ${captured.session}\nGitomic-Actor-Generation: ${captured.generation}\n${captured.run === undefined ? "" : `Gitomic-Actor-Run: ${captured.run}\n`}`
-  return `${writer}: ${message}\n\nGitomic-Writer: ${writer}\n${provenanceTrailers}Gitomic-Instance: ${instance}\nGitomic-Seq: ${seq}\n`
+  // Caller trailers go INSIDE the final block, ahead of gitomic's own: git and
+  // parseCommit read trailers from the last paragraph only, and
+  // `transactionMatches` needs Instance/Seq to end the message.
+  const callerBlock = assertTrailers(trailers)
+    .map(([key, value]) => `${key}: ${value}\n`)
+    .join("")
+  return `${writer}: ${message}\n\n${callerBlock}Gitomic-Writer: ${writer}\n${provenanceTrailers}Gitomic-Instance: ${instance}\nGitomic-Seq: ${seq}\n`
+}
+
+/**
+ * Validate caller trailers before they are serialized. A key is `Token` of
+ * letters, digits and hyphens; a value is one line. `Gitomic-*` keys are
+ * reserved and refused loudly: a caller must never be able to forge a receipt
+ * or an attribution by writing one.
+ */
+export function assertTrailers(trailers: readonly Trailer[]): readonly Trailer[] {
+  for (const entry of trailers) {
+    if (!Array.isArray(entry) || entry.length !== 2) {
+      throw new TypeError("a trailer must be a [key, value] pair")
+    }
+    const [key, value] = entry
+    if (typeof key !== "string" || !/^[A-Za-z0-9][A-Za-z0-9-]*$/.test(key)) {
+      throw new TypeError(`trailer key must be letters, digits and hyphens: ${JSON.stringify(key)}`)
+    }
+    if (key.toLowerCase().startsWith("gitomic-")) {
+      throw new TypeError(`trailer key ${JSON.stringify(key)} is reserved for gitomic's own trailers`)
+    }
+    if (typeof value !== "string") throw new TypeError(`trailer ${key} value must be a string`)
+    assertUtf8(value, `trailer ${key}`)
+    const hasControlCharacter = [...value].some((character) => {
+      const codePoint = character.codePointAt(0) ?? 0
+      return codePoint <= 0x1f || codePoint === 0x7f
+    })
+    if (hasControlCharacter || value !== value.trim()) {
+      throw new TypeError(`trailer ${key} value must be one line without surrounding whitespace`)
+    }
+  }
+  return trailers
 }
 
 /**
@@ -221,8 +268,53 @@ export function transactionLookupExceeded(instance: string, seq: number): Error 
   )
 }
 
-export function encodeCommit(input: { tree: Oid; parent?: Oid; timestamp: number; message: string }): GitObject {
-  const parent = input.parent === undefined ? "" : `parent ${input.parent}\n`
+/**
+ * The complete parent list of a commit input: `parents` when given, otherwise
+ * `parent` alone. The first entry must be `parent` — that is the chain the
+ * first-parent walk follows — and a parent may not repeat.
+ */
+export function commitParents(input: CommitInput): readonly Oid[] {
+  const parents = input.parents ?? [input.parent]
+  if (parents.length === 0 || parents[0] !== input.parent) {
+    throw new TypeError("parents must start with parent: the first parent is the chain a first-parent walk follows")
+  }
+  for (const oid of parents) validateOid(oid, "invalid parent commit id")
+  if (new Set(parents).size !== parents.length) throw new TypeError("a commit may not name the same parent twice")
+  return parents
+}
+
+/**
+ * Whether `ref` falls under `prefix` the way `git for-each-ref <prefix>`
+ * matches: the prefix itself, or anything below it at a `/` boundary. So
+ * `refs/events/demo` never matches `refs/events/demos`.
+ */
+export function refUnderPrefix(ref: string, prefix: string): boolean {
+  if (prefix.endsWith("/")) return ref.startsWith(prefix)
+  return ref === prefix || ref.startsWith(`${prefix}/`)
+}
+
+/** The all-zero id: as a compare-and-swap `expected`, it means the ref must be absent. */
+export function zeroOid(like: Oid): Oid {
+  return "0".repeat(like.length)
+}
+
+export function isZeroOid(oid: Oid): boolean {
+  return /^0+$/.test(oid)
+}
+
+/** The canonical empty root every chain starts from: mem's initial commit, byte for byte. */
+export const GENESIS_MESSAGE = "initial\n"
+
+export function encodeCommit(input: {
+  tree: Oid
+  parent?: Oid
+  /** Every parent in order; overrides `parent` when given. */
+  parents?: readonly Oid[]
+  timestamp: number
+  message: string
+}): GitObject {
+  const parents = input.parents ?? (input.parent === undefined ? [] : [input.parent])
+  const parent = parents.map((oid) => `parent ${oid}\n`).join("")
   const identity = `${GITOMIC_NAME} <${GITOMIC_EMAIL}> ${input.timestamp} +0000`
   const content = Buffer.from(
     `tree ${input.tree}\n${parent}author ${identity}\ncommitter ${identity}\n\n${input.message}`,

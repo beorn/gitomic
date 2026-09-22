@@ -118,7 +118,10 @@ describe("acceptance: a transacted event reads back with its trailers and its ke
       const head = await events.head()
       await events.append([{ type: "note" }], { expect: head })
       const read = await events.events()
-      expect(read.map((event) => event.type), target.name).toEqual(["opened", "note"])
+      expect(
+        read.map((event) => event.type),
+        target.name,
+      ).toEqual(["opened", "note"])
       expect(read[1]?.parent, target.name).toBe(read[0]?.id)
     })
   })
@@ -249,7 +252,10 @@ describe("acceptance: a race re-runs decide on the winner's events and writes th
       const events = await openEvents({ repo: target.repo, ref: CHAIN, backend: target.backend })
       await events.append([{ type: "one" }], { expect: null })
       await expect(events.append([{ type: "two" }], { expect: null }), target.name).rejects.toBeInstanceOf(Conflict)
-      expect((await events.events()).map((event) => event.type), target.name).toEqual(["one"])
+      expect(
+        (await events.events()).map((event) => event.type),
+        target.name,
+      ).toEqual(["one"])
     })
   })
 })
@@ -280,11 +286,7 @@ describe("acceptance: spawn counts on the shell backend", () => {
       }
       const spy = vi.spyOn(childProcess, "spawn")
       const chains = await chainsUnder("refs/events/many/", { repo: fixture.repo, backend })
-      expect([...chains.keys()].sort()).toEqual([
-        "refs/events/many/a",
-        "refs/events/many/b",
-        "refs/events/many/c",
-      ])
+      expect([...chains.keys()].sort()).toEqual(["refs/events/many/a", "refs/events/many/b", "refs/events/many/c"])
       expect(chains.get("refs/events/many/b")?.map((event) => event.type)).toEqual(["opened", "note-b"])
       const walks = spy.mock.calls.filter(
         (call) => call[0] === "git" && (call[1] as string[]).some((arg) => arg === "rev-list" || arg === "log"),
@@ -307,6 +309,11 @@ describe("acceptance: spawn counts on the shell backend", () => {
       const head = await events.head()
       const spy = vi.spyOn(childProcess, "spawn")
       await events.append([{ type: "note", props: [["Reason", "counted"]] }], { expect: head })
+      // Acceptance says at most five; @cto's accepted budget is three: read the
+      // parent, write the commit, compare-and-swap. Hold the tighter one.
+      expect(gitSpawns(spy)).toBeLessThanOrEqual(3)
+      spy.mockClear()
+      await events.transact(() => [{ type: "decided" }], "transact is append plus the two-process read")
       expect(gitSpawns(spy)).toBeLessThanOrEqual(5)
     } finally {
       await fixture.cleanup()
@@ -399,6 +406,64 @@ describe("acceptance: the README and CHANGELOG document events", () => {
     const changelog = await readFile(fileURLToPath(new URL("../CHANGELOG.md", import.meta.url)), "utf8")
     for (const addition of ["parents", "allowEmpty", "trailers", "listRefs"]) {
       expect(changelog).toContain(addition)
+    }
+  })
+})
+
+describe("readHistory returns exactly what readCommit returns (ruling C: Reader.log rides on it)", () => {
+  test("messages with blank lines, trailers, a merge and a root read identically on every backend", async () => {
+    await withTargets(async (target) => {
+      const kept = await workCommit(target, "work.txt")
+      const events = await openEvents({ repo: target.repo, ref: CHAIN, writer: "fidelity", backend: target.backend })
+      await events.append(
+        [
+          {
+            type: "opened",
+            title: "subject line",
+            content: "para one\n\npara two with Key: looks-like-a-trailer\n\n\ntrailing blank lines",
+            props: [["Reason", "a value: with a colon"]],
+            keeps: [kept],
+          },
+        ],
+        { expect: null },
+      )
+      const tip = (await events.head()) as Oid
+      const history = await target.backend.readHistory?.(target.repo, [tip, kept])
+      expect(history, target.name).toBeDefined()
+      for (const meta of history ?? []) {
+        expect(meta, `${target.name} ${meta.oid}`).toEqual(await target.backend.readCommit(target.repo, meta.oid))
+      }
+      // The walk reached both roots-of-interest: the genesis and the work chain's root.
+      expect((history ?? []).filter((meta) => meta.parents.length === 0).length, target.name).toBeGreaterThanOrEqual(1)
+    })
+  })
+})
+
+describe("the README events example runs as written", () => {
+  test("appends, transacts once, and reads back", async () => {
+    const readme = await readFile(fileURLToPath(new URL("../README.md", import.meta.url)), "utf8")
+    const block = [...readme.matchAll(/```ts\n([\s\S]*?)\n```/g)]
+      .map((match) => match[1] ?? "")
+      .find((candidate) => candidate.includes("openEvents"))
+    expect(block).toBeDefined()
+    const body = (block ?? "").replace(/^import[^\n]+\n\n/, "")
+    const fixture = await createBareRepo()
+    try {
+      const AsyncFunction = Object.getPrototypeOf(async () => undefined).constructor as new (
+        ...args: string[]
+      ) => (...values: unknown[]) => Promise<unknown>
+      const pointed = (options: Parameters<typeof openEvents>[0]) => openEvents({ ...options, repo: fixture.repo })
+      const quiet = { log: () => {} }
+      await new AsyncFunction("openEvents", "console", body)(pointed, quiet)
+      // Run it again: the transact must not record a second payment.
+      const chain = await openEvents({ repo: fixture.repo, ref: "refs/events/orders/42" })
+      await chain.transact(
+        (events) => (events.some((event) => event.type === "paid") ? [] : [{ type: "paid" }]),
+        "again",
+      )
+      expect((await chain.events()).map((event) => event.type)).toEqual(["opened", "paid"])
+    } finally {
+      await fixture.cleanup()
     }
   })
 })

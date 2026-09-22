@@ -151,6 +151,12 @@ export type GitomicBackend = {
    * `exclude` commit. Commits reachable from several tips are returned once.
    * This is what keeps chain reads to a single git process.
    */
+  /**
+   * Write, idempotently, the empty root commit every event chain starts from
+   * (empty tree, message "initial", time 946684800, gitomic identity) and
+   * return its oid. It is byte-identical on every backend.
+   */
+  writeGenesis?(repo: string): Promise<Oid>
   readHistory?(
     repo: string,
     tips: readonly Oid[],

@@ -17,7 +17,7 @@ import { main } from "../src/bin.js"
 import { objectOid } from "../src/git-object.js"
 import { createShellBackend, open, type CommitMeta, type GitomicBackend } from "../src/index.js"
 import { createMemBackend } from "../src/mem.js"
-import { createBareRepo, git, gitWithInput } from "./helpers/git.js"
+import { perCommitReads, createBareRepo, git, gitWithInput } from "./helpers/git.js"
 
 const ADDRESS = "repo#main"
 
@@ -304,6 +304,8 @@ describe("gitomic CLI — history reads", () => {
     expect(records[1]).toEqual({
       oid: first.oid,
       parent: initial,
+      parents: [initial],
+      trailers: [],
       writer: "history",
       instance: expect.any(String),
       seq: 0,
@@ -314,6 +316,8 @@ describe("gitomic CLI — history reads", () => {
     expect(records[2]).toEqual({
       oid: initial,
       parent: null,
+      parents: [],
+      trailers: [],
       writer: null,
       instance: null,
       seq: null,
@@ -379,7 +383,7 @@ describe("gitomic CLI — history reads", () => {
     const { backend, store, tip } = await historyOfSize(53)
     let reads = 0
     const observed: GitomicBackend = {
-      ...backend,
+      ...perCommitReads(backend),
       readCommit: async (repo, oid) => {
         reads += 1
         if (reads === 1) await store.transact(async (map) => map.set("late", "excluded"), "advance during log")
@@ -417,7 +421,7 @@ describe("gitomic CLI — history reads", () => {
     }
     let reads = 0
     const observed: GitomicBackend = {
-      ...backend,
+      ...perCommitReads(backend),
       readCommit: async (repo, oid) => {
         reads += 1
         return backend.readCommit(repo, oid)
@@ -443,6 +447,8 @@ describe("gitomic CLI — history reads", () => {
         {
           oid: root,
           parent: null,
+          parents: [],
+          trailers: [],
           message: "binary root\n",
           writer: null,
           instance: null,
@@ -505,7 +511,7 @@ describe("gitomic CLI — history reads", () => {
     const json = asJson ? ["--json"] : []
     let metadata = 0
     const failingLog: GitomicBackend = {
-      ...backend,
+      ...perCommitReads(backend),
       readCommit: async (repo, oid) => {
         if (++metadata === 2) throw new Error("later metadata unavailable")
         return backend.readCommit(repo, oid)

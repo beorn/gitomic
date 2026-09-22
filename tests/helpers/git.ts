@@ -149,3 +149,13 @@ export async function createRemoteRepos(): Promise<{
     cleanup: () => rm(dir, { recursive: true, force: true }),
   }
 }
+
+/**
+ * The same backend without its batched history read, so reads go one commit at
+ * a time. Tests that instrument `readCommit` to prove a caller's own logic —
+ * pinning, bounds, no partial output — use this to keep exercising that path.
+ */
+export function perCommitReads<T extends { readHistory?: unknown }>(backend: T): Omit<T, "readHistory"> {
+  const { readHistory: _batched, ...perCommit } = backend
+  return perCommit
+}

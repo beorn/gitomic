@@ -1,20 +1,25 @@
 import {
+  commitParents,
   encodeCommit,
   encodeFiles,
   formatCommitMessage,
+  GENESIS_MESSAGE,
   INITIAL_TIMESTAMP,
+  isZeroOid,
   parseCommit,
+  refUnderPrefix,
   TRANSACTION_SEARCH_LIMIT,
   transactionLookupExceeded,
   validateOid,
 } from "./git-object.js"
-import type { CommitInput, GitomicBackend, Oid } from "./types.js"
+import type { CommitInput, CommitMeta, GitomicBackend, Oid } from "./types.js"
 import { assertGitPrefixMatched, normalizePrefix } from "./path.js"
 
 type MemCommit = {
   oid: Oid
   content: Uint8Array
-  parent?: Oid
+  /** Every parent in order; the first is the first-parent chain. Empty for a root. */
+  parents: readonly Oid[]
   timestamp: number
   instance?: string
   seq?: number
@@ -29,14 +34,17 @@ type MemRepo = {
 function createInitialCommit(): MemCommit {
   const files = new Map<string, string>()
   const { tree } = encodeFiles(files)
-  const commit = encodeCommit({ tree: tree.oid, timestamp: INITIAL_TIMESTAMP, message: "initial\n" })
+  const commit = encodeCommit({ tree: tree.oid, timestamp: INITIAL_TIMESTAMP, message: GENESIS_MESSAGE })
   return {
     oid: commit.oid,
     content: commit.content,
+    parents: [],
     timestamp: INITIAL_TIMESTAMP,
     files,
   }
 }
+
+const GENESIS_OID = createInitialCommit().oid
 
 export function createMemBackend(): GitomicBackend {
   const repos = new Map<string, MemRepo>()
@@ -72,8 +80,12 @@ export function createMemBackend(): GitomicBackend {
 
   const writeCommit = async (name: string, input: CommitInput): Promise<Oid> => {
     const repo = getRepo(name)
+    const parents = commitParents(input)
     const parent = repo.commits.get(input.parent)
     if (parent === undefined) throw new Error(`unknown parent commit: ${input.parent}`)
+    for (const kept of parents.slice(1)) {
+      if (!repo.commits.has(kept)) throw new Error(`unknown parent commit: ${kept}`)
+    }
     const files = new Map(parent.files)
     for (const [path, content] of input.changes) {
       if (content === undefined) files.delete(path)
@@ -83,14 +95,21 @@ export function createMemBackend(): GitomicBackend {
     const timestamp = parent.timestamp + 1
     const commit = encodeCommit({
       tree: tree.oid,
-      parent: parent.oid,
+      parents,
       timestamp,
-      message: formatCommitMessage(input.writer, input.instance, input.message, input.seq, input.provenance),
+      message: formatCommitMessage(
+        input.writer,
+        input.instance,
+        input.message,
+        input.seq,
+        input.provenance,
+        input.trailers,
+      ),
     })
     repo.commits.set(commit.oid, {
       oid: commit.oid,
       content: commit.content,
-      parent: parent.oid,
+      parents,
       timestamp,
       instance: input.instance,
       seq: input.seq,
@@ -101,7 +120,9 @@ export function createMemBackend(): GitomicBackend {
 
   const compareAndSwap = async (name: string, ref: string, next: Oid, expected: Oid): Promise<boolean> => {
     const repo = getRepo(name)
-    if (repo.refs.get(ref) !== expected) return false
+    const current = repo.refs.get(ref)
+    // An all-zero expected means the ref must be absent: create-if-absent.
+    if (isZeroOid(expected) ? current !== undefined : current !== expected) return false
     if (!repo.commits.has(next)) throw new Error(`unknown next commit: ${next}`)
     repo.refs.set(ref, next)
     return true
@@ -124,9 +145,38 @@ export function createMemBackend(): GitomicBackend {
       if (commit === undefined) throw new Error(`unknown commit: ${oid}`)
       inspected += 1
       if (commit.instance === instance && commit.seq === seq) return oid
-      oid = commit.parent
+      oid = commit.parents[0]
     }
     return undefined
+  }
+
+  const listRefs = async (name: string, prefix: string, remote?: string): Promise<ReadonlyMap<string, Oid>> => {
+    if (remote !== undefined) throw new TypeError("the mem backend has no remotes; omit remote")
+    const listed = [...getRepo(name).refs].filter(([ref]) => refUnderPrefix(ref, prefix))
+    return new Map(listed.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
+  }
+
+  const readHistory = async (
+    name: string,
+    tips: readonly Oid[],
+    options: { readonly exclude?: readonly Oid[]; readonly limit?: number } = {},
+  ): Promise<CommitMeta[]> => {
+    const commits = getRepo(name).commits
+    const exclude = new Set(options.exclude ?? [])
+    const limit = options.limit ?? Number.POSITIVE_INFINITY
+    const seen = new Set<Oid>()
+    const read: CommitMeta[] = []
+    for (const tip of tips) {
+      let oid: Oid | undefined = tip
+      while (oid !== undefined && !exclude.has(oid) && !seen.has(oid) && read.length < limit) {
+        const commit = commits.get(oid)
+        if (commit === undefined) throw new Error(`unknown commit: ${oid}`)
+        seen.add(oid)
+        read.push(parseCommit(oid, commit.content))
+        oid = commit.parents[0]
+      }
+    }
+    return read
   }
 
   const backend: GitomicBackend = {
@@ -142,6 +192,13 @@ export function createMemBackend(): GitomicBackend {
     writeCommit,
     compareAndSwap,
     findTransaction,
+    listRefs,
+    readHistory,
+    // The initial commit every mem repo already holds IS the genesis.
+    writeGenesis: async (name) => {
+      getRepo(name)
+      return GENESIS_OID
+    },
   }
   return backend
 }

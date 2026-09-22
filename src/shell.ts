@@ -6,17 +6,24 @@ import { join, resolve } from "node:path"
 
 import { GitTimeout } from "./errors.js"
 import {
+  commitMeta,
+  commitParents,
   formatCommitMessage,
+  GENESIS_MESSAGE,
   GITOMIC_EMAIL,
   GITOMIC_NAME,
+  INITIAL_TIMESTAMP,
+  isZeroOid,
+  objectOid,
   parseCommit,
+  refUnderPrefix,
   TRANSACTION_SEARCH_LIMIT,
   transactionLookupExceeded,
   transactionMatches,
   validateOid,
 } from "./git-object.js"
 import { assertGitPrefixMatched, assertRegularBlob, normalizePrefix } from "./path.js"
-import type { BlobValue, CommitInput, GitomicBackend, Oid } from "./types.js"
+import type { BlobValue, CommitInput, CommitMeta, GitomicBackend, Oid } from "./types.js"
 import { decodeBlob, decodeUtf8 } from "./utf8.js"
 
 /** The complete output of one native Git command. */
@@ -66,6 +73,7 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
   const resolveGitDir = createGitDirResolver()
   const refStorages = new Map<string, Promise<"files" | "native">>()
   const objectFormats = new Map<string, Promise<"sha1" | "sha256">>()
+  const genesisByGitDir = new Map<string, Promise<Oid>>()
   const refStorage = async (repo: string): Promise<"files" | "native"> =>
     resolveRefStorage(await resolveGitDir(repo), refStorages)
   const objectFormat = async (repo: string): Promise<"sha1" | "sha256"> => {
@@ -129,6 +137,22 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
     findTransaction: async (repo, tip, base, instance, seq) =>
       findTransaction(await resolveGitDir(repo), tip, base, instance, seq),
     fetchRemote: async (repo, ref, remote) => fetchRemote(await resolveGitDir(repo), ref, remote, remoteTimeoutMs),
+    listRefs: async (repo, prefix, remote) => listRefs(await resolveGitDir(repo), prefix, remote, remoteTimeoutMs),
+    readHistory: async (repo, tips, historyOptions) => readHistory(await resolveGitDir(repo), tips, historyOptions),
+    writeGenesis: async (repo) => {
+      const gitdir = await resolveGitDir(repo)
+      let genesis = genesisByGitDir.get(gitdir)
+      if (genesis === undefined) {
+        genesis = writeGenesis(gitdir, await objectFormat(repo))
+        genesisByGitDir.set(gitdir, genesis)
+      }
+      try {
+        return await genesis
+      } catch (error) {
+        genesisByGitDir.delete(gitdir)
+        throw error
+      }
+    },
     compareAndSwapRemote: async (repo, ref, next, expected, remote) =>
       compareAndSwapRemote(await resolveGitDir(repo), ref, next, expected, remote, remoteTimeoutMs),
   }
@@ -435,6 +459,22 @@ function parseBatch(
 }
 
 async function writeCommit(repo: string, input: CommitInput): Promise<Oid> {
+  const parents = commitParents(input)
+  const message = formatCommitMessage(
+    input.writer,
+    input.instance,
+    input.message,
+    input.seq,
+    input.provenance,
+    input.trailers,
+  )
+  // An unchanged tree needs no index: reuse the first parent's tree. This is
+  // the event path (two processes: read the parent, write the commit), and it
+  // lands the same object the index path would have built.
+  if (input.changes.size === 0) {
+    const [tree, parentTime] = text(await git(repo, ["show", "-s", "--format=%T%x00%ct", input.parent])).split("\0")
+    return commitTree(repo, validateOid(tree, "invalid parent tree id"), parents, Number(parentTime), message)
+  }
   const indexDir = await mkdtemp(join(tmpdir(), "gitomic-index-"))
   const index = join(indexDir, "index")
   const indexEnv = { GIT_INDEX_FILE: index }
@@ -463,43 +503,139 @@ async function writeCommit(repo: string, input: CommitInput): Promise<Oid> {
     if (blobs.length !== blobFiles.length) {
       throw new Error(`git hash-object returned ${blobs.length} blob ids for ${blobFiles.length} inputs`)
     }
-    if (changes.length > 0) {
-      const zeroOid = "0".repeat(input.parent.length)
-      let blobPosition = 0
-      const indexInfo: Buffer[] = []
-      for (const [path, content] of changes) {
-        const oid = content === undefined ? zeroOid : blobs[blobPosition++]
-        indexInfo.push(
-          Buffer.from(`${content === undefined ? "0" : "100644"} ${oid}\t`, "utf8"),
-          Buffer.from(path, "utf8"),
-          Buffer.from([0]),
-        )
-      }
-      await gitWrite(repo, ["update-index", "--add", "-z", "--index-info"], {
-        env: indexEnv,
-        input: Buffer.concat(indexInfo),
-      })
+    const zeroOid = "0".repeat(input.parent.length)
+    let blobPosition = 0
+    const indexInfo: Buffer[] = []
+    for (const [path, content] of changes) {
+      const oid = content === undefined ? zeroOid : blobs[blobPosition++]
+      indexInfo.push(
+        Buffer.from(`${content === undefined ? "0" : "100644"} ${oid}\t`, "utf8"),
+        Buffer.from(path, "utf8"),
+        Buffer.from([0]),
+      )
     }
+    await gitWrite(repo, ["update-index", "--add", "-z", "--index-info"], {
+      env: indexEnv,
+      input: Buffer.concat(indexInfo),
+    })
     const tree = text(await gitWrite(repo, ["write-tree"], { env: indexEnv }))
     const parentTime = Number(text(await git(repo, ["show", "-s", "--format=%ct", input.parent])))
-    const timestamp = Number.isFinite(parentTime) ? parentTime + 1 : 1
-    const identityEnv = {
-      GIT_AUTHOR_NAME: GITOMIC_NAME,
-      GIT_AUTHOR_EMAIL: GITOMIC_EMAIL,
-      GIT_COMMITTER_NAME: GITOMIC_NAME,
-      GIT_COMMITTER_EMAIL: GITOMIC_EMAIL,
-      GIT_AUTHOR_DATE: `@${timestamp} +0000`,
-      GIT_COMMITTER_DATE: `@${timestamp} +0000`,
-    }
-    return text(
-      await gitWrite(repo, ["commit-tree", tree, "-p", input.parent], {
-        env: identityEnv,
-        input: formatCommitMessage(input.writer, input.instance, input.message, input.seq, input.provenance),
-      }),
-    )
+    return commitTree(repo, tree, parents, parentTime, message)
   } finally {
     await rm(indexDir, { recursive: true, force: true })
   }
+}
+
+/** Write one commit with gitomic's identity, one second after its first parent. */
+async function commitTree(
+  repo: string,
+  tree: Oid,
+  parents: readonly Oid[],
+  parentTime: number,
+  message: string,
+): Promise<Oid> {
+  const timestamp = Number.isFinite(parentTime) ? parentTime + 1 : 1
+  const args = ["commit-tree", tree]
+  for (const parent of parents) args.push("-p", parent)
+  return text(await gitWrite(repo, args, { env: identityEnv(timestamp), input: message }))
+}
+
+function identityEnv(timestamp: number): NodeJS.ProcessEnv {
+  return {
+    GIT_AUTHOR_NAME: GITOMIC_NAME,
+    GIT_AUTHOR_EMAIL: GITOMIC_EMAIL,
+    GIT_COMMITTER_NAME: GITOMIC_NAME,
+    GIT_COMMITTER_EMAIL: GITOMIC_EMAIL,
+    GIT_AUTHOR_DATE: `@${timestamp} +0000`,
+    GIT_COMMITTER_DATE: `@${timestamp} +0000`,
+  }
+}
+
+/**
+ * Write the empty root every event chain starts from. The empty tree is one
+ * git always has, so this is one `commit-tree`; the same bytes on every run
+ * give the same oid, which is what makes it idempotent.
+ */
+async function writeGenesis(repo: string, format: "sha1" | "sha256"): Promise<Oid> {
+  const emptyTree = objectOid("tree", Buffer.alloc(0), format)
+  return text(
+    await gitWrite(repo, ["commit-tree", emptyTree], { env: identityEnv(INITIAL_TIMESTAMP), input: GENESIS_MESSAGE }),
+  )
+}
+
+/**
+ * Every ref under `prefix` and its tip: `for-each-ref` locally, `ls-remote
+ * --refs` against a remote. Neither moves a ref. Both are filtered through the
+ * same prefix rule, so a remote pattern that git matches by its tail cannot
+ * widen the answer.
+ */
+async function listRefs(
+  repo: string,
+  prefix: string,
+  remote: string | undefined,
+  timeoutMs: number,
+): Promise<ReadonlyMap<string, Oid>> {
+  if (typeof prefix !== "string" || !prefix.startsWith("refs/")) {
+    throw new TypeError(`listRefs prefix must start with refs/: ${JSON.stringify(prefix)}`)
+  }
+  const pairs: Array<[string, Oid]> = []
+  if (remote === undefined) {
+    const output = await git(repo, ["for-each-ref", "--format=%(objectname) %(refname)", prefix])
+    for (const line of decodeUtf8(output, "git for-each-ref").split("\n")) {
+      if (line === "") continue
+      const space = line.indexOf(" ")
+      pairs.push([line.slice(space + 1), validateOid(line.slice(0, space), "git for-each-ref returned a malformed id")])
+    }
+  } else {
+    const patterns = prefix.endsWith("/") ? [`${prefix}*`] : [prefix, `${prefix}/*`]
+    const output = await git(repo, ["ls-remote", "--refs", remote, ...patterns], { timeoutMs })
+    for (const line of decodeUtf8(output, "git ls-remote").split("\n")) {
+      if (line === "") continue
+      const tab = line.indexOf("\t")
+      pairs.push([line.slice(tab + 1), validateOid(line.slice(0, tab), "git ls-remote returned a malformed id")])
+    }
+  }
+  const matching = pairs.filter(([ref]) => refUnderPrefix(ref, prefix))
+  return new Map(matching.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
+}
+
+/**
+ * First-parent history of every tip in ONE process. Records are NUL-separated
+ * and the body is never split on lines, so a message holding blank lines or a
+ * NUL-free "Key: value" line cannot shift the parse.
+ */
+async function readHistory(
+  repo: string,
+  tips: readonly Oid[],
+  options: { readonly exclude?: readonly Oid[]; readonly limit?: number } = {},
+): Promise<CommitMeta[]> {
+  if (tips.length === 0) return []
+  for (const tip of tips) validateOid(tip, "invalid history tip")
+  const exclude = (options.exclude ?? []).map((oid) => `^${validateOid(oid, "invalid history exclusion")}`)
+  const limit = options.limit === undefined ? [] : [`--max-count=${options.limit}`]
+  const output = await git(repo, [
+    "rev-list",
+    "--first-parent",
+    ...limit,
+    "--no-commit-header",
+    "--format=%H%x00%P%x00%ct%x00%B%x00",
+    ...tips,
+    ...exclude,
+  ])
+  const fields = decodeUtf8(output, "git rev-list history").split("\0")
+  const trailing = fields.pop()
+  if (trailing?.trim()) throw new Error("git rev-list returned trailing history data")
+  if (fields.length % 4 !== 0) throw new Error("git rev-list returned a malformed history record")
+  const commits: CommitMeta[] = []
+  for (let index = 0; index < fields.length; index += 4) {
+    const oid = validateOid(fields[index]?.replace(/^\n/, ""), "git rev-list returned a malformed history id")
+    const rawParents = fields[index + 1] ?? ""
+    const parents = rawParents === "" ? [] : rawParents.split(" ").map((parent) => validateOid(parent))
+    const timestamp = Number(fields[index + 2])
+    if (!Number.isSafeInteger(timestamp)) throw new Error(`git rev-list returned an invalid time for ${oid}`)
+    commits.push(commitMeta(oid, parents, timestamp, fields[index + 3] ?? ""))
+  }
+  return commits
 }
 
 async function compareAndSwap(repo: string, ref: string, next: Oid, expected: Oid): Promise<boolean> {
@@ -636,8 +772,12 @@ async function compareAndSwapRemote(
     if (isRemoteCompareAndSwapRejection(detail)) return false
     throw new Error(`git push failed (${result.code})${detail ? `: ${detail}` : ""}`)
   }
-  const local = await head(repo, ref)
-  if (local === expected) await compareAndSwap(repo, ref, next, expected)
+  // Keep the local cache in step. A ref created by this push may not exist
+  // locally yet: an all-zero expected then means "absent here too".
+  const local = await optionalRef(repo, ref)
+  if (local === expected || (local === undefined && isZeroOid(expected))) {
+    await compareAndSwap(repo, ref, next, expected)
+  }
   return true
 }
 

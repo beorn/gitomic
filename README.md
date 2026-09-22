@@ -250,6 +250,74 @@ const { oid } = await apply(store, base, edits, "sync notes")
 
 `parseOwnershipManifest(raw, { label?, acceptPath })` parses a version-1 path/source declaration into sorted paths and an exact source-object mapping. It rejects malformed git paths, duplicates, schema drift, and any path your policy declines. gitomic owns this mechanism; it does not choose your state partition.
 
+## Events
+
+`gitomic/events` keeps an append-only chain of events on one ref, with the
+same compare-and-swap, receipts and retry budget as `transact`. It is one
+engine with two doors: `transact` treats the tree at the tip as its state,
+while `openEvents` treats the chain.
+
+```ts
+import { openEvents } from "gitomic/events"
+
+const events = await openEvents({ repo: "./state.git", ref: "refs/events/orders/42", writer: "checkout" })
+
+// Append at an exact tip, like XADD with an id. null means "the chain must not exist yet".
+await events.append([{ type: "opened", title: "order 42 opened", props: [["Amount", "19.00"]] }], {
+  expect: null,
+})
+
+// Or decide from the whole chain and let a race re-run the decision on the winner's events.
+await events.transact(
+  (chain) => (chain.some((event) => event.type === "paid") ? [] : [{ type: "paid" }]),
+  "record the payment once",
+)
+
+for (const event of await events.events()) console.log(event.type, event.title, event.props)
+```
+
+**An event is an empty-tree commit.** Its first parent is the previous event.
+Any further parents are the commits it **keeps**: `keeps: [oid]` makes a
+commit reachable from the chain, and an event can link to the commit it is
+about. The first event's first parent is the **genesis**, one fixed empty root
+commit (`initial`, time 946684800) that is byte-identical on every backend.
+That keeps a first-parent walk on the chain instead of wandering into a kept
+commit's history. An absent ref reads as `head() === null` and no events.
+
+The message is `writer: title`, then the content paragraphs, then one trailer
+block: your `props` in order (duplicates kept), then `Event: <type>`, then
+gitomic's own `Gitomic-*` trailers. gitomic reads and writes those keys but
+never interprets your values: it has no fold, no status and no kinds.
+`Event` and `Gitomic-*` are reserved: a prop spelled either way is refused,
+never silently overwritten.
+
+| Call                                                                    | Does                                                                                                                  |
+| ----------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `openEvents({ repo, ref, writer?, remote?, backend?, retryBudgetMs? })` | Open one chain.                                                                                                       |
+| `head()`                                                                | The tip, or `null` when the chain does not exist.                                                                     |
+| `events({ from?, limit?, order? })`                                     | Events after `from`, oldest first by default; `limit` defaults to 50, at most 1024.                                   |
+| `transact(decide, message)`                                             | Read the chain, decide what to append, write it, compare-and-swap; on a race, re-run `decide` on the winner's events. |
+| `append(inputs, { expect })`                                            | Write at exactly `expect`; a moved tip throws `Conflict`.                                                             |
+| `watch({ signal, pollIntervalMs? })`                                    | Yield each batch of new events.                                                                                       |
+| `listRefs(prefix, { repo, remote? })`                                   | Every ref under a prefix and its tip: `for-each-ref`, or `ls-remote --refs` against a remote.                         |
+| `chainsUnder(prefix, { repo, limit? })`                                 | Every chain under a prefix, read in one walk.                                                                         |
+
+**Reads are batched.** On the shell backend, reading a 50-event chain takes
+two git processes, every chain under a prefix takes two with exactly one
+walk, and an append takes three: read the parent, write the commit, swap the
+ref. Tests count these.
+
+If you know Redis, this is the one screen:
+
+| Redis                   | gitomic                          |
+| ----------------------- | -------------------------------- |
+| `KEYS` / `SCAN`         | `listRefs`                       |
+| `GET` / `SET` + `WATCH` | `at` / `transact`                |
+| `XADD` / `XRANGE`       | `append` / `events`              |
+| `SUBSCRIBE`             | `watch`                          |
+| `MULTI`                 | multi-ref transactions (planned) |
+| `EXPIRE`                | none                             |
+
 ## The full tour
 
 The whole map, in one update function:

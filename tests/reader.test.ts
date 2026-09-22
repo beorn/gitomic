@@ -6,6 +6,7 @@ import { describe, expect, test, vi } from "vitest"
 
 import { open, openReader } from "../src/index.js"
 import type { GitomicBackend } from "../src/index.js"
+import { perCommitReads } from "./helpers/git.js"
 import { createMemBackend } from "../src/mem.js"
 
 describe("read-only reader", () => {
@@ -54,8 +55,10 @@ describe("read-only reader", () => {
     let heads = 0
     const reads: string[] = []
     let advance = true
+    // No readHistory: this pins the per-commit fallback a third-party backend gets.
+    // The batched path is pinned by the next test.
     const backend: GitomicBackend = {
-      ...mem,
+      ...perCommitReads(mem),
       head: async (name, ref) => {
         heads += 1
         return mem.head(name, ref)
@@ -87,6 +90,8 @@ describe("read-only reader", () => {
       {
         oid: initial,
         parent: null,
+        parents: [],
+        trailers: [],
         message: "initial\n",
         writer: null,
         instance: null,
@@ -95,6 +100,49 @@ describe("read-only reader", () => {
         timestamp: 946_684_800,
       },
     ])
+  })
+
+  test("with a batched backend, log is one pinned readHistory call over exactly the requested range", async () => {
+    const mem = createMemBackend()
+    const repo = "reader-batched-history"
+    const writer = await open({ repo, ref: "main", backend: mem })
+    const commits: string[] = []
+    for (let index = 0; index < 55; index += 1) {
+      commits.push((await writer.transact(async (map) => map.set("count", `${index}`), `write ${index}`)).oid)
+    }
+    let heads = 0
+    const calls: Array<{ tips: readonly string[]; limit: number | undefined }> = []
+    let advance = true
+    const backend: GitomicBackend = {
+      ...mem,
+      head: async (name, ref) => {
+        heads += 1
+        return mem.head(name, ref)
+      },
+      readCommit: async () => {
+        throw new Error("a batched log must not fall back to per-commit reads")
+      },
+      readHistory: async (name, tips, options) => {
+        calls.push({ tips, limit: options?.limit })
+        if (advance) {
+          advance = false
+          await writer.transact(async (map) => map.set("late", "not in pinned history"), "advance during log")
+        }
+        return (await mem.readHistory?.(name, tips, options)) ?? []
+      },
+    }
+    const reader = await openReader({ repo, backend })
+    heads = 0
+    const recent = await reader.log()
+    expect(recent.map(({ oid }) => oid)).toEqual(commits.slice(-50).reverse())
+    expect(heads).toBe(1)
+    expect(calls).toEqual([{ tips: [commits.at(-1)], limit: 50 }])
+    calls.length = 0
+    expect((await reader.log({ from: commits[2] as string, limit: 2 })).map(({ oid }) => oid)).toEqual([
+      commits[2],
+      commits[1],
+    ])
+    expect(calls).toEqual([{ tips: [commits[2]], limit: 2 }])
   })
 
   test("diff sorts add/remove/modify identities and respects the backend file projection", async () => {

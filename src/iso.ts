@@ -4,10 +4,13 @@ import { readBlob, readCommit, readObject, readTree, resolveRef } from "isomorph
 import type { FsClient } from "isomorphic-git"
 
 import {
+  commitParents,
   encodeBlob,
   encodeCommit,
   encodeTreeEntries,
   formatCommitMessage,
+  GENESIS_MESSAGE,
+  INITIAL_TIMESTAMP,
   parseCommit,
   TRANSACTION_SEARCH_LIMIT,
   transactionLookupExceeded,
@@ -139,7 +142,11 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
 
   const writeCommit = async (repo: string, input: CommitInput): Promise<Oid> => {
     const gitdir = await resolveGitDir(repo)
+    const parents = commitParents(input)
     const parentResult = await readCommit({ fs, gitdir, oid: input.parent, cache })
+    // shell's commit-tree refuses a missing parent; an object writer would not,
+    // so check the kept commits exist before writing anything that names them.
+    for (const kept of parents.slice(1)) await readCommit({ fs, gitdir, oid: kept, cache })
     const root = await loadTree(gitdir, parentResult.commit.tree)
     const objects = new Map<Oid, GitObject>()
     const blobs = new Map<string, Oid>()
@@ -154,9 +161,16 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
     const timestamp = parentResult.commit.committer.timestamp + 1
     const commit = encodeCommit({
       tree,
-      parent: input.parent,
+      parents,
       timestamp,
-      message: formatCommitMessage(input.writer, input.instance, input.message, input.seq, input.provenance),
+      message: formatCommitMessage(
+        input.writer,
+        input.instance,
+        input.message,
+        input.seq,
+        input.provenance,
+        input.trailers,
+      ),
     })
     objects.set(commit.oid, commit)
     // Durably written but unreferenced until the publish adopts it. No pin ref
@@ -211,6 +225,16 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
     },
     writeCommit,
     findTransaction,
+    writeGenesis: async (repo) => {
+      const gitdir = await resolveGitDir(repo)
+      const objects = new Map<Oid, GitObject>()
+      const emptyTree = encodeTreeEntries([])
+      objects.set(emptyTree.oid, emptyTree)
+      const genesis = encodeCommit({ tree: emptyTree.oid, timestamp: INITIAL_TIMESTAMP, message: GENESIS_MESSAGE })
+      objects.set(genesis.oid, genesis)
+      await objectWriter.writeObjects(gitdir, objects.values())
+      return genesis.oid
+    },
   }
 }
 

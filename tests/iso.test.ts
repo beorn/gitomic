@@ -95,6 +95,8 @@ describe("iso backend", () => {
         expect(await backend.readCommit(repo, shellFixture.initial)).toEqual({
           oid: shellFixture.initial,
           parent: null,
+          parents: [],
+          trailers: [],
           message: "initial\n",
           writer: null,
           instance: null,
@@ -105,6 +107,8 @@ describe("iso backend", () => {
         expect(await backend.readCommit(repo, second[0] as Oid)).toEqual({
           oid: second[0],
           parent: first[0],
+          parents: [first[0]],
+          trailers: [],
           message: `same-writer: second\n\nGitomic-Writer: same-writer\nGitomic-Actor: ${provenance.actor}\nGitomic-Actor-Session: ${provenance.session}\nGitomic-Actor-Generation: ${provenance.generation}\nGitomic-Actor-Run: ${provenance.run}\nGitomic-Instance: ${identity.instance}\nGitomic-Seq: 1\n`,
           ...identity,
           seq: 1,

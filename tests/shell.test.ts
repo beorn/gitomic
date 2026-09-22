@@ -310,6 +310,8 @@ describe.sequential("shell backend failure boundaries", () => {
       expect(history[1]).toEqual({
         oid: first,
         parent: fixture.initial,
+        parents: [fixture.initial],
+        trailers: [],
         message,
         writer: null,
         instance: null,
@@ -320,6 +322,8 @@ describe.sequential("shell backend failure boundaries", () => {
       expect(history[2]).toEqual({
         oid: fixture.initial,
         parent: null,
+        parents: [],
+        trailers: [],
         message: "initial\n",
         writer: null,
         instance: null,

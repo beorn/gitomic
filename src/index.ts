@@ -1,6 +1,16 @@
 import { randomUUID } from "node:crypto"
 
 import { applyEdits, type Edit } from "./edits.js"
+import { runCasLoop } from "./engine.js"
+import {
+  assertWriter,
+  DEFAULT_WRITER_LABEL,
+  normalizePollInterval,
+  normalizeRef,
+  normalizeRetryBudget,
+  untilAborted,
+  waitForPoll,
+} from "./options.js"
 import { Conflict, EditDoesNotApply, GitTimeout, RetriesExhausted } from "./errors.js"
 import { cloneCommitProvenance, objectOid, validateOid } from "./git-object.js"
 import {
@@ -27,7 +37,6 @@ import type {
   RefTipChange,
   RefTipWatchOptions,
   Snapshot,
-  Trailer,
   Store,
   Update,
 } from "./types.js"
@@ -116,7 +125,14 @@ export async function openReader(options: OpenReaderOptions): Promise<Reader> {
       if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 1_024) {
         throw new TypeError("log limit must be a positive safe integer no greater than 1024")
       }
-      let oid: Oid | null = from === undefined ? await context.refresh() : validateOid(from)
+      const start: Oid = from === undefined ? await context.refresh() : validateOid(from)
+      // One batched walk when the backend has one: a single git process for the
+      // whole range instead of one per commit. The start is pinned above, so a
+      // writer landing mid-read cannot leak into this history either way.
+      if (context.backend.readHistory !== undefined) {
+        return context.backend.readHistory(context.repo, [start], { limit })
+      }
+      let oid: Oid | null = start
       const commits: CommitMeta[] = []
       while (oid !== null && commits.length < limit) {
         const commit = await context.backend.readCommit(context.repo, oid)
@@ -164,10 +180,6 @@ type ReaderContext = {
   refresh(): Promise<Oid>
 }
 
-const DEFAULT_RETRY_BUDGET_MS = 30_000
-const DEFAULT_READER_POLL_INTERVAL_MS = 1_000
-const DEFAULT_WRITER_LABEL = "gitomic"
-
 async function prepareStore(options: OpenOptions): Promise<StoreContext> {
   if (options.writer !== undefined) assertWriter(options.writer)
   const repo = options.repo
@@ -206,14 +218,6 @@ async function prepareStore(options: OpenOptions): Promise<StoreContext> {
   return { repo, ref, writer, instance, backend, retryBudgetMs, refresh, publish, nextSeq }
 }
 
-function normalizeRetryBudget(value: number | undefined): number {
-  const budget = value ?? DEFAULT_RETRY_BUDGET_MS
-  if (!Number.isFinite(budget) || budget <= 0) {
-    throw new TypeError("retryBudgetMs must be a positive number of milliseconds")
-  }
-  return budget
-}
-
 async function prepareReader(options: OpenReaderOptions): Promise<ReaderContext> {
   const repo = options.repo
   const ref = normalizeRef(options.ref ?? "main")
@@ -244,73 +248,45 @@ async function transact(
   }
   assertUtf8(message, "message")
   if (message.includes("\0")) throw new TypeError("message cannot contain NUL because Git commit messages forbid it")
-  let retries = 0
   // Allocated once and reused across replays: every attempt is the SAME
   // transaction, so they must share one `(instance, seq)` receipt.
   let seq: number | undefined
-  // Contention policy lives HERE, not in callers: the budget is TIME, not a
-  // fixed attempt count. Under CAS one publish wins per round, so the unluckiest
-  // of N writers needs about N attempts — a fixed counter abandons a healthy
-  // burst by construction. The deadline resets whenever the ref advances (some
-  // writer landed): a burst that keeps landing someone is never abandoned, while
-  // a transaction that makes no progress for the whole budget fails loudly.
-  let deadline = Date.now() + context.retryBudgetMs
-  while (true) {
-    const parent = await context.refresh()
-    const base = checkedFiles(await context.backend.readFiles(context.repo, parent))
-    const { map, changes } = makeOverlay(base)
-    await update(map, parent)
-    const effective = removeNoopChanges(base, changes)
-    if (effective.size === 0) return { oid: parent, retries }
-    seq ??= context.nextSeq()
-    assertNextTree(base, effective)
-    const next = backendOid(
-      await context.backend.writeCommit(context.repo, {
-        parent,
-        changes: effective,
-        message: message.trim(),
-        writer: context.writer,
+  return runCasLoop<Oid, Committed>({
+    label: `${context.repo} ${context.ref}`,
+    retryBudgetMs: context.retryBudgetMs,
+    refresh: context.refresh,
+    publish: context.publish,
+    findTransaction: async (winner, base, instance, attemptSeq) =>
+      context.backend.findTransaction(context.repo, winner, base, instance, attemptSeq),
+    attempt: async (parent, retries) => {
+      const base = checkedFiles(await context.backend.readFiles(context.repo, parent))
+      const { map, changes } = makeOverlay(base)
+      await update(map, parent)
+      const effective = removeNoopChanges(base, changes)
+      if (effective.size === 0) return { kind: "noop", result: { oid: parent, retries } }
+      seq ??= context.nextSeq()
+      assertNextTree(base, effective)
+      const next = backendOid(
+        await context.backend.writeCommit(context.repo, {
+          parent,
+          changes: effective,
+          message: message.trim(),
+          writer: context.writer,
+          instance: context.instance,
+          seq,
+          ...(provenance === undefined ? {} : { provenance }),
+        }),
+      )
+      return {
+        kind: "write",
+        next,
+        base: parent,
         instance: context.instance,
         seq,
-        ...(provenance === undefined ? {} : { provenance }),
-      }),
-    )
-    let publicationFailure: { cause: unknown; message: string } | undefined
-    try {
-      if (await context.publish(next, parent)) return { oid: next, retries }
-    } catch (cause) {
-      publicationFailure = {
-        cause,
-        message: `Transaction publication to ${context.repo} ${context.ref} is unknown; do not blindly retry. ${cause instanceof Error ? cause.message : String(cause)}`,
+        landed: (oid, retries) => ({ oid: backendOid(oid), retries }),
       }
-    }
-
-    if (publicationFailure === undefined) retries += 1
-    // A false publish is usually contention; false or throw can also mean an
-    // acknowledgement was lost after landing. Look for this exact receipt before
-    // replaying: replaying a landed transaction would apply it twice. The scan
-    // stops at `parent`, so it reads only the commits that arrived during this
-    // attempt.
-    let winner: Oid
-    try {
-      winner = await context.refresh()
-      const landed = await context.backend.findTransaction(context.repo, winner, parent, context.instance, seq)
-      if (landed !== undefined) return { oid: backendOid(landed), retries }
-    } catch (verificationError) {
-      if (publicationFailure !== undefined) {
-        throw new AggregateError([publicationFailure.cause, verificationError], publicationFailure.message)
-      }
-      throw verificationError
-    }
-    if (publicationFailure !== undefined) {
-      throw new Error(publicationFailure.message, { cause: publicationFailure.cause })
-    }
-    // The ref advanced under us: a writer landed this round, so the race is
-    // making progress — extend the budget rather than abandon a healthy burst.
-    if (winner !== parent) deadline = Date.now() + context.retryBudgetMs
-    if (Date.now() >= deadline) throw new RetriesExhausted(retries, context.retryBudgetMs)
-    await delayForRetry(retries)
-  }
+    },
+  })
 }
 
 function makeSnapshot(
@@ -392,54 +368,6 @@ async function* watchRef(context: ReaderContext, options: RefTipWatchOptions): A
     }
     if (!(await waitForPoll(pollIntervalMs, options.signal))) return
   }
-}
-
-function untilAborted<T>(pending: Promise<T>, signal: AbortSignal): Promise<T | undefined> {
-  if (signal.aborted) return Promise.resolve(undefined)
-  return new Promise((resolve, reject) => {
-    const cleanup = (): void => signal.removeEventListener("abort", onAbort)
-    const onAbort = (): void => {
-      cleanup()
-      resolve(undefined)
-    }
-    signal.addEventListener("abort", onAbort, { once: true })
-    pending.then(
-      (value) => {
-        cleanup()
-        resolve(value)
-      },
-      (error: unknown) => {
-        cleanup()
-        reject(error)
-      },
-    )
-  })
-}
-
-function normalizePollInterval(value: number | undefined): number {
-  const interval = value ?? DEFAULT_READER_POLL_INTERVAL_MS
-  if (!Number.isSafeInteger(interval) || interval <= 0) {
-    throw new TypeError("pollIntervalMs must be a positive integer")
-  }
-  return interval
-}
-
-function waitForPoll(milliseconds: number, signal: AbortSignal): Promise<boolean> {
-  if (signal.aborted) return Promise.resolve(false)
-  return new Promise((resolveWait) => {
-    let settled = false
-    const settle = (elapsed: boolean): void => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      signal.removeEventListener("abort", onAbort)
-      resolveWait(elapsed)
-    }
-    const onAbort = (): void => settle(false)
-    // raw-lifecycle-ok: the awaited reader poll owns and clears this timer and abort listener.
-    const timer = setTimeout(() => settle(true), milliseconds)
-    signal.addEventListener("abort", onAbort, { once: true })
-  })
 }
 
 /**
@@ -528,45 +456,6 @@ function createQueue(): <T>(operation: () => Promise<T>) => Promise<T> {
   }
 }
 
-/** The label leads the subject and is echoed as a trailer, so it stays single-line. */
-function assertWriter(writer: string): void {
-  assertUtf8(writer, "writer")
-  const hasControlCharacter = [...writer].some((character) => {
-    const codePoint = character.codePointAt(0) ?? 0
-    return codePoint <= 0x1f || codePoint === 0x7f
-  })
-  if (writer.trim().length === 0 || hasControlCharacter) {
-    throw new TypeError("writer must be a non-empty, single-line identifier")
-  }
-}
-
-function normalizeRef(ref: string): string {
-  assertUtf8(ref, "ref")
-  if (ref.length === 0) throw new TypeError("ref is required")
-  const normalized = ref.startsWith("refs/") ? ref : `refs/heads/${ref}`
-  if (normalized === "refs/gitomic" || normalized.startsWith("refs/gitomic/")) {
-    throw new TypeError("refs/gitomic/ is reserved for Gitomic's internal reachability refs")
-  }
-  const components = normalized.split("/")
-  if (
-    normalized.startsWith("/") ||
-    normalized.endsWith("/") ||
-    normalized.endsWith(".") ||
-    normalized.includes("..") ||
-    normalized.includes("@{") ||
-    [...normalized].some(isInvalidRefCharacter) ||
-    components.some((component) => component.length === 0 || component.startsWith(".") || component.endsWith(".lock"))
-  ) {
-    throw new TypeError(`invalid Git ref: ${JSON.stringify(ref)}`)
-  }
-  return normalized
-}
-
-function isInvalidRefCharacter(character: string): boolean {
-  const codePoint = character.codePointAt(0) ?? 0
-  return codePoint <= 0x20 || codePoint === 0x7f || "~^:?*[\\".includes(character)
-}
-
 function removeNoopChanges(
   base: ReadonlyMap<string, BlobValue>,
   changes: ReadonlyMap<string, string | undefined>,
@@ -579,13 +468,4 @@ function removeNoopChanges(
       return typeof current === "string" || current === undefined ? current !== value : true
     }),
   )
-}
-
-function delayForRetry(retries: number): Promise<void> {
-  const ceiling = Math.min(150, 4 * 2 ** Math.min(retries, 6))
-  const milliseconds = Math.random() * ceiling
-  return new Promise((resolveDelay) => {
-    // raw-lifecycle-ok: this transaction-owned backoff is awaited and cannot outlive its caller.
-    setTimeout(resolveDelay, milliseconds)
-  })
 }

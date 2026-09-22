@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+### Added
+
+- `gitomic/events`: an append-only event chain on one ref, driven by the same
+  compare-and-swap loop as `transact` (`openEvents`, `listRefs`, `chainsUnder`).
+  `Store.transact` and `openEvents` now share one loop (`src/engine.ts`): one
+  CAS, one retry budget and one receipt search, not two.
+- Four backend contract additions for event chains:
+  - `CommitInput.parents`: the complete parent list; the first must equal
+    `parent`, and the rest are kept commits. `CommitMeta.parents` reports every
+    parent, and `CommitMeta.parent` stays as the first.
+  - `allowEmpty`: an opt-in for commits that leave the tree unchanged. Only
+    events use it; `transact` and `apply` still land nothing on an unchanged
+    tree.
+  - `trailers`: `CommitInput.trailers` writes caller trailers into the final
+    block, ahead of gitomic's own, and `CommitMeta.trailers` reads them back in
+    order. `Gitomic-*` keys are refused.
+  - `listRefs`: every ref under a prefix, via `for-each-ref` locally or
+    `ls-remote --refs` remotely.
+- `GitomicBackend.readHistory` and `writeGenesis`, both optional. The first is a
+  batched first-parent read over many tips; the second writes the canonical
+  empty root an event chain starts from.
+- An all-zero `expected` passed to `compareAndSwap` now means the ref must be
+  absent (create-if-absent) on every backend. A remote swap that creates a ref
+  missing locally no longer fails after the push has landed.
+
+### Changed
+
+- `Reader.log` reads the whole range in one process when the backend has
+  `readHistory`. Without it, the per-commit walk is unchanged.
+- The CLI's `log --json` records carry the new `parents` and `trailers` fields.
+
 ### Changed
 
 - Transaction identity is now unique by construction instead of coordinated.

@@ -47,6 +47,7 @@ describe("package dependency boundary", () => {
     const sourceExports = {
       ".": "./src/index.ts",
       "./adapters": "./src/adapters.ts",
+      "./events": "./src/events.ts",
       "./iso": "./src/iso.ts",
       "./mem": "./src/mem.ts",
     }
@@ -60,6 +61,7 @@ describe("package dependency boundary", () => {
     expect(packageManifest.publishConfig?.exports).toEqual({
       ".": { types: "./dist/index.d.ts", import: "./dist/index.js" },
       "./adapters": { types: "./dist/adapters.d.ts", import: "./dist/adapters.js" },
+      "./events": { types: "./dist/events.d.ts", import: "./dist/events.js" },
       "./iso": { types: "./dist/iso.d.ts", import: "./dist/iso.js" },
       "./mem": { types: "./dist/mem.d.ts", import: "./dist/mem.js" },
     })
