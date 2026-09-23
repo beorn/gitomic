@@ -2,7 +2,7 @@
 // @level l1
 // @consumer node:fs, KV, and unstorage callers
 /**
- * @reach fs-walk <fixture-only: fs.readdir("archive") is called against an in-memory VFS returned by withFs() over a mem backend (createMemBackend()), not a real directory.>
+ * @reach fs-walk <fixture-only: fs.readdir runs against an in-memory VFS, not real fs>
  */
 
 import { createStorage } from "unstorage"

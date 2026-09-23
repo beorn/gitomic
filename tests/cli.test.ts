@@ -2,7 +2,7 @@
 // @level l1
 // @consumer file-level-door CLI users — any agent or script reading and writing one repo by address, with no checkout
 /**
- * @reach fs-walk <fixture-only: workdir = mkdtemp(join(tmpdir(), ...)); scratch is a subdir of that temp workdir used as TMPDIR for the spawned CLI.>
+ * @reach fs-walk <fixture-only: workdir=mkdtemp(tmpdir()); scratch is TMPDIR under it>
  */
 
 import { Buffer } from "node:buffer"

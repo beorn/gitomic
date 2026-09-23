@@ -2,7 +2,7 @@
 // @level l1
 // @consumer any store whose tree mixes text with an image — e.g. a coordination repository of Markdown that also holds a screenshot
 /**
- * @reach fs-walk <fixture-only: "tree"/"walk" matches are git mktree/ls-tree object-tree operations inside a bare fixture repo, not a directory walk.>
+ * @reach fs-walk <fixture-only: ls-tree runs against a bare fixture repo, not real checkout>
  */
 
 import { describe, expect, test } from "vitest"

@@ -2,7 +2,7 @@
 // @level l1
 // @consumer concurrent gitomic writers
 /**
- * @reach fs-walk <fixture-only: "tree" comments refer to git tree/ref bookkeeping inside fixture bare repos; no directory enumeration occurs.>
+ * @reach fs-walk <fixture-only: ls-tree runs against a bare fixture repo, not real checkout>
  */
 
 import { spawn } from "node:child_process"

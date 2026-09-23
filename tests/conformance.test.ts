@@ -4,7 +4,7 @@
 // @level l1
 // @consumer concurrent agents applying edits to the same repo with no checkout
 /**
- * @reach fs-walk <fixture-only: unrelatedDir/dirs are mkdtemp(join(tmpdir(), ...)) fixtures used to prove gitomic never touches the caller's cwd.>
+ * @reach fs-walk <fixture-only: unrelatedDir/dirs are mkdtemp(tmpdir()) fixtures>
  */
 
 import { execFile } from "node:child_process"

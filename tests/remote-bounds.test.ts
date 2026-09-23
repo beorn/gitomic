@@ -3,7 +3,7 @@
 // @level l1
 // @consumer km's STATE rail in the km daemon, which must keep answering while a write waits on its remote
 /**
- * @reach fs-walk <fixture-only: every dir/cacheDir is mkdtemp(join(tmpdir(), ...)); readdir calls all target these temp directories.>
+ * @reach fs-walk <fixture-only: dir/cacheDir are mkdtemp(tmpdir()) fixtures>
  */
 
 import { execFile, spawnSync } from "node:child_process"

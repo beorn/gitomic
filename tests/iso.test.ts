@@ -2,7 +2,7 @@
 // @level l1
 // @consumer gitomic users opting into isomorphic-git
 /**
- * @reach fs-walk <fixture-only: "walking beyond the receipt lookup horizon" is a first-parent commit-chain walk inside a fixture bare repo (createBareRepo), not a directory walk.>
+ * @reach fs-walk <fixture-only: ls-tree runs against fixture bare repos, not real checkout>
  */
 
 import * as nodeFs from "node:fs"
