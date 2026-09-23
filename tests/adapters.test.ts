@@ -1,6 +1,9 @@
 // @failure Familiar interface adapters could bypass replay, expose writable tip views, or fail real consumers.
 // @level l1
 // @consumer node:fs, KV, and unstorage callers
+/**
+ * @reach fs-walk <fixture-only: fs.readdir("archive") is called against an in-memory VFS returned by withFs() over a mem backend (createMemBackend()), not a real directory.>
+ */
 
 import { createStorage } from "unstorage"
 import { describe, expect, test } from "vitest"

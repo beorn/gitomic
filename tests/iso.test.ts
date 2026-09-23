@@ -1,6 +1,9 @@
 // @failure The fast backend could serialize different Git objects or weaken delete semantics.
 // @level l1
 // @consumer gitomic users opting into isomorphic-git
+/**
+ * @reach fs-walk <fixture-only: "walking beyond the receipt lookup horizon" is a first-parent commit-chain walk inside a fixture bare repo (createBareRepo), not a directory walk.>
+ */
 
 import * as nodeFs from "node:fs"
 import { spawnSync } from "node:child_process"

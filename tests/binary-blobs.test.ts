@@ -1,6 +1,9 @@
 // @failure One binary file anywhere in a tree makes every transaction on that tree impossible, because the whole-tree read decodes every blob as UTF-8 before the update function runs.
 // @level l1
 // @consumer any store whose tree mixes text with an image — e.g. a coordination repository of Markdown that also holds a screenshot
+/**
+ * @reach fs-walk <fixture-only: "tree"/"walk" matches are git mktree/ls-tree object-tree operations inside a bare fixture repo, not a directory walk.>
+ */
 
 import { describe, expect, test } from "vitest"
 

@@ -3,6 +3,9 @@
 // or regress into a slow per-file process-spawn path.
 // @level l1
 // @consumer concurrent agents applying edits to the same repo with no checkout
+/**
+ * @reach fs-walk <fixture-only: unrelatedDir/dirs are mkdtemp(join(tmpdir(), ...)) fixtures used to prove gitomic never touches the caller's cwd.>
+ */
 
 import { execFile } from "node:child_process"
 import { once } from "node:events"

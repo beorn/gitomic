@@ -1,6 +1,9 @@
 // @failure CAS races could clobber a winner, create merge commits, or double-apply an acknowledged write.
 // @level l1
 // @consumer concurrent gitomic writers
+/**
+ * @reach fs-walk <fixture-only: "tree" comments refer to git tree/ref bookkeeping inside fixture bare repos; no directory enumeration occurs.>
+ */
 
 import { spawn } from "node:child_process"
 import { fileURLToPath } from "node:url"
