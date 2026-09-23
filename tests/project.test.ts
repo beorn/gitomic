@@ -7,7 +7,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { afterAll, describe, expect, test } from "vitest"
+import { afterAll, afterEach, beforeEach, describe, expect, test, vi } from "vitest"
 
 import { main } from "../src/bin.js"
 import {
@@ -18,6 +18,17 @@ import {
 } from "../src/index.js"
 
 const roots: string[] = []
+
+beforeEach(() => {
+  vi.stubEnv("GIT_AUTHOR_NAME", "CLI Test")
+  vi.stubEnv("GIT_AUTHOR_EMAIL", "cli@example.org")
+  vi.stubEnv("GIT_COMMITTER_NAME", "CLI Test")
+  vi.stubEnv("GIT_COMMITTER_EMAIL", "cli@example.org")
+})
+
+afterEach(() => {
+  vi.unstubAllEnvs()
+})
 
 afterAll(() => {
   for (const root of roots) rmSync(root, { recursive: true, force: true })
