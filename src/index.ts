@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto"
 
-import { applyEdits, type Edit } from "./edits.js"
+import { applyEdits, KEEP_MODE_OF, type Edit } from "./edits.js"
 import { runCasLoop } from "./engine.js"
 import {
   assertWriter,
@@ -11,7 +11,7 @@ import {
   untilAborted,
   waitForPoll,
 } from "./options.js"
-import { Conflict, EditDoesNotApply, GitTimeout, RetriesExhausted } from "./errors.js"
+import { CandidateRefused, Conflict, EditDoesNotApply, GitTimeout, RetriesExhausted } from "./errors.js"
 import { cloneCommitProvenance, cloneIdent, GITOMIC_IDENT, objectOid, validateOid } from "./git-object.js"
 import {
   assertGitPrefixMatched,
@@ -24,6 +24,8 @@ import {
 import { createShellBackend } from "./shell.js"
 import type {
   BlobValue,
+  Candidate,
+  Trailer,
   Change,
   CommitProvenance,
   CommitMeta,
@@ -43,9 +45,15 @@ import type {
 } from "./types.js"
 import { assertUtf8, decodeUtf8 } from "./utf8.js"
 
-export { Conflict, EditDoesNotApply, GitTimeout, RetriesExhausted }
+export { CandidateRefused, Conflict, EditDoesNotApply, GitTimeout, RetriesExhausted }
 export type { EditKind, PreconditionType } from "./errors.js"
 export { applyEdits } from "./edits.js"
+export {
+  CANDIDATE_CONFIG,
+  DEFAULT_CANDIDATE_TIMEOUT_MS,
+  repositoryCandidate,
+  type RepositoryCandidateOptions,
+} from "./candidate.js"
 export { identProblem } from "./git-object.js"
 export type { Edit } from "./edits.js"
 export { matchGlob } from "./glob.js"
@@ -59,8 +67,25 @@ export {
 } from "./shell.js"
 export { openRemoteRepository, type OpenedRemoteRepository, type OpenRemoteRepositoryOptions } from "./repository.js"
 export { parseOwnershipManifest } from "./ownership-manifest.js"
+export {
+  checkedOutRef,
+  isBareRepository,
+  projectCheckout,
+  projectRemoteFirstFastForward,
+  synchronizeCheckoutToCommit,
+  worktreeDirtyPaths,
+  type CheckoutSyncOutcome,
+  type CheckoutSyncRequest,
+  type ProjectCheckoutOutcome,
+  type ProjectCheckoutRequest,
+  type RemoteFirstProjectionOutcome,
+  type RemoteFirstProjectionRequest,
+} from "./project.js"
 export type {
   BlobValue,
+  Candidate,
+  CandidateContext,
+  CandidateVerdict,
   Change,
   CommitProvenance,
   CommitMeta,
@@ -96,13 +121,18 @@ export async function open(options: OpenOptions): Promise<Store> {
       // otherwise observe an options object the caller mutated after submit.
       let provenance: CommitProvenance | undefined
       let author: Ident | undefined
+      const candidate = options?.candidate
+      const trailers =
+        options?.trailers === undefined ? undefined : options.trailers.map(([key, value]) => [key, value] as const)
       try {
         provenance = cloneCommitProvenance(options?.provenance)
         author = cloneIdent(options?.author, "author")
+        if (candidate !== undefined && typeof candidate !== "function")
+          throw new TypeError("candidate must be a function")
       } catch (error) {
         return Promise.reject(error)
       }
-      return enqueue(async () => transact(context, update, message, provenance, author))
+      return enqueue(async () => transact(context, update, message, provenance, author, candidate, trailers))
     },
   }
 }
@@ -120,12 +150,18 @@ export async function apply(
   base: Oid,
   edits: readonly Edit[],
   message: string,
-  options?: { readonly author?: Ident },
+  options?: { readonly author?: Ident; readonly candidate?: Candidate; readonly trailers?: readonly Trailer[] },
 ): Promise<Committed> {
   return store.transact(
     (map, head) => applyEdits(map, base, head, edits),
     message,
-    options?.author === undefined ? undefined : { author: options.author },
+    options === undefined
+      ? undefined
+      : {
+          ...(options.author === undefined ? {} : { author: options.author }),
+          ...(options.candidate === undefined ? {} : { candidate: options.candidate }),
+          ...(options.trailers === undefined ? {} : { trailers: options.trailers }),
+        },
   )
 }
 
@@ -259,6 +295,8 @@ async function transact(
   message: string,
   provenance?: CommitProvenance,
   author?: Ident,
+  candidate?: Candidate,
+  trailers?: readonly Trailer[],
 ): Promise<Committed> {
   if (typeof message !== "string" || message.trim().length === 0) {
     throw new TypeError("message must say why this transaction exists")
@@ -277,32 +315,57 @@ async function transact(
       context.backend.findTransaction(context.repo, winner, base, instance, attemptSeq),
     attempt: async (parent, retries) => {
       const base = checkedFiles(await context.backend.readFiles(context.repo, parent))
-      const { map, changes } = makeOverlay(base)
+      const { map, changes, modeSources } = makeOverlay(base)
       await update(map, parent)
-      const effective = removeNoopChanges(base, changes)
-      if (effective.size === 0) return { kind: "noop", result: { oid: parent, retries } }
-      seq ??= context.nextSeq()
-      assertNextTree(base, effective)
-      const next = backendOid(
-        await context.backend.writeCommit(context.repo, {
+      const commitInput = (effective: ReadonlyMap<string, string | undefined>, commitMessage: string) => {
+        seq ??= context.nextSeq()
+        assertNextTree(base, effective)
+        return {
           parent,
           changes: effective,
-          message: message.trim(),
+          ...(modeSources.size === 0 ? {} : { modeSources }),
+          message: commitMessage,
           writer: context.writer,
           instance: context.instance,
           seq,
           ...(provenance === undefined ? {} : { provenance }),
+          ...(trailers === undefined ? {} : { trailers }),
           author: author ?? context.committer,
           committer: context.committer,
-        }),
-      )
+        }
+      }
+      // The candidate runs on THIS attempt's tree, after the caller's update and before the CAS; a replay runs it again.
+      let report: readonly string[] | undefined
+      if (candidate !== undefined) {
+        const changed = [...removeNoopChanges(base, changes).keys()].sort()
+        const verdict = await candidate({
+          base: parent,
+          changed,
+          map,
+          readBase: async (path) => readValue(base.get(path), path),
+          materialize: async () =>
+            backendOid(
+              await context.backend.writeCommit(
+                context.repo,
+                commitInput(removeNoopChanges(base, changes), `gitomic candidate for: ${message.trim()}`),
+              ),
+            ),
+        })
+        if (verdict?.refuse !== undefined && verdict.refuse.length > 0)
+          throw new CandidateRefused([...verdict.refuse], parent)
+        report = verdict?.report === undefined ? [] : [...verdict.report]
+      }
+      const withReport = (result: Committed): Committed => (report === undefined ? result : { ...result, report })
+      const effective = removeNoopChanges(base, changes)
+      if (effective.size === 0) return { kind: "noop", result: withReport({ oid: parent, retries }) }
+      const next = backendOid(await context.backend.writeCommit(context.repo, commitInput(effective, message.trim())))
       return {
         kind: "write",
         next,
         base: parent,
         instance: context.instance,
-        seq,
-        landed: (oid, retries) => ({ oid: backendOid(oid), retries }),
+        seq: seq as number,
+        landed: (oid, retries) => withReport({ oid: backendOid(oid), retries }),
       }
     },
   })
@@ -430,8 +493,10 @@ function backendOid(value: unknown): Oid {
 function makeOverlay(base: ReadonlyMap<string, BlobValue>): {
   map: GitMap
   changes: Map<string, string | undefined>
+  modeSources: Map<string, string>
 } {
   const changes = new Map<string, string | undefined>()
+  const modeSources = new Map<string, string>()
   const get = (path: string): string | undefined =>
     changes.has(path) ? changes.get(path) : readValue(base.get(path), path)
   const present = (path: string): boolean => (changes.has(path) ? changes.get(path) !== undefined : base.has(path))
@@ -460,7 +525,13 @@ function makeOverlay(base: ReadonlyMap<string, BlobValue>): {
       return [...keys].filter((path) => path.startsWith(normalized)).sort()
     },
   }
-  return { map, changes }
+  // A chain of moves keeps the first source's mode: a to b, then b to c, leaves c with a's.
+  const keepModeOf = (to: string, from: string): void => {
+    const source = normalizePath(from)
+    modeSources.set(normalizePath(to), modeSources.get(source) ?? source)
+  }
+  Object.defineProperty(map, KEEP_MODE_OF, { value: keepModeOf })
+  return { map, changes, modeSources }
 }
 
 function createQueue(): <T>(operation: () => Promise<T>) => Promise<T> {

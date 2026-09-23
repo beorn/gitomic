@@ -110,7 +110,27 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
     return files
   }
 
-  const applyChange = (root: TreeNode, path: string, content: string | undefined, oid?: Oid): void => {
+  /** The mode of `path`'s blob entry in the parent tree, or `undefined` when there is none. */
+  const parentMode = (root: TreeNode, path: string): string | undefined => {
+    let node: TreeNode | undefined = root
+    const parts = path.split("/")
+    const filename = parts.pop()
+    for (const part of parts) {
+      const next: TreeNode | BlobEntry | undefined = node.entries.get(part)
+      node = next?.kind === "tree" ? next : undefined
+      if (node === undefined) return undefined
+    }
+    const entry = filename === undefined ? undefined : node.entries.get(filename)
+    return entry?.kind === "blob" ? entry.mode : undefined
+  }
+
+  const applyChange = (
+    root: TreeNode,
+    path: string,
+    content: string | undefined,
+    oid?: Oid,
+    mode: "100644" | "100755" = "100644",
+  ): void => {
     const parts = path.split("/")
     const filename = parts.pop()
     if (filename === undefined) throw new TypeError(`invalid git tree path: ${JSON.stringify(path)}`)
@@ -136,7 +156,7 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
     if (oid === undefined) throw new Error(`missing prepared blob for ${JSON.stringify(path)}`)
     node.entries.set(filename, {
       kind: "blob",
-      mode: "100644",
+      mode,
       oid,
     })
   }
@@ -157,7 +177,13 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
       objects.set(blob.oid, blob)
       blobs.set(path, blob.oid)
     }
-    for (const [path, content] of input.changes) applyChange(root, path, content, blobs.get(path))
+    // Each changed path keeps its parent entry's mode (a move keeps its source's), read before any change applies.
+    const modes = new Map<string, "100644" | "100755">()
+    for (const [path, content] of input.changes) {
+      if (content === undefined) continue
+      modes.set(path, parentMode(root, input.modeSources?.get(path) ?? path) === "100755" ? "100755" : "100644")
+    }
+    for (const [path, content] of input.changes) applyChange(root, path, content, blobs.get(path), modes.get(path))
     const tree = encodeTreeNode(root, objects)
     const timestamp = parentResult.commit.committer.timestamp + 1
     const commit = encodeCommit({

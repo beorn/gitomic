@@ -3,6 +3,14 @@ import { EditDoesNotApply } from "./errors.js"
 import type { GitMap, Oid } from "./types.js"
 
 /**
+ * The transaction map's internal hook that makes `to` keep the parent mode of `from` (an executable moved stays
+ * executable). Symbol-keyed so it is not part of `GitMap`: only the move edit calls it, and a map without it moves
+ * content only.
+ */
+export const KEEP_MODE_OF: unique symbol = Symbol("gitomic.keepModeOf")
+export type ModeKeepingMap = GitMap & { readonly [KEEP_MODE_OF]?: (to: string, from: string) => void }
+
+/**
  * The four edits `apply` carries. Each names the anchor it was authored
  * against so it can re-check itself on a moved base (R44/R45).
  *
@@ -113,6 +121,7 @@ export async function applyEdits(map: GitMap, base: Oid, head: Oid, edits: reado
         // source is defined here: its oid equalled a non-null expect.
         map.set(edit.to, source as string)
         map.delete(edit.from)
+        ;(map as ModeKeepingMap)[KEEP_MODE_OF]?.(edit.to, edit.from)
         break
       }
     }

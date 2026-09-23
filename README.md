@@ -248,6 +248,7 @@ Paths are git tree paths — forward slashes, no leading slash:
 
 - Public paths and prefixes normalize to Unicode NFC, and `keys` returns full canonical paths, sorted.
 - Every path in the scope you read must be NFC, valid UTF-8, free of file/directory collisions, and a regular blob. Bad path bytes, symlink entries and gitlinks fail loudly rather than being replaced, followed, or skipped.
+- A written path keeps its mode: an executable (100755) stays executable when it is changed, appended to, or moved by `apply`. A new path is 100644. A move done by hand inside `transact` (`get` then `set` then `delete`) carries content only.
 - Values are strict UTF-8 strings in v1 — there is no binary value mode. A tree holding a blob that is _not_ valid UTF-8 still works: the entry counts for `keys` and `has`, and a transaction that never touches it carries it into the next commit as the same blob. Only reading that one value fails, and it names the path.
 - Unpaired JavaScript surrogates always fail on write.
 - `at()` takes only a full lowercase 40- or 64-hex commit id and pins it when called. A well-formed but missing id throws on first read.
@@ -498,12 +499,23 @@ Both commands calculate their complete result before writing stdout. Use `--json
 
 Every precondition is the git BLOB oid `ls`/a prior write reports — never a raw hash of the file's bytes. Unless `--expect <path>=<oid>` names it (or `--create`, a strict create), a path's precondition is auto-read the moment the command starts — present means "replace exactly this", absent means a create — and re-checked against whatever tree the commit actually attempts, so the auto-read stays race-safe. `apply` clauses apply in order against one pinned base (`--base <oid>`, default the tip), so `rm to.md` then `mv from.md to.md` frees the destination inside one commit while the reverse order refuses. A path spelled like a clause keyword is written `./put` — git's own path form, which the CLI strips (a gitomic path never begins with `./`).
 
-`--writer <label>` labels the audit trail on any write verb. `--json` replaces the bare-oid line with a one-line receipt — the output contract for a script:
+`--writer <label>` labels the audit trail on any write verb. `--author "Name <email>"` records who acted; without it the author is the ident `git commit` would record (`git var GIT_AUTHOR_IDENT`), and gitomic stays the committer. When no ident resolves, the write still lands, authored by the committer, with a note on stderr. `--trailer Key=Value` (repeatable) adds trailers ahead of gitomic's own; a `Gitomic-*` key is refused (exit 2). `--json` replaces the bare-oid line with a one-line receipt — the output contract for a script:
 
 ```sh
 $ gitomic write 'repo#main' -m edit a.md=./a --json
-{"oid":"9f3c2ab…","retries":0}
+{"oid":"9f3c2ab…","retries":0,"report":[]}
 ```
+
+**The repository's gate.** Every write verb runs the gate the repository declares in `.gitomic.conf` at the root of its tree, read from the write's base commit and never from the write itself (git-config syntax):
+
+```ini
+[candidate]
+	derive = <command>   # prints {"put": {path: content}, "rm": [path]}; lands in the same commit
+	check = <command>    # exit 0 lands (stdout lines are the report); exit 1 refuses (stdout lines are the reasons)
+	timeoutMs = 30000
+```
+
+Each command runs through `sh -c` with `GITOMIC_REPO`, `GITOMIC_BASE` and `GITOMIC_CANDIDATE` (the unpublished candidate commit) set, and the changed paths on stdin, NUL-separated. Any other exit, or running past the limit, refuses. A write that changes `.gitomic.conf` must change nothing else. A landed write's report goes to stderr as `report: <line>`, or into the `--json` receipt. The library takes the same gate as `transact`'s `candidate` option (`repositoryCandidate({ repo })`).
 
 Product output — content, paths, matches, the oid or receipt — goes to stdout; narration and errors to stderr. The exit codes are the whole contract, and nothing fails silently:
 
@@ -513,6 +525,7 @@ Product output — content, paths, matches, the oid or receipt — goes to stdou
 | `1`  | a runtime/data error — a read miss, invalid UTF-8, a backend failure, `RetriesExhausted`; the subject names itself                                                                |
 | `2`  | a usage error — unknown verb, a missing or malformed argument or flag, a bad address                                                                                              |
 | `3`  | a CAS precondition refusal (`EditDoesNotApply`), reported facts-only on stderr: the kind, path, expected and actual oids, and both commits — never an owner, role, or remediation |
+| `4`  | the repository's gate refused the write (`CandidateRefused`): its reasons, then one line `code=candidate-refused base=<oid> reasons=<JSON array>`; the ref does not move          |
 
 `read --log` and `commit <checkout>` are not in this version.
 
