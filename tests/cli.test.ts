@@ -49,9 +49,14 @@ let workdir: string
 
 beforeEach(async () => {
   workdir = await mkdtemp(join(tmpdir(), "gitomic-cli-test-"))
+  // A fixed actor, so no test depends on the machine's git identity: without one, every write adds the no-author
+  // note to stderr (ADR-0020's fallback, tested on its own in cli-candidate.test.ts). CI runners have none.
+  vi.stubEnv("GIT_AUTHOR_NAME", "CLI Test")
+  vi.stubEnv("GIT_AUTHOR_EMAIL", "cli@example.org")
 })
 
 afterEach(async () => {
+  vi.unstubAllEnvs()
   await rm(workdir, { recursive: true, force: true })
 })
 
@@ -85,14 +90,7 @@ describe("gitomic CLI — remote opening", () => {
       const invoke = (args: string[]) =>
         promisify(execFile)("bun", [fileURLToPath(new URL("../src/bin.ts", import.meta.url)), ...args], {
           cwd: workdir,
-          // A fixed actor: without one, a machine with no git identity adds the no-author note to stderr.
-          env: {
-            ...process.env,
-            TMPDIR: scratch,
-            GIT_TERMINAL_PROMPT: "0",
-            GIT_AUTHOR_NAME: "URL Writer",
-            GIT_AUTHOR_EMAIL: "url@example.org",
-          },
+          env: { ...process.env, TMPDIR: scratch, GIT_TERMINAL_PROMPT: "0" },
           encoding: "utf8",
         })
       const write = await invoke(["write", address, "-m", "URL write", "--json", `note.md=${file}`])
