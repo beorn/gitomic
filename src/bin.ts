@@ -11,8 +11,11 @@ import {
   open,
   openReader,
   openRemoteRepository,
+  projectCheckout,
+  projectRemoteFirstFastForward,
   repositoryCandidate,
   runGit,
+  worktreeDirtyPaths,
   type Committed,
   type CommitMeta,
   type Edit,
@@ -109,10 +112,23 @@ import { decodeUtf8 } from "./utf8.js"
  * stays the committer. `--trailer Key=Value` (repeatable) adds caller trailers;
  * `Gitomic-*` keys are gitomic's own and refused.
  *
+ * With `--checkout <path>`, write verbs project `<path>`'s working tree and
+ * index forward after a successful write. A projection failure reports to
+ * stderr and never fails the landed write.
+ *
+ * Project verbs:
+ * - `project <path> [--remote <name>] [--ref <ref>] [--timeout <ms>]` — fetch
+ *   the remote branch (default origin/refs/heads/main) and fast-forward the
+ *   checkout's index and working tree to the fetched tip under the checkout
+ *   lock, preserving unrelated dirt. One-line stdout names outcome kind and
+ *   both oids.
+ *
  * Exit codes — the only five, nothing else is a success:
- * - `0` ok: landed, or already current.
+ * - `0` ok: landed, or already current / fast-forwarded.
  * - `1` a runtime/data error: a read or backend failure (not-found, invalid
- *   UTF-8, exhausted retries — the subject names itself in the message).
+ *   UTF-8, exhausted retries — the subject names itself in the message) or a
+ *   transport/environment projection failure (fetch-failed,
+ *   ancestry-unverifiable, ref-advance-refused, wrong-branch).
  * - `2` a usage error (unknown verb, a missing or malformed argument or
  *   flag, a bad address).
  * - `3` an {@link EditDoesNotApply} CAS precondition refusal, reported as
@@ -120,7 +136,8 @@ import { decodeUtf8 } from "./utf8.js"
  *   ref unchanged.
  * - `4` a {@link CandidateRefused}: the repository's gate refused the write.
  *   Its reasons, then one machine line `code=candidate-refused base=<oid>
- *   reasons=<JSON array>`. Tree and ref unchanged.
+ *   reasons=<JSON array>`. Tree and ref unchanged. Or, for `project`, a
+ *   stranded-local-commits or landed-but-unsynchronized refusal.
  *
  * Deliberately not built here (need new grammar or library plumbing this CLI
  * does not add): `read --log`, `commit <checkout>`.
@@ -153,6 +170,8 @@ export async function main(argv: string[], io: CliIo = {}): Promise<number> {
         return await runMv(args, stdout, stderr, backend)
       case "apply":
         return await runApply(args, stdin, stdout, stderr, backend)
+      case "project":
+        return await runProject(args, stdout, stderr)
       default:
         throw new UsageError(`unknown verb: ${JSON.stringify(verb)}; expected one of ${VERBS.join(", ")}`)
     }
@@ -171,7 +190,7 @@ export type CliIo = {
   backend?: GitomicBackend
 }
 
-const VERBS = ["read", "ls", "grep", "log", "diff", "write", "rm", "mv", "apply"] as const
+const VERBS = ["read", "ls", "grep", "log", "diff", "write", "rm", "mv", "apply", "project"] as const
 
 const OK = 0
 const RUNTIME_ERROR = 1
@@ -373,12 +392,14 @@ async function runWrite(
     "--create": "repeated",
     "--author": "value",
     "--trailer": "repeated",
+    "--checkout": "value",
     "--json": "boolean",
   })
   const attribution = parseAttribution(optionalStringFlag(flags, "--author"), repeated.get("--trailer") ?? [])
   const address = requirePositional(positionals, 0, "<address>")
   const message = requireStringFlag(flags, "-m", "-m <message>")
   const writer = optionalStringFlag(flags, "--writer")
+  const checkoutPath = optionalStringFlag(flags, "--checkout")
   const pairs = parsePathFilePairs(positionals.slice(1))
   const knownPaths = new Set(pairs.map((pair) => pair.path))
   const expect = parseExpectPairs(repeated.get("--expect") ?? [])
@@ -399,6 +420,9 @@ async function runWrite(
   }
 
   const committed = await apply(store, base, edits, message, await writeOptions(attribution, repository, stderr))
+  if (checkoutPath !== undefined) {
+    await projectAfterWrite(checkoutPath, committed.oid, repository, base, stderr)
+  }
   writeReceipt(stdout, stderr, committed, flags.get("--json") === true)
   return OK
 }
@@ -501,6 +525,7 @@ async function runApply(
   let writer: string | undefined
   let base: Oid | undefined
   let author: string | undefined
+  let checkoutPath: string | undefined
   const trailers: string[] = []
   let asJson = false
   while (true) {
@@ -523,6 +548,9 @@ async function runApply(
       case "--trailer":
         trailers.push(requireQueuedValue(queue, token))
         break
+      case "--checkout":
+        checkoutPath = requireQueuedValue(queue, token)
+        break
       case "--json":
         asJson = true
         break
@@ -542,6 +570,9 @@ async function runApply(
     edits.push(await parseClause(clause, snapshot, stdin, address))
   }
   const committed = await apply(store, startBase, edits, message, await writeOptions(attribution, repository, stderr))
+  if (checkoutPath !== undefined) {
+    await projectAfterWrite(checkoutPath, committed.oid, repository, startBase, stderr)
+  }
   writeReceipt(stdout, stderr, committed, asJson)
   return OK
 }
@@ -780,6 +811,66 @@ function writeReceipt(stdout: CliWriter, stderr: CliWriter, committed: Committed
   }
   stdout.write(`${committed.oid}\n`)
   for (const line of report) stderr.write(`report: ${line}\n`)
+}
+
+async function projectAfterWrite(
+  checkoutPath: string,
+  to: Oid,
+  repository: OpenOptions,
+  startBase: Oid,
+  stderr: CliWriter,
+): Promise<void> {
+  const dirtyPaths = worktreeDirtyPaths(checkoutPath)
+  const storeRef = repository.ref.startsWith("refs/heads/") ? repository.ref : `refs/heads/${repository.ref}`
+  const outcome = await projectRemoteFirstFastForward({
+    repoRoot: checkoutPath,
+    to,
+    ref: storeRef,
+    remote: repository.remote ?? "origin",
+    expectedDirtyPaths: dirtyPaths,
+    preTransactTip: startBase,
+  })
+  if (!outcome.ok) {
+    stderr.write(`gitomic: projection failed: ${outcome.error}\nkind=${outcome.kind}\n`)
+  }
+}
+
+async function runProject(args: string[], stdout: CliWriter, stderr: CliWriter): Promise<number> {
+  const { positionals, flags } = extractFlags(args, {
+    "--remote": "value",
+    "--ref": "value",
+    "--timeout": "value",
+  })
+  const checkoutPath = requirePositional(positionals, 0, "<path>")
+  assertNoExtraPositionals(positionals, 1, "<path>", "project")
+  const remote = optionalStringFlag(flags, "--remote") ?? "origin"
+  let ref = optionalStringFlag(flags, "--ref") ?? "refs/heads/main"
+  if (!ref.startsWith("refs/heads/")) ref = `refs/heads/${ref}`
+  const timeoutMs = flags.get("--timeout") ? Number(flags.get("--timeout")) : undefined
+
+  const outcome = await projectCheckout({
+    repoRoot: checkoutPath,
+    remote,
+    ref,
+    ...(timeoutMs !== undefined ? { remoteTimeoutMs: timeoutMs } : {}),
+  })
+
+  if (outcome.ok) {
+    stdout.write(`kind=${outcome.kind} local=${outcome.localTip ?? ""} to=${outcome.to ?? ""}\n`)
+    return OK
+  }
+
+  if (outcome.kind === "stranded-local-commits" || outcome.kind === "landed-but-unsynchronized") {
+    const localOnlyStr =
+      outcome.kind === "stranded-local-commits" ? ` localOnly=${JSON.stringify(outcome.localOnly)}` : ""
+    stderr.write(
+      `${outcome.error}\nkind=${outcome.kind} local=${outcome.localTip} to=${outcome.landedOid}${localOnlyStr}\n`,
+    )
+    return CANDIDATE_REFUSED
+  }
+
+  stderr.write(`gitomic: ${outcome.error}\nkind=${outcome.kind}\n`)
+  return RUNTIME_ERROR
 }
 
 type Attribution = { author: Ident | undefined; trailers: Trailer[] }
