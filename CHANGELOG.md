@@ -6,6 +6,8 @@
 
 ### Added
 
+- Top-level `gitomic --help` and `gitomic -h` print the CLI usage and available
+  verbs without opening a repository.
 - `createShellBackend({ baseEnv })` snapshots an exact environment for every
   backend Git command, while `runGit(..., { env })` keeps overlay semantics.
 - `danglingRefs` and `isMissingObjectFetchError` provide one dependency-free
