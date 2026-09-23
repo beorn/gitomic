@@ -5,6 +5,7 @@ import { type Address, parseAddress } from "./address.js"
 import { assertTrailers, identProblem, validateOid } from "./git-object.js"
 import {
   apply,
+  CANDIDATE_CONFIG,
   CandidateRefused,
   EditDoesNotApply,
   matchGlob,
@@ -13,7 +14,9 @@ import {
   openRemoteRepository,
   projectCheckout,
   projectRemoteFirstFastForward,
+  readRepositoryDeclaration,
   repositoryCandidate,
+  trustDeclaration,
   runGit,
   worktreeDirtyPaths,
   type Committed,
@@ -107,7 +110,8 @@ import { decodeUtf8 } from "./utf8.js"
  * stdout; narration and errors go to stderr.
  *
  * Write verbs run the repository's own gate: the `.gitomic.conf` its base
- * declares (see `repositoryCandidate`). `--author "Name <email>"` records who
+ * declares (see `repositoryCandidate`), only once that exact declaration is
+ * trusted; an untrusted one refuses with exit 4 and runs nothing. `--author "Name <email>"` records who
  * acted, defaulting to the ident `git commit` would record (ADR-0020); gitomic
  * stays the committer. `--trailer Key=Value` (repeatable) adds caller trailers;
  * `Gitomic-*` keys are gitomic's own and refused.
@@ -115,6 +119,14 @@ import { decodeUtf8 } from "./utf8.js"
  * With `--checkout <path>`, write verbs project `<path>`'s working tree and
  * index forward after a successful write. A projection failure reports to
  * stderr and never fails the landed write.
+ *
+ * Trust verb:
+ * - `trust <addr>` — print the `.gitomic.conf` the address's tip declares,
+ *   then record its blob as the one declaration write verbs may run:
+ *   `gitomic.trust` in a path repository's own git config, or
+ *   `gitomic.<url>.trust` in the caller's global git config for a URL (its
+ *   clone keeps no config). Exit 1 when the tip declares none. Read verbs
+ *   never need trust.
  *
  * Project verbs:
  * - `project <path> [--remote <name>] [--ref <ref>] [--timeout <ms>]` — fetch
@@ -172,6 +184,8 @@ export async function main(argv: string[], io: CliIo = {}): Promise<number> {
         return await runApply(args, stdin, stdout, stderr, backend)
       case "project":
         return await runProject(args, stdout, stderr)
+      case "trust":
+        return await runTrust(args, stdout, backend)
       default:
         throw new UsageError(`unknown verb: ${JSON.stringify(verb)}; expected one of ${VERBS.join(", ")}`)
     }
@@ -190,7 +204,7 @@ export type CliIo = {
   backend?: GitomicBackend
 }
 
-const VERBS = ["read", "ls", "grep", "log", "diff", "write", "rm", "mv", "apply", "project"] as const
+const VERBS = ["read", "ls", "grep", "log", "diff", "write", "rm", "mv", "apply", "project", "trust"] as const
 
 const OK = 0
 const RUNTIME_ERROR = 1
@@ -902,14 +916,18 @@ function parseAttribution(author: string | undefined, trailerFlags: readonly str
  */
 async function writeOptions(
   attribution: Attribution,
-  repository: OpenOptions,
+  repository: OpenedAddress,
   stderr: CliWriter,
 ): Promise<{ author?: Ident; trailers: Trailer[]; candidate: ReturnType<typeof repositoryCandidate> }> {
   const author = attribution.author ?? (await claimedAuthor(stderr))
   return {
     ...(author === undefined ? {} : { author }),
     trailers: attribution.trailers,
-    candidate: repositoryCandidate({ repo: repository.repo }),
+    candidate: repositoryCandidate({
+      repo: repository.repo,
+      ref: repository.ref,
+      ...(repository.url === undefined ? {} : { url: repository.url }),
+    }),
   }
 }
 
@@ -1026,10 +1044,33 @@ async function readFileContent(file: string): Promise<string> {
   return decodeUtf8(await readFile(file), `file ${JSON.stringify(file)}`)
 }
 
+// --- trust -------------------------------------------------------------------
+
+/** Print the declaration at the address's tip, then record its blob as trusted (the order the verb promises). */
+async function runTrust(args: string[], stdout: CliWriter, backend: GitomicBackend | undefined): Promise<number> {
+  const { positionals } = extractFlags(args, {})
+  const address = requirePositional(positionals, 0, "<address>")
+  if (positionals.length > 1) throw new UsageError(`trust takes one <address>; got ${positionals.length} arguments`)
+  using repository = await openAddressFor(address, backend)
+  const tip = await (await openReader(repository)).head()
+  const declaration = await readRepositoryDeclaration(repository.repo, tip)
+  if (declaration === undefined)
+    throw new Error(`${address} declares no ${CANDIDATE_CONFIG} at ${tip}; nothing to trust`)
+  stdout.write(`${CANDIDATE_CONFIG} ${declaration.blob} at ${tip} declares:\n`)
+  for (const line of declaration.lines) stdout.write(`  ${line}\n`)
+  const scope = { repo: repository.repo, ...(repository.url === undefined ? {} : { url: repository.url }) }
+  const recorded = await trustDeclaration(scope, declaration.blob)
+  stdout.write(`trusted: ${recorded.key} = ${declaration.blob} (${recorded.file} git config)\n`)
+  return OK
+}
+
 // --- opening the address ---------------------------------------------------
 
+/** An opened address: the store options, plus the URL when `repo` is a throwaway clone of a remote. */
+type OpenedAddress = OpenOptions & Disposable & { readonly ref: string; readonly url?: string }
+
 /** One CLI selection point; a failed local open never selects a remote. */
-async function openAddressFor(address: string, backend: GitomicBackend | undefined): Promise<OpenOptions & Disposable> {
+async function openAddressFor(address: string, backend: GitomicBackend | undefined): Promise<OpenedAddress> {
   const { repo, ref } = parseAddressOrUsageError(address)
   const local = { repo, ref, ...(backend === undefined ? {} : { backend }), [Symbol.dispose]() {} }
   if (backend !== undefined) return local
@@ -1037,7 +1078,7 @@ async function openAddressFor(address: string, backend: GitomicBackend | undefin
   const remote = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(repo) || (!drivePath && /^[^/\\\\:]+:/.test(repo))
   if (!remote) return local
   const repository = await openRemoteRepository(repo)
-  return { ...repository, ref, [Symbol.dispose]: () => repository[Symbol.dispose]() }
+  return { ...repository, ref, url: repo, [Symbol.dispose]: () => repository[Symbol.dispose]() }
 }
 
 function parseAddressOrUsageError(address: string): Address {
