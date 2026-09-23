@@ -197,6 +197,19 @@ export async function runGit(args: readonly string[], options: RunGitOptions = {
   return run("git", args, options)
 }
 
+/**
+ * Run one command that is not Git through the same bounded runner: with `timeoutMs` it leads its own process group,
+ * and past the limit the group is stopped and the call rejects with {@link GitTimeout}. For a repository's declared
+ * candidate commands, which must never hang a writer.
+ */
+export async function runCommand(
+  command: string,
+  args: readonly string[],
+  options: RunGitOptions = {},
+): Promise<GitResult> {
+  return run(command, args, options)
+}
+
 async function run(command: string, args: readonly string[], options: GitOptions = {}): Promise<GitResult> {
   const timeoutMs = options.timeoutMs === undefined ? undefined : normalizeTimeoutMs(options.timeoutMs, "timeoutMs")
   return new Promise((resolveResult, reject) => {
