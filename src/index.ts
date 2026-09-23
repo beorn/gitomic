@@ -67,6 +67,20 @@ export {
 } from "./shell.js"
 export { openRemoteRepository, type OpenedRemoteRepository, type OpenRemoteRepositoryOptions } from "./repository.js"
 export { parseOwnershipManifest } from "./ownership-manifest.js"
+export {
+  checkedOutRef,
+  isBareRepository,
+  projectCheckout,
+  projectRemoteFirstFastForward,
+  synchronizeCheckoutToCommit,
+  worktreeDirtyPaths,
+  type CheckoutSyncOutcome,
+  type CheckoutSyncRequest,
+  type ProjectCheckoutOutcome,
+  type ProjectCheckoutRequest,
+  type RemoteFirstProjectionOutcome,
+  type RemoteFirstProjectionRequest,
+} from "./project.js"
 export type {
   BlobValue,
   Candidate,
