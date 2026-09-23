@@ -3,7 +3,7 @@
 // @consumer default shell-backend users and optional iso reader users
 
 import { spawnSync } from "node:child_process"
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { chmod, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { delimiter, join } from "node:path"
 
@@ -514,6 +514,84 @@ describe.sequential("shell backend failure boundaries", () => {
     } finally {
       restore()
       await wrapper.cleanup()
+    }
+  })
+
+  test("uses one selected executable for the version probe, repository resolution, reads and writes", async () => {
+    const pair = await createRemoteRepos()
+    const directory = await mkdtemp(join(tmpdir(), "gitomic-selected-git-"))
+    const selected = join(directory, "selected-git")
+    const calls = join(directory, "calls.jsonl")
+    const native = spawnSync("which", ["git"], { encoding: "utf8" }).stdout.trim()
+    expect(native).not.toBe("")
+    await symlink(process.execPath, join(directory, "node"))
+    await writeFile(
+      selected,
+      [
+        "#!/usr/bin/env node",
+        'const { appendFileSync } = require("node:fs")',
+        'const { spawnSync } = require("node:child_process")',
+        `appendFileSync(${JSON.stringify(calls)}, JSON.stringify(process.argv.slice(2)) + "\\n")`,
+        `const result = spawnSync(${JSON.stringify(native)}, process.argv.slice(2), { stdio: "inherit" })`,
+        "if (result.error) throw result.error",
+        "process.exit(result.status ?? 1)",
+      ].join("\n"),
+      { mode: 0o755 },
+    )
+    try {
+      const backend = createShellBackend({ gitExecutable: "selected-git", baseEnv: { PATH: directory } })
+      expect(await backend.head(pair.left, "refs/heads/main")).toBe(pair.initial)
+      expect((await backend.readHistory!(pair.left, [pair.initial], { limit: 1 }))[0]?.oid).toBe(pair.initial)
+      expect((await backend.listRefs!(pair.left, "refs/heads/", "origin")).get("refs/heads/main")).toBe(pair.initial)
+      await expect(
+        backend.publish!(pair.left, [{ ref: "refs/yrd/selected-git-test", expect: "0".repeat(40), oid: pair.initial }]),
+      ).resolves.toBeDefined()
+      const argv = (await readFile(calls, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as string[])
+      expect(argv.some((args) => args.includes("--version"))).toBe(true)
+      expect(argv.some((args) => args.includes("--git-common-dir"))).toBe(true)
+      expect(argv.some((args) => args.includes("update-ref"))).toBe(true)
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+      await pair.cleanup()
+    }
+  })
+
+  test("names an unusable selected executable at the first Git command", async () => {
+    await expect(
+      createShellBackend({ gitExecutable: "missing-gitomic-executable", baseEnv: { PATH: "/nonexistent" } }).head(
+        "ignored",
+        "refs/heads/main",
+      ),
+    ).rejects.toThrow("missing-gitomic-executable")
+  })
+
+  test("keeps selected executables separate across concurrent backends", async () => {
+    const first = await createGitWrapper()
+    const second = await createGitWrapper()
+    try {
+      await Promise.all([
+        rename(join(first.bin, "git"), join(first.bin, "selected-one")),
+        rename(join(second.bin, "git"), join(second.bin, "selected-two")),
+        symlink(process.execPath, join(first.bin, "node")),
+        symlink(process.execPath, join(second.bin, "node")),
+      ])
+      const one = createShellBackend({
+        gitExecutable: "selected-one",
+        baseEnv: { PATH: first.bin, GITOMIC_FAKE_GITDIR: "/tmp/one.git", GITOMIC_FAKE_HEAD: "1".repeat(40) },
+      })
+      const two = createShellBackend({
+        gitExecutable: "selected-two",
+        baseEnv: { PATH: second.bin, GITOMIC_FAKE_GITDIR: "/tmp/two.git", GITOMIC_FAKE_HEAD: "2".repeat(40) },
+      })
+      await expect(
+        Promise.all([one.head("ignored", "refs/heads/main"), two.head("ignored", "refs/heads/main")]),
+      ).resolves.toEqual(["1".repeat(40), "2".repeat(40)])
+    } finally {
+      await first.cleanup()
+      await second.cleanup()
     }
   })
 

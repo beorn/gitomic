@@ -40,7 +40,7 @@ npm install gitomic
 
 The default `shell` backend has no runtime dependencies. Install `isomorphic-git` next to gitomic only when you use the optional `gitomic/iso` entry point.
 
-`createShellBackend({ baseEnv })` replaces the environment inherited by that backend's Git commands; `runGit(args, { env })` overlays `env` on the current process environment.
+`createShellBackend({ baseEnv })` replaces the environment inherited by that backend's Git commands; `runGit(args, { env })` overlays `env` on the current process environment. `createShellBackend({ gitExecutable })` selects the Git executable for every backend command, including its version check; a bare name resolves through that backend environment's `PATH`.
 
 ## Example
 

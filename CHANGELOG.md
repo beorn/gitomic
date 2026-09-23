@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.3.0 — 2026-09-23
+
+### Fixed
+
+- `createShellBackend({ gitExecutable })` uses one selected executable for all
+  backend Git commands, including the version probe and repository resolver, so
+  callers with a configured Git tool no longer fall back to an ambient `git`.
+
 ## 0.2.0 — 2026-09-22
 
 ### Added

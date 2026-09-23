@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks"
 import childProcess, { type ChildProcess } from "node:child_process"
 import { randomUUID } from "node:crypto"
 import { mkdtemp, rm, writeFile } from "node:fs/promises"
@@ -57,6 +58,8 @@ export type DanglingRefsOptions = Readonly<{
 
 /** Options for {@link createShellBackend}. */
 export type ShellBackendOptions = {
+  /** Git executable used for every shell-backend command. A bare name resolves through `baseEnv`'s PATH. Defaults to `git`. */
+  gitExecutable?: string
   /**
    * Exact base environment for every command this backend spawns. Unlike
    * `runGit(..., { env })`, omitted keys do not fall through to process.env.
@@ -78,6 +81,8 @@ const DANGLING_REF_SCAN_TIMEOUT_MS = 30_000
 const GROUP_STOP_GRACE_MS = 2_000
 
 const DURABLE_GIT_CONFIG = ["-c", "core.fsync=loose-object,reference", "-c", "core.fsyncMethod=fsync"] as const
+const shellExecutable = new AsyncLocalStorage<string>()
+const selectedGit = (): string => shellExecutable.getStore() ?? "git"
 
 export function createShellBackend(options: ShellBackendOptions = {}): GitomicBackend {
   return createShellRuntime(options).backend
@@ -89,6 +94,8 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
   refStorage(repo: string): Promise<"files" | "native">
   objectFormat(repo: string): Promise<"sha1" | "sha256">
 } {
+  const executable = options.gitExecutable ?? "git"
+  if (executable.trim() === "") throw new TypeError("gitExecutable must name a Git executable")
   const remoteTimeoutMs = normalizeTimeoutMs(options.remoteTimeoutMs ?? DEFAULT_REMOTE_TIMEOUT_MS, "remoteTimeoutMs")
   const baseEnv = snapshotEnvironment(options.baseEnv)
   const resolveGitDir = createGitDirResolver(baseEnv)
@@ -190,11 +197,26 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
     fetchRefs: async (repo, refs, remote) =>
       fetchRefs(await resolveGitDir(repo), refs, remote, remoteTimeoutMs, baseEnv),
   }
-  return { backend, resolveGitDir, refStorage, objectFormat }
+  // Each backend owns its executable even when two backends run concurrently.
+  // Keeping the selection in the async call chain lets the Git plumbing below
+  // use one runner without adding an executable argument to every operation.
+  const inRuntime = <T>(work: () => Promise<T>): Promise<T> => shellExecutable.run(executable, work)
+  const selectedBackend = Object.fromEntries(
+    Object.entries(backend).map(([name, operation]) => [
+      name,
+      (...args: unknown[]) => inRuntime(() => Reflect.apply(operation, backend, args)),
+    ]),
+  ) as GitomicBackend
+  return {
+    backend: selectedBackend,
+    resolveGitDir: (repo) => inRuntime(() => resolveGitDir(repo)),
+    refStorage: (repo) => inRuntime(() => refStorage(repo)),
+    objectFormat: (repo) => inRuntime(() => objectFormat(repo)),
+  }
 }
 
 async function optionalRef(repo: string, ref: string, baseEnv?: NodeJS.ProcessEnv): Promise<Oid | undefined> {
-  const result = await run("git", gitArgs(repo, ["rev-parse", "--verify", "--quiet", ref]), { baseEnv })
+  const result = await run(selectedGit(), gitArgs(repo, ["rev-parse", "--verify", "--quiet", ref]), { baseEnv })
   if (result.code === 1 && result.stdout.length === 0) return undefined
   if (result.code !== 0) {
     const detail = result.stderr.toString("utf8").trim()
@@ -443,7 +465,7 @@ export function createGitDirResolver(baseEnv?: NodeJS.ProcessEnv): (repo: string
       supportedVersion ??= requireSupportedGit(baseEnv)
       gitdir = supportedVersion
         .then(async () =>
-          run("git", ["-C", locator, "rev-parse", "--path-format=absolute", "--git-common-dir"], { baseEnv }),
+          run(selectedGit(), ["-C", locator, "rev-parse", "--path-format=absolute", "--git-common-dir"], { baseEnv }),
         )
         .then((result) => {
           if (result.code !== 0) {
@@ -459,7 +481,13 @@ export function createGitDirResolver(baseEnv?: NodeJS.ProcessEnv): (repo: string
 }
 
 async function requireSupportedGit(baseEnv?: NodeJS.ProcessEnv): Promise<void> {
-  const result = await run("git", ["--version"], { baseEnv })
+  const executable = selectedGit()
+  let result: GitResult
+  try {
+    result = await run(executable, ["--version"], { baseEnv })
+  } catch (error) {
+    throw new Error(`Git executable ${JSON.stringify(executable)} cannot run: ${String(error)}`, { cause: error })
+  }
   const output = result.stdout.toString("utf8").trim()
   const match = /^git version (\d+)\.(\d+)(?:[.\s]|$)/.exec(output)
   const major = Number(match?.[1])
@@ -467,13 +495,13 @@ async function requireSupportedGit(baseEnv?: NodeJS.ProcessEnv): Promise<void> {
   if (result.code !== 0 || match === null || major < 2 || (major === 2 && minor < 36)) {
     const found = output || result.stderr.toString("utf8").trim() || "unknown version"
     throw new Error(
-      `Git 2.36 or newer is required for durable object and ref writes; found ${JSON.stringify(found)}. Upgrade Git, then open the store again.`,
+      `Git 2.36 or newer is required for durable object and ref writes; ${JSON.stringify(executable)} reported ${JSON.stringify(found)}. Upgrade Git, then open the store again.`,
     )
   }
 }
 
 async function git(repo: string, args: readonly string[], options: GitOptions = {}): Promise<Buffer> {
-  const result = await run("git", gitArgs(repo, args), options)
+  const result = await run(selectedGit(), gitArgs(repo, args), options)
   if (result.code !== 0) {
     const detail = result.stderr.toString("utf8").trim()
     throw new Error(`git ${args[0] ?? "command"} failed (${result.code})${detail ? `: ${detail}` : ""}`)
@@ -482,7 +510,7 @@ async function git(repo: string, args: readonly string[], options: GitOptions = 
 }
 
 async function gitWrite(repo: string, args: readonly string[], options: GitOptions = {}): Promise<Buffer> {
-  const result = await run("git", durableGitArgs(repo, args), options)
+  const result = await run(selectedGit(), durableGitArgs(repo, args), options)
   if (result.code !== 0) {
     const detail = result.stderr.toString("utf8").trim()
     throw new Error(`git ${args[0] ?? "command"} failed (${result.code})${detail ? `: ${detail}` : ""}`)
@@ -767,7 +795,7 @@ async function compareAndSwap(
   expected: Oid,
   baseEnv?: NodeJS.ProcessEnv,
 ): Promise<boolean> {
-  const result = await run("git", durableGitArgs(repo, ["update-ref", ref, next, expected]), { baseEnv })
+  const result = await run(selectedGit(), durableGitArgs(repo, ["update-ref", ref, next, expected]), { baseEnv })
   if (result.code === 0) return true
   const detail = result.stderr.toString("utf8").trim()
   if (isCompareAndSwapRejection(detail) || isTransientRefLockContention(detail)) return false
@@ -781,14 +809,16 @@ async function resolveRefStorage(
 ): Promise<"files" | "native"> {
   let storage = pending.get(repo)
   if (storage === undefined) {
-    storage = run("git", gitArgs(repo, ["config", "--get", "extensions.refStorage"]), { baseEnv }).then((result) => {
-      if (result.code === 1) return "files"
-      if (result.code !== 0) {
-        const detail = result.stderr.toString("utf8").trim()
-        throw new Error(`cannot inspect Git ref storage${detail ? `: ${detail}` : ""}`)
-      }
-      return text(result.stdout) === "files" ? "files" : "native"
-    })
+    storage = run(selectedGit(), gitArgs(repo, ["config", "--get", "extensions.refStorage"]), { baseEnv }).then(
+      (result) => {
+        if (result.code === 1) return "files"
+        if (result.code !== 0) {
+          const detail = result.stderr.toString("utf8").trim()
+          throw new Error(`cannot inspect Git ref storage${detail ? `: ${detail}` : ""}`)
+        }
+        return text(result.stdout) === "files" ? "files" : "native"
+      },
+    )
     pending.set(repo, storage)
   }
   try {
@@ -806,7 +836,7 @@ async function deleteRef(
   failure: string,
   baseEnv?: NodeJS.ProcessEnv,
 ): Promise<void> {
-  const result = await run("git", durableGitArgs(repo, ["update-ref", "-d", ref, oid]), { baseEnv })
+  const result = await run(selectedGit(), durableGitArgs(repo, ["update-ref", "-d", ref, oid]), { baseEnv })
   if (result.code !== 0) {
     const detail = result.stderr.toString("utf8").trim()
     throw new Error(`${failure}${detail ? `: ${detail}` : ""}`)
@@ -913,7 +943,7 @@ async function compareAndSwapRemote(
   let result: GitResult
   try {
     result = await run(
-      "git",
+      selectedGit(),
       durableGitArgs(repo, ["push", "--porcelain", `--force-with-lease=${ref}:${expected}`, remote, `${next}:${ref}`]),
       { baseEnv, timeoutMs },
     )
@@ -980,7 +1010,7 @@ async function publishLocal(
   baseEnv?: NodeJS.ProcessEnv,
 ): Promise<PublishResult> {
   const attempt = (unchanged: ReadonlySet<string>) =>
-    run("git", durableGitArgs(repo, ["update-ref", "--stdin"]), {
+    run(selectedGit(), durableGitArgs(repo, ["update-ref", "--stdin"]), {
       baseEnv,
       input: [
         "start",
@@ -1089,7 +1119,7 @@ async function publishRemote(
   ]
   let result: GitResult
   try {
-    result = await run("git", durableGitArgs(repo, args), { baseEnv, timeoutMs })
+    result = await run(selectedGit(), durableGitArgs(repo, args), { baseEnv, timeoutMs })
   } catch (error) {
     throw remoteWriteOutcomeUnknown(updates, error)
   }
@@ -1149,7 +1179,7 @@ async function observeRemote(
   timeoutMs: number,
   baseEnv?: NodeJS.ProcessEnv,
 ): Promise<(ref: string) => string> {
-  const result = await run("git", durableGitArgs(repo, ["ls-remote", remote, ...refs]), { baseEnv, timeoutMs })
+  const result = await run(selectedGit(), durableGitArgs(repo, ["ls-remote", remote, ...refs]), { baseEnv, timeoutMs })
   if (result.code !== 0) {
     const reason = `unread: git ls-remote failed (${result.code}): ${result.stderr.toString("utf8").trim()}`
     return () => reason
@@ -1179,7 +1209,8 @@ async function diagnoseMissingObjectFetch(
 ): Promise<never> {
   const message = original instanceof Error ? original.message : String(original)
   if (!isMissingObjectFetchError(message)) throw original
-  const invoke = (args: readonly string[], options: RunGitOptions = {}) => run("git", args, { ...options, baseEnv })
+  const invoke = (args: readonly string[], options: RunGitOptions = {}) =>
+    run(selectedGit(), args, { ...options, baseEnv })
   let dangling: readonly DanglingRef[]
   try {
     dangling = await danglingRefs(repo, { run: invoke })
