@@ -111,6 +111,13 @@ export type CommitInput = {
    * own. Opaque to gitomic: it neither interprets nor reorders them.
    */
   trailers?: readonly Trailer[]
+  /**
+   * A changed path keeps the mode (100644 or 100755) of its own entry in
+   * `parent`; a new path is 100644. Here a path names the parent entry whose
+   * mode it keeps instead: a moved file's destination keeps its source's.
+   * Written by `apply`'s move edit only.
+   */
+  modeSources?: ReadonlyMap<string, string>
   changes: ReadonlyMap<string, string | undefined>
   message: string
   /** The caller's human-readable label. Not an identity: it may repeat. */

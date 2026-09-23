@@ -246,6 +246,7 @@ Paths are git tree paths — forward slashes, no leading slash:
 
 - Public paths and prefixes normalize to Unicode NFC, and `keys` returns full canonical paths, sorted.
 - Every path in the scope you read must be NFC, valid UTF-8, free of file/directory collisions, and a regular blob. Bad path bytes, symlink entries and gitlinks fail loudly rather than being replaced, followed, or skipped.
+- A written path keeps its mode: an executable (100755) stays executable when it is changed, appended to, or moved by `apply`. A new path is 100644. A move done by hand inside `transact` (`get` then `set` then `delete`) carries content only.
 - Values are strict UTF-8 strings in v1 — there is no binary value mode. A tree holding a blob that is _not_ valid UTF-8 still works: the entry counts for `keys` and `has`, and a transaction that never touches it carries it into the next commit as the same blob. Only reading that one value fails, and it names the path.
 - Unpaired JavaScript surrogates always fail on write.
 - `at()` takes only a full lowercase 40- or 64-hex commit id and pins it when called. A well-formed but missing id throws on first read.

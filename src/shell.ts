@@ -514,6 +514,7 @@ async function writeCommit(repo: string, input: CommitInput): Promise<Oid> {
   try {
     await gitWrite(repo, ["read-tree", input.parent], { env: indexEnv })
     const changes = [...input.changes]
+    const executables = await parentExecutables(repo, indexEnv, changes)
     const blobFiles: string[] = []
     for (const [position, [, content]] of changes.entries()) {
       if (content === undefined) continue
@@ -542,7 +543,7 @@ async function writeCommit(repo: string, input: CommitInput): Promise<Oid> {
     for (const [path, content] of changes) {
       const oid = content === undefined ? zeroOid : blobs[blobPosition++]
       indexInfo.push(
-        Buffer.from(`${content === undefined ? "0" : "100644"} ${oid}\t`, "utf8"),
+        Buffer.from(`${content === undefined ? "0" : keptMode(input, path, executables)} ${oid}\t`, "utf8"),
         Buffer.from(path, "utf8"),
         Buffer.from([0]),
       )
@@ -557,6 +558,31 @@ async function writeCommit(repo: string, input: CommitInput): Promise<Oid> {
   } finally {
     await rm(indexDir, { recursive: true, force: true })
   }
+}
+
+/**
+ * The 100755 paths of the parent tree the temp index holds, read only when the commit writes content. One
+ * `ls-files --stage` (git 2.36 has no NUL-safe per-path mode query); STATE's 19,561 entries list in under 10 ms.
+ */
+async function parentExecutables(
+  repo: string,
+  indexEnv: NodeJS.ProcessEnv,
+  changes: readonly (readonly [string, string | undefined])[],
+): Promise<ReadonlySet<string>> {
+  const executables = new Set<string>()
+  if (!changes.some(([, content]) => content !== undefined)) return executables
+  const listing = await git(repo, ["ls-files", "--stage", "-z"], { env: indexEnv })
+  for (const record of listing.toString("utf8").split("\0")) {
+    if (!record.startsWith("100755 ")) continue
+    const tab = record.indexOf("\t")
+    if (tab >= 0) executables.add(record.slice(tab + 1))
+  }
+  return executables
+}
+
+/** The mode a changed path keeps: its parent entry's (or its move source's) 100755, else 100644. */
+function keptMode(input: CommitInput, path: string, executables: ReadonlySet<string>): "100644" | "100755" {
+  return executables.has(input.modeSources?.get(path) ?? path) ? "100755" : "100644"
 }
 
 /** Write one commit as the given author and committer, one second after its first parent. */

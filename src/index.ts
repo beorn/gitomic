@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto"
 
-import { applyEdits, type Edit } from "./edits.js"
+import { applyEdits, KEEP_MODE_OF, type Edit } from "./edits.js"
 import { runCasLoop } from "./engine.js"
 import {
   assertWriter,
@@ -301,7 +301,7 @@ async function transact(
       context.backend.findTransaction(context.repo, winner, base, instance, attemptSeq),
     attempt: async (parent, retries) => {
       const base = checkedFiles(await context.backend.readFiles(context.repo, parent))
-      const { map, changes } = makeOverlay(base)
+      const { map, changes, modeSources } = makeOverlay(base)
       await update(map, parent)
       const commitInput = (effective: ReadonlyMap<string, string | undefined>, commitMessage: string) => {
         seq ??= context.nextSeq()
@@ -309,6 +309,7 @@ async function transact(
         return {
           parent,
           changes: effective,
+          ...(modeSources.size === 0 ? {} : { modeSources }),
           message: commitMessage,
           writer: context.writer,
           instance: context.instance,
@@ -478,8 +479,10 @@ function backendOid(value: unknown): Oid {
 function makeOverlay(base: ReadonlyMap<string, BlobValue>): {
   map: GitMap
   changes: Map<string, string | undefined>
+  modeSources: Map<string, string>
 } {
   const changes = new Map<string, string | undefined>()
+  const modeSources = new Map<string, string>()
   const get = (path: string): string | undefined =>
     changes.has(path) ? changes.get(path) : readValue(base.get(path), path)
   const present = (path: string): boolean => (changes.has(path) ? changes.get(path) !== undefined : base.has(path))
@@ -508,7 +511,13 @@ function makeOverlay(base: ReadonlyMap<string, BlobValue>): {
       return [...keys].filter((path) => path.startsWith(normalized)).sort()
     },
   }
-  return { map, changes }
+  // A chain of moves keeps the first source's mode: a to b, then b to c, leaves c with a's.
+  const keepModeOf = (to: string, from: string): void => {
+    const source = normalizePath(from)
+    modeSources.set(normalizePath(to), modeSources.get(source) ?? source)
+  }
+  Object.defineProperty(map, KEEP_MODE_OF, { value: keepModeOf })
+  return { map, changes, modeSources }
 }
 
 function createQueue(): <T>(operation: () => Promise<T>) => Promise<T> {

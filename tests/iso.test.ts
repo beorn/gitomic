@@ -214,7 +214,7 @@ describe("iso backend", () => {
     }
   })
 
-  test("canonicalizes a touched executable blob identically in shell and iso", async () => {
+  test("keeps a touched executable blob's mode identically in shell and iso", async () => {
     const shellFixture = await createBareRepo()
     const isoFixture = await createBareRepo()
     try {
@@ -240,8 +240,8 @@ describe("iso backend", () => {
       )
 
       expect(new Set(commits)).toHaveLength(1)
-      expect(await git(shellFixture.repo, "ls-tree", "main", "script")).toMatch(/^100644 blob /)
-      expect(await git(isoFixture.repo, "ls-tree", "main", "script")).toMatch(/^100644 blob /)
+      expect(await git(shellFixture.repo, "ls-tree", "main", "script")).toMatch(/^100755 blob /)
+      expect(await git(isoFixture.repo, "ls-tree", "main", "script")).toMatch(/^100755 blob /)
     } finally {
       await Promise.all([shellFixture.cleanup(), isoFixture.cleanup()])
     }
