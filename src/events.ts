@@ -13,7 +13,7 @@ import { randomUUID } from "node:crypto"
 
 import { runCasLoop } from "./engine.js"
 import { Conflict } from "./errors.js"
-import { assertTrailers, GENESIS_MESSAGE, validateOid, zeroOid } from "./git-object.js"
+import { assertTrailers, cloneIdent, GENESIS_MESSAGE, GITOMIC_IDENT, validateOid, zeroOid } from "./git-object.js"
 import {
   assertWriter,
   DEFAULT_WRITER_LABEL,
@@ -24,7 +24,7 @@ import {
   waitForPoll,
 } from "./options.js"
 import { createShellBackend } from "./shell.js"
-import type { CommitMeta, GitomicBackend, Oid, RefUpdate, Trailer } from "./types.js"
+import type { CommitMeta, GitomicBackend, Ident, Oid, RefUpdate, Trailer } from "./types.js"
 import { assertUtf8 } from "./utf8.js"
 
 /** One trailer as written: key, then value. Order and duplicates are kept. */
@@ -57,12 +57,22 @@ export type Event = {
   readonly writer: string | null
   readonly instance: string | null
   readonly seq: number | null
+  /** Git's author: who the event was written for. */
+  readonly author: Ident
+  /** Git's committer: who wrote it. */
+  readonly committer: Ident
 }
 
 export type EventsOptions = {
   repo: string
   ref: string
   writer?: string
+  /**
+   * Git's committer for every event this handle writes. A call may name its own
+   * author; one that names none has this committer as author. Defaults to
+   * gitomic <gitomic@localhost>. The chain's genesis always keeps gitomic's.
+   */
+  committer?: Ident
   remote?: string
   backend?: GitomicBackend
   retryBudgetMs?: number
@@ -94,9 +104,12 @@ export type Events = {
    * Read every event, decide, append, and replay on a lost race. `message` names
    * the transaction in errors. A chain over 1024 events is refused, not truncated.
    */
-  transact(decide: Decide, message: string, options?: { also?: readonly AlsoRef[] }): Promise<Appended>
+  transact(decide: Decide, message: string, options?: { also?: readonly AlsoRef[]; author?: Ident }): Promise<Appended>
   /** Append at exactly `expect` (null = the chain must not exist); throws Conflict on a moved tip. */
-  append(inputs: readonly EventInput[], options: { expect: Oid | null; also?: readonly AlsoRef[] }): Promise<Appended>
+  append(
+    inputs: readonly EventInput[],
+    options: { expect: Oid | null; also?: readonly AlsoRef[]; author?: Ident },
+  ): Promise<Appended>
   watch(options: { signal: AbortSignal; pollIntervalMs?: number }): AsyncIterable<Event[]>
 }
 
@@ -232,11 +245,14 @@ function toEvent(meta: CommitMeta, ref: string): Event {
     writer: meta.writer,
     instance: meta.instance,
     seq: meta.seq,
+    author: meta.author,
+    committer: meta.committer,
   }
 }
 
 export async function openEvents(options: EventsOptions): Promise<Events> {
   if (options.writer !== undefined) assertWriter(options.writer)
+  const committer = cloneIdent(options.committer, "committer") ?? GITOMIC_IDENT
   const repo = options.repo
   const ref = normalizeRef(options.ref)
   const writer = options.writer ?? DEFAULT_WRITER_LABEL
@@ -355,6 +371,7 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
     newChain: boolean,
     inputs: readonly EventInput[],
     reserved: number[],
+    author: Ident,
   ): Promise<{ next: Oid; written: Event[]; lastSeq: number }> => {
     const shaped = inputs.map(shapeInput)
     let previous = base
@@ -372,6 +389,8 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
         writer,
         instance,
         seq: eventSeq,
+        author,
+        committer,
       })
       written.push({
         id: oid,
@@ -384,6 +403,8 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
         writer,
         instance,
         seq: eventSeq,
+        author,
+        committer,
       })
       previous = oid
     }
@@ -411,6 +432,7 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
     },
     async transact(decide, message, transactOptions = {}) {
       const why = assertLine(typeof message === "string" ? message.trim() : message, "message")
+      const author = cloneIdent(transactOptions.author, "author") ?? committer
       const publish = publishWith(shapeAlso(transactOptions.also))
       const reserved: number[] = []
       return runCasLoop<Oid | null, Appended>({
@@ -426,7 +448,7 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
           const inputs = await decide(current)
           if (inputs.length === 0) return { kind: "noop", result: { head: at, events: [], retries } }
           const base = at ?? (await genesisOf())
-          const { next, written, lastSeq } = await writeRun(base, at === null, inputs, reserved)
+          const { next, written, lastSeq } = await writeRun(base, at === null, inputs, reserved, author)
           return {
             kind: "write",
             next,
@@ -438,8 +460,9 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
         },
       })
     },
-    async append(inputs, { expect, also }) {
+    async append(inputs, { expect, also, author: named }) {
       if (inputs.length === 0) throw new TypeError("append needs at least one event")
+      const author = cloneIdent(named, "author") ?? committer
       const expected = expect === null ? null : validateOid(expect, "append expect must be an event id or null")
       const publish = publishWith(shapeAlso(also))
       const reserved: number[] = []
@@ -467,7 +490,7 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
             throw new Conflict(`${label} is at ${at ?? "nothing"}, not the expected ${expected ?? "nothing"}`)
           }
           const base = at ?? (await genesisOf())
-          const { next, written, lastSeq } = await writeRun(base, at === null, inputs, reserved)
+          const { next, written, lastSeq } = await writeRun(base, at === null, inputs, reserved, author)
           return {
             kind: "write",
             next,

@@ -12,7 +12,7 @@ import {
   waitForPoll,
 } from "./options.js"
 import { Conflict, EditDoesNotApply, GitTimeout, RetriesExhausted } from "./errors.js"
-import { cloneCommitProvenance, objectOid, validateOid } from "./git-object.js"
+import { cloneCommitProvenance, cloneIdent, GITOMIC_IDENT, objectOid, validateOid } from "./git-object.js"
 import {
   assertGitPrefixMatched,
   assertTreeShape,
@@ -30,6 +30,7 @@ import type {
   Committed,
   GitMap,
   GitomicBackend,
+  Ident,
   Oid,
   OpenOptions,
   OpenReaderOptions,
@@ -45,6 +46,7 @@ import { assertUtf8, decodeUtf8 } from "./utf8.js"
 export { Conflict, EditDoesNotApply, GitTimeout, RetriesExhausted }
 export type { EditKind, PreconditionType } from "./errors.js"
 export { applyEdits } from "./edits.js"
+export { identProblem } from "./git-object.js"
 export type { Edit } from "./edits.js"
 export { matchGlob } from "./glob.js"
 export {
@@ -66,6 +68,7 @@ export type {
   CommitInput,
   GitMap,
   GitomicBackend,
+  Ident,
   Oid,
   OpenOptions,
   OpenReaderOptions,
@@ -77,6 +80,7 @@ export type {
   Snapshot,
   Trailer,
   Store,
+  TransactOptions,
   Update,
 } from "./types.js"
 export type { OwnershipManifest, OwnershipManifestPolicy } from "./ownership-manifest.js"
@@ -91,12 +95,14 @@ export async function open(options: OpenOptions): Promise<Store> {
       // Capture the per-call scalar before enqueueing: a later transaction can
       // otherwise observe an options object the caller mutated after submit.
       let provenance: CommitProvenance | undefined
+      let author: Ident | undefined
       try {
         provenance = cloneCommitProvenance(options?.provenance)
+        author = cloneIdent(options?.author, "author")
       } catch (error) {
         return Promise.reject(error)
       }
-      return enqueue(async () => transact(context, update, message, provenance))
+      return enqueue(async () => transact(context, update, message, provenance, author))
     },
   }
 }
@@ -114,8 +120,13 @@ export async function apply(
   base: Oid,
   edits: readonly Edit[],
   message: string,
+  options?: { readonly author?: Ident },
 ): Promise<Committed> {
-  return store.transact((map, head) => applyEdits(map, base, head, edits), message)
+  return store.transact(
+    (map, head) => applyEdits(map, base, head, edits),
+    message,
+    options?.author === undefined ? undefined : { author: options.author },
+  )
 }
 
 export async function openReader(options: OpenReaderOptions): Promise<Reader> {
@@ -167,6 +178,8 @@ type StoreContext = {
   writer: string
   /** This store's unique identity, minted at `open`. */
   instance: string
+  /** Git's committer for every commit this store writes. */
+  committer: Ident
   backend: GitomicBackend
   /** How long a transaction keeps retrying a contended CAS before giving up (ms). */
   retryBudgetMs: number
@@ -184,6 +197,7 @@ type ReaderContext = {
 
 async function prepareStore(options: OpenOptions): Promise<StoreContext> {
   if (options.writer !== undefined) assertWriter(options.writer)
+  const committer = cloneIdent(options.committer, "committer") ?? GITOMIC_IDENT
   const repo = options.repo
   const ref = normalizeRef(options.ref)
   const writer = options.writer ?? DEFAULT_WRITER_LABEL
@@ -217,7 +231,7 @@ async function prepareStore(options: OpenOptions): Promise<StoreContext> {
     publish = async (next, expected) => compareAndSwapRemote(repo, ref, next, expected, remote)
   }
   await refresh()
-  return { repo, ref, writer, instance, backend, retryBudgetMs, refresh, publish, nextSeq }
+  return { repo, ref, writer, instance, committer, backend, retryBudgetMs, refresh, publish, nextSeq }
 }
 
 async function prepareReader(options: OpenReaderOptions): Promise<ReaderContext> {
@@ -244,6 +258,7 @@ async function transact(
   update: Update,
   message: string,
   provenance?: CommitProvenance,
+  author?: Ident,
 ): Promise<Committed> {
   if (typeof message !== "string" || message.trim().length === 0) {
     throw new TypeError("message must say why this transaction exists")
@@ -277,6 +292,8 @@ async function transact(
           instance: context.instance,
           seq,
           ...(provenance === undefined ? {} : { provenance }),
+          author: author ?? context.committer,
+          committer: context.committer,
         }),
       )
       return {

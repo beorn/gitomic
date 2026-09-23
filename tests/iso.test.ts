@@ -102,6 +102,8 @@ describe("iso backend", () => {
           instance: null,
           seq: null,
           provenance: null,
+          author: { name: "gitomic", email: "gitomic@localhost" },
+          committer: { name: "gitomic", email: "gitomic@localhost" },
           timestamp: 946_684_800,
         })
         expect(await backend.readCommit(repo, second[0] as Oid)).toEqual({
@@ -113,6 +115,8 @@ describe("iso backend", () => {
           ...identity,
           seq: 1,
           provenance,
+          author: { name: "gitomic", email: "gitomic@localhost" },
+          committer: { name: "gitomic", email: "gitomic@localhost" },
           timestamp: 946_684_802,
         })
         const files = await backend.readFiles(repo, second[0] as Oid)

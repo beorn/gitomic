@@ -317,6 +317,8 @@ describe.sequential("shell backend failure boundaries", () => {
         instance: null,
         seq: null,
         provenance: null,
+        author: { name: "Author", email: "author@example.invalid" },
+        committer: { name: "Committer", email: "committer@example.invalid" },
         timestamp: 946_684_900,
       })
       expect(history[2]).toEqual({
@@ -329,6 +331,8 @@ describe.sequential("shell backend failure boundaries", () => {
         instance: null,
         seq: null,
         provenance: null,
+        author: { name: "gitomic", email: "gitomic@localhost" },
+        committer: { name: "gitomic", email: "gitomic@localhost" },
         timestamp: 946_684_800,
       })
       const partialMessage = "partial\n\nGitomic-Writer: ordinary-writer\n"
@@ -339,6 +343,8 @@ describe.sequential("shell backend failure boundaries", () => {
         instance: null,
         seq: null,
         provenance: null,
+        author: { name: "gitomic", email: "gitomic@localhost" },
+        committer: { name: "gitomic", email: "gitomic@localhost" },
       })
       const provenanceMessage =
         "provenance\n\nGitomic-Actor: original-actor\nGitomic-Actor-Session: 0198b5e8-cdd2-7a63-8a81-2fdc8144e6a4\nGitomic-Actor-Generation: 7\nGitomic-Actor-Run: run-0198b5e8\n"

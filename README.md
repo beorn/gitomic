@@ -24,7 +24,7 @@ Check those commits out and `git status` is clean: there is no stray file of our
 - **No config keys, no git notes.**
 - **Bookkeeping rides in the commit message**, as trailers — where git already keeps metadata about a commit.
 
-**Where it stops, exactly.** The commits are still gitomic's own, and they say so: author `gitomic <gitomic@localhost>`, timestamps that count up from the parent rather than the clock, and `Gitomic-*` trailers. That is the audit trail, not a leak — but it does mean you can always tell a gitomic commit from one you made by hand. Three more traces:
+**Where it stops, exactly.** The commits are still gitomic's own, and they say so: author and committer `gitomic <gitomic@localhost>` unless you name your own (see [Author and committer](#author-and-committer)), timestamps that count up from the parent rather than the clock, and `Gitomic-*` trailers. That is the audit trail, not a leak — but it does mean you can always tell a gitomic commit from one you made by hand. Three more traces:
 
 - A failed or replayed transaction leaves unreferenced objects until git's next `gc`.
 - Moving your ref adds a reflog entry wherever reflogs are on.
@@ -97,12 +97,39 @@ type CommitProvenance = { readonly actor: string; readonly session: string; read
 
 store.head(): Promise<string>            // newest commit id
 store.at(commit?: string): Snapshot      // read-only view there — lazy
-store.transact(fn: Update, message: string, options?: { readonly provenance?: CommitProvenance }): Promise<Committed>
+store.transact(fn: Update, message: string, options?: { readonly provenance?: CommitProvenance; readonly author?: Ident }): Promise<Committed>
 ```
 
 `transact` runs your update function and lands its writes as one commit, re-running it if another writer got there first. `message` is required — it becomes the commit message; say why, not what. The update function's second argument, `base`, is the commit oid it is running against on this attempt — a fresh tip on every re-run — so a precondition check can name the exact commit it refused on.
 
 Callers with independently verified original attribution may provide it as per-call `provenance`. Gitomic copies and validates its scalar fields before queueing the call, then records them in commit trailers, fixed through every retry; it never infers them from a writer label, process, environment, or store. Omitting provenance leaves that call unattributed even on a reused store. An unchanged transaction returns the existing commit without recording new attribution. This metadata is an audit record, never authority to write.
+
+### Author and committer
+
+Git records two people on every commit, and gitomic takes both as data:
+
+```ts
+type Ident = { readonly name: string; readonly email: string }
+
+const store = await open({ repo, ref, writer: "km", committer: { name: "km", email: "km@example.invalid" } })
+await store.transact(update, "close 42", { author: { name: "ada", email: "ada@example.invalid" } })
+```
+
+- The **committer** is who applied the commit: one per store, set at `open` (or `openEvents`).
+- The **author** is who the commit acts for: one per call, on `transact`, `apply`, and the events `transact` and `append`. A call that names none has the committer as its author, which is git's own rule.
+- Name neither and every byte is as before: author and committer `gitomic <gitomic@localhost>`.
+- An event chain's genesis always keeps gitomic's identity, so every store computes the same empty root.
+- gitomic never reads the environment, git config, or a process to find an ident. The caller works it out and passes it; gitomic records it and never verifies it.
+- The ident is copied when the call is submitted and stays fixed through every retry.
+- `CommitMeta` and `Event` carry `author` and `committer`, read from the commit header. History written before idents were data reads back as `gitomic <gitomic@localhost>`.
+
+**An ident git would change is refused, never changed.** git's `commit-tree` silently strips some characters, which would give the shell backend a different commit from `mem` and `iso` for the same input. So a name or email is refused, with a `TypeError` naming the field, when it:
+
+- is empty or not a valid UTF-8 string;
+- contains `<`, `>`, a newline, NUL or any other control character;
+- begins or ends with a space or any of `. , : ; < > " \ '`. git 2.42 and later keep a trailing `.`, but 2.36 to 2.41 strip it, so it is refused while those stay supported.
+
+`identProblem(ident)` returns the same reason as a string, or `undefined` when the ident is fine. Check an ident you did not choose (a user's git config) with it first, and fall back to your program's own ident instead of failing the write.
 
 ### Who wrote it
 
@@ -166,7 +193,7 @@ const commits = await reader.log({ from: revision, limit: 50 })
 const changes = await reader.diff(olderRevision, revision)
 ```
 
-`log({ from?, limit? })` returns newest-first, first-parent `CommitMeta` records. It pins one tip when `from` is omitted; `limit` defaults to 50 and must be a positive safe integer no greater than 1,024. Each record contains `oid`, `parent` (`null` at the root), the full `message`, and the committer's `timestamp` in seconds. Gitomic's own timestamps preserve order, not wall-clock time. The `writer`, `instance`, and `seq` audit trailers are each `null` when absent; `provenance` is `null` when no attribution trailers are present. Malformed, duplicate, or partial provenance trailers fail loudly. These are recorded labels, not verified authorship.
+`log({ from?, limit? })` returns newest-first, first-parent `CommitMeta` records. It pins one tip when `from` is omitted; `limit` defaults to 50 and must be a positive safe integer no greater than 1,024. Each record contains `oid`, `parent` (`null` at the root), the full `message`, the `author` and `committer` idents, and the committer's `timestamp` in seconds. Gitomic's own timestamps preserve order, not wall-clock time. The `writer`, `instance`, and `seq` audit trailers are each `null` when absent; `provenance` is `null` when no attribution trailers are present. Malformed, duplicate, or partial provenance trailers fail loudly. These are recorded labels, not verified authorship.
 
 `diff(from, to)` returns sorted `{ path, from, to }` records, with blob ids on either side and `null` for an absent path. Both commit endpoints must exist, even when they are equal. It compares the backend's file projection without decoding values, so binary changes work too; it does not report mode-only changes, text hunks, or inferred renames.
 

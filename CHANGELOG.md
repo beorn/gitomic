@@ -4,6 +4,13 @@
 
 ### Added
 
+- Author and committer as data (`Ident = { name, email }`). `open` and
+  `openEvents` take a `committer`; `transact`, `apply`, and the events `transact`
+  and `append` take a per-call `author`, which defaults to the committer.
+  `CommitInput` carries both to every backend, and `CommitMeta` and `Event` read
+  them back from the header. When neither is named, commits are byte-identical
+  to before. An ident that git's `commit-tree` would rewrite is refused, and
+  `identProblem` exposes the same check so callers can fall back first.
 - `gitomic/events`: an append-only event chain on one ref, driven by the same
   compare-and-swap loop as `transact` (`openEvents`, `listRefs`, `chainsUnder`).
   `Store.transact` and `openEvents` now share one loop (`src/engine.ts`): one
