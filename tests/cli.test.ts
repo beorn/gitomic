@@ -85,7 +85,14 @@ describe("gitomic CLI — remote opening", () => {
       const invoke = (args: string[]) =>
         promisify(execFile)("bun", [fileURLToPath(new URL("../src/bin.ts", import.meta.url)), ...args], {
           cwd: workdir,
-          env: { ...process.env, TMPDIR: scratch, GIT_TERMINAL_PROMPT: "0" },
+          // A fixed actor: without one, a machine with no git identity adds the no-author note to stderr.
+          env: {
+            ...process.env,
+            TMPDIR: scratch,
+            GIT_TERMINAL_PROMPT: "0",
+            GIT_AUTHOR_NAME: "URL Writer",
+            GIT_AUTHOR_EMAIL: "url@example.org",
+          },
           encoding: "utf8",
         })
       const write = await invoke(["write", address, "-m", "URL write", "--json", `note.md=${file}`])

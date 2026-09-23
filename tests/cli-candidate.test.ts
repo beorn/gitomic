@@ -139,6 +139,25 @@ describe("gitomic CLI — the repository's gate and one exit-code table", () => 
     expect(commit.committer.email).not.toBe("claimed@example.org")
   })
 
+  test("with no identity anywhere the write still lands, authored by the committer, and stderr says why", async () => {
+    vi.stubEnv("GIT_AUTHOR_NAME", undefined)
+    vi.stubEnv("GIT_AUTHOR_EMAIL", undefined)
+    vi.stubEnv("EMAIL", undefined)
+    vi.stubEnv("GIT_CONFIG_GLOBAL", "/dev/null")
+    vi.stubEnv("GIT_CONFIG_NOSYSTEM", "1")
+    // Refuse auto-detection from the host name, so the case is the same on every machine.
+    vi.stubEnv("GIT_CONFIG_COUNT", "1")
+    vi.stubEnv("GIT_CONFIG_KEY_0", "user.useConfigOnly")
+    vi.stubEnv("GIT_CONFIG_VALUE_0", "true")
+    const result = await run(backend, ["write", address(), "-m", "anonymous", `docs/a.md=${await file("a.md", "a\n")}`])
+    expect(result.code).toBe(0)
+    expect(result.stderr).toMatch(
+      /^gitomic: no author identity \(git var GIT_AUTHOR_IDENT exit 128: .+\); authoring as the committer\n$/u,
+    )
+    const commit = await backend.readCommit(fixture.repo, result.stdout.trim())
+    expect(commit.author).toEqual(commit.committer)
+  })
+
   test("a malformed --author is a usage error (exit 2), never a silent fallback", async () => {
     const result = await run(createMemBackend(), [
       "write",
