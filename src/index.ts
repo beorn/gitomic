@@ -49,8 +49,12 @@ export type { Edit } from "./edits.js"
 export { matchGlob } from "./glob.js"
 export {
   createShellBackend,
+  danglingRefs,
   DEFAULT_REMOTE_TIMEOUT_MS,
+  isMissingObjectFetchError,
   runGit,
+  type DanglingRef,
+  type DanglingRefsOptions,
   type GitResult,
   type RunGitOptions,
   type ShellBackendOptions,

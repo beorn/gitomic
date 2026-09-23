@@ -2,7 +2,15 @@
 
 ## Unreleased
 
+## 0.2.0 — 2026-09-22
+
 ### Added
+
+- `createShellBackend({ baseEnv })` snapshots an exact environment for every
+  backend Git command, while `runGit(..., { env })` keeps overlay semantics.
+- `danglingRefs` and `isMissingObjectFetchError` provide one dependency-free
+  owner for missing local ref-object diagnosis, including actionable fetch
+  errors from the shell backend.
 
 - `gitomic/events`: an append-only event chain on one ref, driven by the same
   compare-and-swap loop as `transact` (`openEvents`, `listRefs`, `chainsUnder`).
