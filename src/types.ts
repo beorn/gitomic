@@ -42,7 +42,35 @@ export type Update = (map: GitMap, base: Oid) => Promise<void>
 export type Committed = {
   oid: Oid
   retries: number
+  /** What the candidate reported for the tree that landed (never a refusal); absent without a candidate. */
+  report?: readonly string[]
 }
+
+/**
+ * What a candidate sees: the attempt's tree, after the caller's update and before the CAS. It runs again on every CAS
+ * replay, against the tree that attempt would land.
+ */
+export type CandidateContext = {
+  /** The tip this attempt builds on. */
+  readonly base: Oid
+  /** The paths the caller's update changed, sorted; what the candidate derives is not in this list. */
+  readonly changed: readonly string[]
+  /** The candidate tree. A derive step sets and deletes here, and those edits land in the same commit. */
+  readonly map: GitMap
+  /** A path's content at `base`, ignoring this write: the trusted view, for a gate the write must not rewrite. */
+  readBase(path: string): Promise<string | undefined>
+  /** Write the current candidate as an unpublished commit on `base` and return its oid, for checks that read git. */
+  materialize(): Promise<Oid>
+}
+
+/** A candidate's verdict: any `refuse` line stops the write; `report` lines ride along with the landed commit. */
+export type CandidateVerdict = {
+  readonly refuse?: readonly string[]
+  readonly report?: readonly string[]
+}
+
+/** Derive and check one candidate tree. gitomic holds no policy: it runs what the caller or repository declares. */
+export type Candidate = (context: CandidateContext) => Promise<CandidateVerdict | undefined>
 
 /**
  * Caller-supplied original attribution recorded beside Gitomic's executor and
@@ -279,6 +307,8 @@ export type TransactOptions = {
   readonly provenance?: CommitProvenance
   /** Git's author for this one transaction. Defaults to the store's committer. */
   readonly author?: Ident
+  /** Derive and check the candidate tree inside the write, before the CAS, on every attempt. */
+  readonly candidate?: Candidate
 }
 
 export type Store = {

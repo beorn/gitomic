@@ -11,7 +11,7 @@ import {
   untilAborted,
   waitForPoll,
 } from "./options.js"
-import { Conflict, EditDoesNotApply, GitTimeout, RetriesExhausted } from "./errors.js"
+import { CandidateRefused, Conflict, EditDoesNotApply, GitTimeout, RetriesExhausted } from "./errors.js"
 import { cloneCommitProvenance, cloneIdent, GITOMIC_IDENT, objectOid, validateOid } from "./git-object.js"
 import {
   assertGitPrefixMatched,
@@ -24,6 +24,7 @@ import {
 import { createShellBackend } from "./shell.js"
 import type {
   BlobValue,
+  Candidate,
   Change,
   CommitProvenance,
   CommitMeta,
@@ -43,7 +44,7 @@ import type {
 } from "./types.js"
 import { assertUtf8, decodeUtf8 } from "./utf8.js"
 
-export { Conflict, EditDoesNotApply, GitTimeout, RetriesExhausted }
+export { CandidateRefused, Conflict, EditDoesNotApply, GitTimeout, RetriesExhausted }
 export type { EditKind, PreconditionType } from "./errors.js"
 export { applyEdits } from "./edits.js"
 export { identProblem } from "./git-object.js"
@@ -61,6 +62,9 @@ export { openRemoteRepository, type OpenedRemoteRepository, type OpenRemoteRepos
 export { parseOwnershipManifest } from "./ownership-manifest.js"
 export type {
   BlobValue,
+  Candidate,
+  CandidateContext,
+  CandidateVerdict,
   Change,
   CommitProvenance,
   CommitMeta,
@@ -96,13 +100,16 @@ export async function open(options: OpenOptions): Promise<Store> {
       // otherwise observe an options object the caller mutated after submit.
       let provenance: CommitProvenance | undefined
       let author: Ident | undefined
+      const candidate = options?.candidate
       try {
         provenance = cloneCommitProvenance(options?.provenance)
         author = cloneIdent(options?.author, "author")
+        if (candidate !== undefined && typeof candidate !== "function")
+          throw new TypeError("candidate must be a function")
       } catch (error) {
         return Promise.reject(error)
       }
-      return enqueue(async () => transact(context, update, message, provenance, author))
+      return enqueue(async () => transact(context, update, message, provenance, author, candidate))
     },
   }
 }
@@ -120,12 +127,17 @@ export async function apply(
   base: Oid,
   edits: readonly Edit[],
   message: string,
-  options?: { readonly author?: Ident },
+  options?: { readonly author?: Ident; readonly candidate?: Candidate },
 ): Promise<Committed> {
   return store.transact(
     (map, head) => applyEdits(map, base, head, edits),
     message,
-    options?.author === undefined ? undefined : { author: options.author },
+    options === undefined
+      ? undefined
+      : {
+          ...(options.author === undefined ? {} : { author: options.author }),
+          ...(options.candidate === undefined ? {} : { candidate: options.candidate }),
+        },
   )
 }
 
@@ -259,6 +271,7 @@ async function transact(
   message: string,
   provenance?: CommitProvenance,
   author?: Ident,
+  candidate?: Candidate,
 ): Promise<Committed> {
   if (typeof message !== "string" || message.trim().length === 0) {
     throw new TypeError("message must say why this transaction exists")
@@ -279,30 +292,53 @@ async function transact(
       const base = checkedFiles(await context.backend.readFiles(context.repo, parent))
       const { map, changes } = makeOverlay(base)
       await update(map, parent)
-      const effective = removeNoopChanges(base, changes)
-      if (effective.size === 0) return { kind: "noop", result: { oid: parent, retries } }
-      seq ??= context.nextSeq()
-      assertNextTree(base, effective)
-      const next = backendOid(
-        await context.backend.writeCommit(context.repo, {
+      const commitInput = (effective: ReadonlyMap<string, string | undefined>, commitMessage: string) => {
+        seq ??= context.nextSeq()
+        assertNextTree(base, effective)
+        return {
           parent,
           changes: effective,
-          message: message.trim(),
+          message: commitMessage,
           writer: context.writer,
           instance: context.instance,
           seq,
           ...(provenance === undefined ? {} : { provenance }),
           author: author ?? context.committer,
           committer: context.committer,
-        }),
-      )
+        }
+      }
+      // The candidate runs on THIS attempt's tree, after the caller's update and before the CAS; a replay runs it again.
+      let report: readonly string[] | undefined
+      if (candidate !== undefined) {
+        const changed = [...removeNoopChanges(base, changes).keys()].sort()
+        const verdict = await candidate({
+          base: parent,
+          changed,
+          map,
+          readBase: async (path) => readValue(base.get(path), path),
+          materialize: async () =>
+            backendOid(
+              await context.backend.writeCommit(
+                context.repo,
+                commitInput(removeNoopChanges(base, changes), `gitomic candidate for: ${message.trim()}`),
+              ),
+            ),
+        })
+        if (verdict?.refuse !== undefined && verdict.refuse.length > 0)
+          throw new CandidateRefused([...verdict.refuse], parent)
+        report = verdict?.report === undefined ? [] : [...verdict.report]
+      }
+      const withReport = (result: Committed): Committed => (report === undefined ? result : { ...result, report })
+      const effective = removeNoopChanges(base, changes)
+      if (effective.size === 0) return { kind: "noop", result: withReport({ oid: parent, retries }) }
+      const next = backendOid(await context.backend.writeCommit(context.repo, commitInput(effective, message.trim())))
       return {
         kind: "write",
         next,
         base: parent,
         instance: context.instance,
-        seq,
-        landed: (oid, retries) => ({ oid: backendOid(oid), retries }),
+        seq: seq as number,
+        landed: (oid, retries) => withReport({ oid: backendOid(oid), retries }),
       }
     },
   })

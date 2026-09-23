@@ -100,3 +100,23 @@ export class GitTimeout extends Error {
     super(`${command} did not finish within its ${timeoutMs} ms limit; its process group was stopped`, options)
   }
 }
+
+/**
+ * The repository's candidate check refused the tree this write would land. Nothing landed and the ref did not move.
+ * `reasons` are the check's own lines, verbatim. `base` is the tip the candidate was built on. Facts only: gitomic
+ * runs whatever check the caller or the repository's trusted base declares; it holds no policy of its own.
+ */
+export class CandidateRefused extends Error {
+  override readonly name = "CandidateRefused"
+  /** Stable machine key; the same string across every backend and release. */
+  readonly code = "candidate-refused" as const
+
+  constructor(
+    readonly reasons: readonly string[],
+    /** The commit the refused candidate was built on. */
+    readonly base: string,
+    options?: ErrorOptions,
+  ) {
+    super(`candidate-refused: ${reasons.length} reason(s) at base ${base}: ${reasons.join("; ")}`, options)
+  }
+}
