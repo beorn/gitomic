@@ -1056,6 +1056,7 @@ async function fetchRefs(
       "--porcelain",
       "--no-tags",
       "--no-write-fetch-head",
+      "--refmap=",
       ...(prefix === undefined ? [] : ["--prune"]),
       remote,
       ...refspecs,

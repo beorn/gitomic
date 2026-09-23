@@ -454,7 +454,7 @@ describe("remote: one atomic push, one fetch", () => {
     }
   })
 
-  test("fetchRefs brings every ref under a prefix in one process, and names what it read", async () => {
+  test("fetchRefs brings every ref under a prefix in one process without applying the remote's tracking refspec", async () => {
     for (const make of [createShellBackend, createIsoBackend]) {
       const pair = await remotePair()
       try {
@@ -471,18 +471,34 @@ describe("remote: one atomic push, one fetch", () => {
         }
         const fetchRefs = backend.fetchRefs as NonNullable<GitomicBackend["fetchRefs"]>
         const there = await listRefs("refs/yrd/q/changes/", { repo: pair.origin.repo, backend: writer })
+        const tracked = there.values().next().value
+        if (tracked === undefined) throw new Error("fixture wrote no remote change tip")
+        await git(pair.origin.repo, "update-ref", "refs/heads/main", tracked)
+        await fetchRefs(pair.local.repo, "refs/yrd/q", "origin")
+        await git(
+          pair.local.repo,
+          "config",
+          "--replace-all",
+          "remote.origin.fetch",
+          "+refs/heads/*:refs/remotes/origin/*",
+        )
+        await git(pair.local.repo, "update-ref", "refs/remotes/origin/main", tracked)
+        expect([...(await fetchRefs(pair.local.repo, "refs/heads/main", "origin"))]).toEqual([
+          ["refs/heads/main", tracked],
+        ])
         // Warm the per-repository probes so the count is the fetch alone.
         await listRefs("refs/yrd/", { repo: pair.local.repo, backend })
 
         const spy = vi.spyOn(childProcess, "spawn")
-        const fetched = await fetchRefs(pair.local.repo, "refs/yrd/q/changes/", "origin")
+        const fetched = await fetchRefs(pair.local.repo, "refs/yrd/q", "origin")
         expect(gitSpawns(spy), name).toBe(1)
         spy.mockRestore()
         expect([...fetched], name).toEqual([...there])
+        expect(await tipOf(pair.local.repo, writer, "refs/remotes/origin/main"), name).toBe(tracked)
         // Unchanged tips are still reported, and a deleted remote ref drops out.
-        expect([...(await fetchRefs(pair.local.repo, "refs/yrd/q/changes/", "origin"))], name).toEqual([...there])
+        expect([...(await fetchRefs(pair.local.repo, "refs/yrd/q", "origin"))], name).toEqual([...there])
         await git(pair.origin.repo, "update-ref", "-d", "refs/yrd/q/changes/a")
-        expect([...(await fetchRefs(pair.local.repo, "refs/yrd/q/changes/", "origin")).keys()], name).toEqual([
+        expect([...(await fetchRefs(pair.local.repo, "refs/yrd/q", "origin")).keys()], name).toEqual([
           "refs/yrd/q/changes/b",
         ])
         // Named refs: a missing one fails loudly, naming it.
