@@ -2,21 +2,26 @@
 import { readFile } from "node:fs/promises"
 
 import { type Address, parseAddress } from "./address.js"
-import { validateOid } from "./git-object.js"
+import { assertTrailers, identProblem, validateOid } from "./git-object.js"
 import {
   apply,
+  CandidateRefused,
   EditDoesNotApply,
   matchGlob,
   open,
   openReader,
   openRemoteRepository,
+  repositoryCandidate,
+  runGit,
   type Committed,
   type CommitMeta,
   type Edit,
   type GitomicBackend,
+  type Ident,
   type Oid,
   type OpenOptions,
   type Snapshot,
+  type Trailer,
 } from "./index.js"
 import { decodeUtf8 } from "./utf8.js"
 
@@ -98,14 +103,24 @@ import { decodeUtf8 } from "./utf8.js"
  * do not, and a write refusal is unchanged by it. Product output goes to
  * stdout; narration and errors go to stderr.
  *
- * Exit codes — the only four, nothing else is a success:
- * - `0` ok.
+ * Write verbs run the repository's own gate: the `.gitomic.conf` its base
+ * declares (see `repositoryCandidate`). `--author "Name <email>"` records who
+ * acted, defaulting to the ident `git commit` would record (ADR-0020); gitomic
+ * stays the committer. `--trailer Key=Value` (repeatable) adds caller trailers;
+ * `Gitomic-*` keys are gitomic's own and refused.
+ *
+ * Exit codes — the only five, nothing else is a success:
+ * - `0` ok: landed, or already current.
  * - `1` a runtime/data error: a read or backend failure (not-found, invalid
  *   UTF-8, exhausted retries — the subject names itself in the message).
  * - `2` a usage error (unknown verb, a missing or malformed argument or
  *   flag, a bad address).
  * - `3` an {@link EditDoesNotApply} CAS precondition refusal, reported as
- *   facts only on stderr — never an owner, role, or remediation.
+ *   facts only on stderr — never an owner, role, or remediation. Tree and
+ *   ref unchanged.
+ * - `4` a {@link CandidateRefused}: the repository's gate refused the write.
+ *   Its reasons, then one machine line `code=candidate-refused base=<oid>
+ *   reasons=<JSON array>`. Tree and ref unchanged.
  *
  * Deliberately not built here (need new grammar or library plumbing this CLI
  * does not add): `read --log`, `commit <checkout>`.
@@ -131,13 +146,13 @@ export async function main(argv: string[], io: CliIo = {}): Promise<number> {
       case "diff":
         return await runDiff(args, stdout, backend)
       case "write":
-        return await runWrite(args, stdin, stdout, backend)
+        return await runWrite(args, stdin, stdout, stderr, backend)
       case "rm":
-        return await runRm(args, stdout, backend)
+        return await runRm(args, stdout, stderr, backend)
       case "mv":
-        return await runMv(args, stdout, backend)
+        return await runMv(args, stdout, stderr, backend)
       case "apply":
-        return await runApply(args, stdin, stdout, backend)
+        return await runApply(args, stdin, stdout, stderr, backend)
       default:
         throw new UsageError(`unknown verb: ${JSON.stringify(verb)}; expected one of ${VERBS.join(", ")}`)
     }
@@ -162,6 +177,7 @@ const OK = 0
 const RUNTIME_ERROR = 1
 const USAGE_ERROR = 2
 const PRECONDITION_REFUSED = 3
+const CANDIDATE_REFUSED = 4
 const HISTORY_SCAN_LIMIT = 1_024
 
 // --- read verbs --------------------------------------------------------
@@ -347,6 +363,7 @@ async function runWrite(
   args: string[],
   stdin: CliStdin,
   stdout: CliWriter,
+  stderr: CliWriter,
   backend: GitomicBackend | undefined,
 ): Promise<number> {
   const { positionals, flags, repeated } = extractFlags(args, {
@@ -354,8 +371,11 @@ async function runWrite(
     "--writer": "value",
     "--expect": "repeated",
     "--create": "repeated",
+    "--author": "value",
+    "--trailer": "repeated",
     "--json": "boolean",
   })
+  const attribution = parseAttribution(optionalStringFlag(flags, "--author"), repeated.get("--trailer") ?? [])
   const address = requirePositional(positionals, 0, "<address>")
   const message = requireStringFlag(flags, "-m", "-m <message>")
   const writer = optionalStringFlag(flags, "--writer")
@@ -378,18 +398,26 @@ async function runWrite(
     edits.push({ kind: "put", path, content, expect: anchor })
   }
 
-  const committed = await apply(store, base, edits, message)
-  writeReceipt(stdout, committed, flags.get("--json") === true)
+  const committed = await apply(store, base, edits, message, await writeOptions(attribution, repository, stderr))
+  writeReceipt(stdout, stderr, committed, flags.get("--json") === true)
   return OK
 }
 
-async function runRm(args: string[], stdout: CliWriter, backend: GitomicBackend | undefined): Promise<number> {
+async function runRm(
+  args: string[],
+  stdout: CliWriter,
+  stderr: CliWriter,
+  backend: GitomicBackend | undefined,
+): Promise<number> {
   const { positionals, flags, repeated } = extractFlags(args, {
     "-m": "value",
     "--writer": "value",
     "--expect": "repeated",
+    "--author": "value",
+    "--trailer": "repeated",
     "--json": "boolean",
   })
+  const attribution = parseAttribution(optionalStringFlag(flags, "--author"), repeated.get("--trailer") ?? [])
   const address = requirePositional(positionals, 0, "<address>")
   const message = requireStringFlag(flags, "-m", "-m <message>")
   const writer = optionalStringFlag(flags, "--writer")
@@ -413,13 +441,25 @@ async function runRm(args: string[], stdout: CliWriter, backend: GitomicBackend 
     if (anchor === undefined) throw new Error(`path not found, cannot remove: ${JSON.stringify(path)} at ${address}`)
     edits.push({ kind: "rm", path, expect: anchor })
   }
-  const committed = await apply(store, base, edits, message)
-  writeReceipt(stdout, committed, flags.get("--json") === true)
+  const committed = await apply(store, base, edits, message, await writeOptions(attribution, repository, stderr))
+  writeReceipt(stdout, stderr, committed, flags.get("--json") === true)
   return OK
 }
 
-async function runMv(args: string[], stdout: CliWriter, backend: GitomicBackend | undefined): Promise<number> {
-  const { positionals, flags } = extractFlags(args, { "-m": "value", "--writer": "value", "--json": "boolean" })
+async function runMv(
+  args: string[],
+  stdout: CliWriter,
+  stderr: CliWriter,
+  backend: GitomicBackend | undefined,
+): Promise<number> {
+  const { positionals, flags, repeated } = extractFlags(args, {
+    "-m": "value",
+    "--writer": "value",
+    "--author": "value",
+    "--trailer": "repeated",
+    "--json": "boolean",
+  })
+  const attribution = parseAttribution(optionalStringFlag(flags, "--author"), repeated.get("--trailer") ?? [])
   const address = requirePositional(positionals, 0, "<address>")
   const from = requirePositional(positionals, 1, "<from>")
   const to = requirePositional(positionals, 2, "<to>")
@@ -431,8 +471,14 @@ async function runMv(args: string[], stdout: CliWriter, backend: GitomicBackend 
   const base = await store.head()
   const expect = await store.at(base).oid(from)
   if (expect === undefined) throw new Error(`source path not found: ${JSON.stringify(from)} at ${address}`)
-  const committed = await apply(store, base, [{ kind: "mv", from, to, expect }], message)
-  writeReceipt(stdout, committed, flags.get("--json") === true)
+  const committed = await apply(
+    store,
+    base,
+    [{ kind: "mv", from, to, expect }],
+    message,
+    await writeOptions(attribution, repository, stderr),
+  )
+  writeReceipt(stdout, stderr, committed, flags.get("--json") === true)
   return OK
 }
 
@@ -444,6 +490,7 @@ async function runApply(
   args: string[],
   stdin: CliStdin,
   stdout: CliWriter,
+  stderr: CliWriter,
   backend: GitomicBackend | undefined,
 ): Promise<number> {
   const queue = [...args]
@@ -453,6 +500,8 @@ async function runApply(
   let message: string | undefined
   let writer: string | undefined
   let base: Oid | undefined
+  let author: string | undefined
+  const trailers: string[] = []
   let asJson = false
   while (true) {
     const token = queue.at(0)
@@ -468,6 +517,12 @@ async function runApply(
       case "--base":
         base = requireQueuedValue(queue, token)
         break
+      case "--author":
+        author = requireQueuedValue(queue, token)
+        break
+      case "--trailer":
+        trailers.push(requireQueuedValue(queue, token))
+        break
       case "--json":
         asJson = true
         break
@@ -476,6 +531,7 @@ async function runApply(
     }
   }
   if (message === undefined) throw new UsageError("missing -m <message>")
+  const attribution = parseAttribution(author, trailers)
 
   using repository = await openAddressFor(address, backend)
   const store = await open({ ...repository, ...(writer === undefined ? {} : { writer }) })
@@ -485,8 +541,8 @@ async function runApply(
   for (const clause of splitClauses(queue)) {
     edits.push(await parseClause(clause, snapshot, stdin, address))
   }
-  const committed = await apply(store, startBase, edits, message)
-  writeReceipt(stdout, committed, asJson)
+  const committed = await apply(store, startBase, edits, message, await writeOptions(attribution, repository, stderr))
+  writeReceipt(stdout, stderr, committed, asJson)
   return OK
 }
 
@@ -710,14 +766,84 @@ async function removalPrecondition(
 
 /**
  * A write verb's success output: the committed oid on its own line, or — with
- * `--json` — a one-line `{"oid":…,"retries":…}` receipt of the oid and how many
- * CAS retries the landing took (the output contract for an agent scripting the
- * door). An {@link EditDoesNotApply} refusal is unaffected: it stays facts-only
- * on stderr with exit 3.
+ * `--json` — a one-line `{"oid":…,"retries":…,"report":[…]}` receipt of the oid,
+ * how many CAS retries the landing took, and the repository gate's report (the
+ * output contract for an agent scripting the door). In plain mode each report
+ * line goes to stderr as `report: <line>`, so stdout stays the bare oid. A
+ * refusal is unaffected: facts only on stderr, exit 3 or 4.
  */
-function writeReceipt(stdout: CliWriter, committed: Committed, asJson: boolean): void {
-  if (asJson) stdout.write(`${JSON.stringify({ oid: committed.oid, retries: committed.retries })}\n`)
-  else stdout.write(`${committed.oid}\n`)
+function writeReceipt(stdout: CliWriter, stderr: CliWriter, committed: Committed, asJson: boolean): void {
+  const report = committed.report ?? []
+  if (asJson) {
+    stdout.write(`${JSON.stringify({ oid: committed.oid, retries: committed.retries, report })}\n`)
+    return
+  }
+  stdout.write(`${committed.oid}\n`)
+  for (const line of report) stderr.write(`report: ${line}\n`)
+}
+
+type Attribution = { author: Ident | undefined; trailers: Trailer[] }
+
+/** Parse `--author "Name <email>"` and each `--trailer Key=Value`; either one malformed is a usage error. */
+function parseAttribution(author: string | undefined, trailerFlags: readonly string[]): Attribution {
+  const trailers: Trailer[] = trailerFlags.map((flag) => {
+    const equals = flag.indexOf("=")
+    if (equals <= 0) throw new UsageError(`--trailer must be Key=Value, got ${JSON.stringify(flag)}`)
+    return [flag.slice(0, equals), flag.slice(equals + 1)]
+  })
+  try {
+    assertTrailers(trailers)
+  } catch (error) {
+    throw new UsageError(`--trailer: ${error instanceof Error ? error.message : String(error)}`)
+  }
+  if (author === undefined) return { author: undefined, trailers }
+  const match = /^(.+?) <([^<>]+)>$/u.exec(author)
+  if (match === null) throw new UsageError(`--author must be "Name <email>", got ${JSON.stringify(author)}`)
+  const ident = { name: match[1] ?? "", email: match[2] ?? "" }
+  const problem = identProblem(ident)
+  if (problem !== undefined) throw new UsageError(`--author ${problem}`)
+  return { author: ident, trailers }
+}
+
+/**
+ * The options every write verb passes to `apply`: the actor (ADR-0020 — `--author`, else the ident `git commit` would
+ * record, resolved by `git var GIT_AUTHOR_IDENT`), the caller's trailers, and the repository's own declared gate.
+ */
+async function writeOptions(
+  attribution: Attribution,
+  repository: OpenOptions,
+  stderr: CliWriter,
+): Promise<{ author?: Ident; trailers: Trailer[]; candidate: ReturnType<typeof repositoryCandidate> }> {
+  const author = attribution.author ?? (await claimedAuthor(stderr))
+  return {
+    ...(author === undefined ? {} : { author }),
+    trailers: attribution.trailers,
+    candidate: repositoryCandidate({ repo: repository.repo }),
+  }
+}
+
+/**
+ * The author `git commit` would record in the caller's environment. A missing or unusable ident never stops the write
+ * (ADR-0020): the commit is authored by gitomic's committer, and stderr says why.
+ */
+async function claimedAuthor(stderr: CliWriter): Promise<Ident | undefined> {
+  const result = await runGit(["var", "GIT_AUTHOR_IDENT"])
+  const line = result.stdout.toString("utf8").trim()
+  const match = /^(.+?) <([^<>]*)> \d+ [+-]\d{4}$/u.exec(line)
+  if (result.code !== 0 || match === null) {
+    const detail = result.stderr.toString("utf8").trim().split("\n").at(-1) ?? ""
+    stderr.write(
+      `gitomic: no author identity (git var GIT_AUTHOR_IDENT exit ${result.code}${detail ? `: ${detail}` : ""}); authoring as the committer\n`,
+    )
+    return undefined
+  }
+  const ident = { name: match[1] ?? "", email: match[2] ?? "" }
+  const problem = identProblem(ident)
+  if (problem !== undefined) {
+    stderr.write(`gitomic: git var GIT_AUTHOR_IDENT ${problem}; authoring as the committer\n`)
+    return undefined
+  }
+  return ident
 }
 
 // --- argument parsing ------------------------------------------------------
@@ -875,6 +1001,10 @@ function reportError(error: unknown, stderr: CliWriter): number {
   if (error instanceof EditDoesNotApply) {
     stderr.write(formatEditDoesNotApply(error))
     return PRECONDITION_REFUSED
+  }
+  if (error instanceof CandidateRefused) {
+    stderr.write(`${error.message}\ncode=${error.code} base=${error.base} reasons=${JSON.stringify(error.reasons)}\n`)
+    return CANDIDATE_REFUSED
   }
   stderr.write(`gitomic: ${describeFailure(error)}\n`)
   return RUNTIME_ERROR

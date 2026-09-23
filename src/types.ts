@@ -309,6 +309,8 @@ export type TransactOptions = {
   readonly author?: Ident
   /** Derive and check the candidate tree inside the write, before the CAS, on every attempt. */
   readonly candidate?: Candidate
+  /** Caller trailers for this one transaction, written ahead of gitomic's own; `Gitomic-*` keys are reserved. */
+  readonly trailers?: readonly Trailer[]
 }
 
 export type Store = {

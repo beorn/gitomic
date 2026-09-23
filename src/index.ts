@@ -25,6 +25,7 @@ import { createShellBackend } from "./shell.js"
 import type {
   BlobValue,
   Candidate,
+  Trailer,
   Change,
   CommitProvenance,
   CommitMeta,
@@ -107,6 +108,8 @@ export async function open(options: OpenOptions): Promise<Store> {
       let provenance: CommitProvenance | undefined
       let author: Ident | undefined
       const candidate = options?.candidate
+      const trailers =
+        options?.trailers === undefined ? undefined : options.trailers.map(([key, value]) => [key, value] as const)
       try {
         provenance = cloneCommitProvenance(options?.provenance)
         author = cloneIdent(options?.author, "author")
@@ -115,7 +118,7 @@ export async function open(options: OpenOptions): Promise<Store> {
       } catch (error) {
         return Promise.reject(error)
       }
-      return enqueue(async () => transact(context, update, message, provenance, author, candidate))
+      return enqueue(async () => transact(context, update, message, provenance, author, candidate, trailers))
     },
   }
 }
@@ -133,7 +136,7 @@ export async function apply(
   base: Oid,
   edits: readonly Edit[],
   message: string,
-  options?: { readonly author?: Ident; readonly candidate?: Candidate },
+  options?: { readonly author?: Ident; readonly candidate?: Candidate; readonly trailers?: readonly Trailer[] },
 ): Promise<Committed> {
   return store.transact(
     (map, head) => applyEdits(map, base, head, edits),
@@ -143,6 +146,7 @@ export async function apply(
       : {
           ...(options.author === undefined ? {} : { author: options.author }),
           ...(options.candidate === undefined ? {} : { candidate: options.candidate }),
+          ...(options.trailers === undefined ? {} : { trailers: options.trailers }),
         },
   )
 }
@@ -278,6 +282,7 @@ async function transact(
   provenance?: CommitProvenance,
   author?: Ident,
   candidate?: Candidate,
+  trailers?: readonly Trailer[],
 ): Promise<Committed> {
   if (typeof message !== "string" || message.trim().length === 0) {
     throw new TypeError("message must say why this transaction exists")
@@ -309,6 +314,7 @@ async function transact(
           instance: context.instance,
           seq,
           ...(provenance === undefined ? {} : { provenance }),
+          ...(trailers === undefined ? {} : { trailers }),
           author: author ?? context.committer,
           committer: context.committer,
         }
