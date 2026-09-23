@@ -45,7 +45,7 @@ type GitOptions = {
 }
 
 /** Options for {@link runGit}. */
-export type RunGitOptions = GitOptions
+export type RunGitOptions = Omit<GitOptions, "baseEnv">
 
 /** One local ref whose named object is absent from the repository. */
 export type DanglingRef = Readonly<{ ref: string; oid: string }>
