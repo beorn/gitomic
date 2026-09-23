@@ -34,6 +34,8 @@ Check those commits out and `git status` is clean: there is no stray file of our
 
 ## Install
 
+> Install from npm; a git install resolves the TypeScript source and runs only under Bun.
+
 ```sh
 npm install gitomic
 ```
