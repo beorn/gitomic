@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, test } from "vitest"
 
 import { CandidateRefused } from "../src/errors.js"
 import { CANDIDATE_CONFIG, createShellBackend, open, repositoryCandidate, type Store } from "../src/index.js"
+import { runCommand } from "../src/shell.js"
 import { createBareRepo } from "./helpers/git.js"
 
 let scripts: string
@@ -130,6 +131,17 @@ describe("repositoryCandidate — the gate the repository's trusted base declare
     await expect(write("docs/a.md", "a\n")).rejects.toMatchObject({
       reasons: [expect.stringMatching(/check .*absent\.sh.* could not run \(exit 127\)/u)],
     })
+  })
+
+  test("a command that exits without reading its stdin resolves with its own exit code, never the closed pipe", async () => {
+    // A gate may ignore the changed paths on stdin. Whether the write meets the closed pipe (EPIPE) before the exit is
+    // a race, lost about half the time, so ten runs make a regression near-certain to show.
+    const input = "x".repeat(200_000)
+    const codes: number[] = []
+    for (let run = 0; run < 10; run++) {
+      codes.push((await runCommand("sh", ["-c", `exit ${run % 2}`], { input, timeoutMs: 5_000 })).code)
+    }
+    expect(codes).toEqual([0, 1, 0, 1, 0, 1, 0, 1, 0, 1])
   })
 
   test("a write that changes .gitomic.conf and anything else is refused; alone it lands", async () => {

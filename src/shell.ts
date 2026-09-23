@@ -278,10 +278,13 @@ async function run(command: string, args: readonly string[], options: GitOptions
       if (timedOut) return
       settle(() => resolveResult(result(code)))
     })
-    child.stdin.on("error", (error) => {
+    child.stdin.on("error", (error: NodeJS.ErrnoException) => {
       // A command stopped at its limit closes stdin under a pending write; the
-      // limit is then the reported outcome. Any other stdin failure is the result.
-      if (!timedOut) settle(() => reject(error))
+      // limit is then the reported outcome. A command that exits (or closes
+      // stdin) without reading all of its input breaks the pipe: its exit code
+      // is the result, never the EPIPE. Any other stdin failure is the result.
+      if (timedOut || error.code === "EPIPE") return
+      settle(() => reject(error))
     })
     child.stdin.end(options.input)
   })
