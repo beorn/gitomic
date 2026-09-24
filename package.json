@@ -30,11 +30,15 @@
     "CHANGELOG.md",
     "LICENSE"
   ],
+  "dependencies": {
+    "@bearly/flock": "^0.1.1"
+  },
   "type": "module",
   "sideEffects": false,
   "exports": {
     ".": "./src/index.ts",
     "./adapters": "./src/adapters.ts",
+    "./checkout-lock": "./src/checkout-lock.ts",
     "./events": "./src/events.ts",
     "./iso": "./src/iso.ts",
     "./mem": "./src/mem.ts"
@@ -51,6 +55,10 @@
       "./adapters": {
         "types": "./dist/adapters.d.ts",
         "import": "./dist/adapters.js"
+      },
+      "./checkout-lock": {
+        "types": "./dist/checkout-lock.d.ts",
+        "import": "./dist/checkout-lock.js"
       },
       "./events": {
         "types": "./dist/events.d.ts",

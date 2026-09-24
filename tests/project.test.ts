@@ -9,7 +9,6 @@ import { join } from "node:path"
 
 import { afterAll, afterEach, beforeEach, describe, expect, test, vi } from "vitest"
 
-import { main } from "../src/bin.js"
 import { projectRemoteFirstFastForward, synchronizeCheckoutToCommit, worktreeDirtyPaths } from "../src/index.js"
 import { gitOutcomeForTest } from "../src/project.js"
 
@@ -47,22 +46,12 @@ function git(root: string, ...args: string[]): string {
   return (result.stdout ?? "").trim()
 }
 
-function capture(): { write(chunk: string): void; text(): string } {
-  const chunks: string[] = []
-  return {
-    write(chunk: string) {
-      chunks.push(chunk)
-    },
-    text: () => chunks.join(""),
-  }
-}
-
+/**
+ * `project` and `apply --checkout` hold the checkout lock, which needs Bun, and
+ * this suite's runner is Node: every CLI call here runs the real `bun` binary.
+ */
 async function runCli(args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
-  const stdout = capture()
-  const stderr = capture()
-  async function* emptyStdin(): AsyncGenerator<string> {}
-  const code = await main(args, { stdin: emptyStdin(), stdout, stderr })
-  return { code, stdout: stdout.text(), stderr: stderr.text() }
+  return runCliSubprocess(args)
 }
 
 function runCliSubprocess(args: string[]): { code: number; stdout: string; stderr: string } {
@@ -626,9 +615,12 @@ describe("gitomic project and checkout synchronization", () => {
       const shim = join(root, "git-shim")
       mkdirSync(shim)
       const realGit = spawnSync("which", ["git"], { encoding: "utf8" }).stdout.trim()
+      // The first common-dir read resolves the checkout lock; the inspection that
+      // fails is the one after the write lands.
+      const seen = join(root, "lock-resolved")
       writeFileSync(
         join(shim, "git"),
-        `#!/bin/sh\nif [ "$2" = "${checkout}" ] && [ "$3" = rev-parse ] && [ "$4" = --path-format=absolute ]; then\n  echo inspection unavailable >&2\n  exit 74\nfi\nexec ${realGit} "$@"\n`,
+        `#!/bin/sh\nif [ "$2" = "${checkout}" ] && [ "$3" = rev-parse ] && [ "$4" = --path-format=absolute ]; then\n  if [ -e "${seen}" ]; then\n    echo inspection unavailable >&2\n    exit 74\n  fi\n  : > "${seen}"\nfi\nexec ${realGit} "$@"\n`,
         { mode: 0o755 },
       )
       vi.stubEnv("PATH", `${shim}:${process.env.PATH}`)
@@ -655,6 +647,39 @@ describe("gitomic project and checkout synchronization", () => {
       expect(result.stderr).toContain(`cannot inspect repository "${checkout}"`)
       expect(result.stderr).toContain("inspection unavailable")
       expect(result.stderr).toContain("kind=repository-inspection-failed")
+    })
+
+    test("apply --checkout that cannot resolve the checkout lock refuses before writing", async () => {
+      const { root, bare, checkout } = remoteFixture()
+      const shim = join(root, "git-shim")
+      mkdirSync(shim)
+      const realGit = spawnSync("which", ["git"], { encoding: "utf8" }).stdout.trim()
+      writeFileSync(
+        join(shim, "git"),
+        `#!/bin/sh\nif [ "$2" = "${checkout}" ] && [ "$3" = rev-parse ] && [ "$4" = --path-format=absolute ]; then\n  echo inspection unavailable >&2\n  exit 74\nfi\nexec ${realGit} "$@"\n`,
+        { mode: 0o755 },
+      )
+      vi.stubEnv("PATH", `${shim}:${process.env.PATH}`)
+      const before = git(bare, "rev-parse", "refs/heads/main")
+      const content = join(root, "inspection.txt")
+      writeFileSync(content, "# never committed\n")
+
+      const result = await runCli([
+        "apply",
+        `${bare}#main`,
+        "-m",
+        "lock unresolvable",
+        "--checkout",
+        checkout,
+        "put",
+        "tracked.md",
+        content,
+      ])
+
+      expect(result.code).toBe(1)
+      expect(result.stderr).toContain(`cannot resolve the checkout lock of "${checkout}"`)
+      expect(result.stderr).toContain("inspection unavailable")
+      expect(git(bare, "rev-parse", "refs/heads/main")).toBe(before)
     })
   })
 

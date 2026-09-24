@@ -384,6 +384,11 @@ function sameSet(left: readonly string[], right: readonly string[]): boolean {
  * stake, because the ref has ALREADY advanced by the time this runs: a silent
  * failure here leaves exactly the bricked state this module exists to prevent,
  * and the write refusals it then produces name files nobody edited.
+ *
+ * Runs under the caller's checkout lock (`gitomic/checkout-lock`) and never
+ * takes it: a second open of the lock file in a process that already holds it
+ * is a second open file description, which waits on its own holder until the
+ * timeout.
  */
 export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): CheckoutSyncOutcome {
   const { repoRoot, from, to, ref } = request
@@ -562,7 +567,10 @@ export type RemoteFirstProjectionOutcome =
  * off-checkout transport (the 24161 seam): fetch the landing, fast-forward the
  * local branch ONLY when it is a strict ancestor, then reuse the existing
  * two-way index merge above — this arm is a composition, never a third
- * synchronizer. Runs under the caller's checkout lock, like every projection.
+ * synchronizer. Runs under the caller's checkout lock (`gitomic/checkout-lock`),
+ * like every projection, and never takes it: a second open of the lock file in
+ * a process that already holds it is a second open file description, which
+ * waits on its own holder until the timeout.
  *
  * A local-only commit (the legacy strand) blocks the fast-forward and is
  * reported as `landed-but-unsynchronized`, naming both commits and the
@@ -784,7 +792,13 @@ export type ProjectCheckoutOutcome = RemoteFirstProjectionOutcome & {
 /**
  * Fetch a remote branch and project a checkout to that branch's remote tip.
  *
- * This is the routine fronted by `gitomic project <path>`.
+ * This is the routine fronted by `gitomic project <path>`, which takes the
+ * checkout lock around it.
+ *
+ * Runs under the caller's checkout lock (`gitomic/checkout-lock`) and never
+ * takes it: a second open of the lock file in a process that already holds it
+ * is a second open file description, which waits on its own holder until the
+ * timeout.
  */
 export async function projectCheckout(request: ProjectCheckoutRequest): Promise<ProjectCheckoutOutcome> {
   const { repoRoot } = request

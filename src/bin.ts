@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process"
 import { readFile } from "node:fs/promises"
 import { resolve } from "node:path"
 
+import type { CheckoutLock } from "./checkout-lock.js"
 import { type Address, parseAddress } from "./address.js"
 import { assertTrailers, identProblem, validateOid } from "./git-object.js"
 import {
@@ -123,7 +124,9 @@ import { decodeUtf8 } from "./utf8.js"
  *
  * With `--checkout <path>`, write verbs project `<path>`'s working tree and
  * index forward after a successful write. A projection failure reports to
- * stderr and never fails the landed write.
+ * stderr and never fails the landed write. `apply --checkout` holds the
+ * checkout lock (`gitomic/checkout-lock`) from before it records the
+ * checkout's dirt through the projection.
  *
  * Trust verb:
  * - `trust <addr>` — print the `.gitomic.conf` the address's tip declares,
@@ -134,13 +137,20 @@ import { decodeUtf8 } from "./utf8.js"
  *   never need trust.
  *
  * Project verbs:
- * - `project <path> [--remote <name>] [--ref <ref>] [--timeout <ms>]` — fetch
+ * - `project <path> [--remote <name>] [--ref <ref>] [--timeout <ms>] [--lock-timeout <ms>]` — fetch
  *   the remote branch (default origin/refs/heads/main) and fast-forward the
  *   checkout's index and working tree to the fetched tip under the checkout
  *   lock, preserving unrelated dirt. One-line stdout names outcome kind and
  *   both oids.
  *
- * Exit codes — the only five, nothing else is a success:
+ * The checkout lock is `<git-common-dir>/km-state-write.lock`, waited on for
+ * 15 s unless `--lock-timeout <ms>` says otherwise. A parent that
+ * already holds it passes the descriptor as an inherited fd named by
+ * `GITOMIC_CHECKOUT_LOCK_FD`; the child adopts it rather than waiting on it.
+ * The lock uses @bearly/flock, which needs Bun: under Node, `project` and
+ * `apply --checkout` exit 6, and every other verb is unaffected.
+ *
+ * Exit codes — the only seven, nothing else is a success:
  * - `0` ok: landed, or already current / fast-forwarded.
  * - `1` a runtime/data error: a read or backend failure (not-found, invalid
  *   UTF-8, exhausted retries — the subject names itself in the message) or a
@@ -157,6 +167,13 @@ import { decodeUtf8 } from "./utf8.js"
  *   unsynchronized or stranded checkout (stranded-local-commits,
  *   landed-but-unsynchronized, worktree-update-refused, dirt-changed,
  *   dirt-unverifiable).
+ * - `5` the checkout lock is held by another writer past the wait: transient,
+ *   and nothing was written — not the write, not the checkout. The refusal
+ *   names the lock path and, when the lock records it, the holder's pid and
+ *   argv, then one machine line `kind=checkout-lock-busy path=<path>`.
+ * - `6` the runtime cannot hold the checkout lock: `project` and
+ *   `apply --checkout` under Node. The lock uses flock(2) through bun:ffi and
+ *   Node has no flock API, so these two verbs need Bun. Nothing was written.
  *
  * Deliberately not built here (need new grammar or library plumbing this CLI
  * does not add): `read --log`, `commit <checkout>`.
@@ -222,6 +239,8 @@ const RUNTIME_ERROR = 1
 const USAGE_ERROR = 2
 const PRECONDITION_REFUSED = 3
 const CANDIDATE_REFUSED = 4
+const CHECKOUT_LOCK_BUSY = 5
+const RUNTIME_UNSUPPORTED = 6
 const HISTORY_SCAN_LIMIT = 1_024
 
 // --- read verbs --------------------------------------------------------
@@ -560,6 +579,7 @@ async function runApply(
   let base: Oid | undefined
   let author: string | undefined
   let checkoutPath: string | undefined
+  let lockTimeoutMs: number | undefined
   const trailers: string[] = []
   let asJson = false
   while (true) {
@@ -585,6 +605,9 @@ async function runApply(
       case "--checkout":
         checkoutPath = requireQueuedValue(queue, token)
         break
+      case "--lock-timeout":
+        lockTimeoutMs = parseLockTimeout(requireQueuedValue(queue, token))
+        break
       case "--json":
         asJson = true
         break
@@ -593,7 +616,16 @@ async function runApply(
     }
   }
   if (message === undefined) throw new UsageError("missing -m <message>")
+  if (lockTimeoutMs !== undefined && checkoutPath === undefined) {
+    throw new UsageError("--lock-timeout applies only with --checkout")
+  }
   const attribution = parseAttribution(author, trailers)
+  let checkoutLock: CheckoutLock | undefined
+  if (checkoutPath !== undefined) {
+    checkoutLock = await holdCheckoutLockFor("apply --checkout", checkoutPath, stderr, lockTimeoutMs)
+    if (checkoutLock === undefined) return CHECKOUT_LOCK_BUSY
+  }
+  using _heldThroughProjection = checkoutLock
   const expectedDirtyPaths = checkoutPath !== undefined ? worktreeDirtyPaths(checkoutPath) : []
 
   using repository = await openAddressFor(address, backend)
@@ -618,6 +650,14 @@ async function runApply(
   }
   writeReceipt(stdout, stderr, committed, asJson, projectionOutcome)
   return OK
+}
+
+/** `--lock-timeout <ms>`: how long to wait for another holder of the checkout lock; `0` tries once. */
+function parseLockTimeout(raw: string): number {
+  if (!/^\d+$/u.test(raw)) {
+    throw new UsageError(`--lock-timeout must be a non-negative integer in milliseconds, got ${JSON.stringify(raw)}`)
+  }
+  return Number(raw)
 }
 
 /** Shift the next token as a required flag value, failing loudly by the flag's own name. */
@@ -848,6 +888,35 @@ async function removalPrecondition(
  */
 type ProjectOutcomeReceipt = { readonly ok: boolean; readonly kind: string; readonly error?: string }
 
+/**
+ * Hold the checkout lock of `checkoutPath` for a verb that writes its index or
+ * working tree, or report the busy refusal and return undefined. The module is
+ * loaded here, not at the top, because @bearly/flock needs Bun and every other
+ * verb must keep working under Node.
+ */
+async function holdCheckoutLockFor(
+  verb: string,
+  checkoutPath: string,
+  stderr: CliWriter,
+  timeoutMs: number | undefined,
+): Promise<CheckoutLock | undefined> {
+  let lockModule: typeof import("./checkout-lock.js")
+  try {
+    lockModule = await import("./checkout-lock.js")
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error)
+    throw new RuntimeUnsupported(
+      `${verb} needs Bun: the checkout lock takes flock(2) through bun:ffi, and Node has no flock API; ` +
+        `run \`gitomic ${verb}\` under Bun (loading the lock failed: ${detail})`,
+      { cause: error },
+    )
+  }
+  const held = lockModule.holdCheckoutLock(checkoutPath, timeoutMs === undefined ? {} : { timeoutMs })
+  if (held.ok) return held.lock
+  stderr.write(`gitomic: ${held.error}\nkind=${held.kind} path=${held.path}\n`)
+  return undefined
+}
+
 function isSameRepository(pathA: string, pathB: string): boolean {
   if (resolve(pathA) === resolve(pathB)) return true
   const commonDir = (path: string): string => {
@@ -951,6 +1020,7 @@ async function runProject(args: string[], stdout: CliWriter, stderr: CliWriter):
     "--remote": "value",
     "--ref": "value",
     "--timeout": "value",
+    "--lock-timeout": "value",
   })
   const checkoutPath = requirePositional(positionals, 0, "<path>")
   assertNoExtraPositionals(positionals, 1, "<path>", "project")
@@ -967,6 +1037,10 @@ async function runProject(args: string[], stdout: CliWriter, stderr: CliWriter):
     timeoutMs = Number(timeoutRaw)
   }
 
+  const lockTimeoutRaw = optionalStringFlag(flags, "--lock-timeout")
+  const lockTimeoutMs = lockTimeoutRaw === undefined ? undefined : parseLockTimeout(lockTimeoutRaw)
+  using checkoutLock = await holdCheckoutLockFor("project", checkoutPath, stderr, lockTimeoutMs)
+  if (checkoutLock === undefined) return CHECKOUT_LOCK_BUSY
   const outcome = await projectCheckout({
     repoRoot: checkoutPath,
     remote,
@@ -1211,6 +1285,11 @@ class UsageError extends Error {
   override readonly name = "UsageError"
 }
 
+/** This runtime cannot do what the verb needs; another runtime can. Nothing was written. */
+class RuntimeUnsupported extends Error {
+  override readonly name = "RuntimeUnsupported"
+}
+
 /** Facts only (R8): kind, path, the anchor, what was found, the two commits. No owner, role, or remediation. */
 function formatEditDoesNotApply(error: EditDoesNotApply): string {
   const expected = error.expected ?? "absent"
@@ -1253,6 +1332,10 @@ function reportError(error: unknown, stderr: CliWriter): number {
   if (error instanceof CandidateRefused) {
     stderr.write(`${error.message}\ncode=${error.code} base=${error.base} reasons=${JSON.stringify(error.reasons)}\n`)
     return CANDIDATE_REFUSED
+  }
+  if (error instanceof RuntimeUnsupported) {
+    stderr.write(`gitomic: ${error.message}\nkind=runtime-unsupported\n`)
+    return RUNTIME_UNSUPPORTED
   }
   stderr.write(`gitomic: ${describeFailure(error)}\n`)
   return RUNTIME_ERROR
