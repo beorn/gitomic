@@ -402,7 +402,7 @@ describe("gitomic project and checkout synchronization", () => {
         ref: "refs/heads/main",
         expectedDirtyPaths: worktreeDirtyPaths(checkout),
       })
-      expect(outcome).toMatchObject({ ok: true, kind: "already-current", repairedIndexFrom: parent })
+      expect(outcome).toMatchObject({ ok: true, kind: "synchronized", repairedIndexFrom: parent })
       expect(git(checkout, "write-tree")).toBe(git(checkout, "rev-parse", `${head}^{tree}`))
       expect(worktreeDirtyPaths(checkout)).toEqual([])
     })

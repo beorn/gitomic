@@ -339,7 +339,13 @@ export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): Check
           "so the checkout is not current. Nothing was changed.",
       }
     }
-    return { ok: true, kind: "already-current", dirtyPaths: current.paths, ...repaired }
+    // A repaired index DID move, so the outcome says so: current only when nothing was brought forward.
+    return {
+      ok: true,
+      kind: carried.repairedIndexFrom === undefined ? "already-current" : "synchronized",
+      dirtyPaths: current.paths,
+      ...repaired,
+    }
   }
 
   const branch = checkedOutRef(repoRoot)
@@ -534,15 +540,15 @@ export async function projectRemoteFirstFastForward(
   // Carry an index left at any ancestor's tree forward to the local tip FIRST (25393). This subsumes the old
   // `preTransactTip` arm: an object-side writer that advanced the ref mid-flight leaves the index at an ancestor,
   // which the search finds. From here on the index holds `localTip`, so every merge below starts there.
-  const carried = carryIndexTo(repoRoot, localTip, ref, request.expectedDirtyPaths)
+  const carried = carryIndexTo(repoRoot, localTip, ref, request.expectedDirtyPaths, to)
   if (!carried.ok) return carried.outcome
   const expectedDirtyPaths = carried.expectedDirtyPaths
-  const reported = (outcome: RemoteFirstProjectionOutcome): RemoteFirstProjectionOutcome =>
-    outcome.ok &&
-    carried.repairedIndexFrom !== undefined &&
-    (outcome.kind === "synchronized" || outcome.kind === "already-current")
-      ? { ...outcome, repairedIndexFrom: carried.repairedIndexFrom }
-      : outcome
+  // A repair moved the index and tree, so the checkout was synchronized even when the ref itself did not move.
+  const reported = (outcome: RemoteFirstProjectionOutcome): RemoteFirstProjectionOutcome => {
+    if (!outcome.ok || carried.repairedIndexFrom === undefined) return outcome
+    if (outcome.kind !== "synchronized" && outcome.kind !== "already-current") return outcome
+    return { ...outcome, kind: "synchronized", repairedIndexFrom: carried.repairedIndexFrom }
+  }
   if (localTip === to) {
     // The ref already holds the landing; already-current is verified against the expected dirt and the index.
     return reported(synchronizeCheckoutToCommit({ repoRoot, from: to, to, ref, expectedDirtyPaths }))
