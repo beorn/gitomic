@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto"
 
-import { applyEdits, KEEP_MODE_OF, type Edit } from "./edits.js"
+import { applyEdits, editPaths, KEEP_MODE_OF, PREFETCH_PATHS, type Edit, type PrefetchingUpdate } from "./edits.js"
 import { runCasLoop } from "./engine.js"
 import {
   assertWriter,
@@ -21,6 +21,7 @@ import {
   normalizePath,
   normalizePrefix,
 } from "./path.js"
+import { readLazyBase, type LazyBase } from "./lazy-base.js"
 import { createShellBackend } from "./shell.js"
 import type {
   BlobValue,
@@ -111,6 +112,8 @@ export type {
   Trailer,
   Store,
   TransactOptions,
+  TreeEntry,
+  TreeListing,
   Update,
 } from "./types.js"
 export type { OwnershipManifest, OwnershipManifestPolicy } from "./ownership-manifest.js"
@@ -157,8 +160,11 @@ export async function apply(
   message: string,
   options?: { readonly author?: Ident; readonly candidate?: Candidate; readonly trailers?: readonly Trailer[] },
 ): Promise<Committed> {
+  // The edit list names every path it will read, so one attempt fetches them all in ONE read before the first edit.
+  const update: PrefetchingUpdate = (map, head) => applyEdits(map, base, head, edits)
+  Object.defineProperty(update, PREFETCH_PATHS, { value: editPaths(edits) })
   return store.transact(
-    (map, head) => applyEdits(map, base, head, edits),
+    update,
     message,
     options === undefined
       ? undefined
@@ -319,7 +325,10 @@ async function transact(
     findTransaction: async (winner, base, instance, attemptSeq) =>
       context.backend.findTransaction(context.repo, winner, base, instance, attemptSeq),
     attempt: async (parent, retries) => {
-      const base = checkedFiles(await context.backend.readFiles(context.repo, parent))
+      // Built inside the attempt and never captured by the receipt search: a replay reads its own parent afresh.
+      const base = await readLazyBase(context.backend, context.repo, parent)
+      const prefetch = (update as PrefetchingUpdate)[PREFETCH_PATHS]
+      if (prefetch !== undefined) await base.prefetch(prefetch)
       const { map, changes, modeSources } = makeOverlay(base)
       await update(map, parent)
       const commitInput = (effective: ReadonlyMap<string, string | undefined>, commitMessage: string) => {
@@ -347,7 +356,7 @@ async function transact(
           base: parent,
           changed,
           map,
-          readBase: async (path) => readValue(base.get(path), path),
+          readBase: (path) => base.get(path),
           materialize: async () =>
             backendOid(
               await context.backend.writeCommit(
@@ -482,28 +491,28 @@ function readValue(value: BlobValue | undefined, path: string): string | undefin
   return decodeUtf8(value, `Git blob at ${JSON.stringify(path)}`)
 }
 
-function assertNextTree(base: ReadonlyMap<string, BlobValue>, changes: ReadonlyMap<string, string | undefined>): void {
-  const next = new Map(base)
+function assertNextTree(base: LazyBase, changes: ReadonlyMap<string, string | undefined>): void {
+  const next = new Set(base.listing.keys())
   for (const [path, content] of changes) {
     if (content === undefined) next.delete(path)
-    else next.set(path, content)
+    else next.add(path)
   }
-  assertTreeShape(next.keys())
+  assertTreeShape(next)
 }
 
 function backendOid(value: unknown): Oid {
   return validateOid(value, "backend returned an invalid Git object id")
 }
 
-function makeOverlay(base: ReadonlyMap<string, BlobValue>): {
+function makeOverlay(base: LazyBase): {
   map: GitMap
   changes: Map<string, string | undefined>
   modeSources: Map<string, string>
 } {
   const changes = new Map<string, string | undefined>()
   const modeSources = new Map<string, string>()
-  const get = (path: string): string | undefined =>
-    changes.has(path) ? changes.get(path) : readValue(base.get(path), path)
+  const get = (path: string): Promise<string | undefined> =>
+    changes.has(path) ? Promise.resolve(changes.get(path)) : base.get(path)
   const present = (path: string): boolean => (changes.has(path) ? changes.get(path) !== undefined : base.has(path))
   const map: GitMap = {
     async get(path) {
@@ -522,7 +531,7 @@ function makeOverlay(base: ReadonlyMap<string, BlobValue>): {
     },
     async keys(prefix = "") {
       const normalized = normalizePrefix(prefix)
-      const keys = new Set([...base.keys()].filter(isPublicPath))
+      const keys = new Set(base.publicPaths())
       for (const [path, value] of changes) {
         if (value === undefined) keys.delete(path)
         else keys.add(path)
@@ -551,16 +560,10 @@ function createQueue(): <T>(operation: () => Promise<T>) => Promise<T> {
   }
 }
 
+/** The changes that alter the tree, decided from the listing's oids: no base value is read for it. */
 function removeNoopChanges(
-  base: ReadonlyMap<string, BlobValue>,
+  base: LazyBase,
   changes: ReadonlyMap<string, string | undefined>,
 ): Map<string, string | undefined> {
-  return new Map(
-    [...changes].filter(([path, value]) => {
-      const current = base.get(path)
-      // A byte-valued entry is never equal to a string write: replacing a
-      // binary blob with text is a real change, not a no-op.
-      return typeof current === "string" || current === undefined ? current !== value : true
-    }),
-  )
+  return new Map([...changes].filter(([path, value]) => base.isChange(path, value)))
 }

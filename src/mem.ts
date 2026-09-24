@@ -9,13 +9,24 @@ import {
   GENESIS_MESSAGE,
   INITIAL_TIMESTAMP,
   isZeroOid,
+  objectOid,
   parseCommit,
   refUnderPrefix,
   TRANSACTION_SEARCH_LIMIT,
   transactionLookupExceeded,
   validateOid,
 } from "./git-object.js"
-import type { CommitInput, CommitMeta, GitomicBackend, Oid, PublishResult, RefUpdate } from "./types.js"
+import type {
+  BlobValue,
+  CommitInput,
+  CommitMeta,
+  GitomicBackend,
+  Oid,
+  PublishResult,
+  RefUpdate,
+  TreeEntry,
+  TreeListing,
+} from "./types.js"
 import { assertGitPrefixMatched, normalizePrefix } from "./path.js"
 
 type MemCommit = {
@@ -32,6 +43,10 @@ type MemCommit = {
 type MemRepo = {
   refs: Map<string, Oid>
   commits: Map<Oid, MemCommit>
+  /** Every blob a commit of this repo names, by oid — what `readBlobs` answers from. */
+  blobs: Map<Oid, string>
+  /** The oid of each content already hashed, so a 20,000-file listing hashes each value once. */
+  oidsByContent: Map<string, Oid>
 }
 
 function createInitialCommit(): MemCommit {
@@ -56,7 +71,7 @@ export function createMemBackend(): GitomicBackend {
     let repo = repos.get(name)
     if (repo === undefined) {
       const initial = createInitialCommit()
-      repo = { refs: new Map(), commits: new Map([[initial.oid, initial]]) }
+      repo = { refs: new Map(), commits: new Map([[initial.oid, initial]]), blobs: new Map(), oidsByContent: new Map() }
       repos.set(name, repo)
     }
     return repo
@@ -70,6 +85,41 @@ export function createMemBackend(): GitomicBackend {
       repo.refs.set(ref, oid)
     }
     return oid
+  }
+
+  /** The mem backend hashes like git: the same content is the same blob oid the shell backend reports. */
+  const blobOid = (repo: MemRepo, content: string): Oid => {
+    let oid = repo.oidsByContent.get(content)
+    if (oid === undefined) {
+      oid = objectOid("blob", Buffer.from(content, "utf8"))
+      repo.oidsByContent.set(content, oid)
+      repo.blobs.set(oid, content)
+    }
+    return oid
+  }
+
+  const readTree = async (name: string, commit: Oid, prefix?: string): Promise<TreeListing> => {
+    const repo = getRepo(name)
+    const found = repo.commits.get(commit)
+    if (found === undefined) throw new Error(`unknown commit: ${commit}`)
+    const normalizedPrefix = prefix === undefined ? "" : normalizePrefix(prefix)
+    const listing = new Map<string, TreeEntry>()
+    for (const [path, content] of found.files) {
+      if (path.startsWith(normalizedPrefix)) listing.set(path, { oid: blobOid(repo, content), mode: "100644" })
+    }
+    assertGitPrefixMatched(listing.size, name, commit, normalizedPrefix)
+    return listing
+  }
+
+  const readBlobs = async (name: string, oids: readonly Oid[]): Promise<ReadonlyMap<Oid, BlobValue>> => {
+    const repo = getRepo(name)
+    const read = new Map<Oid, BlobValue>()
+    for (const oid of new Set(oids)) {
+      const content = repo.blobs.get(oid)
+      if (content === undefined) throw new Error(`unknown blob: ${oid}`)
+      read.set(oid, content)
+    }
+    return read
   }
 
   const readFiles = async (name: string, commit: Oid, prefix?: string): Promise<ReadonlyMap<string, string>> => {
@@ -91,8 +141,12 @@ export function createMemBackend(): GitomicBackend {
     }
     const files = new Map(parent.files)
     for (const [path, content] of input.changes) {
-      if (content === undefined) files.delete(path)
-      else files.set(path, content)
+      if (content === undefined) {
+        files.delete(path)
+      } else {
+        files.set(path, content)
+        blobOid(repo, content)
+      }
     }
     const { tree } = encodeFiles(files)
     const timestamp = parent.timestamp + 1
@@ -232,6 +286,8 @@ export function createMemBackend(): GitomicBackend {
         if (found === undefined) throw new Error(`cannot read commit ${oid} in ${JSON.stringify(name)}: unknown commit`)
         return parseCommit(oid, found.content)
       }),
+    readTree,
+    readBlobs,
     readFiles,
     writeCommit,
     compareAndSwap,

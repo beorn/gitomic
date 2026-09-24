@@ -1,6 +1,6 @@
 import { objectOid, validateOid } from "./git-object.js"
 import { EditDoesNotApply } from "./errors.js"
-import type { GitMap, Oid } from "./types.js"
+import type { GitMap, Oid, Update } from "./types.js"
 
 /**
  * The transaction map's internal hook that makes `to` keep the parent mode of `from` (an executable moved stays
@@ -9,6 +9,29 @@ import type { GitMap, Oid } from "./types.js"
  */
 export const KEEP_MODE_OF: unique symbol = Symbol("gitomic.keepModeOf")
 export type ModeKeepingMap = GitMap & { readonly [KEEP_MODE_OF]?: (to: string, from: string) => void }
+
+/**
+ * The paths an update will read, declared ahead of it so one attempt fetches
+ * their values in ONE backend read instead of one per `await map.get`. Symbol-
+ * keyed so it is not part of `Update`: `apply` sets it from its edit list, and
+ * an update without it reads lazily as it goes.
+ */
+export const PREFETCH_PATHS: unique symbol = Symbol("gitomic.prefetchPaths")
+export type PrefetchingUpdate = Update & { readonly [PREFETCH_PATHS]?: readonly string[] }
+
+/** Every path an edit list reads before it writes: the anchor of each edit, both ends of a move. */
+export function editPaths(edits: readonly Edit[]): readonly string[] {
+  const paths = new Set<string>()
+  for (const edit of edits) {
+    if (edit.kind === "mv") {
+      paths.add(edit.from)
+      paths.add(edit.to)
+    } else {
+      paths.add(edit.path)
+    }
+  }
+  return [...paths]
+}
 
 /**
  * The four edits `apply` carries. Each names the anchor it was authored
