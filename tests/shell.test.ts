@@ -21,7 +21,7 @@ import {
 } from "../src/index.js"
 import type { GitomicBackend } from "../src/index.js"
 import { createIsoBackend } from "../src/iso.js"
-import { isRemoteCompareAndSwapRejection } from "../src/shell.js"
+import { isRemoteCompareAndSwapRejection, parseRefLockFailures } from "../src/shell.js"
 import { appendEmptyHistory, createBareRepo, createRemoteRepos, git, gitWithInput } from "./helpers/git.js"
 
 const TRANSACTION_SEARCH_LIMIT = 1_024
@@ -718,11 +718,17 @@ describe.sequential("shell backend failure boundaries", () => {
       GITOMIC_REAL_GIT: realGit,
       PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`,
     })
+    const timers = vi.spyOn(globalThis, "setTimeout")
     try {
       const tips = await createShellBackend().fetchRefs?.(pair.left, ["refs/heads/main"], "origin")
       expect(tips).toEqual(new Map([["refs/heads/main", pair.initial]]))
       expect((await readFile(fetches, "utf8")).trim().split("\n")).toEqual(["lost", "fetched"])
+      // A moved ref is already settled, so its retry does not wait.
+      expect(timers.mock.calls.filter(([, delay]) => typeof delay === "number" && delay >= 25 && delay < 100)).toEqual(
+        [],
+      )
     } finally {
+      timers.mockRestore()
       restore()
       await rm(directory, { recursive: true, force: true })
       await pair.cleanup()
@@ -773,6 +779,10 @@ describe.sequential("shell backend failure boundaries", () => {
         /lost the race for its fetched refs to another fetch in .* 3 times in a row/,
       )
       expect((error as Error).message).toContain("File exists")
+      expect((error as Error).cause).toBeInstanceOf(Error)
+      expect(((error as Error).cause as Error).message).toContain(
+        "cannot lock ref 'refs/gitomic/fetched/origin/heads/main'",
+      )
       expect((await readFile(fetches, "utf8")).trim().split("\n")).toHaveLength(3)
       const pauses = timers.mock.calls.filter(([, delay]) => typeof delay === "number" && delay >= 25 && delay < 100)
       expect(pauses).toHaveLength(2)
@@ -783,6 +793,42 @@ describe.sequential("shell backend failure boundaries", () => {
       await pair.cleanup()
     }
   }, 30_000)
+
+  /** @failure Five hand-written readings of git's "cannot lock ref" text drifted apart in anchoring and accepted forms. */
+  test("reads each cannot-lock-ref line git writes into its reporter, ref and reason", () => {
+    const a = "a".repeat(40)
+    const b = "b".repeat(40)
+    const lines = [
+      `fatal: cannot lock ref 'refs/heads/main': is at ${a} but expected ${b}`,
+      "fatal: prepare: cannot lock ref 'refs/heads/main': Unable to create '/r/.git/refs/heads/main.lock': File exists.",
+      "",
+      "Another git process seems to be running in this repository.",
+      "remote: error: cannot lock ref 'refs/heads/next': reference already exists",
+      `git fetch failed (1): error: cannot lock ref 'refs/gitomic/fetched/origin/heads/main': reference is missing but expected ${a}`,
+      `fatal: update_ref failed for ref 'refs/heads/x': cannot lock ref 'refs/heads/x': is at ${b} but expected ${a}`,
+      "fatal: Unable to create '/r/.git/index.lock': File exists.",
+    ]
+    expect(parseRefLockFailures(lines.join("\n"))).toEqual([
+      { reporter: "fatal: ", ref: "refs/heads/main", form: "moved", at: a, expected: b },
+      { reporter: "fatal: prepare: ", ref: "refs/heads/main", form: "held" },
+      { reporter: "remote: error: ", ref: "refs/heads/next", form: "exists" },
+      {
+        reporter: "git fetch failed (1): error: ",
+        ref: "refs/gitomic/fetched/origin/heads/main",
+        form: "missing",
+        expected: a,
+      },
+      {
+        reporter: "fatal: update_ref failed for ref 'refs/heads/x': ",
+        ref: "refs/heads/x",
+        form: "moved",
+        at: b,
+        expected: a,
+      },
+    ])
+    expect(parseRefLockFailures("fatal: Unable to create '/r/.git/index.lock': File exists.")).toEqual([])
+    expect(parseRefLockFailures("")).toEqual([])
+  })
 
   test("checks raw and peeled names in one ordered batch and refuses malformed answers", async () => {
     const raw = "1".repeat(40)
