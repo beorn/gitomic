@@ -22,7 +22,7 @@ import type { GitObject, GitTreeObjectEntry } from "./git-object.js"
 import { createDurableObjectWriter } from "./iso-durable.js"
 import { assertGitPrefixMatched, assertRegularBlob, normalizePrefix } from "./path.js"
 import { createShellRuntime } from "./shell.js"
-import type { BlobValue, CommitInput, GitomicBackend, Oid } from "./types.js"
+import type { BlobValue, CommitInput, GitomicBackend, Oid, TreeEntry, TreeListing } from "./types.js"
 import { decodeBlob } from "./utf8.js"
 
 type BlobEntry = {
@@ -84,6 +84,47 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
       }),
     )
     return { kind: "tree", entries }
+  }
+
+  // Named apart from isomorphic-git's `readTree`/`readBlob` imported above, which `loadTree` and this batch read call.
+  const listTree = async (repo: string, oid: Oid, prefix?: string): Promise<TreeListing> => {
+    const normalizedPrefix = prefix === undefined ? "" : normalizePrefix(prefix)
+    const gitdir = await resolveGitDir(repo)
+    const { commit } = await readCommit({ fs, gitdir, oid, cache })
+    const root = await loadTree(gitdir, commit.tree, "", normalizedPrefix)
+    const listing = new Map<string, TreeEntry>()
+    const visit = (node: TreeNode, prefix: string): void => {
+      for (const [name, entry] of node.entries) {
+        const path = prefix === "" ? name : `${prefix}/${name}`
+        if (entry.kind === "tree") visit(entry, path)
+        else if (entry.kind === "blob" && path.startsWith(normalizedPrefix)) {
+          listing.set(path, { oid: entry.oid, mode: entry.mode === "100755" ? "100755" : "100644" })
+        }
+      }
+    }
+    visit(root, "")
+    assertGitPrefixMatched(listing.size, repo, oid, normalizedPrefix)
+    return listing
+  }
+
+  const readBlobBatch = async (repo: string, oids: readonly Oid[]): Promise<ReadonlyMap<Oid, BlobValue>> => {
+    const gitdir = await resolveGitDir(repo)
+    const read = new Map<Oid, BlobValue>()
+    await Promise.all(
+      [...new Set(oids)].map(async (oid) => {
+        let blob: Uint8Array
+        try {
+          blob = (await readBlob({ fs, gitdir, oid, cache })).blob
+        } catch (cause) {
+          throw new Error(
+            `cannot read blob ${oid} in ${JSON.stringify(repo)}: ${cause instanceof Error ? cause.message : String(cause)}`,
+            { cause },
+          )
+        }
+        read.set(oid, decodeBlob(blob))
+      }),
+    )
+    return read
   }
 
   const readFiles = async (repo: string, oid: Oid, prefix?: string): Promise<ReadonlyMap<string, BlobValue>> => {
@@ -235,6 +276,8 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
       const gitdir = await resolveGitDir(repo)
       return (await refStorage(repo)) === "files" ? resolveRef({ fs, gitdir, ref }) : shell.head(repo, ref)
     },
+    readTree: listTree,
+    readBlobs: readBlobBatch,
     readFiles,
     readCommit: async (repo, oid) => {
       validateOid(oid)
