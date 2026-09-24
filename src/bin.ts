@@ -1246,4 +1246,23 @@ function reportError(error: unknown, stderr: CliWriter): number {
   return RUNTIME_ERROR
 }
 
-if (import.meta.main) process.exit(await main(process.argv.slice(2)))
+/**
+ * The process entry. It never calls `process.exit`: a write to a pipe is
+ * asynchronous past the kernel's buffer, and exiting there discards the rest
+ * of the output while still reporting success (25382). Setting `exitCode` and
+ * returning lets the event loop drain stdout and stderr first. A stdout that
+ * refuses the write (the reader closed early, EPIPE) is a failure of this
+ * command, named with its arguments, never a truncated success.
+ */
+async function runProcess(argv: string[]): Promise<void> {
+  process.stdout.on("error", (error: NodeJS.ErrnoException) => {
+    process.stderr.write(
+      `gitomic: stdout refused the output of \`gitomic ${argv.join(" ")}\`: ${error.code ?? error.message}\n`,
+    )
+    process.exitCode = RUNTIME_ERROR
+  })
+  const code = await main(argv)
+  if (!process.exitCode) process.exitCode = code
+}
+
+if (import.meta.main) await runProcess(process.argv.slice(2))
