@@ -10,7 +10,15 @@ import { join } from "node:path"
 import { afterEach, beforeEach, describe, expect, test } from "vitest"
 
 import { CandidateRefused } from "../src/errors.js"
-import { CANDIDATE_CONFIG, createShellBackend, open, repositoryCandidate, type Store } from "../src/index.js"
+import {
+  CANDIDATE_CONFIG,
+  createShellBackend,
+  open,
+  readRepositoryDeclaration,
+  repositoryCandidate,
+  trustDeclaration,
+  type Store,
+} from "../src/index.js"
 import { runCommand } from "../src/shell.js"
 import { createBareRepo } from "./helpers/git.js"
 
@@ -42,9 +50,20 @@ async function script(name: string, body: string): Promise<string> {
   return path
 }
 
-/** Declare the gate in its own write, the bootstrap commit that runs no gate because its base has none. */
+/**
+ * Declare the gate in its own write, the bootstrap commit that runs no gate because its base has none, and trust it
+ * (25325): nothing a repository declares runs until its exact blob is trusted.
+ */
 async function declare(config: string): Promise<void> {
-  await store.transact(async (map) => map.set(CANDIDATE_CONFIG, config), "declare the gate")
+  const declared = await store.transact(async (map) => map.set(CANDIDATE_CONFIG, config), "declare the gate")
+  await trustAt({ repo: fixture.repo }, declared.oid)
+}
+
+/** Trust the declaration at `commit`, as `gitomic trust` does after showing it (the bootstrap's step). */
+async function trustAt(scope: { repo: string; url?: string }, commit: string): Promise<void> {
+  const declaration = await readRepositoryDeclaration(scope.repo, commit)
+  if (declaration === undefined) throw new Error(`no ${CANDIDATE_CONFIG} at ${commit}`)
+  await trustDeclaration(scope, declaration.blob)
 }
 
 async function write(path: string, content: string) {

@@ -10,7 +10,14 @@ import { join } from "node:path"
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest"
 
 import { main } from "../src/bin.js"
-import { CANDIDATE_CONFIG, createShellBackend, open, type GitomicBackend } from "../src/index.js"
+import {
+  CANDIDATE_CONFIG,
+  createShellBackend,
+  open,
+  readRepositoryDeclaration,
+  trustDeclaration,
+  type GitomicBackend,
+} from "../src/index.js"
 import { createMemBackend } from "../src/mem.js"
 import { createBareRepo, git } from "./helpers/git.js"
 
@@ -52,10 +59,18 @@ async function file(name: string, content: string, mode?: number): Promise<strin
 async function declareCheck(body: string): Promise<void> {
   const check = await file("check.sh", `#!/bin/sh\n${body}\n`, 0o755)
   const store = await open({ repo: fixture.repo, ref: "main", writer: "fixture", backend })
-  await store.transact(
+  const declared = await store.transact(
     async (map) => map.set(CANDIDATE_CONFIG, `[candidate]\n\tcheck = ${check}\n`),
     "declare the gate",
   )
+  await trustAt({ repo: fixture.repo }, declared.oid)
+}
+
+/** Trust the declaration at `commit`, as `gitomic trust` does after showing it (the bootstrap's step). */
+async function trustAt(scope: { repo: string; url?: string }, commit: string): Promise<void> {
+  const declaration = await readRepositoryDeclaration(scope.repo, commit)
+  if (declaration === undefined) throw new Error(`no ${CANDIDATE_CONFIG} at ${commit}`)
+  await trustDeclaration(scope, declaration.blob)
 }
 
 const address = () => `${fixture.repo}#main`

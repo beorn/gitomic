@@ -44,8 +44,13 @@ export { applyEdits } from "./edits.js"
 export {
   CANDIDATE_CONFIG,
   DEFAULT_CANDIDATE_TIMEOUT_MS,
+  TRUST_CONFIG,
+  readRepositoryDeclaration,
   repositoryCandidate,
+  trustDeclaration,
   type RepositoryCandidateOptions,
+  type RepositoryDeclaration,
+  type TrustScope,
 } from "./candidate.js"
 export { identProblem } from "./git-object.js"
 export type { Edit } from "./edits.js"
