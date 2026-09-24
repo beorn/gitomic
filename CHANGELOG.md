@@ -10,6 +10,14 @@
 
 ### Added
 
+- `authoredPaths` on `CheckoutSyncRequest` and `RemoteFirstProjectionRequest`
+  (25350 S3): "paths whose checkout content IS this landing" — a write authored
+  in the checkout lands files the caller already wrote. The projection proves
+  every one first (the landing changed it, and the checkout holds the landed
+  blob or is absent for a removal), then stages exactly those paths and never
+  writes one, so a landing that also carries another writer's paths still ends
+  clean. Any mismatch refuses as the new outcome `authored-mismatch`, naming the
+  path and both blob oids, with nothing staged; a refused merge unstages them.
 - The checkout lock (25350): `gitomic project` and `gitomic apply --checkout`
   hold `<git-common-dir>/km-state-write.lock` — the file hh's other checkout
   writers already take — for their whole checkout write, waiting 15 s

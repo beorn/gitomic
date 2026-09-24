@@ -33,9 +33,10 @@
 
 import { spawnSync } from "node:child_process"
 import { randomUUID } from "node:crypto"
-import { copyFileSync, rmSync } from "node:fs"
+import { copyFileSync, readFileSync, rmSync } from "node:fs"
 import { dirname, join } from "node:path"
 
+import { objectOid } from "./git-object.js"
 import { DEFAULT_REMOTE_TIMEOUT_MS, runGit } from "./shell.js"
 
 /**
@@ -69,6 +70,13 @@ export interface CheckoutSyncRequest {
    * pathset behind; anything else means it touched authored work.
    */
   readonly expectedDirtyPaths: readonly string[]
+  /**
+   * The paths whose checkout content IS this landing: a write authored in the checkout (25350 S3) lands files the
+   * caller already wrote, so they are dirty with exactly the landed content. Each must be a path the landing
+   * changed and must already hold `to`'s blob (or be absent for a removal); the projection proves that for all of
+   * them before staging exactly them, and never writes one. Repository-relative, as every gitomic path is.
+   */
+  readonly authoredPaths?: readonly string[] | undefined
 }
 
 export type CheckoutSyncOutcome =
@@ -105,6 +113,20 @@ export type CheckoutSyncOutcome =
     }
   /** The merge ran but the resulting dirt could not be read back. */
   | { readonly ok: false; readonly kind: "dirt-unverifiable"; readonly error: string }
+  /**
+   * An `authoredPaths` entry is not this landing: the landing did not change it, or the checkout's content is not
+   * the landed blob. Nothing was staged; the index is exactly as the carry left it.
+   */
+  | {
+      readonly ok: false
+      readonly kind: "authored-mismatch"
+      readonly error: string
+      readonly path: string
+      /** The checkout's blob, or null when the file is absent. */
+      readonly checkoutOid: string | null
+      /** The landing's blob, or null when the landing removes the path. */
+      readonly landedOid: string | null
+    }
   /** The merge ran and changed which paths are dirty — authored work moved under someone. */
   | {
       readonly ok: false
@@ -365,6 +387,104 @@ export function isBareRepository(repoRoot: string): boolean {
 
 type DirtRead = { readonly ok: true; readonly paths: string[] } | { readonly ok: false; readonly detail: string }
 
+type AuthoredStage =
+  | { readonly ok: true; readonly expectedDirtyPaths: string[] }
+  | { readonly ok: false; readonly outcome: Extract<CheckoutSyncOutcome, { readonly ok: false }> }
+
+/**
+ * Stage exactly the paths whose checkout content IS the landing `from` -> `to` (25350 S3, @cto 7473e4ec), and drop
+ * them from the dirt the projection must preserve. Every path is proven first — changed by the landing, and the
+ * checkout holding `to`'s blob or absent for a removal — so a mismatch refuses with nothing staged: the index stays
+ * exactly as the carry left it and the next catch-up can still project. No authored path is ever written here.
+ */
+function stageAuthoredPaths(
+  repoRoot: string,
+  ref: string,
+  from: string,
+  to: string,
+  authoredPaths: readonly string[],
+  expectedDirtyPaths: readonly string[],
+): AuthoredStage {
+  if (authoredPaths.length === 0) return { ok: true, expectedDirtyPaths: [...expectedDirtyPaths] }
+  const mismatch = (
+    path: string,
+    checkoutOid: string | null,
+    landedOid: string | null,
+    why: string,
+  ): AuthoredStage => ({
+    ok: false,
+    outcome: {
+      ok: false,
+      kind: "authored-mismatch",
+      path,
+      checkoutOid,
+      landedOid,
+      error:
+        `${ref} in the checkout ${repoRoot}: ${JSON.stringify(path)} was named as authored content of the landing ` +
+        `${from} -> ${to}, but ${why} (checkout ${checkoutOid ?? "absent"}, landed ${landedOid ?? "absent"}). ` +
+        "Nothing was staged and the index is unchanged; the landing is complete and safe in the ref.",
+    },
+  })
+  const unreadable = (what: string, result: GitOutcome): AuthoredStage => ({
+    ok: false,
+    outcome: {
+      ok: false,
+      kind: "dirt-unverifiable",
+      error:
+        `${ref} in the checkout ${repoRoot}: ${what} could not be read (${gitDetail(result)}), so the authored ` +
+        "paths cannot be proven to be the landing. Nothing was staged and the index is unchanged.",
+    },
+  })
+
+  const top = git(repoRoot, readonlyArgs(["rev-parse", "--show-toplevel"]))
+  if (top.status !== 0) return unreadable("the checkout's top level", top)
+  const topLevel = top.stdout.trim()
+  const changed = git(topLevel, readonlyArgs(["diff", "--name-only", "-z", "--no-renames", from, to, "--"]))
+  if (changed.status !== 0) return unreadable(`the landing's diff ${from} -> ${to}`, changed)
+  const landingPaths = new Set(nulPaths(changed.stdout))
+  const listed = git(topLevel, readonlyArgs(["ls-tree", "--full-tree", "-z", to, "--", ...authoredPaths]))
+  if (listed.status !== 0) return unreadable(`${to}'s tree entries for the authored paths`, listed)
+  const landed = new Map<string, string>()
+  for (const entry of nulPaths(listed.stdout)) {
+    const tab = entry.indexOf("\t")
+    landed.set(entry.slice(tab + 1), entry.slice(0, tab).split(" ")[2] ?? "")
+  }
+  const algorithm = /^[0-9a-f]{64}$/.test(to) ? "sha256" : "sha1"
+
+  // Verify every path before staging any: never a half-staged index.
+  for (const path of authoredPaths) {
+    const landedOid = landed.get(path) ?? null
+    let content: Buffer | undefined
+    try {
+      content = readFileSync(join(topLevel, path))
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        return unreadable(`the checkout file ${path} (${(error as Error).message})`, {
+          status: 1,
+          stdout: "",
+          stderr: "",
+        })
+      }
+    }
+    const checkoutOid = content === undefined ? null : objectOid("blob", content, algorithm)
+    if (!landingPaths.has(path)) return mismatch(path, checkoutOid, landedOid, "the landing did not change that path")
+    if (checkoutOid !== landedOid)
+      return mismatch(path, checkoutOid, landedOid, "the checkout does not hold the landed content")
+  }
+
+  const staged = git(topLevel, ["update-index", "--add", "--remove", "--", ...authoredPaths])
+  if (staged.status !== 0) return unreadable("staging the authored paths", staged)
+  const authored = new Set(authoredPaths)
+  return { ok: true, expectedDirtyPaths: expectedDirtyPaths.filter((path) => !authored.has(path)) }
+}
+
+/** Put the authored paths' index entries back to `tip`'s; the working tree is untouched. Returns the failure, if any. */
+function unstageAuthoredPaths(repoRoot: string, tip: string, authoredPaths: readonly string[]): string | undefined {
+  if (authoredPaths.length === 0) return undefined
+  const reset = git(repoRoot, ["reset", "-q", tip, "--", ...authoredPaths.map((path) => `:(top)${path}`)])
+  return reset.status === 0 ? undefined : gitDetail(reset)
+}
+
 function readDirt(repoRoot: string): DirtRead {
   try {
     return { ok: true, paths: worktreeDirtyPaths(repoRoot) }
@@ -398,7 +518,9 @@ export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): Check
   const carried = carryIndexTo(repoRoot, from, ref, request.expectedDirtyPaths, to)
   if (!carried.ok) return carried.outcome
   const repaired = carried.repairedIndexFrom === undefined ? {} : { repairedIndexFrom: carried.repairedIndexFrom }
-  const expected = [...carried.expectedDirtyPaths].sort()
+  const authored = stageAuthoredPaths(repoRoot, ref, from, to, request.authoredPaths ?? [], carried.expectedDirtyPaths)
+  if (!authored.ok) return authored.outcome
+  const expected = [...authored.expectedDirtyPaths].sort()
   if (from === to) {
     const current = readDirt(repoRoot)
     if (!current.ok) {
@@ -461,6 +583,7 @@ export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): Check
 
   const merged = git(repoRoot, ["read-tree", "-m", "-u", from, to])
   if (merged.status !== 0) {
+    const unstaged = unstageAuthoredPaths(repoRoot, from, request.authoredPaths ?? [])
     return {
       ok: false,
       kind: "worktree-update-refused",
@@ -471,7 +594,10 @@ export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): Check
         `brought forward without overwriting an uncommitted local edit to a path the transaction wrote ` +
         `(${gitDetail(merged)}). Dirty at the time of the transaction: [${expected.join(", ")}]. Both the dirt ` +
         `and the commit are intact, and the index and working tree still hold their pre-advance state; until ` +
-        "the checkout is reconciled, every write here refuses, naming the whole inverse delta as dirt.",
+        "the checkout is reconciled, every write here refuses, naming the whole inverse delta as dirt." +
+        (unstaged === undefined
+          ? ""
+          : ` The authored paths could NOT be unstaged back to ${from} (${unstaged}); the index holds them staged.`),
     }
   }
 
@@ -511,6 +637,13 @@ export interface RemoteFirstProjectionRequest {
   readonly remote: string
   /** Dirt observed before projecting, under the same lock; must survive exactly. */
   readonly expectedDirtyPaths: readonly string[]
+  /**
+   * The paths whose checkout content IS this landing: a write authored in the checkout (25350 S3) lands files the
+   * caller already wrote, so they are dirty with exactly the landed content. Each must be a path the landing
+   * changed and must already hold `to`'s blob (or be absent for a removal); the projection proves that for all of
+   * them before staging exactly them, and never writes one. Repository-relative, as every gitomic path is.
+   */
+  readonly authoredPaths?: readonly string[] | undefined
   /** Limit, in milliseconds, for fetching the landing. Defaults to Gitomic's remote limit. */
   readonly remoteTimeoutMs?: number | undefined
   /**
@@ -637,6 +770,7 @@ export async function projectRemoteFirstFastForward(
   const carried = carryIndexTo(repoRoot, localTip, ref, request.expectedDirtyPaths, to)
   if (!carried.ok) return carried.outcome
   const expectedDirtyPaths = carried.expectedDirtyPaths
+  const authoredPaths = request.authoredPaths ?? []
   // A repair moved the index and tree, so the checkout was synchronized even when the ref itself did not move.
   const reported = (outcome: RemoteFirstProjectionOutcome): RemoteFirstProjectionOutcome => {
     if (!outcome.ok || carried.repairedIndexFrom === undefined) return outcome
@@ -645,7 +779,7 @@ export async function projectRemoteFirstFastForward(
   }
   if (localTip === to) {
     // The ref already holds the landing; already-current is verified against the expected dirt and the index.
-    return reported(synchronizeCheckoutToCommit({ repoRoot, from: to, to, ref, expectedDirtyPaths }))
+    return reported(synchronizeCheckoutToCommit({ repoRoot, from: to, to, ref, expectedDirtyPaths, authoredPaths }))
   }
 
   const ancestry = git(repoRoot, readonlyArgs(["merge-base", "--is-ancestor", localTip, to]))
@@ -670,7 +804,9 @@ export async function projectRemoteFirstFastForward(
         // passes through unchanged, a stale one is repaired, and the dirt is
         // verified either way. Claiming already-current here without merging
         // is the false report the moved-ref witness pins.
-        return reported(synchronizeCheckoutToCommit({ repoRoot, from: to, to: localTip, ref, expectedDirtyPaths }))
+        return reported(
+          synchronizeCheckoutToCommit({ repoRoot, from: to, to: localTip, ref, expectedDirtyPaths, authoredPaths }),
+        )
       }
       if (published.status !== 1) {
         return {
@@ -734,8 +870,13 @@ export async function projectRemoteFirstFastForward(
   // synchronizeCheckoutToCommit re-runs idempotently (index already at `to`),
   // and the delegate then verifies dirt against the ADVANCED head, which is
   // why the verification cannot run before the ref moves.
+  // Authored paths are staged here, on the fast-forward alone: the probe then keeps them (index matches `to`) and
+  // every other path moves. A refused probe unstages them again, so no refusal leaves an index no commit holds.
+  const authored = stageAuthoredPaths(repoRoot, ref, localTip, to, authoredPaths, expectedDirtyPaths)
+  if (!authored.ok) return authored.outcome
   const probed = git(repoRoot, ["read-tree", "-m", "-u", localTip, to])
   if (probed.status !== 0) {
+    const unstaged = unstageAuthoredPaths(repoRoot, localTip, authoredPaths)
     const expected = [...expectedDirtyPaths].sort()
     return {
       ok: false,
@@ -746,7 +887,10 @@ export async function projectRemoteFirstFastForward(
         `${ref} in the checkout ${repoRoot}: the landed commit ${to} is at ${remote}, but the checkout could not ` +
         `be brought forward without overwriting an uncommitted local edit to a path the landing wrote ` +
         `(${gitDetail(probed)}). The ref still holds ${localTip} and nothing was changed. Dirty at projection ` +
-        `time: [${expected.join(", ")}]. The landing ${to} is complete and safe at ${remote}.`,
+        `time: [${expected.join(", ")}]. The landing ${to} is complete and safe at ${remote}.` +
+        (unstaged === undefined
+          ? ""
+          : ` The authored paths could NOT be unstaged back to ${localTip} (${unstaged}); the index holds them staged.`),
     }
   }
 
@@ -762,7 +906,9 @@ export async function projectRemoteFirstFastForward(
         `again from the current state is safe.`,
     }
   }
-  return reported(synchronizeCheckoutToCommit({ repoRoot, from: localTip, to, ref, expectedDirtyPaths }))
+  return reported(
+    synchronizeCheckoutToCommit({ repoRoot, from: localTip, to, ref, expectedDirtyPaths: authored.expectedDirtyPaths }),
+  )
 }
 
 export interface ProjectCheckoutRequest {

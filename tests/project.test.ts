@@ -829,4 +829,144 @@ describe("gitomic project and checkout synchronization", () => {
       expect(readFileSync(join(checkout, "fresh.md"), "utf8")).toBe("# fresh process write\n")
     })
   })
+
+  // 25350 S3 (@cto 7473e4ec): a write authored IN the checkout lands the files the caller already wrote, so the
+  // projection must stage exactly those paths — after proving they are the landing — and never write one.
+  describe("authoredPaths: the checkout's content IS the landing", () => {
+    /** Land `files` at origin from a fresh clone; a null content removes the path. Returns the landed commit. */
+    function landFiles(bare: string, root: string, name: string, files: Record<string, string | null>): string {
+      git(root, "clone", "-q", bare, name)
+      const lander = join(root, name)
+      git(lander, "config", "user.email", "lander@example.invalid")
+      git(lander, "config", "user.name", "Lander")
+      for (const [path, content] of Object.entries(files)) {
+        if (content === null) git(lander, "rm", "-q", path)
+        else {
+          writeFileSync(join(lander, path), content)
+          git(lander, "add", path)
+        }
+      }
+      git(lander, "commit", "-qm", `land ${Object.keys(files).join(" ")}`)
+      git(lander, "push", "-q", "origin", "main")
+      return git(lander, "rev-parse", "HEAD")
+    }
+    const indexHolds = (checkout: string, commit: string): boolean =>
+      gitOutcomeForTest(checkout, ["diff-index", "--cached", "--quiet", commit, "--"]).status === 0
+
+    test("a clean landing of an authored put and rm ends clean, with the index at the landing's tree", async () => {
+      const { root, bare, checkout } = remoteFixture()
+      writeFileSync(join(checkout, "tracked.md"), "# authored\n")
+      rmSync(join(checkout, "bystander.md"))
+      const expectedDirtyPaths = worktreeDirtyPaths(checkout)
+      const to = landFiles(bare, root, "author", { "tracked.md": "# authored\n", "bystander.md": null })
+
+      const outcome = await projectRemoteFirstFastForward({
+        repoRoot: checkout,
+        to,
+        ref: "refs/heads/main",
+        remote: "origin",
+        expectedDirtyPaths,
+        authoredPaths: ["tracked.md", "bystander.md"],
+      })
+
+      expect(outcome).toMatchObject({ ok: true, kind: "synchronized", dirtyPaths: [] })
+      expect(git(checkout, "rev-parse", "HEAD")).toBe(to)
+      expect(indexHolds(checkout, to)).toBe(true)
+      expect(worktreeDirtyPaths(checkout)).toEqual([])
+    })
+
+    test("a landing that also carries another writer's path (a CAS retry) ends clean at the landing's tree", async () => {
+      const { root, bare, checkout } = remoteFixture()
+      writeFileSync(join(checkout, "tracked.md"), "# authored\n")
+      const expectedDirtyPaths = worktreeDirtyPaths(checkout)
+      landFiles(bare, root, "peer", { "bystander.md": "# the peer's write\n" })
+      const to = landFiles(bare, root, "author", { "tracked.md": "# authored\n" })
+
+      const outcome = await projectRemoteFirstFastForward({
+        repoRoot: checkout,
+        to,
+        ref: "refs/heads/main",
+        remote: "origin",
+        expectedDirtyPaths,
+        authoredPaths: ["tracked.md"],
+      })
+
+      expect(outcome).toMatchObject({ ok: true, kind: "synchronized", dirtyPaths: [] })
+      expect(indexHolds(checkout, to)).toBe(true)
+      expect(readFileSync(join(checkout, "bystander.md"), "utf8")).toBe("# the peer's write\n")
+      expect(worktreeDirtyPaths(checkout)).toEqual([])
+    })
+
+    test("a checkout path that disagrees with the landing refuses with both oids, staging nothing", async () => {
+      const { root, bare, checkout } = remoteFixture()
+      const before = git(checkout, "rev-parse", "HEAD")
+      writeFileSync(join(checkout, "tracked.md"), "# what the checkout holds\n")
+      const expectedDirtyPaths = worktreeDirtyPaths(checkout)
+      const to = landFiles(bare, root, "author", { "tracked.md": "# what landed\n" })
+
+      const outcome = await projectRemoteFirstFastForward({
+        repoRoot: checkout,
+        to,
+        ref: "refs/heads/main",
+        remote: "origin",
+        expectedDirtyPaths,
+        authoredPaths: ["tracked.md"],
+      })
+
+      expect(outcome).toMatchObject({
+        ok: false,
+        kind: "authored-mismatch",
+        path: "tracked.md",
+        checkoutOid: git(checkout, "hash-object", "tracked.md"),
+        landedOid: git(checkout, "rev-parse", `${to}:tracked.md`),
+      })
+      expect(git(checkout, "rev-parse", "HEAD")).toBe(before)
+      expect(indexHolds(checkout, before)).toBe(true)
+      expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# what the checkout holds\n")
+    })
+
+    test("an authored path the landing did not change refuses, naming it, staging nothing", async () => {
+      const { root, bare, checkout } = remoteFixture()
+      const before = git(checkout, "rev-parse", "HEAD")
+      writeFileSync(join(checkout, "tracked.md"), "# authored\n")
+      const expectedDirtyPaths = worktreeDirtyPaths(checkout)
+      const to = landFiles(bare, root, "author", { "tracked.md": "# authored\n" })
+
+      const outcome = await projectRemoteFirstFastForward({
+        repoRoot: checkout,
+        to,
+        ref: "refs/heads/main",
+        remote: "origin",
+        expectedDirtyPaths,
+        authoredPaths: ["tracked.md", "bystander.md"],
+      })
+
+      expect(outcome).toMatchObject({ ok: false, kind: "authored-mismatch", path: "bystander.md" })
+      expect(outcome.ok ? "" : outcome.error).toContain("the landing did not change that path")
+      expect(git(checkout, "rev-parse", "HEAD")).toBe(before)
+      expect(indexHolds(checkout, before)).toBe(true)
+    })
+
+    test("synchronizeCheckoutToCommit stages the authored paths of an object-side landing and ends clean", () => {
+      const { root, bare, checkout } = remoteFixture()
+      const from = git(checkout, "rev-parse", "HEAD")
+      writeFileSync(join(checkout, "tracked.md"), "# authored\n")
+      const expectedDirtyPaths = worktreeDirtyPaths(checkout)
+      const to = landFiles(bare, root, "author", { "tracked.md": "# authored\n" })
+      git(checkout, "fetch", "-q", "origin")
+      git(checkout, "update-ref", "refs/heads/main", to, from)
+
+      const outcome = synchronizeCheckoutToCommit({
+        repoRoot: checkout,
+        from,
+        to,
+        ref: "refs/heads/main",
+        expectedDirtyPaths,
+        authoredPaths: ["tracked.md"],
+      })
+
+      expect(outcome).toMatchObject({ ok: true, kind: "synchronized", dirtyPaths: [] })
+      expect(indexHolds(checkout, to)).toBe(true)
+    })
+  })
 })
