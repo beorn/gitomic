@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 — 2026-09-24
 
 ### Removed
 
@@ -49,11 +49,6 @@
 - A local git command that does not run to completion (its output passed the
   buffer, it could not start, or a signal stopped it) is reported by its cause,
   such as `ENOBUFS`, never by its truncated output.
-
-### Deprecated
-
-- `RemoteFirstProjectionRequest.preTransactTip` is no longer consulted: the
-  history walk above subsumes it. It will be removed.
 
 ## 0.3.0 — 2026-09-23
 
