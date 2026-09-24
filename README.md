@@ -519,6 +519,19 @@ $ gitomic write 'repo#main' -m edit a.md=./a --json
 
 Each command runs through `sh -c` with `GITOMIC_REPO`, `GITOMIC_BASE` and `GITOMIC_CANDIDATE` (the unpublished candidate commit) set, and the changed paths on stdin, NUL-separated. Any other exit, or running past the limit, refuses. A write that changes `.gitomic.conf` must change nothing else. A landed write's report goes to stderr as `report: <line>`, or into the `--json` receipt. The library takes the same gate as `transact`'s `candidate` option (`repositoryCandidate({ repo })`).
 
+**Trust.** Nothing a repository declares runs until you have trusted that exact declaration, the way direnv allows an `.envrc` by its hash. A write whose base `.gitomic.conf` is not the trusted blob exits `4`, runs nothing, and names the blob and the command to run:
+
+```console
+$ gitomic trust 'repo#main'
+.gitomic.conf 3f9a1c… at 81b2e0… declares:
+  candidate.check=/opt/checks/state.sh
+trusted: gitomic.trust = 3f9a1c… (local git config)
+```
+
+`trust` prints the declaration first, then records its blob in unversioned git config: `gitomic.trust` in a path repository's own config, or `gitomic.<url>.trust` in your global config for a URL address, whose throwaway clone keeps none. Any later edit of the file is a new blob, and writes refuse until you trust it again. Read verbs never need trust. The library records the same entry with `readRepositoryDeclaration` and `trustDeclaration`.
+
+Trust pins the declaration's text, not the scripts it names. A trusted `check = sh ./check.sh` runs whatever `check.sh` the repository holds later; direnv has the same property. Name commands by absolute paths outside the repository to close it: hh's STATE declaration names checks in CODE `main` (`/hh/dev/tools/…`), so no STATE commit can change the code that judges it.
+
 Product output — content, paths, matches, the oid or receipt — goes to stdout; narration and errors to stderr. The exit codes are the whole contract, and nothing fails silently:
 
 | code | meaning                                                                                                                                                                           |

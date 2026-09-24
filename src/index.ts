@@ -51,8 +51,13 @@ export { applyEdits } from "./edits.js"
 export {
   CANDIDATE_CONFIG,
   DEFAULT_CANDIDATE_TIMEOUT_MS,
+  TRUST_CONFIG,
+  readRepositoryDeclaration,
   repositoryCandidate,
+  trustDeclaration,
   type RepositoryCandidateOptions,
+  type RepositoryDeclaration,
+  type TrustScope,
 } from "./candidate.js"
 export { identProblem } from "./git-object.js"
 export type { Edit } from "./edits.js"
@@ -131,8 +136,9 @@ export async function open(options: OpenOptions): Promise<Store> {
       try {
         provenance = cloneCommitProvenance(options?.provenance)
         author = cloneIdent(options?.author, "author")
-        if (candidate !== undefined && typeof candidate !== "function")
+        if (candidate !== undefined && typeof candidate !== "function") {
           throw new TypeError("candidate must be a function")
+        }
       } catch (error) {
         return Promise.reject(error)
       }
@@ -346,7 +352,7 @@ async function transact(
           base: parent,
           changed,
           map,
-          readBase: async (path) => readValue(base.get(path), path),
+          readBase: (path) => Promise.resolve(readValue(base.get(path), path)),
           materialize: async () =>
             backendOid(
               await context.backend.writeCommit(
@@ -355,8 +361,9 @@ async function transact(
               ),
             ),
         })
-        if (verdict?.refuse !== undefined && verdict.refuse.length > 0)
+        if (verdict?.refuse !== undefined && verdict.refuse.length > 0) {
           throw new CandidateRefused([...verdict.refuse], parent)
+        }
         report = verdict?.report === undefined ? [] : [...verdict.report]
       }
       const withReport = (result: Committed): Committed => (report === undefined ? result : { ...result, report })
@@ -505,8 +512,8 @@ function makeOverlay(base: ReadonlyMap<string, BlobValue>): {
     changes.has(path) ? changes.get(path) : readValue(base.get(path), path)
   const present = (path: string): boolean => (changes.has(path) ? changes.get(path) !== undefined : base.has(path))
   const map: GitMap = {
-    async get(path) {
-      return get(normalizePath(path))
+    get(path) {
+      return Promise.resolve(get(normalizePath(path)))
     },
     set(path, content) {
       const normalized = normalizePath(path)
@@ -516,17 +523,17 @@ function makeOverlay(base: ReadonlyMap<string, BlobValue>): {
     delete(path) {
       changes.set(normalizePath(path), undefined)
     },
-    async has(path) {
-      return present(normalizePath(path))
+    has(path) {
+      return Promise.resolve(present(normalizePath(path)))
     },
-    async keys(prefix = "") {
+    keys(prefix = "") {
       const normalized = normalizePrefix(prefix)
       const keys = new Set([...base.keys()].filter(isPublicPath))
       for (const [path, value] of changes) {
         if (value === undefined) keys.delete(path)
         else keys.add(path)
       }
-      return [...keys].filter((path) => path.startsWith(normalized)).sort()
+      return Promise.resolve([...keys].filter((path) => path.startsWith(normalized)).sort())
     },
   }
   // A chain of moves keeps the first source's mode: a to b, then b to c, leaves c with a's.

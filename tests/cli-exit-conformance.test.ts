@@ -10,10 +10,17 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { pathToFileURL } from "node:url"
 
-import { afterEach, beforeEach, describe, expect, test } from "vitest"
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest"
 
 import { main } from "../src/bin.js"
-import { CANDIDATE_CONFIG, createShellBackend, open, type GitomicBackend } from "../src/index.js"
+import {
+  CANDIDATE_CONFIG,
+  createShellBackend,
+  open,
+  readRepositoryDeclaration,
+  trustDeclaration,
+  type GitomicBackend,
+} from "../src/index.js"
 import { createIsoBackend } from "../src/iso.js"
 import { createBareRepo, git, gitWithInput } from "./helpers/git.js"
 
@@ -35,10 +42,13 @@ let fixture: { repo: string; cleanup(): Promise<void> }
 
 beforeEach(async () => {
   work = await mkdtemp(join(tmpdir(), "gitomic-exit-conformance-"))
+  // A URL address's trust lives in the caller's global git config: point it at a scratch file, never the real one.
+  vi.stubEnv("GIT_CONFIG_GLOBAL", join(work, "global-gitconfig"))
   fixture = await createBareRepo()
 })
 
 afterEach(async () => {
+  vi.unstubAllEnvs()
   await fixture.cleanup()
   await rm(work, { recursive: true, force: true })
 })
@@ -108,7 +118,14 @@ describe.each(targets)("the CLI exit contract on $name", (target) => {
     await writeFile(check, '#!/bin/sh\necho "a.md: refused by the gate"\nexit 1\n', "utf8")
     await chmod(check, 0o755)
     const declarer = await open({ repo: fixture.repo, ref: "main", writer: "declare", backend: createShellBackend() })
-    await declarer.transact(async (map) => map.set(CANDIDATE_CONFIG, `[candidate]\n\tcheck = ${check}\n`), "gate")
+    const gate = await declarer.transact(
+      async (map) => map.set(CANDIDATE_CONFIG, `[candidate]\n\tcheck = ${check}\n`),
+      "gate",
+    )
+    // Trust it where this target's writes read trust: the repository's config for a path, global for a URL (25325).
+    const url = target.backend === undefined ? target.address(fixture.repo).replace(/#main$/u, "") : undefined
+    const declaration = await readRepositoryDeclaration(fixture.repo, gate.oid)
+    await trustDeclaration({ repo: fixture.repo, ...(url === undefined ? {} : { url }) }, declaration?.blob ?? "")
     const before = await tip()
 
     const refused = await cli(target, [

@@ -1,10 +1,13 @@
 #!/usr/bin/env bun
+import { spawnSync } from "node:child_process"
 import { readFile } from "node:fs/promises"
+import { resolve } from "node:path"
 
 import { type Address, parseAddress } from "./address.js"
 import { assertTrailers, identProblem, validateOid } from "./git-object.js"
 import {
   apply,
+  CANDIDATE_CONFIG,
   CandidateRefused,
   EditDoesNotApply,
   matchGlob,
@@ -13,9 +16,13 @@ import {
   openRemoteRepository,
   projectCheckout,
   projectRemoteFirstFastForward,
+  readRepositoryDeclaration,
   repositoryCandidate,
+  trustDeclaration,
   runGit,
+  synchronizeCheckoutToCommit,
   worktreeDirtyPaths,
+  type CheckoutSyncOutcome,
   type Committed,
   type CommitMeta,
   type Edit,
@@ -23,6 +30,7 @@ import {
   type Ident,
   type Oid,
   type OpenOptions,
+  type RemoteFirstProjectionOutcome,
   type Snapshot,
   type Trailer,
 } from "./index.js"
@@ -107,7 +115,8 @@ import { decodeUtf8 } from "./utf8.js"
  * stdout; narration and errors go to stderr.
  *
  * Write verbs run the repository's own gate: the `.gitomic.conf` its base
- * declares (see `repositoryCandidate`). `--author "Name <email>"` records who
+ * declares (see `repositoryCandidate`), only once that exact declaration is
+ * trusted; an untrusted one refuses with exit 4 and runs nothing. `--author "Name <email>"` records who
  * acted, defaulting to the ident `git commit` would record (ADR-0020); gitomic
  * stays the committer. `--trailer Key=Value` (repeatable) adds caller trailers;
  * `Gitomic-*` keys are gitomic's own and refused.
@@ -115,6 +124,14 @@ import { decodeUtf8 } from "./utf8.js"
  * With `--checkout <path>`, write verbs project `<path>`'s working tree and
  * index forward after a successful write. A projection failure reports to
  * stderr and never fails the landed write.
+ *
+ * Trust verb:
+ * - `trust <addr>` — print the `.gitomic.conf` the address's tip declares,
+ *   then record its blob as the one declaration write verbs may run:
+ *   `gitomic.trust` in a path repository's own git config, or
+ *   `gitomic.<url>.trust` in the caller's global git config for a URL (its
+ *   clone keeps no config). Exit 1 when the tip declares none. Read verbs
+ *   never need trust.
  *
  * Project verbs:
  * - `project <path> [--remote <name>] [--ref <ref>] [--timeout <ms>]` — fetch
@@ -136,8 +153,10 @@ import { decodeUtf8 } from "./utf8.js"
  *   ref unchanged.
  * - `4` a {@link CandidateRefused}: the repository's gate refused the write.
  *   Its reasons, then one machine line `code=candidate-refused base=<oid>
- *   reasons=<JSON array>`. Tree and ref unchanged. Or, for `project`, a
- *   stranded-local-commits or landed-but-unsynchronized refusal.
+ *   reasons=<JSON array>`. Tree and ref unchanged. Or, for `project`, an
+ *   unsynchronized or stranded checkout (stranded-local-commits,
+ *   landed-but-unsynchronized, worktree-update-refused, dirt-changed,
+ *   dirt-unverifiable).
  *
  * Deliberately not built here (need new grammar or library plumbing this CLI
  * does not add): `read --log`, `commit <checkout>`.
@@ -176,6 +195,8 @@ export async function main(argv: string[], io: CliIo = {}): Promise<number> {
         return await runApply(args, stdin, stdout, stderr, backend)
       case "project":
         return await runProject(args, stdout, stderr)
+      case "trust":
+        return await runTrust(args, stdout, backend)
       default:
         throw new UsageError(`unknown verb: ${JSON.stringify(verb)}; expected one of ${VERBS.join(", ")}`)
     }
@@ -194,7 +215,7 @@ export type CliIo = {
   backend?: GitomicBackend
 }
 
-export const VERBS = ["read", "ls", "grep", "log", "diff", "write", "rm", "mv", "apply", "project"] as const
+export const VERBS = ["read", "ls", "grep", "log", "diff", "write", "rm", "mv", "apply", "project", "trust"] as const
 
 const OK = 0
 const RUNTIME_ERROR = 1
@@ -404,6 +425,7 @@ async function runWrite(
   const message = requireStringFlag(flags, "-m", "-m <message>")
   const writer = optionalStringFlag(flags, "--writer")
   const checkoutPath = optionalStringFlag(flags, "--checkout")
+  const expectedDirtyPaths = checkoutPath !== undefined ? worktreeDirtyPaths(checkoutPath) : []
   const pairs = parsePathFilePairs(positionals.slice(1))
   const knownPaths = new Set(pairs.map((pair) => pair.path))
   const expect = parseExpectPairs(repeated.get("--expect") ?? [])
@@ -424,10 +446,18 @@ async function runWrite(
   }
 
   const committed = await apply(store, base, edits, message, await writeOptions(attribution, repository, stderr))
+  let projectionOutcome: ProjectOutcomeReceipt | undefined
   if (checkoutPath !== undefined) {
-    await projectAfterWrite(checkoutPath, committed.oid, repository, base, stderr)
+    projectionOutcome = await projectAfterWrite(
+      checkoutPath,
+      committed.oid,
+      repository,
+      base,
+      expectedDirtyPaths,
+      stderr,
+    )
   }
-  writeReceipt(stdout, stderr, committed, flags.get("--json") === true)
+  writeReceipt(stdout, stderr, committed, flags.get("--json") === true, projectionOutcome)
   return OK
 }
 
@@ -564,6 +594,7 @@ async function runApply(
   }
   if (message === undefined) throw new UsageError("missing -m <message>")
   const attribution = parseAttribution(author, trailers)
+  const expectedDirtyPaths = checkoutPath !== undefined ? worktreeDirtyPaths(checkoutPath) : []
 
   using repository = await openAddressFor(address, backend)
   const store = await open({ ...repository, ...(writer === undefined ? {} : { writer }) })
@@ -574,10 +605,18 @@ async function runApply(
     edits.push(await parseClause(clause, snapshot, stdin, address))
   }
   const committed = await apply(store, startBase, edits, message, await writeOptions(attribution, repository, stderr))
+  let projectionOutcome: ProjectOutcomeReceipt | undefined
   if (checkoutPath !== undefined) {
-    await projectAfterWrite(checkoutPath, committed.oid, repository, startBase, stderr)
+    projectionOutcome = await projectAfterWrite(
+      checkoutPath,
+      committed.oid,
+      repository,
+      startBase,
+      expectedDirtyPaths,
+      stderr,
+    )
   }
-  writeReceipt(stdout, stderr, committed, asJson)
+  writeReceipt(stdout, stderr, committed, asJson, projectionOutcome)
   return OK
 }
 
@@ -807,10 +846,55 @@ async function removalPrecondition(
  * line goes to stderr as `report: <line>`, so stdout stays the bare oid. A
  * refusal is unaffected: facts only on stderr, exit 3 or 4.
  */
-function writeReceipt(stdout: CliWriter, stderr: CliWriter, committed: Committed, asJson: boolean): void {
+type ProjectOutcomeReceipt = { readonly ok: boolean; readonly kind: string; readonly error?: string }
+
+function isSameRepository(pathA: string, pathB: string): boolean {
+  if (resolve(pathA) === resolve(pathB)) return true
+  const commonDir = (path: string): string => {
+    const result = spawnSync("git", ["-C", path, "rev-parse", "--path-format=absolute", "--git-common-dir"], {
+      encoding: "utf8",
+    })
+    const directory = result.stdout?.trim() ?? ""
+    if (result.error !== undefined || result.status !== 0 || directory.length === 0) {
+      const detail = result.error?.message || result.stderr?.trim() || "no common directory returned"
+      throw new Error(
+        `cannot inspect repository ${JSON.stringify(path)}: git rev-parse exited ${result.status ?? "without status"}: ${detail}`,
+      )
+    }
+    return directory
+  }
+  return commonDir(pathA) === commonDir(pathB)
+}
+
+/**
+ * A write verb's success output: the committed oid on its own line, or — with
+ * `--json` — a one-line `{"oid":…,"retries":…,"report":[…]}` receipt of the oid,
+ * how many CAS retries the landing took, and the repository gate's report (the
+ * output contract for an agent scripting the door). In plain mode each report
+ * line goes to stderr as `report: <line>`, so stdout stays the bare oid. A
+ * refusal is unaffected: facts only on stderr, exit 3 or 4.
+ *
+ * When `--checkout` is given, the `--json` receipt also carries `projection: <kind>`
+ * so a caller can inspect the projection outcome directly.
+ */
+function writeReceipt(
+  stdout: CliWriter,
+  stderr: CliWriter,
+  committed: Committed,
+  asJson: boolean,
+  projectionOutcome?: ProjectOutcomeReceipt,
+): void {
   const report = committed.report ?? []
   if (asJson) {
-    stdout.write(`${JSON.stringify({ oid: committed.oid, retries: committed.retries, report })}\n`)
+    const receipt: Record<string, unknown> = {
+      oid: committed.oid,
+      retries: committed.retries,
+      report,
+    }
+    if (projectionOutcome !== undefined) {
+      receipt.projection = projectionOutcome.kind
+    }
+    stdout.write(`${JSON.stringify(receipt)}\n`)
     return
   }
   stdout.write(`${committed.oid}\n`)
@@ -822,21 +906,44 @@ async function projectAfterWrite(
   to: Oid,
   repository: OpenOptions,
   startBase: Oid,
+  expectedDirtyPaths: readonly string[],
   stderr: CliWriter,
-): Promise<void> {
-  const dirtyPaths = worktreeDirtyPaths(checkoutPath)
+): Promise<ProjectOutcomeReceipt> {
   const storeRef = repository.ref.startsWith("refs/heads/") ? repository.ref : `refs/heads/${repository.ref}`
-  const outcome = await projectRemoteFirstFastForward({
-    repoRoot: checkoutPath,
-    to,
-    ref: storeRef,
-    remote: repository.remote ?? "origin",
-    expectedDirtyPaths: dirtyPaths,
-    preTransactTip: startBase,
-  })
+  let isLocal: boolean
+  try {
+    isLocal = isSameRepository(checkoutPath, repository.repo)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    stderr.write(`gitomic: projection failed: ${message}\nkind=repository-inspection-failed\n`)
+    return { ok: false, kind: "repository-inspection-failed", error: message }
+  }
+
+  let outcome: CheckoutSyncOutcome | RemoteFirstProjectionOutcome
+  if (isLocal) {
+    outcome = synchronizeCheckoutToCommit({
+      repoRoot: checkoutPath,
+      from: startBase,
+      to,
+      ref: storeRef,
+      expectedDirtyPaths,
+    })
+  } else {
+    outcome = await projectRemoteFirstFastForward({
+      repoRoot: checkoutPath,
+      to,
+      ref: storeRef,
+      remote: repository.remote ?? "origin",
+      expectedDirtyPaths,
+      preTransactTip: startBase,
+    })
+  }
+
   if (!outcome.ok) {
     stderr.write(`gitomic: projection failed: ${outcome.error}\nkind=${outcome.kind}\n`)
+    return { ok: false, kind: outcome.kind, error: outcome.error }
   }
+  return { ok: true, kind: outcome.kind }
 }
 
 async function runProject(args: string[], stdout: CliWriter, stderr: CliWriter): Promise<number> {
@@ -850,7 +957,15 @@ async function runProject(args: string[], stdout: CliWriter, stderr: CliWriter):
   const remote = optionalStringFlag(flags, "--remote") ?? "origin"
   let ref = optionalStringFlag(flags, "--ref") ?? "refs/heads/main"
   if (!ref.startsWith("refs/heads/")) ref = `refs/heads/${ref}`
-  const timeoutMs = flags.get("--timeout") ? Number(flags.get("--timeout")) : undefined
+
+  const timeoutRaw = flags.get("--timeout")
+  let timeoutMs: number | undefined
+  if (timeoutRaw !== undefined) {
+    if (typeof timeoutRaw !== "string" || !/^\d+$/u.test(timeoutRaw) || Number(timeoutRaw) <= 0) {
+      throw new UsageError(`--timeout must be a positive integer in milliseconds, got ${JSON.stringify(timeoutRaw)}`)
+    }
+    timeoutMs = Number(timeoutRaw)
+  }
 
   const outcome = await projectCheckout({
     repoRoot: checkoutPath,
@@ -864,12 +979,20 @@ async function runProject(args: string[], stdout: CliWriter, stderr: CliWriter):
     return OK
   }
 
-  if (outcome.kind === "stranded-local-commits" || outcome.kind === "landed-but-unsynchronized") {
+  const UNSYNCHRONIZED_KINDS = new Set([
+    "stranded-local-commits",
+    "landed-but-unsynchronized",
+    "worktree-update-refused",
+    "dirt-changed",
+    "dirt-unverifiable",
+  ])
+
+  if (UNSYNCHRONIZED_KINDS.has(outcome.kind)) {
     const localOnlyStr =
       outcome.kind === "stranded-local-commits" ? ` localOnly=${JSON.stringify(outcome.localOnly)}` : ""
-    stderr.write(
-      `${outcome.error}\nkind=${outcome.kind} local=${outcome.localTip} to=${outcome.landedOid}${localOnlyStr}\n`,
-    )
+    const localTipStr = outcome.localTip ?? ""
+    const toStr = "landedOid" in outcome ? outcome.landedOid : (outcome.to ?? "")
+    stderr.write(`${outcome.error}\nkind=${outcome.kind} local=${localTipStr} to=${toStr}${localOnlyStr}\n`)
     return CANDIDATE_REFUSED
   }
 
@@ -906,14 +1029,18 @@ function parseAttribution(author: string | undefined, trailerFlags: readonly str
  */
 async function writeOptions(
   attribution: Attribution,
-  repository: OpenOptions,
+  repository: OpenedAddress,
   stderr: CliWriter,
 ): Promise<{ author?: Ident; trailers: Trailer[]; candidate: ReturnType<typeof repositoryCandidate> }> {
   const author = attribution.author ?? (await claimedAuthor(stderr))
   return {
     ...(author === undefined ? {} : { author }),
     trailers: attribution.trailers,
-    candidate: repositoryCandidate({ repo: repository.repo }),
+    candidate: repositoryCandidate({
+      repo: repository.repo,
+      ref: repository.ref,
+      ...(repository.url === undefined ? {} : { url: repository.url }),
+    }),
   }
 }
 
@@ -1030,10 +1157,34 @@ async function readFileContent(file: string): Promise<string> {
   return decodeUtf8(await readFile(file), `file ${JSON.stringify(file)}`)
 }
 
+// --- trust -------------------------------------------------------------------
+
+/** Print the declaration at the address's tip, then record its blob as trusted (the order the verb promises). */
+async function runTrust(args: string[], stdout: CliWriter, backend: GitomicBackend | undefined): Promise<number> {
+  const { positionals } = extractFlags(args, {})
+  const address = requirePositional(positionals, 0, "<address>")
+  if (positionals.length > 1) throw new UsageError(`trust takes one <address>; got ${positionals.length} arguments`)
+  using repository = await openAddressFor(address, backend)
+  const tip = await (await openReader(repository)).head()
+  const declaration = await readRepositoryDeclaration(repository.repo, tip)
+  if (declaration === undefined) {
+    throw new Error(`${address} declares no ${CANDIDATE_CONFIG} at ${tip}; nothing to trust`)
+  }
+  stdout.write(`${CANDIDATE_CONFIG} ${declaration.blob} at ${tip} declares:\n`)
+  for (const line of declaration.lines) stdout.write(`  ${line}\n`)
+  const scope = { repo: repository.repo, ...(repository.url === undefined ? {} : { url: repository.url }) }
+  const recorded = await trustDeclaration(scope, declaration.blob)
+  stdout.write(`trusted: ${recorded.key} = ${declaration.blob} (${recorded.file} git config)\n`)
+  return OK
+}
+
 // --- opening the address ---------------------------------------------------
 
+/** An opened address: the store options, plus the URL when `repo` is a throwaway clone of a remote. */
+type OpenedAddress = OpenOptions & Disposable & { readonly ref: string; readonly url?: string }
+
 /** One CLI selection point; a failed local open never selects a remote. */
-async function openAddressFor(address: string, backend: GitomicBackend | undefined): Promise<OpenOptions & Disposable> {
+async function openAddressFor(address: string, backend: GitomicBackend | undefined): Promise<OpenedAddress> {
   const { repo, ref } = parseAddressOrUsageError(address)
   const local = { repo, ref, ...(backend === undefined ? {} : { backend }), [Symbol.dispose]() {} }
   if (backend !== undefined) return local
@@ -1041,7 +1192,7 @@ async function openAddressFor(address: string, backend: GitomicBackend | undefin
   const remote = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(repo) || (!drivePath && /^[^/\\\\:]+:/.test(repo))
   if (!remote) return local
   const repository = await openRemoteRepository(repo)
-  return { ...repository, ref, [Symbol.dispose]: () => repository[Symbol.dispose]() }
+  return { ...repository, ref, url: repo, [Symbol.dispose]: () => repository[Symbol.dispose]() }
 }
 
 function parseAddressOrUsageError(address: string): Address {
