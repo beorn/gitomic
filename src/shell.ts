@@ -309,10 +309,10 @@ export async function batchCheck(
   })
   if (checked.code !== 0) throw commandFailure(repository, args, checked)
   const output = checked.stdout.toString("utf8")
-  if (!output.endsWith("\n")) {
+  if (output !== "" && !output.endsWith("\n")) {
     throw new Error(`git cat-file --batch-check returned an unterminated answer in ${repository}`)
   }
-  const answers = output.slice(0, -1).split("\n")
+  const answers = output === "" ? [] : output.slice(0, -1).split("\n")
   if (answers.length !== names.length) throw new BatchCheckCountError(answers.length, names.length, repository)
   return answers.map((answer, index) => {
     const input = names[index]

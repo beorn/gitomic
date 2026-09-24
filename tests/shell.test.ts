@@ -738,6 +738,21 @@ describe.sequential("shell backend failure boundaries", () => {
     expect((oldError as Error).message).toBe(
       "git cat-file --batch-check answered 1 lines for 2 refs in /tmp/gitomic-batch",
     )
+
+    const emptyError = await danglingRefs("/tmp/gitomic-batch", {
+      run: async (args) => ({
+        stdout: Buffer.from(args.includes("for-each-ref") ? `${raw} refs/heads/one\n${peeled} refs/heads/two\n` : ""),
+        stderr: Buffer.alloc(0),
+        code: 0,
+      }),
+    }).then(
+      () => undefined,
+      (error: unknown) => error,
+    )
+    expect(emptyError).toBeInstanceOf(Error)
+    expect((emptyError as Error).message).toBe(
+      "git cat-file --batch-check answered 0 lines for 2 refs in /tmp/gitomic-batch",
+    )
   })
 
   test("does not misclassify a non-CAS update-ref error after a concurrent move", async () => {
