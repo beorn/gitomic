@@ -82,8 +82,6 @@ export type CheckoutSyncOutcome =
       readonly ok: true
       readonly kind: "already-current"
       readonly dirtyPaths: readonly string[]
-      /** The ancestor whose tree the index still held; it was carried forward first (25393). */
-      readonly repairedIndexFrom?: string
     }
   /** A bare repository has no working tree to reconcile. */
   | { readonly ok: true; readonly kind: "bare" }
@@ -340,12 +338,10 @@ export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): Check
       }
     }
     // A repaired index DID move, so the outcome says so: current only when nothing was brought forward.
-    return {
-      ok: true,
-      kind: carried.repairedIndexFrom === undefined ? "already-current" : "synchronized",
-      dirtyPaths: current.paths,
-      ...repaired,
+    if (carried.repairedIndexFrom !== undefined) {
+      return { ok: true, kind: "synchronized", dirtyPaths: current.paths, repairedIndexFrom: carried.repairedIndexFrom }
     }
+    return { ok: true, kind: "already-current", dirtyPaths: current.paths }
   }
 
   const branch = checkedOutRef(repoRoot)
@@ -414,9 +410,8 @@ export interface RemoteFirstProjectionRequest {
   /** Dirt observed before projecting, under the same lock; must survive exactly. */
   readonly expectedDirtyPaths: readonly string[]
   /**
-   * The ref's value the caller read before publishing. No longer consulted (25393): the projection finds the base
-   * the index still reflects by matching its tree against the local tip's history, which covers this case and any
-   * deeper one. Accepted so existing callers keep compiling.
+   * @deprecated Not consulted since 25393: the first-parent walk against the index's tree id subsumes it. Deleted,
+   * with its in-repo callers, by the next carrier that touches km-storage and km-beads.
    */
   readonly preTransactTip?: string | undefined
   /** Limit, in milliseconds, for fetching the landing. Defaults to Gitomic's remote limit. */
