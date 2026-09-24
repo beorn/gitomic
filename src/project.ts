@@ -161,6 +161,35 @@ export function worktreeDirtyPaths(repoRoot: string): string[] {
   return [...new Set([...nulPaths(tracked.stdout), ...nulPaths(untracked.stdout)])].sort()
 }
 
+export type StaleIndexRead =
+  | { readonly kind: "none" }
+  | { readonly kind: "parent"; readonly parent: string; readonly delta: readonly string[] }
+  | { readonly kind: "unreadable"; readonly detail: string }
+
+/**
+ * Whether the index still holds exactly `tip`'s first parent's tree, not `tip`'s: the state a commit leaves when it
+ * advanced the ref but its own checkout update was refused (25393; a hook commit that lost the index.lock race).
+ * `git status` then shows the commit's whole inverse delta, and a projection that judges only the ref would call it
+ * current. Read-only; `delta` is the pathset between the parent and `tip`, the dirt the repair resolves.
+ */
+export function indexLeftAtParent(repoRoot: string, tip: string): StaleIndexRead {
+  const parent = git(repoRoot, readonlyArgs(["rev-parse", "--verify", "--quiet", `${tip}^1^{commit}`]))
+  if (parent.status !== 0 || parent.stdout === "") return { kind: "none" }
+  const atTip = git(repoRoot, readonlyArgs(["diff-index", "--cached", "--quiet", tip, "--"]))
+  if (atTip.status === 0) return { kind: "none" }
+  if (atTip.status !== 1) return { kind: "unreadable", detail: `index against ${tip}: ${gitDetail(atTip)}` }
+  const atParent = git(repoRoot, readonlyArgs(["diff-index", "--cached", "--quiet", parent.stdout, "--"]))
+  if (atParent.status === 1) return { kind: "none" }
+  if (atParent.status !== 0) {
+    return { kind: "unreadable", detail: `index against ${parent.stdout}: ${gitDetail(atParent)}` }
+  }
+  const delta = git(repoRoot, readonlyArgs(["diff", "--name-only", "-z", parent.stdout, tip, "--"]))
+  if (delta.status !== 0) {
+    return { kind: "unreadable", detail: `paths between ${parent.stdout} and ${tip}: ${gitDetail(delta)}` }
+  }
+  return { kind: "parent", parent: parent.stdout, delta: nulPaths(delta.stdout) }
+}
+
 /** The branch HEAD points at, or null when HEAD is detached. */
 export function checkedOutRef(repoRoot: string): string | null {
   const symbolic = git(repoRoot, readonlyArgs(["symbolic-ref", "--quiet", "HEAD"]))
@@ -567,6 +596,8 @@ export interface ProjectCheckoutRequest {
 export type ProjectCheckoutOutcome = RemoteFirstProjectionOutcome & {
   readonly to?: string | undefined
   readonly localTip?: string | undefined
+  /** The parent whose tree the index still held; the projection carried it forward to the local tip first (25393). */
+  readonly repairedIndexFrom?: string | undefined
 }
 
 /**
@@ -628,6 +659,37 @@ export async function projectCheckout(request: ProjectCheckoutRequest): Promise<
   const localTipRead = git(repoRoot, readonlyArgs(["rev-parse", "--verify", ref]))
   const localTip = localTipRead.status === 0 ? localTipRead.stdout : undefined
 
+  // An index left at the parent's tree is repaired to the local tip first, by the same conditional two-way merge
+  // every projection uses: unrelated dirt survives exactly and an edit to a path the commit wrote refuses. Only
+  // then does the projection judge the ref, so it never calls a stale index current (25393).
+  let repairedIndexFrom: string | undefined
+  if (localTip !== undefined) {
+    const stale = indexLeftAtParent(repoRoot, localTip)
+    if (stale.kind === "unreadable") {
+      return {
+        ok: false,
+        kind: "dirt-unverifiable",
+        error:
+          `${ref} in the checkout ${repoRoot}: whether the index still holds the parent of ${localTip} could not ` +
+          `be read (${stale.detail}). Nothing was changed.`,
+        to,
+        localTip,
+      }
+    }
+    if (stale.kind === "parent") {
+      const resolved = new Set(stale.delta)
+      const repaired = synchronizeCheckoutToCommit({
+        repoRoot,
+        from: stale.parent,
+        to: localTip,
+        ref,
+        expectedDirtyPaths: worktreeDirtyPaths(repoRoot).filter((path) => !resolved.has(path)),
+      })
+      if (!repaired.ok) return { ...repaired, to, localTip }
+      repairedIndexFrom = stale.parent
+    }
+  }
+
   const expectedDirtyPaths = worktreeDirtyPaths(repoRoot)
   const projectionOutcome = await projectRemoteFirstFastForward({
     repoRoot,
@@ -643,5 +705,6 @@ export async function projectCheckout(request: ProjectCheckoutRequest): Promise<
     ...projectionOutcome,
     to,
     ...(localTip !== undefined ? { localTip } : {}),
+    ...(repairedIndexFrom !== undefined ? { repairedIndexFrom } : {}),
   }
 }
