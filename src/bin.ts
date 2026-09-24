@@ -1,6 +1,5 @@
 #!/usr/bin/env bun
 import { spawnSync } from "node:child_process"
-import { readFile } from "node:fs/promises"
 import { resolve } from "node:path"
 
 import type { CheckoutLock } from "./checkout-lock.js"
@@ -985,7 +984,6 @@ async function projectAfterWrite(
       ref: storeRef,
       remote: repository.remote ?? "origin",
       expectedDirtyPaths,
-      preTransactTip: startBase,
     })
   }
 
