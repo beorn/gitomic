@@ -95,6 +95,13 @@ export type Trailer = readonly [key: string, value: string]
 export type CommitInput = {
   parent: Oid
   /**
+   * The commit's time in unix seconds (author and committer alike), from the
+   * store's clock at this attempt. Every backend writes the later of this and
+   * the parent's time plus one, so times track the clock and never run
+   * backwards; a non-integer is a fault (25486).
+   */
+  time: number
+  /**
    * The complete parent list, when the commit has more than one. The first
    * entry must equal `parent`; the rest are commits this one keeps (an event
    * keeps the commit it is about). Omitted, the commit has `parent` alone.
@@ -271,6 +278,9 @@ export type RefOutcome = { readonly ref: string; readonly outcome: "updated" | "
 /** A MULTI publish that landed: every ref's outcome, in the order given. */
 export type PublishResult = { readonly outcomes: readonly RefOutcome[] }
 
+/** A clock in unix seconds (an integer). */
+export type Clock = () => number
+
 export type OpenOptions = {
   repo: string
   ref: string
@@ -288,6 +298,13 @@ export type OpenOptions = {
   committer?: Ident
   remote?: string
   backend?: GitomicBackend
+  /**
+   * The clock this store dates its commits by, in unix seconds (an integer).
+   * Defaults to the wall clock. Pass a fixed or counting clock when commit ids
+   * must be identical across backends or retries (tests, replays); a
+   * consumer never inherits that determinism by accident (25486).
+   */
+  clock?: Clock
   /**
    * How long, in milliseconds, a transaction keeps retrying a contended CAS
    * before throwing {@link RetriesExhausted}. The budget is time, not an attempt

@@ -8,15 +8,16 @@ import { join, resolve } from "node:path"
 import { GitTimeout } from "./errors.js"
 import {
   assertRefUpdates,
-  leaseConflict,
+  commitIdents,
   commitMeta,
   commitParents,
-  commitIdents,
+  commitTimestamp,
   formatCommitMessage,
   GENESIS_MESSAGE,
   GITOMIC_IDENT,
   INITIAL_TIMESTAMP,
   isZeroOid,
+  leaseConflict,
   objectOid,
   parseCommit,
   refUnderPrefix,
@@ -712,6 +713,7 @@ async function writeCommit(repo: string, input: CommitInput, baseEnv?: NodeJS.Pr
       validateOid(tree, "invalid parent tree id"),
       parents,
       Number(parentTime),
+      input.time,
       message,
       idents,
       baseEnv,
@@ -765,7 +767,7 @@ async function writeCommit(repo: string, input: CommitInput, baseEnv?: NodeJS.Pr
     })
     const tree = text(await gitWrite(repo, ["write-tree"], { baseEnv, env: indexEnv }))
     const parentTime = Number(text(await git(repo, ["show", "-s", "--format=%ct", input.parent], { baseEnv })))
-    return await commitTree(repo, tree, parents, parentTime, message, idents, baseEnv)
+    return await commitTree(repo, tree, parents, parentTime, input.time, message, idents, baseEnv)
   } finally {
     await rm(indexDir, { recursive: true, force: true })
   }
@@ -797,17 +799,18 @@ function keptMode(input: CommitInput, path: string, executables: ReadonlySet<str
   return executables.has(input.modeSources?.get(path) ?? path) ? "100755" : "100644"
 }
 
-/** Write one commit as the given author and committer, one second after its first parent. */
+/** Write one commit as the given author and committer, at the store's time and never earlier than its first parent plus one. */
 async function commitTree(
   repo: string,
   tree: Oid,
   parents: readonly Oid[],
   parentTime: number,
+  time: number,
   message: string,
   idents: { readonly author: Ident; readonly committer: Ident },
   baseEnv?: NodeJS.ProcessEnv,
 ): Promise<Oid> {
-  const timestamp = Number.isFinite(parentTime) ? parentTime + 1 : 1
+  const timestamp = commitTimestamp(parentTime, time)
   const args = ["commit-tree", tree]
   for (const parent of parents) args.push("-p", parent)
   return text(await gitWrite(repo, args, { baseEnv, env: identityEnv(timestamp, idents), input: message }))

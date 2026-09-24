@@ -69,6 +69,7 @@ describe("iso backend", () => {
         ...identity,
         provenance,
         seq: 0,
+        time: 946_684_800, // the genesis time: parent + 1 wins, so the pinned numbers hold
         message: "first",
         changes: new Map([
           ["nested/a.txt", "a\n"],
@@ -82,6 +83,7 @@ describe("iso backend", () => {
         ...identity,
         provenance,
         seq: 1,
+        time: 946_684_800, // the genesis time: parent + 1 wins, so the pinned numbers hold
         message: "second",
         changes: new Map([
           ["nested/a.txt", undefined],
@@ -235,6 +237,7 @@ describe("iso backend", () => {
           writer: "same-writer",
           instance: "3f9d1c02-5b7a-4e18-9c44-0a2b6d8e1f30",
           seq: 0,
+          time: 946_684_800, // the genesis time: parent + 1 wins, so the pinned numbers hold
           message: "edit script",
           changes: new Map([["script", "after\n"]]),
         },

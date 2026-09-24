@@ -37,6 +37,7 @@ function input(overrides: Partial<CommitInput> = {}): CommitInput {
     writer: "km",
     instance: "00000000-0000-4000-8000-000000000000",
     seq: 0,
+    time: 946_684_800, // the genesis time: parent + 1 wins, so the pinned oid holds
     ...overrides,
   }
 }

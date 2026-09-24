@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Changed
+
+- Commit times are the wall clock (25486). Every backend dated a commit one
+  second after its parent, so a busy chain's dates fell hours behind the clock
+  (316 STATE commits made over five hours carried five minutes of dates).
+  `open` and `openEvents` take `clock?: () => number` (unix seconds, an
+  integer; the wall clock by default), `CommitInput` carries `time`, and every
+  backend writes the later of that time and the parent's plus one, so a chain
+  never runs backwards. Pass a fixed or counting clock for deterministic
+  commit ids across shell, iso and mem and across a retry; the genesis keeps
+  its fixed time. A non-integer clock value or an unreadable parent time is a
+  `TypeError` by name, replacing the silent `1` fallback. No CLI flag: the CLI
+  is a wall-clock writer.
+
 ### Removed
 
 - `RemoteFirstProjectionRequest.preTransactTip` (25350 S2, 25436): deprecated and

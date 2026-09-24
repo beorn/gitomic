@@ -10,6 +10,19 @@ export const GITOMIC_IDENT: Ident = Object.freeze({ name: GITOMIC_NAME, email: G
 export const INITIAL_TIMESTAMP = 946_684_800
 export const TRANSACTION_SEARCH_LIMIT = 1_024
 
+/**
+ * The time a commit is written with: the store's clock reading for this attempt, never earlier than the
+ * parent's time plus one, so dates track the clock and a chain never runs backwards (25486). A parent time git
+ * could not read, or a clock that is not an integer of unix seconds, is a fault raised by name, never a default.
+ */
+export function commitTimestamp(parentTime: number, time: number): number {
+  if (!Number.isFinite(parentTime))
+    throw new TypeError(`gitomic: the parent commit's time is not a number (${String(parentTime)})`)
+  if (!Number.isInteger(time))
+    throw new TypeError(`gitomic: the clock returned ${String(time)}; an integer of unix seconds is required`)
+  return Math.max(time, parentTime + 1)
+}
+
 export type GitObject = {
   type: "blob" | "tree" | "commit"
   content: Buffer
