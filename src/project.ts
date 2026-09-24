@@ -511,11 +511,6 @@ export interface RemoteFirstProjectionRequest {
   readonly remote: string
   /** Dirt observed before projecting, under the same lock; must survive exactly. */
   readonly expectedDirtyPaths: readonly string[]
-  /**
-   * @deprecated Not consulted since 25393: the first-parent walk against the index's tree id subsumes it. Deleted,
-   * with its in-repo callers, by the next carrier that touches km-storage and km-beads.
-   */
-  readonly preTransactTip?: string | undefined
   /** Limit, in milliseconds, for fetching the landing. Defaults to Gitomic's remote limit. */
   readonly remoteTimeoutMs?: number | undefined
   /**
@@ -637,9 +632,8 @@ export async function projectRemoteFirstFastForward(
     }
   }
   const localTip = localTipRead.stdout
-  // Carry an index left at any ancestor's tree forward to the local tip FIRST (25393). This subsumes the old
-  // `preTransactTip` arm: an object-side writer that advanced the ref mid-flight leaves the index at an ancestor,
-  // which the search finds. From here on the index holds `localTip`, so every merge below starts there.
+  // Carry an index left at any ancestor's tree forward to the local tip FIRST (25393): an object-side writer that
+  // advanced the ref mid-flight leaves the index at an ancestor, which the search finds. From here on the index holds `localTip`, so every merge below starts there.
   const carried = carryIndexTo(repoRoot, localTip, ref, request.expectedDirtyPaths, to)
   if (!carried.ok) return carried.outcome
   const expectedDirtyPaths = carried.expectedDirtyPaths

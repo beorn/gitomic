@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Removed
+
+- `RemoteFirstProjectionRequest.preTransactTip` (25350 S2, 25436): deprecated and
+  unread since 25393, whose first-parent walk against the index's tree id
+  subsumes it; its in-repo callers are gone with it.
+
 ### Added
 
 - The checkout lock (25350): `gitomic project` and `gitomic apply --checkout`
