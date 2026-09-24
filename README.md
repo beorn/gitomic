@@ -540,6 +540,8 @@ Both verbs hold the **checkout lock**, `<git-common-dir>/km-state-write.lock`, s
 
 The lock is flock(2) through `bun:ffi`, and Node has no flock API, so these two verbs need Bun: under Node they exit `6` and write nothing, while every other verb runs. The library exposes the lock at the Bun-only subpath `gitomic/checkout-lock` (`holdCheckoutLock`, `checkoutLockPath`, `CHECKOUT_LOCK_NAME`, `CHECKOUT_LOCK_FD_ENV`); the root `gitomic` entry never imports it. The library's projection functions run under the caller's lock and never take it.
 
+A caller that writes files in the checkout and lands them object-side builds its edits with `editsFromCheckout(root, paths, base)` from the root entry: each named path present in the checkout becomes a `put` of its UTF-8 content, anchored as the CLI's `put` anchors it (the path's oid at `base`, or a create), and each missing one an `rm` of its oid at `base`. A path absent from both, or named twice, refuses. Hold the checkout lock around the build, the `apply` and the projection that follows.
+
 Product output — content, paths, matches, the oid or receipt — goes to stdout; narration and errors to stderr. The exit codes are the whole contract, and nothing fails silently:
 
 | code | meaning                                                                                                                                                                           |

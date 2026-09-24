@@ -149,7 +149,9 @@ function isAlive(pid: number): boolean {
 function adoptCheckoutLock(path: string, text: string): CheckoutLock {
   const fd = /^\d+$/u.test(text) ? Number(text) : Number.NaN
   if (!Number.isSafeInteger(fd) || fd < 3) {
-    throw new Error(`${CHECKOUT_LOCK_FD_ENV} must name an inherited descriptor >= 3 holding ${path}, got ${JSON.stringify(text)}`)
+    throw new Error(
+      `${CHECKOUT_LOCK_FD_ENV} must name an inherited descriptor >= 3 holding ${path}, got ${JSON.stringify(text)}`,
+    )
   }
   const lock = adoptInheritedFlock(path, fd)
   if (lock === null) {

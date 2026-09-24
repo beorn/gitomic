@@ -30,9 +30,6 @@
     "CHANGELOG.md",
     "LICENSE"
   ],
-  "dependencies": {
-    "@bearly/flock": "^0.1.1"
-  },
   "type": "module",
   "sideEffects": false,
   "exports": {
@@ -88,6 +85,9 @@
     "test:stress": "vitest run --config vitest.stress.config.ts",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@bearly/flock": "^0.1.1"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",

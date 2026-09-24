@@ -79,7 +79,10 @@ async function holdLock(repo: string, mode: "hold" | "silent"): Promise<number> 
 describe("the checkout lock", () => {
   test("project waits out a busy lock, exits 5, and names the path and the holder", async () => {
     const { checkout } = fixture()
-    const lockPath = join(git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir"), "km-state-write.lock")
+    const lockPath = join(
+      git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir"),
+      "km-state-write.lock",
+    )
     const pid = await holdLock(checkout, "hold")
 
     const result = gitomic(["project", checkout, "--lock-timeout", "200"])
@@ -174,7 +177,7 @@ describe("the checkout lock", () => {
     })
 
     expect(result.status).toBe(1)
-    expect(result.stderr).toContain('GITOMIC_CHECKOUT_LOCK_FD must name an inherited descriptor >= 3 holding')
+    expect(result.stderr).toContain("GITOMIC_CHECKOUT_LOCK_FD must name an inherited descriptor >= 3 holding")
     expect(result.stderr).toContain('got "stdin"')
   })
 

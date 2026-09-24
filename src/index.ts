@@ -41,6 +41,7 @@ import { assertUtf8 } from "./utf8.js"
 export { CandidateRefused, Conflict, EditDoesNotApply, GitTimeout, RetriesExhausted }
 export type { EditKind, PreconditionType } from "./errors.js"
 export { applyEdits } from "./edits.js"
+export { editsFromCheckout } from "./checkout-edits.js"
 export {
   CANDIDATE_CONFIG,
   DEFAULT_CANDIDATE_TIMEOUT_MS,

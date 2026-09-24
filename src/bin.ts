@@ -35,6 +35,7 @@ import {
   type Snapshot,
   type Trailer,
 } from "./index.js"
+import { putPrecondition, readTextFile } from "./checkout-edits.js"
 import { decodeUtf8 } from "./utf8.js"
 
 /**
@@ -459,7 +460,7 @@ async function runWrite(
   const snapshot = store.at(base)
   const edits: Edit[] = []
   for (const { path, file } of pairs) {
-    const content = file === "-" ? await readStdin(stdin) : await readFileContent(file)
+    const content = file === "-" ? await readStdin(stdin) : await readTextFile(file)
     const anchor = await putPrecondition(path, expect.get(path), create.has(path), snapshot)
     edits.push({ kind: "put", path, content, expect: anchor })
   }
@@ -735,7 +736,7 @@ async function parsePutClause(tokens: readonly string[], snapshot: Snapshot, std
   const expectFlag = optionalStringFlag(flags, "--expect")
   const createFlag = flags.get("--create") === true
   assertNotContradictoryPrecondition(path, expectFlag !== undefined, createFlag)
-  const content = file === "-" ? await readStdin(stdin) : await readFileContent(file)
+  const content = file === "-" ? await readStdin(stdin) : await readTextFile(file)
   const anchor = await putPrecondition(path, expectFlag, createFlag, snapshot)
   return { kind: "put", path, content, expect: anchor }
 }
@@ -745,7 +746,7 @@ async function parseAppendClause(tokens: readonly string[], stdin: CliStdin): Pr
   assertNoExtraPositionals(positionals, 2, "append <path> <file>")
   const path = clausePath(requirePositional(positionals, 0, "append <path>"))
   const file = requirePositional(positionals, 1, "append <path> <file>")
-  const content = file === "-" ? await readStdin(stdin) : await readFileContent(file)
+  const content = file === "-" ? await readStdin(stdin) : await readTextFile(file)
   return { kind: "append", path, content }
 }
 
@@ -842,26 +843,6 @@ function parseUniquePaths(flag: string, raw: readonly string[]): ReadonlySet<str
 /** A path cannot claim both "must already hold this oid" (`--expect`) and "must be strictly absent" (`--create`). */
 function assertNotContradictoryPrecondition(path: string, hasExpect: boolean, hasCreate: boolean): void {
   if (hasExpect && hasCreate) throw new UsageError(`--create and --expect both given for the same path: ${path}`)
-}
-
-/**
- * `put`'s precondition for one path — shared by `write` and `apply`'s `put`
- * clause: an explicit oid wins, else a strict `--create` is `null` (refuses
- * if the path turns out to be present), else auto-read the path's own
- * current oid at the base the moment the command started — present means
- * "replace exactly that", absent means a create. Race-safe like `rm`/`mv`'s
- * auto-read below: `apply`'s CAS replay re-checks this same precondition
- * against whatever tree the commit actually attempts.
- */
-async function putPrecondition(
-  path: string,
-  explicitExpect: Oid | undefined,
-  strictCreate: boolean,
-  snapshot: Snapshot,
-): Promise<Oid | null> {
-  if (explicitExpect !== undefined) return explicitExpect
-  if (strictCreate) return null
-  return (await snapshot.oid(path)) ?? null
 }
 
 /**
@@ -1229,10 +1210,6 @@ async function readStdin(stdin: CliStdin): Promise<string> {
 }
 
 /** Read one `write` pair's `<file>` from the local filesystem, failing loudly on either an unreadable file or invalid UTF-8. */
-async function readFileContent(file: string): Promise<string> {
-  return decodeUtf8(await readFile(file), `file ${JSON.stringify(file)}`)
-}
-
 // --- trust -------------------------------------------------------------------
 
 /** Print the declaration at the address's tip, then record its blob as trusted (the order the verb promises). */

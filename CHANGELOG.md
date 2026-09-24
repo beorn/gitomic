@@ -17,6 +17,11 @@
   `bun:ffi`, and Node has no flock API, so `project` and `apply --checkout`
   need Bun and exit `6` under Node, writing nothing; every other verb runs on
   either runtime.
+- `editsFromCheckout(root, paths, base)` on the root entry (25350): the files a
+  caller wrote in a checkout become edits against the snapshot it read — a
+  present file a `put` under `put`'s own auto-read precondition, a missing one
+  an `rm` anchored on its base oid; a path absent from both, or named twice,
+  refuses. The CLI's `put` shares its file read and precondition.
 
 ### Fixed
 
