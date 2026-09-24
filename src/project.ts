@@ -70,9 +70,21 @@ export interface CheckoutSyncRequest {
 
 export type CheckoutSyncOutcome =
   /** Index and working tree now hold `to`, and the dirt is the pathset we started with. */
-  | { readonly ok: true; readonly kind: "synchronized"; readonly dirtyPaths: readonly string[] }
+  | {
+      readonly ok: true
+      readonly kind: "synchronized"
+      readonly dirtyPaths: readonly string[]
+      /** The ancestor whose tree the index still held; it was carried forward first (25393). */
+      readonly repairedIndexFrom?: string
+    }
   /** The ref did not move, so there is nothing to bring forward. */
-  | { readonly ok: true; readonly kind: "already-current"; readonly dirtyPaths: readonly string[] }
+  | {
+      readonly ok: true
+      readonly kind: "already-current"
+      readonly dirtyPaths: readonly string[]
+      /** The ancestor whose tree the index still held; it was carried forward first (25393). */
+      readonly repairedIndexFrom?: string
+    }
   /** A bare repository has no working tree to reconcile. */
   | { readonly ok: true; readonly kind: "bare" }
   /** HEAD is detached or on another branch, so no two-way merge can reconcile this checkout. */
@@ -161,49 +173,88 @@ export function worktreeDirtyPaths(repoRoot: string): string[] {
   return [...new Set([...nulPaths(tracked.stdout), ...nulPaths(untracked.stdout)])].sort()
 }
 
-/** How many first-parent ancestors of the tip a projection searches for the tree a stale index still holds. */
-export const STALE_INDEX_SEARCH_DEPTH = 64
-
-export type IndexBaseRead =
-  /** The index holds `tip`'s tree. */
-  | { readonly kind: "at-tip" }
-  /** The index holds exactly the tree of `ancestor`, `depth` first parents below `tip`; `delta` is what it lacks. */
-  | {
-      readonly kind: "ancestor"
-      readonly ancestor: string
-      readonly depth: number
-      readonly delta: readonly string[]
-    }
-  /** The index matches neither `tip` nor any of its `bound` first-parent ancestors. */
-  | { readonly kind: "none-within-bound"; readonly bound: number }
-  | { readonly kind: "unreadable"; readonly detail: string }
+type IndexCarry =
+  | { readonly ok: true; readonly expectedDirtyPaths: string[]; readonly repairedIndexFrom?: string }
+  | { readonly ok: false; readonly outcome: Extract<CheckoutSyncOutcome, { readonly ok: false }> }
 
 /**
- * Which commit's tree the index holds: `tip`, or the nearest of its first-parent ancestors within `bound`. A commit
- * that advanced the ref while its checkout update was refused (25393: a hook commit that lost the index.lock race)
- * leaves the index at its parent, and `gitomic apply` commits without the index, so later landings can leave it
- * several commits behind. Read-only.
+ * Bring an index that still holds an ANCESTOR's tree forward to `tip`, before any projection judges the ref.
+ *
+ * A commit that advanced the ref while its own checkout update was refused (25393: a hook commit that lost the
+ * index.lock race) leaves the index at its parent, and `gitomic apply` commits without the index, so any number of
+ * later landings can leave it further behind. The index's tree id is matched against `tip`'s first-parent history in
+ * ONE walk, with no depth cliff; the first match is carried forward by the conditional two-way merge every projection
+ * uses, so unrelated dirt survives and an edit to a path the skipped commits wrote refuses. An index already at
+ * `tip`, or at `alreadyAt` (a projection re-running after its probe merge), needs nothing. An index that holds no
+ * ancestor's tree carries staged changes no projection may overwrite, and refuses. `expectedDirtyPaths` comes back
+ * without the paths the repair resolved.
  */
-export function indexBaseAmongAncestors(
+function carryIndexTo(
   repoRoot: string,
   tip: string,
-  bound: number = STALE_INDEX_SEARCH_DEPTH,
-): IndexBaseRead {
-  const chain = git(repoRoot, readonlyArgs(["rev-list", "--first-parent", `--max-count=${bound + 1}`, tip, "--"]))
-  if (chain.status !== 0) return { kind: "unreadable", detail: `first parents of ${tip}: ${gitDetail(chain)}` }
-  const commits = chain.stdout.split("\n").filter(Boolean)
-  for (const [depth, commit] of commits.entries()) {
-    const same = git(repoRoot, readonlyArgs(["diff-index", "--cached", "--quiet", commit, "--"]))
-    if (same.status === 1) continue
-    if (same.status !== 0) return { kind: "unreadable", detail: `index against ${commit}: ${gitDetail(same)}` }
-    if (depth === 0) return { kind: "at-tip" }
-    const delta = git(repoRoot, readonlyArgs(["diff", "--name-only", "-z", commit, tip, "--"]))
-    if (delta.status !== 0) {
-      return { kind: "unreadable", detail: `paths between ${commit} and ${tip}: ${gitDetail(delta)}` }
-    }
-    return { kind: "ancestor", ancestor: commit, depth, delta: nulPaths(delta.stdout) }
+  ref: string,
+  expectedDirtyPaths: readonly string[],
+  alreadyAt?: string,
+): IndexCarry {
+  const refuse = (error: string): IndexCarry => ({
+    ok: false,
+    outcome: { ok: false, kind: "dirt-unverifiable", error },
+  })
+  const indexTree = git(repoRoot, ["write-tree"])
+  if (indexTree.status !== 0) {
+    return refuse(
+      `${ref} in the checkout ${repoRoot}: the index's tree could not be read (${gitDetail(indexTree)}). ` +
+        "Nothing was changed.",
+    )
   }
-  return { kind: "none-within-bound", bound }
+  const expected = [...expectedDirtyPaths]
+  if (alreadyAt !== undefined) {
+    const at = git(repoRoot, readonlyArgs(["rev-parse", "--verify", `${alreadyAt}^{tree}`]))
+    if (at.status === 0 && at.stdout === indexTree.stdout) return { ok: true, expectedDirtyPaths: expected }
+  }
+  const walk = git(
+    repoRoot,
+    readonlyArgs(["rev-list", "--first-parent", "--no-commit-header", "--format=%H %T", tip, "--"]),
+  )
+  if (walk.status !== 0) {
+    return refuse(`${ref} in the checkout ${repoRoot}: the history of ${tip} could not be read (${gitDetail(walk)}).`)
+  }
+  const history = walk.stdout.split("\n").filter(Boolean)
+  const match = history.find((line) => line.endsWith(` ${indexTree.stdout}`))
+  if (match === undefined) {
+    return refuse(
+      `${ref} in the checkout ${repoRoot}: the index holds neither ${tip}'s tree nor that of any of its ` +
+        `${history.length - 1} first-parent ancestors, so it carries staged changes no projection may overwrite. ` +
+        "Nothing was changed; project again once the index holds one of those trees.",
+    )
+  }
+  const ancestor = match.slice(0, match.indexOf(" "))
+  if (ancestor === tip) return { ok: true, expectedDirtyPaths: expected }
+  const delta = git(repoRoot, readonlyArgs(["diff", "--name-only", "-z", ancestor, tip, "--"]))
+  if (delta.status !== 0) {
+    return refuse(
+      `${ref} in the checkout ${repoRoot}: the paths between ${ancestor} and ${tip} could not be read ` +
+        `(${gitDetail(delta)}). Nothing was changed.`,
+    )
+  }
+  const merged = git(repoRoot, ["read-tree", "-m", "-u", ancestor, tip])
+  if (merged.status !== 0) {
+    return {
+      ok: false,
+      outcome: {
+        ok: false,
+        kind: "worktree-update-refused",
+        expectedDirtyPaths: [...expected].sort(),
+        gitDetail: gitDetail(merged),
+        error:
+          `${ref} in the checkout ${repoRoot} is at ${tip}, but its index still holds ${ancestor}'s tree and could ` +
+          `not be brought forward without overwriting an uncommitted local edit (${gitDetail(merged)}). The index ` +
+          "and working tree are unchanged.",
+      },
+    }
+  }
+  const resolved = new Set(nulPaths(delta.stdout))
+  return { ok: true, expectedDirtyPaths: expected.filter((path) => !resolved.has(path)), repairedIndexFrom: ancestor }
 }
 
 /** The branch HEAD points at, or null when HEAD is detached. */
@@ -240,10 +291,14 @@ function sameSet(left: readonly string[], right: readonly string[]): boolean {
  * and the write refusals it then produces name files nobody edited.
  */
 export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): CheckoutSyncOutcome {
-  const { repoRoot, from, to, ref, expectedDirtyPaths } = request
+  const { repoRoot, from, to, ref } = request
   if (isBareRepository(repoRoot)) return { ok: true, kind: "bare" }
 
-  const expected = [...expectedDirtyPaths].sort()
+  // The index must hold `from` (or already `to`) before the two-way merge can be trusted: carry a stale one forward.
+  const carried = carryIndexTo(repoRoot, from, ref, request.expectedDirtyPaths, to)
+  if (!carried.ok) return carried.outcome
+  const repaired = carried.repairedIndexFrom === undefined ? {} : { repairedIndexFrom: carried.repairedIndexFrom }
+  const expected = [...carried.expectedDirtyPaths].sort()
   if (from === to) {
     const current = readDirt(repoRoot)
     if (!current.ok) {
@@ -284,7 +339,7 @@ export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): Check
           "so the checkout is not current. Nothing was changed.",
       }
     }
-    return { ok: true, kind: "already-current", dirtyPaths: current.paths }
+    return { ok: true, kind: "already-current", dirtyPaths: current.paths, ...repaired }
   }
 
   const branch = checkedOutRef(repoRoot)
@@ -338,7 +393,7 @@ export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): Check
         `[${remaining.paths.join(", ")}].`,
     }
   }
-  return { ok: true, kind: "synchronized", dirtyPaths: remaining.paths }
+  return { ok: true, kind: "synchronized", dirtyPaths: remaining.paths, ...repaired }
 }
 
 export interface RemoteFirstProjectionRequest {
@@ -353,14 +408,9 @@ export interface RemoteFirstProjectionRequest {
   /** Dirt observed before projecting, under the same lock; must survive exactly. */
   readonly expectedDirtyPaths: readonly string[]
   /**
-   * The ref's value read by the caller BEFORE publishing, under the same
-   * operation lock — the same capture the local path hands to
-   * `synchronizeCheckoutToCommit` as `from`. When the projection finds the
-   * ref already AT the landing, this names the base the index still
-   * reflects, so a checkout whose ref an object-side writer advanced
-   * mid-flight is repaired by the same two-way merge instead of being
-   * reported current unverified. Absent or equal to the landing, the
-   * checkout is verified as already current.
+   * The ref's value the caller read before publishing. No longer consulted (25393): the projection finds the base
+   * the index still reflects by matching its tree against the local tip's history, which covers this case and any
+   * deeper one. Accepted so existing callers keep compiling.
    */
   readonly preTransactTip?: string | undefined
   /** Limit, in milliseconds, for fetching the landing. Defaults to Gitomic's remote limit. */
@@ -430,7 +480,7 @@ export type RemoteFirstProjectionOutcome =
 export async function projectRemoteFirstFastForward(
   request: RemoteFirstProjectionRequest,
 ): Promise<RemoteFirstProjectionOutcome> {
-  const { repoRoot, to, ref, remote, expectedDirtyPaths } = request
+  const { repoRoot, to, ref, remote } = request
   if (isBareRepository(repoRoot)) return { ok: true, kind: "bare" }
 
   const branch = checkedOutRef(repoRoot)
@@ -481,15 +531,21 @@ export async function projectRemoteFirstFastForward(
     }
   }
   const localTip = localTipRead.stdout
+  // Carry an index left at any ancestor's tree forward to the local tip FIRST (25393). This subsumes the old
+  // `preTransactTip` arm: an object-side writer that advanced the ref mid-flight leaves the index at an ancestor,
+  // which the search finds. From here on the index holds `localTip`, so every merge below starts there.
+  const carried = carryIndexTo(repoRoot, localTip, ref, request.expectedDirtyPaths)
+  if (!carried.ok) return carried.outcome
+  const expectedDirtyPaths = carried.expectedDirtyPaths
+  const reported = (outcome: RemoteFirstProjectionOutcome): RemoteFirstProjectionOutcome =>
+    outcome.ok &&
+    carried.repairedIndexFrom !== undefined &&
+    (outcome.kind === "synchronized" || outcome.kind === "already-current")
+      ? { ...outcome, repairedIndexFrom: carried.repairedIndexFrom }
+      : outcome
   if (localTip === to) {
-    // The ref already holds the landing. If the caller observed a DIFFERENT
-    // tip before publishing, an object-side writer advanced the ref to
-    // exactly `to` mid-flight and the index still reflects that observed
-    // base — merge from it (dirt preserved, refusal on collision) rather
-    // than reporting current over a stale index. Without such an
-    // observation, already-current is verified against the expected dirt.
-    const from = request.preTransactTip !== undefined && request.preTransactTip !== to ? request.preTransactTip : to
-    return synchronizeCheckoutToCommit({ repoRoot, from, to, ref, expectedDirtyPaths })
+    // The ref already holds the landing; already-current is verified against the expected dirt and the index.
+    return reported(synchronizeCheckoutToCommit({ repoRoot, from: to, to, ref, expectedDirtyPaths }))
   }
 
   const ancestry = git(repoRoot, readonlyArgs(["merge-base", "--is-ancestor", localTip, to]))
@@ -514,7 +570,7 @@ export async function projectRemoteFirstFastForward(
         // passes through unchanged, a stale one is repaired, and the dirt is
         // verified either way. Claiming already-current here without merging
         // is the false report the moved-ref witness pins.
-        return synchronizeCheckoutToCommit({ repoRoot, from: to, to: localTip, ref, expectedDirtyPaths })
+        return reported(synchronizeCheckoutToCommit({ repoRoot, from: to, to: localTip, ref, expectedDirtyPaths }))
       }
       if (published.status !== 1) {
         return {
@@ -606,7 +662,7 @@ export async function projectRemoteFirstFastForward(
         `again from the current state is safe.`,
     }
   }
-  return synchronizeCheckoutToCommit({ repoRoot, from: localTip, to, ref, expectedDirtyPaths })
+  return reported(synchronizeCheckoutToCommit({ repoRoot, from: localTip, to, ref, expectedDirtyPaths }))
 }
 
 export interface ProjectCheckoutRequest {
@@ -688,41 +744,6 @@ export async function projectCheckout(request: ProjectCheckoutRequest): Promise<
   const localTipRead = git(repoRoot, readonlyArgs(["rev-parse", "--verify", ref]))
   const localTip = localTipRead.status === 0 ? localTipRead.stdout : undefined
 
-  // An index left at an ancestor's tree is repaired to the local tip first, by the same conditional two-way merge
-  // every projection uses: unrelated dirt survives exactly and an edit to a path the commits wrote refuses. Only
-  // then does the projection judge the ref, so it never calls a stale index current (25393).
-  let repairedIndexFrom: string | undefined
-  if (localTip !== undefined) {
-    const base = indexBaseAmongAncestors(repoRoot, localTip)
-    if (base.kind === "unreadable" || base.kind === "none-within-bound") {
-      return {
-        ok: false,
-        kind: "dirt-unverifiable",
-        error:
-          base.kind === "unreadable"
-            ? `${ref} in the checkout ${repoRoot}: which commit's tree the index holds could not be read ` +
-              `(${base.detail}). Nothing was changed.`
-            : `${ref} in the checkout ${repoRoot}: the index holds neither ${localTip}'s tree nor that of any of its ` +
-              `${base.bound} first-parent ancestors, so it carries staged changes no projection may overwrite. ` +
-              `Nothing was changed; project again once the index holds one of those trees.`,
-        to,
-        localTip,
-      }
-    }
-    if (base.kind === "ancestor") {
-      const resolved = new Set(base.delta)
-      const repaired = synchronizeCheckoutToCommit({
-        repoRoot,
-        from: base.ancestor,
-        to: localTip,
-        ref,
-        expectedDirtyPaths: worktreeDirtyPaths(repoRoot).filter((path) => !resolved.has(path)),
-      })
-      if (!repaired.ok) return { ...repaired, to, localTip }
-      repairedIndexFrom = base.ancestor
-    }
-  }
-
   const expectedDirtyPaths = worktreeDirtyPaths(repoRoot)
   const projectionOutcome = await projectRemoteFirstFastForward({
     repoRoot,
@@ -738,6 +759,5 @@ export async function projectCheckout(request: ProjectCheckoutRequest): Promise<
     ...projectionOutcome,
     to,
     ...(localTip !== undefined ? { localTip } : {}),
-    ...(repairedIndexFrom !== undefined ? { repairedIndexFrom } : {}),
   }
 }

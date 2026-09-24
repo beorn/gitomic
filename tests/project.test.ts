@@ -10,13 +10,7 @@ import { join } from "node:path"
 import { afterAll, afterEach, beforeEach, describe, expect, test, vi } from "vitest"
 
 import { main } from "../src/bin.js"
-import { indexBaseAmongAncestors, STALE_INDEX_SEARCH_DEPTH } from "../src/project.js"
-import {
-  projectCheckout,
-  projectRemoteFirstFastForward,
-  synchronizeCheckoutToCommit,
-  worktreeDirtyPaths,
-} from "../src/index.js"
+import { projectRemoteFirstFastForward, synchronizeCheckoutToCommit, worktreeDirtyPaths } from "../src/index.js"
 
 const roots: string[] = []
 
@@ -355,19 +349,52 @@ describe("gitomic project and checkout synchronization", () => {
       expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# staged by hand\n")
     })
 
-    test("the search is bounded: an index older than the bound reads none-within-bound, never at-tip", () => {
+    test("an index 70 commits behind is repaired: the search has no depth cliff", async () => {
       const { checkout } = remoteFixture()
-      const { parent, head } = commitThenLeaveIndexAtParent(checkout)
-      expect(indexBaseAmongAncestors(checkout, head, 1)).toMatchObject({ kind: "ancestor", ancestor: parent, depth: 1 })
+      const { parent } = commitThenLeaveIndexAtParent(checkout)
+      // 69 later landings that commit without the index, as `gitomic apply` does.
       const tree = git(checkout, "rev-parse", "HEAD^{tree}")
-      const later = git(checkout, "commit-tree", tree, "-p", "HEAD", "-m", "later landing")
-      expect(indexBaseAmongAncestors(checkout, later, 1)).toEqual({ kind: "none-within-bound", bound: 1 })
-      expect(STALE_INDEX_SEARCH_DEPTH).toBe(64)
+      let tip = git(checkout, "rev-parse", "HEAD")
+      for (let i = 0; i < 69; i += 1) tip = git(checkout, "commit-tree", tree, "-p", tip, "-m", `landing ${i}`)
+      git(checkout, "update-ref", "refs/heads/main", tip)
+      git(checkout, "push", "-q", "origin", "main")
+
+      const result = await runCli(["project", checkout])
+      expect(result.code).toBe(0)
+      expect(result.stdout).toContain(`repaired-from=${parent}`)
+      expect(worktreeDirtyPaths(checkout)).toEqual([])
     })
 
-    test("HEAD at the tip over a stale index is never already-current, even to the library", () => {
+    test("apply --checkout over a stale index repairs it first and never mixes the stale entries in", async () => {
+      const { bare, checkout } = remoteFixture()
+      commitThenLeaveIndexAtParent(checkout)
+      git(checkout, "push", "-q", "origin", "main")
+      const file = join(tmpdir(), `apply-stale-${Date.now()}.txt`)
+      writeFileSync(file, "# written through apply --checkout\n")
+
+      const result = await runCli([
+        "apply",
+        `${bare}#main`,
+        "-m",
+        "over a stale index",
+        "--checkout",
+        checkout,
+        "put",
+        "bystander.md",
+        file,
+      ])
+      rmSync(file, { force: true })
+      expect(result.code).toBe(0)
+      const landed = result.stdout.trim()
+      expect(git(checkout, "rev-parse", "HEAD")).toBe(landed)
+      expect(worktreeDirtyPaths(checkout)).toEqual([])
+      expect(readFileSync(join(checkout, "added.md"), "utf8")).toBe("# added by the hook\n")
+      expect(readFileSync(join(checkout, "bystander.md"), "utf8")).toBe("# written through apply --checkout\n")
+    })
+
+    test("HEAD at the tip over a stale index is repaired, never reported current as it stands, even to the library", () => {
       const { checkout } = remoteFixture()
-      const { head } = commitThenLeaveIndexAtParent(checkout)
+      const { parent, head } = commitThenLeaveIndexAtParent(checkout)
       const outcome = synchronizeCheckoutToCommit({
         repoRoot: checkout,
         from: head,
@@ -375,7 +402,9 @@ describe("gitomic project and checkout synchronization", () => {
         ref: "refs/heads/main",
         expectedDirtyPaths: worktreeDirtyPaths(checkout),
       })
-      expect(outcome.kind).toBe("dirt-unverifiable")
+      expect(outcome).toMatchObject({ ok: true, kind: "already-current", repairedIndexFrom: parent })
+      expect(git(checkout, "write-tree")).toBe(git(checkout, "rev-parse", `${head}^{tree}`))
+      expect(worktreeDirtyPaths(checkout)).toEqual([])
     })
   })
 
