@@ -1457,15 +1457,28 @@ export function fetchedNamespace(remote: string): string {
 
 const FETCH_RACE_ATTEMPTS = 3
 
-/** A fetch that failed only because a concurrent fetch in the same repository raced it for a ref in `namespace`. */
-function lostFetchedRefRace(error: unknown, namespace: string): boolean {
+/**
+ * How a fetch lost a race with a concurrent fetch in the same repository for refs in `namespace`:
+ * "moved" when the other fetch already moved a ref (retry at once), "held" when it still holds a
+ * ref's lock (wait for it first). Undefined when the failure is anything else.
+ */
+function lostFetchedRefRace(error: unknown, namespace: string): "moved" | "held" | undefined {
   const detail = error instanceof Error ? error.message : ""
-  const refs = [
+  const lost = [
     ...detail.matchAll(
-      /(?:^|: )error: cannot lock ref '([^']+)': (?:is at [0-9a-f]+ but expected [0-9a-f]+|reference is missing but expected [0-9a-f]+|Unable to create '[^']*\.lock': File exists\.?)$/gm,
+      /(?:^|: )error: cannot lock ref '([^']+)': (?:is at [0-9a-f]+ but expected [0-9a-f]+|reference is missing but expected [0-9a-f]+|(Unable to create '[^']*\.lock': File exists\.?))$/gm,
     ),
-  ].map((match) => match[1] ?? "")
-  return refs.length > 0 && refs.every((ref) => ref.startsWith(namespace))
+  ].map((match) => ({ ref: match[1] ?? "", held: match[2] !== undefined }))
+  if (lost.length === 0 || !lost.every(({ ref }) => ref.startsWith(namespace))) return undefined
+  return lost.some(({ held }) => held) ? "held" : "moved"
+}
+
+/** A short jittered wait, so a retry does not land inside the lock window of the fetch that holds it. */
+function waitOutHeldFetchLock(): Promise<void> {
+  return new Promise((resolve) => {
+    // raw-lifecycle-ok: the fetch retry awaits this wait, so it cannot outlive its caller.
+    setTimeout(resolve, 25 + Math.floor(Math.random() * 75))
+  })
 }
 
 /**
@@ -1521,7 +1534,18 @@ async function fetchRefs(
       // Another fetch in this repository moved or held one of our private
       // fetched refs between this fetch's read and its lock. The namespace is
       // only a cache of remote tips, so fetching again reads them afresh.
-      if (attempt < FETCH_RACE_ATTEMPTS && lostFetchedRefRace(error, namespace)) continue
+      const race = lostFetchedRefRace(error, namespace)
+      if (race !== undefined && attempt < FETCH_RACE_ATTEMPTS) {
+        if (race === "held") await waitOutHeldFetchLock()
+        continue
+      }
+      if (race !== undefined) {
+        throw new Error(
+          `git fetch lost the race for its fetched refs to another fetch in ${repo} ${attempt} times in a row; ` +
+            `the last attempt failed with: ${error instanceof Error ? error.message : String(error)}`,
+          { cause: error },
+        )
+      }
       await diagnoseMissingObjectFetch(repo, remote, error, baseEnv)
       throw error
     }

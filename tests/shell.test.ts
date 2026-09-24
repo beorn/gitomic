@@ -7,7 +7,7 @@ import { chmod, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 
 import { tmpdir } from "node:os"
 import { delimiter, join } from "node:path"
 
-import { describe, expect, test } from "vitest"
+import { describe, expect, test, vi } from "vitest"
 
 import {
   apply,
@@ -723,6 +723,61 @@ describe.sequential("shell backend failure boundaries", () => {
       expect(tips).toEqual(new Map([["refs/heads/main", pair.initial]]))
       expect((await readFile(fetches, "utf8")).trim().split("\n")).toEqual(["lost", "fetched"])
     } finally {
+      restore()
+      await rm(directory, { recursive: true, force: true })
+      await pair.cleanup()
+    }
+  }, 30_000)
+
+  /** @failure A fetch that kept losing the lock race retried at once and then threw git's bare lock error, hiding that it had retried. */
+  test("waits between attempts while a rival holds the fetched-ref lock, and says how often it lost", async () => {
+    const pair = await createRemoteRepos()
+    const directory = await mkdtemp(join(tmpdir(), "gitomic-fetch-held-"))
+    const bin = join(directory, "bin")
+    const fetches = join(directory, "fetches.log")
+    await mkdir(bin)
+    await writeFile(
+      join(bin, "git"),
+      [
+        "#!/usr/bin/env node",
+        'const { appendFileSync } = require("node:fs")',
+        'const { spawnSync } = require("node:child_process")',
+        "const args = process.argv.slice(2)",
+        'if (args.includes("fetch")) {',
+        '  appendFileSync(process.env.GITOMIC_RACE_LOG, "held\\n")',
+        "  const ref = process.env.GITOMIC_RACE_REF",
+        "  process.stderr.write(`error: cannot lock ref '${ref}': Unable to create '/repo/.git/${ref}.lock': File exists.\\n`)",
+        "  process.exit(1)",
+        "}",
+        'const result = spawnSync(process.env.GITOMIC_REAL_GIT, args, { stdio: "inherit" })',
+        "process.exit(result.status ?? 1)",
+      ].join("\n"),
+    )
+    await chmod(join(bin, "git"), 0o755)
+    const restore = replaceEnvironment({
+      GITOMIC_RACE_LOG: fetches,
+      GITOMIC_RACE_REF: "refs/gitomic/fetched/origin/heads/main",
+      GITOMIC_REAL_GIT: spawnSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).stdout.trim(),
+      PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`,
+    })
+    const timers = vi.spyOn(globalThis, "setTimeout")
+    try {
+      const error = await createShellBackend()
+        .fetchRefs?.(pair.left, ["refs/heads/main"], "origin")
+        .then(
+          () => undefined,
+          (thrown: unknown) => thrown,
+        )
+      expect(error).toBeInstanceOf(Error)
+      expect((error as Error).message).toMatch(
+        /lost the race for its fetched refs to another fetch in .* 3 times in a row/,
+      )
+      expect((error as Error).message).toContain("File exists")
+      expect((await readFile(fetches, "utf8")).trim().split("\n")).toHaveLength(3)
+      const pauses = timers.mock.calls.filter(([, delay]) => typeof delay === "number" && delay >= 25 && delay < 100)
+      expect(pauses).toHaveLength(2)
+    } finally {
+      timers.mockRestore()
       restore()
       await rm(directory, { recursive: true, force: true })
       await pair.cleanup()

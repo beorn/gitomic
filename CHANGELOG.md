@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- A fetch that loses the fetched-ref lock race to another fetch in the same
+  repository waits 25-99 ms before retrying while the rival still holds the
+  lock, and after its last attempt the error says how many times it lost,
+  with git's error as its cause.
+
 ## 0.4.0 — 2026-09-24
 
 ### Removed
