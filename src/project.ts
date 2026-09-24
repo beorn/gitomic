@@ -32,6 +32,9 @@
  */
 
 import { spawnSync } from "node:child_process"
+import { randomUUID } from "node:crypto"
+import { copyFileSync, rmSync } from "node:fs"
+import { dirname, join } from "node:path"
 
 import { DEFAULT_REMOTE_TIMEOUT_MS, runGit } from "./shell.js"
 
@@ -111,16 +114,39 @@ export type CheckoutSyncOutcome =
       readonly observedDirtyPaths: readonly string[]
     }
 
-interface GitOutcome {
+export interface GitOutcome {
   readonly status: number
   readonly stdout: string
   readonly stderr: string
 }
 
-function git(repoRoot: string, args: readonly string[]): GitOutcome {
-  const result = spawnSync("git", ["-C", repoRoot, ...args], { encoding: "utf8" })
+/** @internal The local git runner, exported for its own test only. */
+export function gitOutcomeForTest(repoRoot: string, args: readonly string[]): GitOutcome {
+  return git(repoRoot, args)
+}
+
+/**
+ * One local git command. A command that did not run to completion — it could not start (ENOENT), its output passed
+ * `maxBuffer` (ENOBUFS, default 1 MiB), or a signal stopped it — is a failure that names that cause, with no stdout:
+ * what it printed is truncated, and offering it as the failure's detail would misstate what went wrong.
+ */
+function git(repoRoot: string, args: readonly string[], maxBuffer?: number): GitOutcome {
+  const result = spawnSync("git", ["-C", repoRoot, ...args], {
+    encoding: "utf8",
+    ...(maxBuffer === undefined ? {} : { maxBuffer }),
+  })
+  if (result.error !== undefined || result.status === null) {
+    const code = (result.error as NodeJS.ErrnoException | undefined)?.code
+    const cause = result.error === undefined ? "" : (code ?? result.error.message)
+    const signal = result.signal === null ? "" : `killed by ${result.signal}`
+    return {
+      status: result.status ?? 1,
+      stdout: "",
+      stderr: `git ${args.join(" ")} did not run to completion: ${[cause, signal].filter(Boolean).join(", ")}`,
+    }
+  }
   return {
-    status: result.status ?? 1,
+    status: result.status,
     stdout: (result.stdout ?? "").trim(),
     stderr: (result.stderr ?? "").trim(),
   }
@@ -186,6 +212,11 @@ type IndexCarry =
  * `tip`, or at `alreadyAt` (a projection re-running after its probe merge), needs nothing. An index that holds no
  * ancestor's tree carries staged changes no projection may overwrite, and refuses. `expectedDirtyPaths` comes back
  * without the paths the repair resolved.
+ *
+ * Reading the index never takes `.git/index.lock`: another git may hold it at any moment (a hook commit), and a
+ * projector that took it would both refuse while that git runs and collide with it, which is how an index is left
+ * behind in the first place. The healthy path compares with `diff-index --cached`, which is lock-free; only when the
+ * index matches neither `tip` nor `alreadyAt` is its tree id read, by `write-tree` over a COPY of the index.
  */
 function carryIndexTo(
   repoRoot: string,
@@ -198,31 +229,54 @@ function carryIndexTo(
     ok: false,
     outcome: { ok: false, kind: "dirt-unverifiable", error },
   })
-  const indexTree = git(repoRoot, ["write-tree"])
-  if (indexTree.status !== 0) {
+  const expected = [...expectedDirtyPaths]
+  for (const commit of alreadyAt === undefined ? [tip] : [tip, alreadyAt]) {
+    const same = git(repoRoot, readonlyArgs(["diff-index", "--cached", "--quiet", commit, "--"]))
+    if (same.status === 0) return { ok: true, expectedDirtyPaths: expected }
+    if (same.status !== 1) {
+      return refuse(
+        `${ref} in the checkout ${repoRoot}: the index could not be compared with ${commit} (${gitDetail(same)}). ` +
+          "Nothing was changed.",
+      )
+    }
+  }
+  const indexTree = indexTreeFromCopy(repoRoot)
+  if (!indexTree.ok) {
     return refuse(
-      `${ref} in the checkout ${repoRoot}: the index's tree could not be read (${gitDetail(indexTree)}). ` +
+      `${ref} in the checkout ${repoRoot}: the index's tree could not be read (${indexTree.detail}). ` +
         "Nothing was changed.",
     )
   }
-  const expected = [...expectedDirtyPaths]
-  if (alreadyAt !== undefined) {
-    const at = git(repoRoot, readonlyArgs(["rev-parse", "--verify", `${alreadyAt}^{tree}`]))
-    if (at.status === 0 && at.stdout === indexTree.stdout) return { ok: true, expectedDirtyPaths: expected }
+  let scanned = 0
+  let match: string | undefined
+  for (let window = 0; match === undefined; window += 1) {
+    const count = walkWindow(window)
+    const page = git(
+      repoRoot,
+      readonlyArgs([
+        "rev-list",
+        "--first-parent",
+        "--no-commit-header",
+        "--format=%H %T",
+        `--max-count=${count}`,
+        `--skip=${scanned}`,
+        tip,
+        "--",
+      ]),
+      count * WALK_LINE_BYTES_MAX,
+    )
+    if (page.status !== 0) {
+      return refuse(`${ref} in the checkout ${repoRoot}: the history of ${tip} could not be read (${gitDetail(page)}).`)
+    }
+    const lines = page.stdout.split("\n").filter(Boolean)
+    scanned += lines.length
+    match = lines.find((line) => line.endsWith(` ${indexTree.tree}`))
+    if (match === undefined && lines.length < count) break
   }
-  const walk = git(
-    repoRoot,
-    readonlyArgs(["rev-list", "--first-parent", "--no-commit-header", "--format=%H %T", tip, "--"]),
-  )
-  if (walk.status !== 0) {
-    return refuse(`${ref} in the checkout ${repoRoot}: the history of ${tip} could not be read (${gitDetail(walk)}).`)
-  }
-  const history = walk.stdout.split("\n").filter(Boolean)
-  const match = history.find((line) => line.endsWith(` ${indexTree.stdout}`))
   if (match === undefined) {
     return refuse(
       `${ref} in the checkout ${repoRoot}: the index holds neither ${tip}'s tree nor that of any of its ` +
-        `${history.length - 1} first-parent ancestors, so it carries staged changes no projection may overwrite. ` +
+        `${scanned - 1} first-parent ancestors, so it carries staged changes no projection may overwrite. ` +
         "Nothing was changed; project again once the index holds one of those trees.",
     )
   }
@@ -253,6 +307,49 @@ function carryIndexTo(
   }
   const resolved = new Set(nulPaths(delta.stdout))
   return { ok: true, expectedDirtyPaths: expected.filter((path) => !resolved.has(path)), repairedIndexFrom: ancestor }
+}
+
+/**
+ * The first-parent walk's windows, in commits. An index a few commits behind is the common case, so the first window
+ * is small; later ones grow so a long history costs few processes. The walk stops at the match, so its cost is bounded
+ * by how far behind the index is, never by the length of the history.
+ */
+function walkWindow(index: number): number {
+  return index === 0 ? 256 : index === 1 ? 4_096 : 10_000
+}
+/** One `%H %T` line: two sha256 ids, a space and a newline, rounded up. */
+const WALK_LINE_BYTES_MAX = 160
+
+/**
+ * The tree id the index holds, written from a copy of it so that `.git/index.lock` is never taken. The copy sits
+ * beside the index, in the directory `git rev-parse --git-path index` names, because a split index finds its shared
+ * file there; it is removed afterwards. `write-tree` only adds tree objects to the store.
+ */
+function indexTreeFromCopy(repoRoot: string): { ok: true; tree: string } | { ok: false; detail: string } {
+  const located = git(repoRoot, readonlyArgs(["rev-parse", "--path-format=absolute", "--git-path", "index"]))
+  if (located.status !== 0 || located.stdout === "") return { ok: false, detail: gitDetail(located) }
+  const copy = join(dirname(located.stdout), `index.gitomic-read-${process.pid}-${randomUUID()}`)
+  try {
+    copyFileSync(located.stdout, copy)
+  } catch (error) {
+    return { ok: false, detail: `copying ${located.stdout}: ${error instanceof Error ? error.message : String(error)}` }
+  }
+  try {
+    const written = spawnSync("git", ["-C", repoRoot, "write-tree"], {
+      encoding: "utf8",
+      env: { ...process.env, GIT_INDEX_FILE: copy },
+    })
+    const tree = (written.stdout ?? "").trim()
+    if ((written.status ?? 1) !== 0 || tree === "") {
+      return {
+        ok: false,
+        detail: gitDetail({ status: written.status ?? 1, stdout: tree, stderr: (written.stderr ?? "").trim() }),
+      }
+    }
+    return { ok: true, tree }
+  } finally {
+    rmSync(copy, { force: true })
+  }
 }
 
 /** The branch HEAD points at, or null when HEAD is detached. */

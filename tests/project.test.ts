@@ -3,7 +3,7 @@
 // @consumer gitomic project and apply --checkout callers, including state-checkout-sync and km create
 
 import { spawnSync } from "node:child_process"
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -11,6 +11,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, test, vi } from "vit
 
 import { main } from "../src/bin.js"
 import { projectRemoteFirstFastForward, synchronizeCheckoutToCommit, worktreeDirtyPaths } from "../src/index.js"
+import { gitOutcomeForTest } from "../src/project.js"
 
 const roots: string[] = []
 
@@ -332,6 +333,98 @@ describe("gitomic project and checkout synchronization", () => {
       expect(result.stdout).toContain(`repaired-from=${parent}`)
       expect(git(checkout, "rev-parse", "HEAD~2")).toBe(parent)
       expect(worktreeDirtyPaths(checkout)).toEqual([])
+      // The index's tree was read from a copy, and the copy is gone.
+      const gitDir = git(checkout, "rev-parse", "--absolute-git-dir")
+      expect(readdirSync(gitDir).filter((name) => name.startsWith("index") && name !== "index")).toEqual([])
+    })
+
+    // 1 is inside the first window, 300 the second, 5,000 the third (256, then 4,096, then 10,000 commits).
+    test.each([1, 300, 5_000])(
+      "an index %i behind in a history too long for one read is repaired: the walk pages",
+      (behind) => {
+        const root = mkdtempSync(join(tmpdir(), "gitomic-long-history-"))
+        roots.push(root)
+        const repo = join(root, "long")
+        git(root, "init", "-q", "--initial-branch=main", "long")
+        // 13,500 first-parent commits print about 1.1 MB of `%H %T` lines, past spawnSync's 1 MiB default.
+        const commits = 13_500
+        const stream: string[] = []
+        for (let i = 1; i <= commits; i += 1) {
+          const body = `${i}\n`
+          stream.push(
+            "commit refs/heads/main",
+            `mark :${i}`,
+            `committer Test <test@example.com> ${1_700_000_000 + i} +0000`,
+            "data 2",
+            "c",
+            ...(i === 1 ? [] : [`from :${i - 1}`]),
+            "M 644 inline counter.md",
+            `data ${Buffer.byteLength(body)}`,
+            body,
+          )
+        }
+        const imported = spawnSync("git", ["-C", repo, "fast-import", "--quiet"], {
+          input: `${stream.join("\n")}\n`,
+          encoding: "utf8",
+        })
+        expect(imported.status, imported.stderr).toBe(0)
+        git(repo, "read-tree", "--reset", "-u", "HEAD")
+        const head = git(repo, "rev-parse", "HEAD")
+        const parent = git(repo, "rev-parse", `HEAD~${behind}`)
+        git(repo, "read-tree", "-m", "-u", head, parent)
+        expect(worktreeDirtyPaths(repo)).toEqual(["counter.md"])
+
+        const outcome = synchronizeCheckoutToCommit({
+          repoRoot: repo,
+          from: head,
+          to: head,
+          ref: "refs/heads/main",
+          expectedDirtyPaths: ["counter.md"],
+        })
+        expect(outcome).toEqual({ ok: true, kind: "synchronized", dirtyPaths: [], repairedIndexFrom: parent })
+        expect(readFileSync(join(repo, "counter.md"), "utf8")).toBe(`${commits}\n`)
+      },
+    )
+
+    test("a git read past the output limit names ENOBUFS, never its truncated output", () => {
+      const root = mkdtempSync(join(tmpdir(), "gitomic-enobufs-"))
+      roots.push(root)
+      git(root, "init", "-q", "--initial-branch=main", "big")
+      const repo = join(root, "big")
+      writeFileSync(join(root, "big.bin"), "x".repeat(1_536 * 1024))
+      const blob = git(repo, "hash-object", "-w", join(root, "big.bin"))
+
+      const read = gitOutcomeForTest(repo, ["cat-file", "-p", blob])
+      expect(read.status).not.toBe(0)
+      expect(read.stderr).toContain("ENOBUFS")
+      expect(read.stdout).toBe("")
+    })
+
+    test("a projection with index.lock held succeeds on the healthy path and leaves the lock untouched", async () => {
+      const { checkout } = remoteFixture()
+      const lockFile = join(git(checkout, "rev-parse", "--absolute-git-dir"), "index.lock")
+      // Another git holds the index: its lock file exists, with whatever it has written so far.
+      writeFileSync(lockFile, "another git's half-written index\n")
+      try {
+        const result = await runCli(["project", checkout])
+        expect(result.stderr).toBe("")
+        expect(result.code).toBe(0)
+        expect(result.stdout).toContain("kind=already-current")
+        expect(readFileSync(lockFile, "utf8")).toBe("another git's half-written index\n")
+
+        const head = git(checkout, "rev-parse", "HEAD")
+        const outcome = synchronizeCheckoutToCommit({
+          repoRoot: checkout,
+          from: head,
+          to: head,
+          ref: "refs/heads/main",
+          expectedDirtyPaths: [],
+        })
+        expect(outcome).toEqual({ ok: true, kind: "already-current", dirtyPaths: [] })
+        expect(readFileSync(lockFile, "utf8")).toBe("another git's half-written index\n")
+      } finally {
+        rmSync(lockFile, { force: true })
+      }
     })
 
     test("staged changes matching no ancestor refuse, exit 4, and are never called current", async () => {

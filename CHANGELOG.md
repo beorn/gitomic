@@ -11,6 +11,14 @@
   conditional two-way merge; a repaired projection reports `synchronized` with
   `repairedIndexFrom` on that variant only (CLI: `kind=synchronized … repaired-from=<oid>`), and an
   index matching no ancestor exits 4 (`dirt-unverifiable`), changing nothing.
+  Reading the index never takes `.git/index.lock`: the common case compares
+  with `diff-index --cached`, and only an index behind the tip has its tree id
+  written from a copy of the index. The history walk reads in growing windows
+  (256, 4,096, then 10,000 commits) and stops at the match, so a history longer
+  than one process's output buffer no longer refuses.
+- A local git command that does not run to completion (its output passed the
+  buffer, it could not start, or a signal stopped it) is reported by its cause,
+  such as `ENOBUFS`, never by its truncated output.
 
 ### Deprecated
 
