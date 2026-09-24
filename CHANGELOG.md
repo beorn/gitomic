@@ -16,6 +16,15 @@
   `TypeError` by name, replacing the silent `1` fallback. No CLI flag: the CLI
   is a wall-clock writer.
 
+### Fixed
+
+- A fetch that loses the fetched-ref lock race to another fetch in the same
+  repository waits 25-99 ms before retrying while the rival still holds the
+  lock, and after its last attempt the error says how many times it lost,
+  with git's error as its cause.
+
+## 0.4.0 — 2026-09-24
+
 ### Removed
 
 - `RemoteFirstProjectionRequest.preTransactTip` (25350 S2, 25436): deprecated and
@@ -63,11 +72,6 @@
 - A local git command that does not run to completion (its output passed the
   buffer, it could not start, or a signal stopped it) is reported by its cause,
   such as `ENOBUFS`, never by its truncated output.
-
-### Deprecated
-
-- `RemoteFirstProjectionRequest.preTransactTip` is no longer consulted: the
-  history walk above subsumes it. It will be removed.
 
 ## 0.3.0 — 2026-09-23
 
