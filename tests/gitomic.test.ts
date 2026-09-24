@@ -170,14 +170,19 @@ describe("gitomic public transaction contract", () => {
       const trace = join(fixture.repo, "gitomic-trace.json")
       process.env.GIT_TRACE2_EVENT = trace
 
-      expect(await store.at(committed.oid).keys()).toEqual(["first.md", "second.md"])
-
-      const events = (await readFile(trace, "utf8"))
-        .trim()
-        .split("\n")
-        .map((line) => JSON.parse(line) as { event?: string; argv?: string[] })
-      const catFileStarts = events.filter((event) => event.event === "start" && event.argv?.includes("cat-file"))
-      expect(catFileStarts).toHaveLength(1)
+      const catFileStarts = async (): Promise<number> =>
+        (await readFile(trace, "utf8"))
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line) as { event?: string; argv?: string[] })
+          .filter((event) => event.event === "start" && event.argv?.includes("cat-file")).length
+      const snapshot = store.at(committed.oid)
+      // The listing alone answers keys: no blob is read for it.
+      expect(await snapshot.keys()).toEqual(["first.md", "second.md"])
+      expect(await catFileStarts()).toBe(0)
+      // Two values asked for together are one cat-file --batch.
+      expect(await Promise.all([snapshot.get("first.md"), snapshot.get("second.md")])).toEqual(["first", "second"])
+      expect(await catFileStarts()).toBe(1)
     } finally {
       if (previousTrace === undefined) delete process.env.GIT_TRACE2_EVENT
       else process.env.GIT_TRACE2_EVENT = previousTrace

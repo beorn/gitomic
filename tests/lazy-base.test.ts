@@ -253,6 +253,28 @@ describe("the shell backend on a 2,000-file tree", () => {
     }
   })
 
+  test("a Snapshot lists by prefix and reads a blob only for get: oid, has and keys never fetch one", async () => {
+    const fixture = await createBareRepo()
+    try {
+      const recorded = recordReads(createShellBackend())
+      const store = await open({ repo: fixture.repo, ref: "main", writer: "worker", backend: recorded.backend })
+      const parent = await seedNotes(store, 2_000)
+      recorded.reset()
+      const snapshot = store.at(parent)
+      expect((await snapshot.keys("notes/")).length).toBe(2_000)
+      expect(await snapshot.has(notePath(1_500))).toBe(true)
+      const oid = await snapshot.oid(notePath(42))
+      expect(oid).toMatch(/^[0-9a-f]{40}$/)
+      expect(recorded.blobCalls).toEqual([])
+      expect(await snapshot.get(notePath(42))).toBe("note 42\n")
+      expect(recorded.blobCalls).toEqual([[oid]])
+      // The whole-prefix listing served every later read: one readTree for "notes/", none for the paths under it.
+      expect(recorded.treeCalls).toEqual([parent])
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
   test("readBlobs deduplicates its oids and refuses a missing one loudly", async () => {
     const fixture = await createBareRepo()
     try {

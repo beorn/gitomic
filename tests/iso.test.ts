@@ -119,9 +119,10 @@ describe("iso backend", () => {
           committer: { name: "gitomic", email: "gitomic@localhost" },
           timestamp: 946_684_802,
         })
-        const files = await backend.readFiles(repo, second[0] as Oid)
-        expect([...files.keys()].sort()).toEqual(["nested/deeper/b.txt", "root.txt"])
-        expect(files.get("nested/deeper/b.txt")).toBe("b\nchanged\n")
+        const listing = await backend.readTree(repo, second[0] as Oid)
+        expect([...listing.keys()].sort()).toEqual(["nested/deeper/b.txt", "root.txt"])
+        const changedOid = (listing.get("nested/deeper/b.txt") as { oid: Oid }).oid
+        expect((await backend.readBlobs(repo, [changedOid])).get(changedOid)).toBe("b\nchanged\n")
       }
     } finally {
       await Promise.all([shellFixture.cleanup(), isoFixture.cleanup()])
@@ -362,7 +363,7 @@ describe("iso backend", () => {
         await expect(snapshot.keys()).rejects.toThrow()
       }
       for (const backend of [createShellBackend(), createIsoBackend()]) {
-        await expect(backend.readFiles(fixture.repo, commit, "missing/")).rejects.toThrow(
+        await expect(backend.readTree(fixture.repo, commit, "missing/")).rejects.toThrow(
           /prefix "missing\/" matched no files.+repository.+commit/iu,
         )
       }

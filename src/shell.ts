@@ -132,7 +132,6 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
     },
     readTree: async (repo, commit, prefix) => readTree(await resolveGitDir(repo), commit, prefix),
     readBlobs: async (repo, oids) => readBlobs(await resolveGitDir(repo), oids),
-    readFiles: async (repo, commit, prefix) => readFiles(await resolveGitDir(repo), commit, prefix),
     // A completed commit is unreferenced until the compare-and-swap below adopts
     // it. Gitomic writes NO ref to protect that window: Git's default gc grace
     // (`gc.pruneExpire = 2.weeks.ago`) already covers a gap that is milliseconds
@@ -470,25 +469,6 @@ async function readBlobs(repo: string, oids: readonly Oid[]): Promise<ReadonlyMa
   for (const oid of distinct) validateOid(oid, "readBlobs needs valid Git object ids")
   const output = await git(repo, ["cat-file", "--batch"], { input: `${distinct.join("\n")}\n` })
   return parseBatch(distinct, output)
-}
-
-/** The listing with every value read: `readTree`, then one `readBlobs` of all its oids. */
-async function readFiles(repo: string, commit: Oid, prefix?: string): Promise<ReadonlyMap<string, BlobValue>> {
-  const listing = await readTree(repo, commit, prefix)
-  if (listing.size === 0) return new Map()
-  const blobs = await readBlobs(
-    repo,
-    [...listing.values()].map((entry) => entry.oid),
-  )
-  const files = new Map<string, BlobValue>()
-  for (const [path, entry] of listing) {
-    const value = blobs.get(entry.oid)
-    if (value === undefined) {
-      throw new Error(`git cat-file --batch returned no blob ${entry.oid} for ${JSON.stringify(path)}`)
-    }
-    files.set(path, value)
-  }
-  return files
 }
 
 function parseBatch(oids: readonly Oid[], output: Buffer): ReadonlyMap<Oid, BlobValue> {
