@@ -69,6 +69,25 @@ async function runCli(args: string[]): Promise<{ code: number; stdout: string; s
   return { code, stdout: stdout.text(), stderr: stderr.text() }
 }
 
+function runCliSubprocess(args: string[]): { code: number; stdout: string; stderr: string } {
+  const binPath = new URL("../src/bin.ts", import.meta.url).pathname
+  const result = spawnSync("bun", [binPath, ...args], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      GIT_AUTHOR_NAME: "CLI Test",
+      GIT_AUTHOR_EMAIL: "cli@example.org",
+      GIT_COMMITTER_NAME: "CLI Test",
+      GIT_COMMITTER_EMAIL: "cli@example.org",
+    },
+  })
+  return {
+    code: result.status ?? 1,
+    stdout: result.stdout ?? "",
+    stderr: result.stderr ?? "",
+  }
+}
+
 function remoteFixture(): {
   root: string
   bare: string
@@ -259,6 +278,95 @@ describe("gitomic project and checkout synchronization", () => {
       expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# written via gitomic apply\n")
       expect(worktreeDirtyPaths(checkout)).toEqual([])
     })
+
+    test("apply with --checkout to checkout's own repository (local case) succeeds without false dirt-changed", async () => {
+      const { checkout } = remoteFixture()
+      writeFileSync(join(checkout, "local-dirt.md"), "# local dirt\n")
+      expect(worktreeDirtyPaths(checkout)).toEqual(["local-dirt.md"])
+
+      const tempFile = join(tmpdir(), `apply-local-${Date.now()}.txt`)
+      writeFileSync(tempFile, "# written directly to local repo\n")
+
+      const result = await runCli([
+        "apply",
+        `${checkout}#main`,
+        "-m",
+        "commit from local apply",
+        "--checkout",
+        checkout,
+        "put",
+        "tracked.md",
+        tempFile,
+      ])
+
+      rmSync(tempFile, { force: true })
+      expect(result.code).toBe(0)
+      const landedOid = result.stdout.trim()
+      expect(landedOid).toMatch(/^[0-9a-f]{40}$/u)
+
+      expect(git(checkout, "rev-parse", "HEAD")).toBe(landedOid)
+      expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# written directly to local repo\n")
+      expect(worktreeDirtyPaths(checkout)).toEqual(["local-dirt.md"])
+      expect(result.stderr).not.toContain("projection failed")
+    })
+
+    test("apply with --checkout and --json includes projection outcome in receipt", async () => {
+      const { checkout } = remoteFixture()
+      const tempFile = join(tmpdir(), `apply-json-${Date.now()}.txt`)
+      writeFileSync(tempFile, "# json projection test\n")
+
+      const result = await runCli([
+        "apply",
+        `${checkout}#main`,
+        "-m",
+        "commit with json receipt",
+        "--checkout",
+        checkout,
+        "--json",
+        "put",
+        "tracked.md",
+        tempFile,
+      ])
+
+      rmSync(tempFile, { force: true })
+      expect(result.code).toBe(0)
+      const receipt = JSON.parse(result.stdout.trim()) as {
+        oid: string
+        retries: number
+        report: string[]
+        projection: string
+      }
+      expect(receipt.oid).toMatch(/^[0-9a-f]{40}$/u)
+      expect(receipt.projection).toBe("synchronized")
+    })
+
+    test("apply with --checkout reports projection failure on colliding uncommitted work while write lands", async () => {
+      const { checkout } = remoteFixture()
+      writeFileSync(join(checkout, "tracked.md"), "# local edit that collides\n")
+
+      const tempFile = join(tmpdir(), `apply-fail-${Date.now()}.txt`)
+      writeFileSync(tempFile, "# write that collides\n")
+
+      const result = await runCli([
+        "apply",
+        `${checkout}#main`,
+        "-m",
+        "colliding write",
+        "--checkout",
+        checkout,
+        "--json",
+        "put",
+        "tracked.md",
+        tempFile,
+      ])
+
+      rmSync(tempFile, { force: true })
+      expect(result.code).toBe(0)
+      const receipt = JSON.parse(result.stdout.trim()) as { oid: string; projection: string }
+      expect(receipt.projection).toBe("worktree-update-refused")
+      expect(result.stderr).toContain("gitomic: projection failed:")
+      expect(result.stderr).toContain("kind=worktree-update-refused")
+    })
   })
 
   describe("Witness 5: mid-flight ref advance (beforeRefAdvance) -> ref-advance-refused", () => {
@@ -343,6 +451,68 @@ describe("gitomic project and checkout synchronization", () => {
       const result = await runCli(["project", checkout, "--bad-flag"])
       expect(result.code).toBe(2)
       expect(result.stderr).toContain("unrecognized flag")
+    })
+
+    test("exit 4 with worktree-update-refused when uncommitted local changes collide with incoming remote commit", async () => {
+      const { checkout, landAtOrigin } = remoteFixture()
+      writeFileSync(join(checkout, "tracked.md"), "# conflicting local dirt\n")
+      landAtOrigin("tracked.md", "# incoming remote landing\n")
+
+      const result = await runCli(["project", checkout])
+      expect(result.code).toBe(4)
+      expect(result.stderr).toContain("kind=worktree-update-refused")
+    })
+
+    test("exit 2 on malformed or non-positive --timeout", async () => {
+      const { checkout } = remoteFixture()
+      const resAlpha = await runCli(["project", checkout, "--timeout", "abc"])
+      expect(resAlpha.code).toBe(2)
+      expect(resAlpha.stderr).toContain("--timeout must be a positive integer")
+
+      const resZero = await runCli(["project", checkout, "--timeout", "0"])
+      expect(resZero.code).toBe(2)
+      expect(resZero.stderr).toContain("--timeout must be a positive integer")
+
+      const resNeg = await runCli(["project", checkout, "--timeout", "-10"])
+      expect(resNeg.code).toBe(2)
+      expect(resNeg.stderr).toContain("--timeout must be a positive integer")
+    })
+  })
+
+  describe("Fresh-process CLI load (owed receipt 7)", () => {
+    test("fresh process gitomic project exits 0 on current checkout", () => {
+      const { checkout } = remoteFixture()
+      const tip = git(checkout, "rev-parse", "HEAD")
+      const result = runCliSubprocess(["project", checkout])
+      expect(result.code).toBe(0)
+      expect(result.stdout).toContain("kind=already-current")
+      expect(result.stdout).toContain(`local=${tip} to=${tip}`)
+    })
+
+    test("fresh process gitomic apply --checkout projects successfully", () => {
+      const { checkout } = remoteFixture()
+      const tempFile = join(tmpdir(), `apply-fresh-${Date.now()}.txt`)
+      writeFileSync(tempFile, "# fresh process write\n")
+
+      const result = runCliSubprocess([
+        "apply",
+        `${checkout}#main`,
+        "-m",
+        "commit from fresh process apply",
+        "--checkout",
+        checkout,
+        "--json",
+        "put",
+        "fresh.md",
+        tempFile,
+      ])
+
+      rmSync(tempFile, { force: true })
+      expect(result.code).toBe(0)
+      const receipt = JSON.parse(result.stdout.trim()) as { oid: string; projection: string }
+      expect(receipt.oid).toMatch(/^[0-9a-f]{40}$/u)
+      expect(receipt.projection).toBe("synchronized")
+      expect(readFileSync(join(checkout, "fresh.md"), "utf8")).toBe("# fresh process write\n")
     })
   })
 })
