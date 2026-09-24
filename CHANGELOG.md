@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Added
+
+- The checkout lock (25350): `gitomic project` and `gitomic apply --checkout`
+  hold `<git-common-dir>/km-state-write.lock` — the file hh's other checkout
+  writers already take — for their whole checkout write, waiting 15 s
+  (`--lock-timeout <ms>`) before exiting `5` with the lock path and the
+  recorded holder. A parent holding the lock lends it to a child through
+  `GITOMIC_CHECKOUT_LOCK_FD`. The Bun-only subpath `gitomic/checkout-lock`
+  exports `holdCheckoutLock`, `checkoutLockPath`, `CHECKOUT_LOCK_NAME` and
+  `CHECKOUT_LOCK_FD_ENV`; the root entry never imports it and still loads
+  under Node.
+- A runtime dependency, `@bearly/flock` (^0.1.1): the lock is flock(2) through
+  `bun:ffi`, and Node has no flock API, so `project` and `apply --checkout`
+  need Bun and exit `6` under Node, writing nothing; every other verb runs on
+  either runtime.
+
 ### Fixed
 
 - `gitomic project` and `gitomic apply --checkout` no longer report a checkout

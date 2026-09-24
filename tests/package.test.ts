@@ -29,10 +29,11 @@ async function manifest(): Promise<PackageManifest> {
 }
 
 describe("package dependency boundary", () => {
-  test("keeps the default install runtime-free and makes isomorphic-git an optional peer", async () => {
+  test("depends only on the checkout lock's flock and makes isomorphic-git an optional peer", async () => {
     const packageManifest = await manifest()
 
-    expect(packageManifest.dependencies).toBeUndefined()
+    // @bearly/flock is the estate's one fd-held flock; it has no dependencies, so nothing it pulls in imports gitomic.
+    expect(packageManifest.dependencies).toEqual({ "@bearly/flock": "^0.1.1" })
     expect(packageManifest.optionalDependencies).toBeUndefined()
     expect(packageManifest.peerDependencies).toEqual({ "isomorphic-git": "^1.38.7" })
     expect(packageManifest.peerDependenciesMeta).toEqual({ "isomorphic-git": { optional: true } })
@@ -47,6 +48,7 @@ describe("package dependency boundary", () => {
     const sourceExports = {
       ".": "./src/index.ts",
       "./adapters": "./src/adapters.ts",
+      "./checkout-lock": "./src/checkout-lock.ts",
       "./events": "./src/events.ts",
       "./iso": "./src/iso.ts",
       "./mem": "./src/mem.ts",
@@ -61,6 +63,7 @@ describe("package dependency boundary", () => {
     expect(packageManifest.publishConfig?.exports).toEqual({
       ".": { types: "./dist/index.d.ts", import: "./dist/index.js" },
       "./adapters": { types: "./dist/adapters.d.ts", import: "./dist/adapters.js" },
+      "./checkout-lock": { types: "./dist/checkout-lock.d.ts", import: "./dist/checkout-lock.js" },
       "./events": { types: "./dist/events.d.ts", import: "./dist/events.js" },
       "./iso": { types: "./dist/iso.d.ts", import: "./dist/iso.js" },
       "./mem": { types: "./dist/mem.d.ts", import: "./dist/mem.js" },
@@ -77,5 +80,25 @@ describe("package dependency boundary", () => {
     expect(openReader).toBeTypeOf("function")
     expect(readme).toContain('import { openReader } from "gitomic"')
     expect(readme).not.toContain("Not on npm yet")
+  })
+
+  test("keeps the root entry free of the Bun-only checkout lock", async () => {
+    // The lock's flock goes through bun:ffi. Only its subpath and the CLI's dynamic import may reach it, so the root
+    // entry imports under Node; scripts/node-smoke.mjs proves the same against the built package.
+    const seen = new Set<string>()
+    const pending = ["index.ts"]
+    while (pending.length > 0) {
+      const file = pending.pop()
+      if (file === undefined || seen.has(file)) continue
+      seen.add(file)
+      const source = await readFile(new URL(`../src/${file}`, import.meta.url), "utf8")
+      for (const match of source.matchAll(/^(?:import|export)\s(?!type\s)[^"']*from\s+["']([^"']+)["']/gmu)) {
+        const specifier = match[1] ?? ""
+        expect(specifier, `${file} imports ${specifier}`).not.toMatch(/^(?:bun:|@bearly\/flock$)/u)
+        if (specifier.startsWith("./")) pending.push(specifier.slice(2).replace(/\.js$/u, ".ts"))
+      }
+    }
+    expect(seen.has("index.ts")).toBe(true)
+    expect(seen.has("checkout-lock.ts")).toBe(false)
   })
 })

@@ -78,15 +78,16 @@
   "scripts": {
     "bench": "bun benchmarks/backends.ts",
     "build": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.build.json && node scripts/fix-dist-shebang.mjs",
-    "check": "bun run format && bun run lint && bun run typecheck && bun run test && bun run build",
+    "check": "bun run format && bun run lint && bun run typecheck && bun run test && bun run build && bun run smoke:node",
     "format": "oxfmt --check .",
     "format:write": "oxfmt .",
     "lint": "oxlint src tests benchmarks",
     "prepack": "bun run build",
-    "typecheck": "tsc --noEmit",
+    "smoke:node": "node scripts/node-smoke.mjs",
     "test": "vitest run",
     "test:stress": "vitest run --config vitest.stress.config.ts",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",

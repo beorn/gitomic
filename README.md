@@ -40,7 +40,7 @@ Check those commits out and `git status` is clean: there is no stray file of our
 npm install gitomic
 ```
 
-The default `shell` backend has no runtime dependencies. Install `isomorphic-git` next to gitomic only when you use the optional `gitomic/iso` entry point.
+The default `shell` backend runs on Node or Bun. Install `isomorphic-git` next to gitomic only when you use the optional `gitomic/iso` entry point. The one runtime dependency, `@bearly/flock`, serves only the Bun-only `gitomic/checkout-lock` entry point (see [Projecting a checkout](#projecting-a-checkout)); nothing else imports it.
 
 `createShellBackend({ baseEnv })` replaces the environment inherited by that backend's Git commands; `runGit(args, { env })` overlays `env` on the current process environment. `createShellBackend({ gitExecutable })` selects the Git executable for every backend command, including its version check; a bare name resolves through that backend environment's `PATH`.
 
@@ -532,6 +532,14 @@ trusted: gitomic.trust = 3f9a1c… (local git config)
 
 Trust pins the declaration's text, not the scripts it names. A trusted `check = sh ./check.sh` runs whatever `check.sh` the repository holds later; direnv has the same property. Name commands by absolute paths outside the repository to close it: hh's STATE declaration names checks in CODE `main` (`/hh/dev/tools/…`), so no STATE commit can change the code that judges it.
 
+### Projecting a checkout
+
+Writes land object-side, so a checkout of the written branch goes stale. `gitomic project <path>` fetches the branch (`--remote`, default `origin`; `--ref`, default `main`) and fast-forwards the checkout's index and working tree to it, preserving unrelated dirt; `apply --checkout <path>` does the same right after its write. One stdout line names the outcome: `kind=<kind> local=<oid> to=<oid>`.
+
+Both verbs hold the **checkout lock**, `<git-common-dir>/km-state-write.lock`, so linked worktrees and the main checkout serialize on one file; `apply --checkout` takes it before it records the checkout's dirt and keeps it through the projection. They wait 15 s for another holder (`--lock-timeout <ms>`), then exit `5` naming the lock and, when the lock records it, the holder's pid and argv. A parent that already holds the lock passes its descriptor to a child `gitomic` as an inherited fd named by `GITOMIC_CHECKOUT_LOCK_FD`; the child adopts it instead of waiting on its own parent.
+
+The lock is flock(2) through `bun:ffi`, and Node has no flock API, so these two verbs need Bun: under Node they exit `6` and write nothing, while every other verb runs. The library exposes the lock at the Bun-only subpath `gitomic/checkout-lock` (`holdCheckoutLock`, `checkoutLockPath`, `CHECKOUT_LOCK_NAME`, `CHECKOUT_LOCK_FD_ENV`); the root `gitomic` entry never imports it. The library's projection functions run under the caller's lock and never take it.
+
 Product output — content, paths, matches, the oid or receipt — goes to stdout; narration and errors to stderr. The exit codes are the whole contract, and nothing fails silently:
 
 | code | meaning                                                                                                                                                                           |
@@ -541,6 +549,8 @@ Product output — content, paths, matches, the oid or receipt — goes to stdou
 | `2`  | a usage error — unknown verb, a missing or malformed argument or flag, a bad address                                                                                              |
 | `3`  | a CAS precondition refusal (`EditDoesNotApply`), reported facts-only on stderr: the kind, path, expected and actual oids, and both commits — never an owner, role, or remediation |
 | `4`  | the repository's gate refused the write (`CandidateRefused`): its reasons, then one line `code=candidate-refused base=<oid> reasons=<JSON array>`; the ref does not move          |
+| `5`  | the checkout lock stayed busy past the wait — transient; nothing was written, then one line `kind=checkout-lock-busy path=<path>`                                                 |
+| `6`  | `project` or `apply --checkout` under Node: the checkout lock needs Bun; nothing was written, then one line `kind=runtime-unsupported`                                            |
 
 `read --log` and `commit <checkout>` are not in this version.
 
