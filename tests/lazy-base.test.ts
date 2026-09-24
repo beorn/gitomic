@@ -302,6 +302,38 @@ describe("the shell backend on a 2,000-file tree", () => {
         cause: expect.objectContaining({ message: expect.stringContaining("missing") }),
       })
       expect(await store.at(tip).get("here.md")).toBe("here\n")
+      // Co-batched (review2 7404381500): an apply prefetches both edit paths in ONE read; the present blob resolves
+      // and only the lost one is named, and the same snapshot still reads the present blob after sharing a batch.
+      const hereOid = await store.at(tip).oid("here.md")
+      await expect(
+        apply(
+          store,
+          tip,
+          [
+            { kind: "put", path: "here.md", content: "changed\n", expect: hereOid as Oid },
+            { kind: "put", path: "lost.md", content: "changed\n", expect: lost },
+          ],
+          "two edits, one lost",
+        ),
+      ).rejects.toThrow(pathAndOid)
+      await expect(
+        apply(
+          store,
+          tip,
+          [
+            { kind: "put", path: "here.md", content: "changed\n", expect: hereOid as Oid },
+            { kind: "put", path: "lost.md", content: "changed\n", expect: lost },
+          ],
+          "two edits, one lost",
+        ),
+      ).rejects.not.toThrow(/"here\.md"/u)
+      const shared = store.at(tip)
+      const [hereValue, lostValue] = await Promise.allSettled([shared.get("here.md"), shared.get("lost.md")])
+      expect(hereValue).toEqual({ status: "fulfilled", value: "here\n" })
+      expect(lostValue.status).toBe("rejected")
+      // A rejected read is not memoised: the same snapshot asks again and still names the path.
+      await expect(shared.get("lost.md")).rejects.toThrow(pathAndOid)
+      expect(await shared.get("here.md")).toBe("here\n")
     } finally {
       await fixture.cleanup()
     }

@@ -15,8 +15,12 @@ import { assertUtf8, decodeUtf8 } from "./utf8.js"
  * not touch. Reads issued in one microtask coalesce into one `readBlobs`; a
  * value is memoised by oid for the rest of the attempt.
  *
- * A LazyBase is created inside one attempt and never outlives it: a CAS replay
- * builds a new one on the new parent, so no memoised value crosses parents.
+ * A transaction's LazyBase is created inside one attempt and never outlives
+ * it: a CAS replay builds a new one on the new parent, so no memoised value
+ * crosses parents. A Snapshot keeps one LazyBase per prefix it reads for the
+ * Snapshot's whole life, pinned at its one commit, so a value it memoises can
+ * never go stale; a read that failed is not memoised, so a later read of the
+ * same path asks the backend again.
  */
 export type LazyBase = {
   readonly listing: TreeListing
@@ -53,40 +57,55 @@ export function createLazyBase(backend: GitomicBackend, repo: string, parent: Oi
   const memo = new Map<Oid, Promise<BlobValue>>()
   let pending: Map<Oid, Waiter[]> | undefined
 
+  const unreadable = (oid: Oid, path: string, error: unknown): Error =>
+    new Error(
+      `cannot read Git blob at ${JSON.stringify(path)} (${oid}) in ${JSON.stringify(repo)} at commit ${parent}: ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    )
+  const settle = (oid: Oid, waiters: readonly Waiter[], read: ReadonlyMap<Oid, BlobValue>): void => {
+    const value = read.get(oid)
+    for (const waiter of waiters) {
+      if (value === undefined) {
+        memo.delete(oid)
+        waiter.reject(
+          new Error(
+            `backend returned no blob ${oid} for Git blob at ${JSON.stringify(waiter.path)} in ${JSON.stringify(repo)} at commit ${parent}`,
+          ),
+        )
+      } else {
+        waiter.resolve(value)
+      }
+    }
+  }
   const flush = async (batch: Map<Oid, Waiter[]>): Promise<void> => {
     let read: ReadonlyMap<Oid, BlobValue>
     try {
       read = await backend.readBlobs(repo, [...batch.keys()])
     } catch (error) {
-      // The backend names the oid it could not read; the reader wants the PATH that asked. Each waiter gets an
-      // error naming its own path, repo and commit, with the backend's error as the cause.
+      // The backend names the oid it could not read; the reader wants the PATH that asked. A batch of several oids
+      // is re-read one oid at a time, so a present blob resolves and only the lost one rejects, naming its own
+      // path, repo and commit with the backend's error as the cause. A rejected value leaves the memo, so a later
+      // read of that path asks again instead of inheriting this failure.
       for (const [oid, waiters] of batch) {
-        for (const waiter of waiters) {
-          waiter.reject(
-            new Error(
-              `cannot read Git blob at ${JSON.stringify(waiter.path)} (${oid}) in ${JSON.stringify(repo)} at commit ${parent}: ` +
-                `${error instanceof Error ? error.message : String(error)}`,
-              { cause: error },
-            ),
-          )
+        let alone: ReadonlyMap<Oid, BlobValue> | undefined
+        try {
+          alone = batch.size === 1 ? undefined : await backend.readBlobs(repo, [oid])
+        } catch (own) {
+          memo.delete(oid)
+          for (const waiter of waiters) waiter.reject(unreadable(oid, waiter.path, own))
+          continue
         }
+        if (alone === undefined) {
+          memo.delete(oid)
+          for (const waiter of waiters) waiter.reject(unreadable(oid, waiter.path, error))
+          continue
+        }
+        settle(oid, waiters, alone)
       }
       return
     }
-    for (const [oid, waiters] of batch) {
-      const value = read.get(oid)
-      for (const waiter of waiters) {
-        if (value === undefined) {
-          waiter.reject(
-            new Error(
-              `backend returned no blob ${oid} for Git blob at ${JSON.stringify(waiter.path)} in ${JSON.stringify(repo)} at commit ${parent}`,
-            ),
-          )
-        } else {
-          waiter.resolve(value)
-        }
-      }
-    }
+    for (const [oid, waiters] of batch) settle(oid, waiters, read)
   }
 
   const request = (oid: Oid, path: string): Promise<BlobValue> =>
