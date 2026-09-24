@@ -10,6 +10,7 @@ import { join } from "node:path"
 import { afterAll, afterEach, beforeEach, describe, expect, test, vi } from "vitest"
 
 import { main } from "../src/bin.js"
+import { indexBaseAmongAncestors, STALE_INDEX_SEARCH_DEPTH } from "../src/project.js"
 import {
   projectCheckout,
   projectRemoteFirstFastForward,
@@ -323,17 +324,58 @@ describe("gitomic project and checkout synchronization", () => {
       expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# a local edit nobody committed\n")
     })
 
-    test("staged dirt that matches no parent tree is left alone and reported as dirt", async () => {
+    test("an index two commits behind is repaired from tip~2", async () => {
       const { checkout } = remoteFixture()
-      writeFileSync(join(checkout, "tracked.md"), "# staged by hand\n")
-      git(checkout, "add", "tracked.md")
+      const { parent } = commitThenLeaveIndexAtParent(checkout)
+      // A later landing that commits without the index, as `gitomic apply` does.
+      const tree = git(checkout, "rev-parse", "HEAD^{tree}")
+      const later = git(checkout, "commit-tree", tree, "-p", "HEAD", "-m", "later landing")
+      git(checkout, "update-ref", "refs/heads/main", later)
+      git(checkout, "push", "-q", "origin", "main")
 
       const result = await runCli(["project", checkout])
       expect(result.code).toBe(0)
-      expect(result.stdout).toContain("kind=already-current")
-      expect(result.stdout).not.toContain("repaired-from=")
+      expect(result.stdout).toContain(`repaired-from=${parent}`)
+      expect(git(checkout, "rev-parse", "HEAD~2")).toBe(parent)
+      expect(worktreeDirtyPaths(checkout)).toEqual([])
+    })
+
+    test("staged changes matching no ancestor refuse, exit 4, and are never called current", async () => {
+      const { checkout } = remoteFixture()
+      writeFileSync(join(checkout, "tracked.md"), "# staged by hand\n")
+      git(checkout, "add", "tracked.md")
+      const indexBefore = git(checkout, "write-tree")
+
+      const result = await runCli(["project", checkout])
+      expect(result.code).toBe(4)
+      expect(result.stderr).toContain("kind=dirt-unverifiable")
+      expect(result.stderr).toContain(`first-parent ancestors`)
+      expect(result.stdout).not.toContain("already-current")
+      expect(git(checkout, "write-tree")).toBe(indexBefore)
       expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# staged by hand\n")
-      expect(worktreeDirtyPaths(checkout)).toEqual(["tracked.md"])
+    })
+
+    test("the search is bounded: an index older than the bound reads none-within-bound, never at-tip", () => {
+      const { checkout } = remoteFixture()
+      const { parent, head } = commitThenLeaveIndexAtParent(checkout)
+      expect(indexBaseAmongAncestors(checkout, head, 1)).toMatchObject({ kind: "ancestor", ancestor: parent, depth: 1 })
+      const tree = git(checkout, "rev-parse", "HEAD^{tree}")
+      const later = git(checkout, "commit-tree", tree, "-p", "HEAD", "-m", "later landing")
+      expect(indexBaseAmongAncestors(checkout, later, 1)).toEqual({ kind: "none-within-bound", bound: 1 })
+      expect(STALE_INDEX_SEARCH_DEPTH).toBe(64)
+    })
+
+    test("HEAD at the tip over a stale index is never already-current, even to the library", () => {
+      const { checkout } = remoteFixture()
+      const { head } = commitThenLeaveIndexAtParent(checkout)
+      const outcome = synchronizeCheckoutToCommit({
+        repoRoot: checkout,
+        from: head,
+        to: head,
+        ref: "refs/heads/main",
+        expectedDirtyPaths: worktreeDirtyPaths(checkout),
+      })
+      expect(outcome.kind).toBe("dirt-unverifiable")
     })
   })
 

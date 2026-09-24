@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed
+
+- `gitomic project` no longer reports `already-current` over an index that holds
+  an older tree than the tip (25393). An index at one of the tip's last 64
+  first-parent ancestors is carried forward by the conditional two-way merge and
+  reported as `ProjectCheckoutOutcome.repairedIndexFrom` (CLI: ` repaired-from=<oid>`);
+  an index matching none of them exits 4 (`dirt-unverifiable`), changing nothing.
+
 ## 0.3.0 — 2026-09-23
 
 ### Fixed
