@@ -29,6 +29,9 @@
   an `rm` anchored on its base oid; a path absent from both, or named twice,
   refuses. The CLI's `put` shares its file read and precondition.
 
+- `batchCheck` checks ordered raw and peeled object names in one bounded Git
+  process and reports missing objects or malformed batch answers explicitly.
+
 ### Fixed
 
 - `gitomic project` and `gitomic apply --checkout` no longer report a checkout

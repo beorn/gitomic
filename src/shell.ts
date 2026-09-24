@@ -67,6 +67,17 @@ export type DanglingRefsOptions = Readonly<{
   run?: (args: readonly string[], options?: RunGitOptions) => Promise<GitResult>
 }>
 
+/** One answer to a name supplied to {@link batchCheck}. */
+export type BatchCheckResult =
+  | Readonly<{ input: string; oid: string; type: "blob" | "tree" | "commit" | "tag" }>
+  | Readonly<{ input: string; missing: true }>
+
+/** A function-local command seam and deadline for {@link batchCheck}. */
+export type BatchCheckOptions = Readonly<{
+  run?: (args: readonly string[], options?: RunGitOptions) => Promise<GitResult>
+  timeoutMs?: number
+}>
+
 /** Options for {@link createShellBackend}. */
 export type ShellBackendOptions = {
   /** Git executable used for every shell-backend command. A bare name resolves through `baseEnv`'s PATH. Defaults to `git`. */
@@ -267,6 +278,56 @@ export function isMissingObjectFetchError(detail: string): boolean {
   return /\bbad object refs\/|did not send all necessary objects/u.test(detail)
 }
 
+class BatchCheckCountError extends Error {
+  constructor(
+    readonly answered: number,
+    readonly requested: number,
+    repository: string,
+  ) {
+    super(`git cat-file --batch-check answered ${answered} lines for ${requested} names in ${repository}`)
+  }
+}
+
+/** Check object names in order with one Git process; missing or malformed answers never disappear. */
+export async function batchCheck(
+  repository: string,
+  names: readonly string[],
+  options: BatchCheckOptions = {},
+): Promise<readonly BatchCheckResult[]> {
+  if (names.length === 0) return []
+  for (const name of names) {
+    if (name.length === 0 || name.includes("\n") || name.includes("\r")) {
+      throw new TypeError(
+        `git cat-file --batch-check received an invalid name in ${repository}: ${JSON.stringify(name)}`,
+      )
+    }
+  }
+  const args = ["-C", resolve(repository), "cat-file", "--batch-check=%(objectname) %(objecttype)"]
+  const checked = await (options.run ?? runGit)(args, {
+    input: `${names.join("\n")}\n`,
+    timeoutMs: options.timeoutMs ?? DANGLING_REF_SCAN_TIMEOUT_MS,
+  })
+  if (checked.code !== 0) throw commandFailure(repository, args, checked)
+  const output = checked.stdout.toString("utf8")
+  if (output !== "" && !output.endsWith("\n")) {
+    throw new Error(`git cat-file --batch-check returned an unterminated answer in ${repository}`)
+  }
+  const answers = output === "" ? [] : output.slice(0, -1).split("\n")
+  if (answers.length !== names.length) throw new BatchCheckCountError(answers.length, names.length, repository)
+  return answers.map((answer, index) => {
+    const input = names[index]
+    if (input === undefined) throw new BatchCheckCountError(answers.length, names.length, repository)
+    if (answer === `${input} missing`) return { input, missing: true }
+    const present = /^([0-9a-f]{40}|[0-9a-f]{64}) (blob|tree|commit|tag)$/u.exec(answer)
+    if (present?.[1] && present[2]) {
+      return { input, oid: present[1], type: present[2] as "blob" | "tree" | "commit" | "tag" }
+    }
+    throw new Error(
+      `git cat-file --batch-check returned a malformed answer in ${repository}: ${JSON.stringify(answer)}`,
+    )
+  })
+}
+
 /**
  * Every local ref whose named object is missing, from one explicit-format ref
  * listing and one ordered cat-file batch. A failed scan throws and never reads
@@ -296,19 +357,26 @@ export async function danglingRefs(
       }
     })
   if (refs.length === 0) return []
-  const checkArgs = [...at, "cat-file", "--batch-check=%(objectname) %(objecttype)"]
-  const checked = await invoke(checkArgs, {
-    input: `${refs.map(({ oid }) => oid).join("\n")}\n`,
-    timeoutMs: DANGLING_REF_SCAN_TIMEOUT_MS,
-  })
-  if (checked.code !== 0) throw commandFailure(repository, checkArgs, checked)
-  const answers = checked.stdout.toString("utf8").split("\n").filter(Boolean)
-  if (answers.length !== refs.length) {
-    throw new Error(
-      `git cat-file --batch-check answered ${answers.length} lines for ${refs.length} refs in ${repository}`,
+  let answers: readonly BatchCheckResult[]
+  try {
+    answers = await batchCheck(
+      repository,
+      refs.map(({ oid }) => oid),
+      { run: invoke, timeoutMs: DANGLING_REF_SCAN_TIMEOUT_MS },
     )
+  } catch (error) {
+    if (error instanceof BatchCheckCountError) {
+      throw new Error(
+        `git cat-file --batch-check answered ${error.answered} lines for ${refs.length} refs in ${repository}`,
+      )
+    }
+    throw error
   }
-  return refs.filter(({ oid }, index) => answers[index] === `${oid} missing`)
+  return refs.filter((_, index) => {
+    const answer = answers[index]
+    if (answer === undefined) throw new BatchCheckCountError(answers.length, refs.length, repository)
+    return "missing" in answer
+  })
 }
 
 function commandFailure(repository: string, args: readonly string[], result: GitResult): Error {
