@@ -275,6 +275,38 @@ describe("the shell backend on a 2,000-file tree", () => {
     }
   })
 
+  test("a tree entry whose blob the repository does not hold fails the read naming the PATH, through transact and at() (review2 09d0f178)", async () => {
+    const fixture = await createBareRepo()
+    try {
+      const present = await gitWithInput(fixture.repo, "here\n", "hash-object", "-w", "--stdin")
+      const lost = "0123456789abcdef0123456789abcdef01234567"
+      const tree = await gitWithInput(
+        fixture.repo,
+        `100644 blob ${present}\there.md\0` + `100644 blob ${lost}\tlost.md\0`,
+        "mktree",
+        "-z",
+        "--missing",
+      )
+      const tip = await git(fixture.repo, "commit-tree", tree, "-p", fixture.initial, "-m", "a lost blob")
+      await git(fixture.repo, "update-ref", "refs/heads/main", tip, fixture.initial)
+      const store = await open({ repo: fixture.repo, ref: "main", writer: "worker", backend: createShellBackend() })
+      const pathAndOid = /"lost\.md" \(0123456789abcdef0123456789abcdef01234567\)/u
+      await expect(
+        store.transact(async (map) => {
+          await map.get("lost.md")
+        }, "read a lost blob"),
+      ).rejects.toThrow(pathAndOid)
+      await expect(store.at(tip).get("lost.md")).rejects.toThrow(pathAndOid)
+      // The backend's own refusal rides along as the cause, and the present blob still reads.
+      await expect(store.at(tip).get("lost.md")).rejects.toMatchObject({
+        cause: expect.objectContaining({ message: expect.stringContaining("missing") }),
+      })
+      expect(await store.at(tip).get("here.md")).toBe("here\n")
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
   test("readBlobs deduplicates its oids and refuses a missing one loudly", async () => {
     const fixture = await createBareRepo()
     try {
