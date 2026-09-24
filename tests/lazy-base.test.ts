@@ -327,13 +327,66 @@ describe("the shell backend on a 2,000-file tree", () => {
           "two edits, one lost",
         ),
       ).rejects.not.toThrow(/"here\.md"/u)
+      // One whole-tree listing first, so the two reads below share one base and one batch (review2 93216db332).
       const shared = store.at(tip)
+      expect(await shared.keys()).toEqual(["here.md", "lost.md"])
       const [hereValue, lostValue] = await Promise.allSettled([shared.get("here.md"), shared.get("lost.md")])
       expect(hereValue).toEqual({ status: "fulfilled", value: "here\n" })
       expect(lostValue.status).toBe("rejected")
-      // A rejected read is not memoised: the same snapshot asks again and still names the path.
       await expect(shared.get("lost.md")).rejects.toThrow(pathAndOid)
       expect(await shared.get("here.md")).toBe("here\n")
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  test("a read that failed is not memoised: after a transient backend failure the same Snapshot's next read resolves (review2 93216db332)", async () => {
+    const fixture = await createBareRepo()
+    try {
+      const shell = createShellBackend()
+      let failures = 0
+      const flaky: GitomicBackend = {
+        ...shell,
+        readBlobs: async (repo, oids) => {
+          if (failures === 0) {
+            failures += 1
+            throw new Error("transient: the object store was busy")
+          }
+          return shell.readBlobs(repo, oids)
+        },
+      }
+      const store = await open({ repo: fixture.repo, ref: "main", writer: "worker", backend: flaky })
+      const committed = await store.transact(async (map) => map.set("note.md", "first\n"), "seed")
+      const snapshot = store.at(committed.oid)
+      await expect(snapshot.get("note.md")).rejects.toThrow(/"note\.md".*transient: the object store was busy/u)
+      // The same Snapshot, the same path: the rejection was not kept, so the backend is asked again and answers.
+      expect(await snapshot.get("note.md")).toBe("first\n")
+      expect(failures).toBe(1)
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  test("two paths holding the same lost oid each fail naming their own path (review2 P3)", async () => {
+    const fixture = await createBareRepo()
+    try {
+      const lost = "0123456789abcdef0123456789abcdef01234567"
+      const tree = await gitWithInput(
+        fixture.repo,
+        `100644 blob ${lost}\ta.md\0` + `100644 blob ${lost}\tb.md\0`,
+        "mktree",
+        "-z",
+        "--missing",
+      )
+      const tip = await git(fixture.repo, "commit-tree", tree, "-p", fixture.initial, "-m", "two paths, one lost blob")
+      await git(fixture.repo, "update-ref", "refs/heads/main", tip, fixture.initial)
+      const store = await open({ repo: fixture.repo, ref: "main", writer: "worker", backend: createShellBackend() })
+      const snapshot = store.at(tip)
+      expect(await snapshot.keys()).toEqual(["a.md", "b.md"])
+      const [a, b] = await Promise.allSettled([snapshot.get("a.md"), snapshot.get("b.md")])
+      expect(a.status === "rejected" && String(a.reason.message)).toMatch(/^cannot read Git blob at "a\.md"/u)
+      expect(b.status === "rejected" && String(b.reason.message)).toMatch(/^cannot read Git blob at "b\.md"/u)
+      expect(b.status === "rejected" && String(b.reason.message)).not.toContain('"a.md"')
     } finally {
       await fixture.cleanup()
     }

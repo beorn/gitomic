@@ -143,7 +143,15 @@ export function createLazyBase(backend: GitomicBackend, repo: string, parent: Oi
     oid: (path) => listing.get(path)?.oid,
     publicPaths: () => [...listing.keys()].filter(isPublicPath),
     async get(path) {
-      const value = await stored(path)
+      let value: BlobValue | undefined
+      try {
+        value = await stored(path)
+      } catch (error) {
+        // The memo is keyed by oid, so a shared promise was named after the first path that asked; this read names
+        // its own path, with the backend's error (not the other path's wrapper) as the cause.
+        const cause = error instanceof Error && error.cause !== undefined ? error.cause : error
+        throw unreadable(listing.get(path)?.oid ?? "?", path, cause)
+      }
       if (value === undefined) return undefined
       // The one UTF-8 check a write performs: on the value it reads, at the read.
       if (typeof value === "string") {
