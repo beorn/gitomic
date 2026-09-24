@@ -319,7 +319,8 @@ function commandFailure(repository: string, args: readonly string[], result: Git
 
 async function run(command: string, args: readonly string[], options: GitOptions = {}): Promise<GitResult> {
   const timeoutMs = options.timeoutMs === undefined ? undefined : normalizeTimeoutMs(options.timeoutMs, "timeoutMs")
-  return new Promise((resolve, reject) => {
+  // oxlint-disable-next-line promise/param-names -- resolveResult cannot shadow the imported path.resolve.
+  return new Promise((resolveResult, reject) => {
     const bounded = timeoutMs !== undefined && process.platform !== "win32"
     const child = childProcess.spawn(command, args, {
       env: { ...(options.baseEnv ?? process.env), ...options.env, GIT_TERMINAL_PROMPT: "0", LC_ALL: "C" },
@@ -363,7 +364,7 @@ async function run(command: string, args: readonly string[], options: GitOptions
           // The command finished inside its limit; only a helper it started
           // still holds the output pipes, so the command's own result stands.
           abandonHelpers()
-          settle(() => resolve(result(exited)))
+          settle(() => resolveResult(result(exited)))
           return
         }
         timedOut = true
@@ -383,7 +384,7 @@ async function run(command: string, args: readonly string[], options: GitOptions
     })
     child.once("close", (code) => {
       if (timedOut) return
-      settle(() => resolve(result(code)))
+      settle(() => resolveResult(result(code)))
     })
     child.stdin.on("error", (error: NodeJS.ErrnoException) => {
       // A command stopped at its limit closes stdin under a pending write; the

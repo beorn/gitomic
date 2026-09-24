@@ -476,8 +476,9 @@ function makeOverlay(base: LazyBase): {
     changes.has(path) ? Promise.resolve(changes.get(path)) : base.get(path)
   const present = (path: string): boolean => (changes.has(path) ? changes.get(path) !== undefined : base.has(path))
   const map: GitMap = {
-    get(path) {
-      return Promise.resolve(get(normalizePath(path)))
+    // oxlint-disable-next-line typescript/require-await -- Promise-typed reads reject validation errors, never throw synchronously.
+    async get(path) {
+      return get(normalizePath(path))
     },
     set(path, content) {
       const normalized = normalizePath(path)
@@ -487,17 +488,19 @@ function makeOverlay(base: LazyBase): {
     delete(path) {
       changes.set(normalizePath(path), undefined)
     },
-    has(path) {
-      return Promise.resolve(present(normalizePath(path)))
+    // oxlint-disable-next-line typescript/require-await -- Promise-typed reads reject validation errors, never throw synchronously.
+    async has(path) {
+      return present(normalizePath(path))
     },
-    keys(prefix = "") {
+    // oxlint-disable-next-line typescript/require-await -- Promise-typed reads reject validation errors, never throw synchronously.
+    async keys(prefix = "") {
       const normalized = normalizePrefix(prefix)
       const keys = new Set(base.publicPaths())
       for (const [path, value] of changes) {
         if (value === undefined) keys.delete(path)
         else keys.add(path)
       }
-      return Promise.resolve([...keys].filter((path) => path.startsWith(normalized)).sort())
+      return [...keys].filter((path) => path.startsWith(normalized)).sort()
     },
   }
   // A chain of moves keeps the first source's mode: a to b, then b to c, leaves c with a's.

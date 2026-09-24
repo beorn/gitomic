@@ -189,6 +189,22 @@ describe("public contract guards", () => {
     expect(await store.at().has(composed)).toBe(false)
   })
 
+  test("Promise-typed map reads reject invalid paths in transactions and snapshots", async () => {
+    const backend = createMemBackend()
+    const store = await open({ repo: "read-rejections", ref: "main", writer: "worker", backend })
+
+    await store.transact(async (map) => {
+      await expect(map.get("../x")).rejects.toThrow(TypeError)
+      await expect(map.has("../x")).rejects.toThrow(TypeError)
+      await expect(map.keys("../x")).rejects.toThrow(TypeError)
+    }, "read validation rejects")
+
+    const snapshot = store.at(await store.head())
+    await expect(snapshot.get("../x")).rejects.toThrow(TypeError)
+    await expect(snapshot.has("../x")).rejects.toThrow(TypeError)
+    await expect(snapshot.keys("../x")).rejects.toThrow(TypeError)
+  })
+
   test("rejects strings that cannot round-trip through UTF-8", async () => {
     const backend = createMemBackend()
     const store = await open({ repo: "invalid-utf8-string", ref: "main", writer: "worker", backend })
