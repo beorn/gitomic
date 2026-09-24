@@ -206,8 +206,10 @@ describe("a remote that stalls", () => {
 
       const committed = store.transact(async (map) => map.set("note.md", "stalls on push\n"), "stall on push")
 
-      await expect(committed).rejects.toThrow(/git push.*500 ms/)
-      await expect(committed).rejects.toMatchObject({ cause: { name: "GitTimeout" } })
+      await expect(committed).rejects.toThrow(
+        /Transaction publication .* is unknown; do not blindly retry.*remote write outcome is unknown for refs\/heads\/main expected [0-9a-f]{40}/s,
+      )
+      await expect(committed).rejects.toMatchObject({ cause: { cause: { name: "GitTimeout" } } })
       expect(Date.now() - startedAt).toBeLessThan(4_500)
       expect(await git(fixture.remote, "rev-parse", "main")).toBe(fixture.initial)
       expect(await survivors(await stall.pids())).toEqual([])

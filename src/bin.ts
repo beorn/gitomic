@@ -170,6 +170,10 @@ export async function main(argv: string[], io: CliIo = {}): Promise<number> {
   try {
     const verb = args.shift()
     if (verb === undefined) throw new UsageError(`missing verb; expected one of ${VERBS.join(", ")}`)
+    if (verb === "--help" || verb === "-h") {
+      stdout.write(`Usage: gitomic <verb> <repo>#<ref> [args] [flags]\n\nVerbs: ${VERBS.join(", ")}\n`)
+      return OK
+    }
     switch (verb) {
       case "read":
         return await runRead(args, stdout, backend)
@@ -211,7 +215,7 @@ export type CliIo = {
   backend?: GitomicBackend
 }
 
-const VERBS = ["read", "ls", "grep", "log", "diff", "write", "rm", "mv", "apply", "project", "trust"] as const
+export const VERBS = ["read", "ls", "grep", "log", "diff", "write", "rm", "mv", "apply", "project", "trust"] as const
 
 const OK = 0
 const RUNTIME_ERROR = 1
@@ -846,22 +850,20 @@ type ProjectOutcomeReceipt = { readonly ok: boolean; readonly kind: string; read
 
 function isSameRepository(pathA: string, pathB: string): boolean {
   if (resolve(pathA) === resolve(pathB)) return true
-  try {
-    const resA = spawnSync("git", ["-C", pathA, "rev-parse", "--path-format=absolute", "--git-common-dir"], {
+  const commonDir = (path: string): string => {
+    const result = spawnSync("git", ["-C", path, "rev-parse", "--path-format=absolute", "--git-common-dir"], {
       encoding: "utf8",
     })
-    const resB = spawnSync("git", ["-C", pathB, "rev-parse", "--path-format=absolute", "--git-common-dir"], {
-      encoding: "utf8",
-    })
-    if ((resA.status ?? 1) === 0 && (resB.status ?? 1) === 0) {
-      const gitDirA = (resA.stdout ?? "").trim()
-      const gitDirB = (resB.stdout ?? "").trim()
-      if (gitDirA.length > 0 && gitDirA === gitDirB) return true
+    const directory = result.stdout?.trim() ?? ""
+    if (result.error !== undefined || result.status !== 0 || directory.length === 0) {
+      const detail = result.error?.message || result.stderr?.trim() || "no common directory returned"
+      throw new Error(
+        `cannot inspect repository ${JSON.stringify(path)}: git rev-parse exited ${result.status ?? "without status"}: ${detail}`,
+      )
     }
-  } catch {
-    // ignore
+    return directory
   }
-  return false
+  return commonDir(pathA) === commonDir(pathB)
 }
 
 /**
@@ -908,7 +910,14 @@ async function projectAfterWrite(
   stderr: CliWriter,
 ): Promise<ProjectOutcomeReceipt> {
   const storeRef = repository.ref.startsWith("refs/heads/") ? repository.ref : `refs/heads/${repository.ref}`
-  const isLocal = isSameRepository(checkoutPath, repository.repo)
+  let isLocal: boolean
+  try {
+    isLocal = isSameRepository(checkoutPath, repository.repo)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    stderr.write(`gitomic: projection failed: ${message}\nkind=repository-inspection-failed\n`)
+    return { ok: false, kind: "repository-inspection-failed", error: message }
+  }
 
   let outcome: CheckoutSyncOutcome | RemoteFirstProjectionOutcome
   if (isLocal) {
@@ -1158,8 +1167,9 @@ async function runTrust(args: string[], stdout: CliWriter, backend: GitomicBacke
   using repository = await openAddressFor(address, backend)
   const tip = await (await openReader(repository)).head()
   const declaration = await readRepositoryDeclaration(repository.repo, tip)
-  if (declaration === undefined)
+  if (declaration === undefined) {
     throw new Error(`${address} declares no ${CANDIDATE_CONFIG} at ${tip}; nothing to trust`)
+  }
   stdout.write(`${CANDIDATE_CONFIG} ${declaration.blob} at ${tip} declares:\n`)
   for (const line of declaration.lines) stdout.write(`  ${line}\n`)
   const scope = { repo: repository.repo, ...(repository.url === undefined ? {} : { url: repository.url }) }
@@ -1246,4 +1256,23 @@ function reportError(error: unknown, stderr: CliWriter): number {
   return RUNTIME_ERROR
 }
 
-if (import.meta.main) process.exit(await main(process.argv.slice(2)))
+/**
+ * The process entry. It never calls `process.exit`: a write to a pipe is
+ * asynchronous past the kernel's buffer, and exiting there discards the rest
+ * of the output while still reporting success (25382). Setting `exitCode` and
+ * returning lets the event loop drain stdout and stderr first. A stdout that
+ * refuses the write (the reader closed early, EPIPE) is a failure of this
+ * command, named with its arguments, never a truncated success.
+ */
+async function runProcess(argv: string[]): Promise<void> {
+  process.stdout.on("error", (error: NodeJS.ErrnoException) => {
+    process.stderr.write(
+      `gitomic: stdout refused the output of \`gitomic ${argv.join(" ")}\`: ${error.code ?? error.message}\n`,
+    )
+    process.exitCode = RUNTIME_ERROR
+  })
+  const code = await main(argv)
+  if (!process.exitCode) process.exitCode = code
+}
+
+if (import.meta.main) await runProcess(process.argv.slice(2))

@@ -13,7 +13,7 @@ import { promisify } from "node:util"
 
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest"
 
-import { main } from "../src/bin.js"
+import { main, VERBS } from "../src/bin.js"
 import { objectOid } from "../src/git-object.js"
 import { createShellBackend, open, type CommitMeta, type GitomicBackend } from "../src/index.js"
 import { createMemBackend } from "../src/mem.js"
@@ -1033,6 +1033,21 @@ describe("gitomic CLI — --json receipt on write verbs", () => {
 })
 
 describe("gitomic CLI — usage errors (exit 2, never silent)", () => {
+  test.each(["--help", "-h"])("%s prints every verb without opening a repository", async (flag) => {
+    await expect(promisify(execFile)("git", ["rev-parse", "--git-dir"], { cwd: workdir })).rejects.toMatchObject({
+      code: 128,
+    })
+
+    const result = await promisify(execFile)("bun", [fileURLToPath(new URL("../src/bin.ts", import.meta.url)), flag], {
+      cwd: workdir,
+      encoding: "utf8",
+    })
+
+    expect(result.stderr).toBe("")
+    expect(result.stdout).toContain("Usage: gitomic <verb> <repo>#<ref> [args] [flags]")
+    for (const verb of VERBS) expect(result.stdout).toContain(verb)
+  })
+
   test("an unknown verb fails loudly, naming itself", async () => {
     const backend = createMemBackend()
     const result = await run(backend, ["frobnicate", ADDRESS])

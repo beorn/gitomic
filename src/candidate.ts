@@ -174,18 +174,20 @@ async function readDeclaration(
         }
       }
       declaration.timeoutMs = timeoutMs
-    } else
+    } else {
       return {
         refuse: [`${CANDIDATE_CONFIG}: unknown key ${key}; the [candidate] keys are derive, check and timeoutMs`],
       }
+    }
   }
   return declaration
 }
 
 async function resolveGitDir(repo: string): Promise<string> {
   const result = await runGit(["-C", repo, "rev-parse", "--absolute-git-dir"])
-  if (result.code !== 0)
+  if (result.code !== 0) {
     throw new Error(`cannot resolve the git dir of ${repo}: ${result.stderr.toString("utf8").trim()}`)
+  }
   return result.stdout.toString("utf8").trim()
 }
 
@@ -246,8 +248,9 @@ async function derive(
       return { refuse: [`derive \`${command}\`: "put" must map paths to string content`] }
     }
     for (const [path, content] of Object.entries(edits.put)) {
-      if (typeof content !== "string")
+      if (typeof content !== "string") {
         return { refuse: [`derive \`${command}\`: "put" content for ${path} is not a string`] }
+      }
       context.map.set(path, content)
     }
   }

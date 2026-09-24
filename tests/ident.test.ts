@@ -5,6 +5,8 @@
 // @consumer km's rail writes, which must record the acting agent as author and km as committer
 
 import { execFile } from "node:child_process"
+import { readFile } from "node:fs/promises"
+import { join } from "node:path"
 import { promisify } from "node:util"
 
 import { describe, expect, test } from "vitest"
@@ -53,6 +55,50 @@ async function legs(): Promise<Leg[]> {
 }
 
 describe("author and committer are data, identical on every backend", () => {
+  test("the shell uses its selected environment and explicit identities for both commit paths", async () => {
+    const fixture = await createBareRepo()
+    try {
+      const tracePath = join(fixture.repo, "git-trace.jsonl")
+      const backend = createShellBackend({
+        baseEnv: {
+          PATH: process.env.PATH,
+          GIT_TRACE2_EVENT: tracePath,
+          GIT_AUTHOR_NAME: "ambient author",
+          GIT_AUTHOR_EMAIL: "ambient@author.invalid",
+          GIT_COMMITTER_NAME: "ambient committer",
+          GIT_COMMITTER_EMAIL: "ambient@committer.invalid",
+        },
+      })
+      const changed = await backend.writeCommit(fixture.repo, input({ author: AGENT, committer: KM }))
+      const empty = await backend.writeCommit(
+        fixture.repo,
+        input({ parent: changed, changes: new Map(), seq: 1, author: OTHER, committer: KM }),
+      )
+      expect(await backend.readCommit(fixture.repo, changed)).toMatchObject({ author: AGENT, committer: KM })
+      expect(await backend.readCommit(fixture.repo, empty)).toMatchObject({ author: OTHER, committer: KM })
+      expect(
+        (await backend.readHistory!(fixture.repo, [empty], { limit: 2 })).map(({ author, committer }) => ({
+          author,
+          committer,
+        })),
+      ).toEqual([
+        { author: OTHER, committer: KM },
+        { author: AGENT, committer: KM },
+      ])
+      const trace = await readFile(tracePath, "utf8")
+      const starts = trace
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as { event?: string; argv?: string[] })
+        .filter((entry) => entry.event === "start")
+      expect(starts.filter((entry) => entry.argv?.includes("commit-tree"))).toHaveLength(2)
+      expect(starts.some((entry) => entry.argv?.includes("ls-files"))).toBe(true)
+      expect(starts.some((entry) => entry.argv?.includes("rev-list"))).toBe(true)
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
   test("the same input gives the same oid and the same author and committer on mem, iso and shell", async () => {
     const all = await legs()
     try {

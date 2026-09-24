@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.3.0 — 2026-09-23
+
+### Fixed
+
+- `createShellBackend({ gitExecutable })` uses one selected executable for all
+  backend Git commands, including the version probe and repository resolver, so
+  callers with a configured Git tool no longer fall back to an ambient `git`.
+
+## 0.2.0 — 2026-09-22
+
 ### Added
 
 - `GitomicBackend.readTree` and `readBlobs`, both REQUIRED members of the
@@ -28,6 +38,13 @@
   them back from the header. When neither is named, commits are byte-identical
   to before. An ident that git's `commit-tree` would rewrite is refused, and
   `identProblem` exposes the same check so callers can fall back first.
+- Top-level `gitomic --help` and `gitomic -h` print the CLI usage and available
+  verbs without opening a repository.
+- `createShellBackend({ baseEnv })` snapshots an exact environment for every
+  backend Git command, while `runGit(..., { env })` keeps overlay semantics.
+- `danglingRefs` and `isMissingObjectFetchError` provide one dependency-free
+  owner for missing local ref-object diagnosis, including actionable fetch
+  errors from the shell backend.
 - `gitomic/events`: an append-only event chain on one ref, driven by the same
   compare-and-swap loop as `transact` (`openEvents`, `listRefs`, `chainsUnder`).
   `Store.transact` and `openEvents` now share one loop (`src/engine.ts`): one

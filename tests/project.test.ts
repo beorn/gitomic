@@ -367,6 +367,42 @@ describe("gitomic project and checkout synchronization", () => {
       expect(result.stderr).toContain("gitomic: projection failed:")
       expect(result.stderr).toContain("kind=worktree-update-refused")
     })
+
+    test("apply reports repository inspection failure after landing the write", async () => {
+      const { root, bare, checkout } = remoteFixture()
+      const shim = join(root, "git-shim")
+      mkdirSync(shim)
+      const realGit = spawnSync("which", ["git"], { encoding: "utf8" }).stdout.trim()
+      writeFileSync(
+        join(shim, "git"),
+        `#!/bin/sh\nif [ "$2" = "${checkout}" ] && [ "$3" = rev-parse ] && [ "$4" = --path-format=absolute ]; then\n  echo inspection unavailable >&2\n  exit 74\nfi\nexec ${realGit} "$@"\n`,
+        { mode: 0o755 },
+      )
+      vi.stubEnv("PATH", `${shim}:${process.env.PATH}`)
+      const content = join(root, "inspection.txt")
+      writeFileSync(content, "# committed before projection\n")
+
+      const result = await runCli([
+        "apply",
+        `${bare}#main`,
+        "-m",
+        "inspection failure",
+        "--checkout",
+        checkout,
+        "--json",
+        "put",
+        "tracked.md",
+        content,
+      ])
+
+      expect(result.code).toBe(0)
+      const receipt = JSON.parse(result.stdout.trim()) as { oid: string; projection: string }
+      expect(receipt.projection).toBe("repository-inspection-failed")
+      expect(git(bare, "rev-parse", "refs/heads/main")).toBe(receipt.oid)
+      expect(result.stderr).toContain(`cannot inspect repository "${checkout}"`)
+      expect(result.stderr).toContain("inspection unavailable")
+      expect(result.stderr).toContain("kind=repository-inspection-failed")
+    })
   })
 
   describe("Witness 5: mid-flight ref advance (beforeRefAdvance) -> ref-advance-refused", () => {
