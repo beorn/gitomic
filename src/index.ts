@@ -5,6 +5,7 @@ import { runCasLoop } from "./engine.js"
 import {
   assertWriter,
   DEFAULT_WRITER_LABEL,
+  normalizeClock,
   normalizePollInterval,
   normalizeRef,
   normalizeRetryBudget,
@@ -18,10 +19,10 @@ import { createLazyBase, readLazyBase, type LazyBase } from "./lazy-base.js"
 import { createShellBackend } from "./shell.js"
 import type {
   Candidate,
-  Trailer,
   Change,
-  CommitProvenance,
+  Clock,
   CommitMeta,
+  CommitProvenance,
   Committed,
   GitMap,
   GitomicBackend,
@@ -34,6 +35,7 @@ import type {
   RefTipWatchOptions,
   Snapshot,
   Store,
+  Trailer,
   Update,
 } from "./types.js"
 import { assertUtf8 } from "./utf8.js"
@@ -57,6 +59,7 @@ export { identProblem } from "./git-object.js"
 export type { Edit } from "./edits.js"
 export { matchGlob } from "./glob.js"
 export {
+  batchCheck,
   createShellBackend,
   danglingRefs,
   DEFAULT_REMOTE_TIMEOUT_MS,
@@ -64,6 +67,8 @@ export {
   runGit,
   type DanglingRef,
   type DanglingRefsOptions,
+  type BatchCheckOptions,
+  type BatchCheckResult,
   type GitResult,
   type RunGitOptions,
   type ShellBackendOptions,
@@ -228,6 +233,8 @@ type StoreContext = {
   backend: GitomicBackend
   /** How long a transaction keeps retrying a contended CAS before giving up (ms). */
   retryBudgetMs: number
+  /** The clock every commit of this store is dated by, in unix seconds (25486). */
+  clock: Clock
   refresh(): Promise<Oid>
   publish(next: Oid, expected: Oid): Promise<boolean>
   nextSeq(): number
@@ -255,6 +262,7 @@ async function prepareStore(options: OpenOptions): Promise<StoreContext> {
   const nextSeq = (): number => seq++
   const backend = options.backend ?? createShellBackend()
   const retryBudgetMs = normalizeRetryBudget(options.retryBudgetMs)
+  const clock = normalizeClock(options.clock)
   const remote = options.remote
   let refresh: () => Promise<Oid>
   let publish: (next: Oid, expected: Oid) => Promise<boolean>
@@ -276,7 +284,7 @@ async function prepareStore(options: OpenOptions): Promise<StoreContext> {
     publish = async (next, expected) => compareAndSwapRemote(repo, ref, next, expected, remote)
   }
   await refresh()
-  return { repo, ref, writer, instance, committer, backend, retryBudgetMs, refresh, publish, nextSeq }
+  return { repo, ref, writer, instance, committer, backend, retryBudgetMs, clock, refresh, publish, nextSeq }
 }
 
 async function prepareReader(options: OpenReaderOptions): Promise<ReaderContext> {
@@ -334,6 +342,7 @@ async function transact(
         assertNextTree(base, effective)
         return {
           parent,
+          time: context.clock(),
           changes: effective,
           ...(modeSources.size === 0 ? {} : { modeSources }),
           message: commitMessage,

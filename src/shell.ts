@@ -8,15 +8,16 @@ import { join, resolve } from "node:path"
 import { GitTimeout } from "./errors.js"
 import {
   assertRefUpdates,
-  leaseConflict,
+  commitIdents,
   commitMeta,
   commitParents,
-  commitIdents,
+  commitTimestamp,
   formatCommitMessage,
   GENESIS_MESSAGE,
   GITOMIC_IDENT,
   INITIAL_TIMESTAMP,
   isZeroOid,
+  leaseConflict,
   objectOid,
   parseCommit,
   refUnderPrefix,
@@ -65,6 +66,17 @@ export type DanglingRef = Readonly<{ ref: string; oid: string }>
 /** A function-local command seam for {@link danglingRefs}. */
 export type DanglingRefsOptions = Readonly<{
   run?: (args: readonly string[], options?: RunGitOptions) => Promise<GitResult>
+}>
+
+/** One answer to a name supplied to {@link batchCheck}. */
+export type BatchCheckResult =
+  | Readonly<{ input: string; oid: string; type: "blob" | "tree" | "commit" | "tag" }>
+  | Readonly<{ input: string; missing: true }>
+
+/** A function-local command seam and deadline for {@link batchCheck}. */
+export type BatchCheckOptions = Readonly<{
+  run?: (args: readonly string[], options?: RunGitOptions) => Promise<GitResult>
+  timeoutMs?: number
 }>
 
 /** Options for {@link createShellBackend}. */
@@ -267,6 +279,56 @@ export function isMissingObjectFetchError(detail: string): boolean {
   return /\bbad object refs\/|did not send all necessary objects/u.test(detail)
 }
 
+class BatchCheckCountError extends Error {
+  constructor(
+    readonly answered: number,
+    readonly requested: number,
+    repository: string,
+  ) {
+    super(`git cat-file --batch-check answered ${answered} lines for ${requested} names in ${repository}`)
+  }
+}
+
+/** Check object names in order with one Git process; missing or malformed answers never disappear. */
+export async function batchCheck(
+  repository: string,
+  names: readonly string[],
+  options: BatchCheckOptions = {},
+): Promise<readonly BatchCheckResult[]> {
+  if (names.length === 0) return []
+  for (const name of names) {
+    if (name.length === 0 || name.includes("\n") || name.includes("\r")) {
+      throw new TypeError(
+        `git cat-file --batch-check received an invalid name in ${repository}: ${JSON.stringify(name)}`,
+      )
+    }
+  }
+  const args = ["-C", resolve(repository), "cat-file", "--batch-check=%(objectname) %(objecttype)"]
+  const checked = await (options.run ?? runGit)(args, {
+    input: `${names.join("\n")}\n`,
+    timeoutMs: options.timeoutMs ?? DANGLING_REF_SCAN_TIMEOUT_MS,
+  })
+  if (checked.code !== 0) throw commandFailure(repository, args, checked)
+  const output = checked.stdout.toString("utf8")
+  if (output !== "" && !output.endsWith("\n")) {
+    throw new Error(`git cat-file --batch-check returned an unterminated answer in ${repository}`)
+  }
+  const answers = output === "" ? [] : output.slice(0, -1).split("\n")
+  if (answers.length !== names.length) throw new BatchCheckCountError(answers.length, names.length, repository)
+  return answers.map((answer, index) => {
+    const input = names[index]
+    if (input === undefined) throw new BatchCheckCountError(answers.length, names.length, repository)
+    if (answer === `${input} missing`) return { input, missing: true }
+    const present = /^([0-9a-f]{40}|[0-9a-f]{64}) (blob|tree|commit|tag)$/u.exec(answer)
+    if (present?.[1] && present[2]) {
+      return { input, oid: present[1], type: present[2] as "blob" | "tree" | "commit" | "tag" }
+    }
+    throw new Error(
+      `git cat-file --batch-check returned a malformed answer in ${repository}: ${JSON.stringify(answer)}`,
+    )
+  })
+}
+
 /**
  * Every local ref whose named object is missing, from one explicit-format ref
  * listing and one ordered cat-file batch. A failed scan throws and never reads
@@ -296,19 +358,26 @@ export async function danglingRefs(
       }
     })
   if (refs.length === 0) return []
-  const checkArgs = [...at, "cat-file", "--batch-check=%(objectname) %(objecttype)"]
-  const checked = await invoke(checkArgs, {
-    input: `${refs.map(({ oid }) => oid).join("\n")}\n`,
-    timeoutMs: DANGLING_REF_SCAN_TIMEOUT_MS,
-  })
-  if (checked.code !== 0) throw commandFailure(repository, checkArgs, checked)
-  const answers = checked.stdout.toString("utf8").split("\n").filter(Boolean)
-  if (answers.length !== refs.length) {
-    throw new Error(
-      `git cat-file --batch-check answered ${answers.length} lines for ${refs.length} refs in ${repository}`,
+  let answers: readonly BatchCheckResult[]
+  try {
+    answers = await batchCheck(
+      repository,
+      refs.map(({ oid }) => oid),
+      { run: invoke, timeoutMs: DANGLING_REF_SCAN_TIMEOUT_MS },
     )
+  } catch (error) {
+    if (error instanceof BatchCheckCountError) {
+      throw new Error(
+        `git cat-file --batch-check answered ${error.answered} lines for ${refs.length} refs in ${repository}`,
+      )
+    }
+    throw error
   }
-  return refs.filter(({ oid }, index) => answers[index] === `${oid} missing`)
+  return refs.filter((_, index) => {
+    const answer = answers[index]
+    if (answer === undefined) throw new BatchCheckCountError(answers.length, refs.length, repository)
+    return "missing" in answer
+  })
 }
 
 function commandFailure(repository: string, args: readonly string[], result: GitResult): Error {
@@ -644,6 +713,7 @@ async function writeCommit(repo: string, input: CommitInput, baseEnv?: NodeJS.Pr
       validateOid(tree, "invalid parent tree id"),
       parents,
       Number(parentTime),
+      input.time,
       message,
       idents,
       baseEnv,
@@ -697,7 +767,7 @@ async function writeCommit(repo: string, input: CommitInput, baseEnv?: NodeJS.Pr
     })
     const tree = text(await gitWrite(repo, ["write-tree"], { baseEnv, env: indexEnv }))
     const parentTime = Number(text(await git(repo, ["show", "-s", "--format=%ct", input.parent], { baseEnv })))
-    return await commitTree(repo, tree, parents, parentTime, message, idents, baseEnv)
+    return await commitTree(repo, tree, parents, parentTime, input.time, message, idents, baseEnv)
   } finally {
     await rm(indexDir, { recursive: true, force: true })
   }
@@ -729,17 +799,18 @@ function keptMode(input: CommitInput, path: string, executables: ReadonlySet<str
   return executables.has(input.modeSources?.get(path) ?? path) ? "100755" : "100644"
 }
 
-/** Write one commit as the given author and committer, one second after its first parent. */
+/** Write one commit as the given author and committer, at the store's time and never earlier than its first parent plus one. */
 async function commitTree(
   repo: string,
   tree: Oid,
   parents: readonly Oid[],
   parentTime: number,
+  time: number,
   message: string,
   idents: { readonly author: Ident; readonly committer: Ident },
   baseEnv?: NodeJS.ProcessEnv,
 ): Promise<Oid> {
-  const timestamp = Number.isFinite(parentTime) ? parentTime + 1 : 1
+  const timestamp = commitTimestamp(parentTime, time)
   const args = ["commit-tree", tree]
   for (const parent of parents) args.push("-p", parent)
   return text(await gitWrite(repo, args, { baseEnv, env: identityEnv(timestamp, idents), input: message }))
@@ -1389,15 +1460,28 @@ export function fetchedNamespace(remote: string): string {
 
 const FETCH_RACE_ATTEMPTS = 3
 
-/** A fetch that failed only because a concurrent fetch in the same repository raced it for a ref in `namespace`. */
-function lostFetchedRefRace(error: unknown, namespace: string): boolean {
+/**
+ * How a fetch lost a race with a concurrent fetch in the same repository for refs in `namespace`:
+ * "moved" when the other fetch already moved a ref (retry at once), "held" when it still holds a
+ * ref's lock (wait for it first). Undefined when the failure is anything else.
+ */
+function lostFetchedRefRace(error: unknown, namespace: string): "moved" | "held" | undefined {
   const detail = error instanceof Error ? error.message : ""
-  const refs = [
+  const lost = [
     ...detail.matchAll(
-      /(?:^|: )error: cannot lock ref '([^']+)': (?:is at [0-9a-f]+ but expected [0-9a-f]+|reference is missing but expected [0-9a-f]+|Unable to create '[^']*\.lock': File exists\.?)$/gm,
+      /(?:^|: )error: cannot lock ref '([^']+)': (?:is at [0-9a-f]+ but expected [0-9a-f]+|reference is missing but expected [0-9a-f]+|(Unable to create '[^']*\.lock': File exists\.?))$/gm,
     ),
-  ].map((match) => match[1] ?? "")
-  return refs.length > 0 && refs.every((ref) => ref.startsWith(namespace))
+  ].map((match) => ({ ref: match[1] ?? "", held: match[2] !== undefined }))
+  if (lost.length === 0 || !lost.every(({ ref }) => ref.startsWith(namespace))) return undefined
+  return lost.some(({ held }) => held) ? "held" : "moved"
+}
+
+/** A short jittered wait, so a retry does not land inside the lock window of the fetch that holds it. */
+function waitOutHeldFetchLock(): Promise<void> {
+  return new Promise((resolve) => {
+    // raw-lifecycle-ok: the fetch retry awaits this wait, so it cannot outlive its caller.
+    setTimeout(resolve, 25 + Math.floor(Math.random() * 75))
+  })
 }
 
 /**
@@ -1453,7 +1537,18 @@ async function fetchRefs(
       // Another fetch in this repository moved or held one of our private
       // fetched refs between this fetch's read and its lock. The namespace is
       // only a cache of remote tips, so fetching again reads them afresh.
-      if (attempt < FETCH_RACE_ATTEMPTS && lostFetchedRefRace(error, namespace)) continue
+      const race = lostFetchedRefRace(error, namespace)
+      if (race !== undefined && attempt < FETCH_RACE_ATTEMPTS) {
+        if (race === "held") await waitOutHeldFetchLock()
+        continue
+      }
+      if (race !== undefined) {
+        throw new Error(
+          `git fetch lost the race for its fetched refs to another fetch in ${repo} ${attempt} times in a row; ` +
+            `the last attempt failed with: ${error instanceof Error ? error.message : String(error)}`,
+          { cause: error },
+        )
+      }
       await diagnoseMissingObjectFetch(repo, remote, error, baseEnv)
       throw error
     }

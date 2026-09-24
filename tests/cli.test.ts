@@ -289,7 +289,8 @@ async function historyOfSize(size: number) {
 describe("gitomic CLI — history reads", () => {
   test("log and diff expose anchored metadata and sorted blob changes in plain and JSON modes", async () => {
     const backend = createMemBackend()
-    const store = await open({ repo: "repo", ref: "main", backend, writer: "history" })
+    // The test's own writer asks for deterministic dates by name (25486): parent + 1 keeps the pinned timestamps.
+    const store = await open({ repo: "repo", ref: "main", backend, writer: "history", clock: () => 946_684_800 })
     const initial = await store.head()
     const first = await store.transact(async (map) => {
       map.set("b.md", "before")

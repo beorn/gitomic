@@ -585,7 +585,7 @@ Product output — content, paths, matches, the oid or receipt — goes to stdou
 3. Lose the race? The update function re-runs on the winner's version — no merges. Retries back off by a random, roughly doubling delay (≤150ms; the jitter stops lockstep). Contention is bounded by TIME, not a fixed attempt count: a transaction keeps retrying for `retryBudgetMs` (default 30s), and the budget RESETS every time the ref advances — a writer landing means the race is making progress — so a healthy burst is never abandoned, while a transaction that makes no progress for the whole budget fails with `RetriesExhausted`. Writers in one process queue locally.
 4. Commits carry who, why, and a receipt no other process can mint, so a retry cannot apply twice. When git's answer is unclear, recovery looks for that receipt among the commits that arrived since the one this transaction was built on, and fails loudly rather than walking the whole history.
 
-Commit timestamps count up from the parent so every backend produces the same commit id. They preserve order, not wall-clock time; store a real timestamp in your data when event time matters.
+Commit times are the wall clock, never earlier than the parent's plus one second, so `git log` and every reader that ages work by commit time see when a commit was made and a chain never runs backwards. Pass `clock` (unix seconds, an integer) to `open` or `openEvents` for deterministic ids: under one injected clock every backend produces the same commit id for the same input, and a retry the same id. The genesis keeps its fixed time on every backend.
 
 The test suite runs 3 writers × 100 sustained writes and a 12-writer burst, checking that 300 of 300 land exactly once on one linear tip.
 

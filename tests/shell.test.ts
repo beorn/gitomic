@@ -7,11 +7,12 @@ import { chmod, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 
 import { tmpdir } from "node:os"
 import { delimiter, join } from "node:path"
 
-import { describe, expect, test } from "vitest"
+import { describe, expect, test, vi } from "vitest"
 
 import {
   apply,
   Conflict,
+  batchCheck,
   createShellBackend,
   danglingRefs,
   isMissingObjectFetchError,
@@ -727,6 +728,131 @@ describe.sequential("shell backend failure boundaries", () => {
       await pair.cleanup()
     }
   }, 30_000)
+
+  /** @failure A fetch that kept losing the lock race retried at once and then threw git's bare lock error, hiding that it had retried. */
+  test("waits between attempts while a rival holds the fetched-ref lock, and says how often it lost", async () => {
+    const pair = await createRemoteRepos()
+    const directory = await mkdtemp(join(tmpdir(), "gitomic-fetch-held-"))
+    const bin = join(directory, "bin")
+    const fetches = join(directory, "fetches.log")
+    await mkdir(bin)
+    await writeFile(
+      join(bin, "git"),
+      [
+        "#!/usr/bin/env node",
+        'const { appendFileSync } = require("node:fs")',
+        'const { spawnSync } = require("node:child_process")',
+        "const args = process.argv.slice(2)",
+        'if (args.includes("fetch")) {',
+        '  appendFileSync(process.env.GITOMIC_RACE_LOG, "held\\n")',
+        "  const ref = process.env.GITOMIC_RACE_REF",
+        "  process.stderr.write(`error: cannot lock ref '${ref}': Unable to create '/repo/.git/${ref}.lock': File exists.\\n`)",
+        "  process.exit(1)",
+        "}",
+        'const result = spawnSync(process.env.GITOMIC_REAL_GIT, args, { stdio: "inherit" })',
+        "process.exit(result.status ?? 1)",
+      ].join("\n"),
+    )
+    await chmod(join(bin, "git"), 0o755)
+    const restore = replaceEnvironment({
+      GITOMIC_RACE_LOG: fetches,
+      GITOMIC_RACE_REF: "refs/gitomic/fetched/origin/heads/main",
+      GITOMIC_REAL_GIT: spawnSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).stdout.trim(),
+      PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`,
+    })
+    const timers = vi.spyOn(globalThis, "setTimeout")
+    try {
+      const error = await createShellBackend()
+        .fetchRefs?.(pair.left, ["refs/heads/main"], "origin")
+        .then(
+          () => undefined,
+          (thrown: unknown) => thrown,
+        )
+      expect(error).toBeInstanceOf(Error)
+      expect((error as Error).message).toMatch(
+        /lost the race for its fetched refs to another fetch in .* 3 times in a row/,
+      )
+      expect((error as Error).message).toContain("File exists")
+      expect((await readFile(fetches, "utf8")).trim().split("\n")).toHaveLength(3)
+      const pauses = timers.mock.calls.filter(([, delay]) => typeof delay === "number" && delay >= 25 && delay < 100)
+      expect(pauses).toHaveLength(2)
+    } finally {
+      timers.mockRestore()
+      restore()
+      await rm(directory, { recursive: true, force: true })
+      await pair.cleanup()
+    }
+  }, 30_000)
+
+  test("checks raw and peeled names in one ordered batch and refuses malformed answers", async () => {
+    const raw = "1".repeat(40)
+    const peeled = "2".repeat(40)
+    const absent = "3".repeat(40)
+    const names = [raw, `${raw}^{commit}`, absent]
+    const calls: Array<{ args: readonly string[]; input: string | Buffer | undefined }> = []
+    const run = async (args: readonly string[], options?: { input?: string | Buffer }) => {
+      calls.push({ args, input: options?.input })
+      return {
+        stdout: Buffer.from(`${raw} tag\n${peeled} commit\n${absent} missing\n`),
+        stderr: Buffer.alloc(0),
+        code: 0,
+      }
+    }
+    expect(await batchCheck("/tmp/gitomic-batch", names, { run })).toEqual([
+      { input: raw, oid: raw, type: "tag" },
+      { input: `${raw}^{commit}`, oid: peeled, type: "commit" },
+      { input: absent, missing: true },
+    ])
+    expect(calls).toEqual([
+      {
+        args: ["-C", "/tmp/gitomic-batch", "cat-file", "--batch-check=%(objectname) %(objecttype)"],
+        input: `${names.join("\n")}\n`,
+      },
+    ])
+
+    await expect(
+      batchCheck("/tmp/gitomic-batch", names, {
+        run: async () => ({ stdout: Buffer.from(`${raw} tag\n`), stderr: Buffer.alloc(0), code: 0 }),
+      }),
+    ).rejects.toThrow(/answered 1 lines for 3 names/u)
+    await expect(
+      batchCheck("/tmp/gitomic-batch", [raw], {
+        run: async () => ({ stdout: Buffer.from(`${raw} potato\n`), stderr: Buffer.alloc(0), code: 0 }),
+      }),
+    ).rejects.toThrow(/malformed answer/u)
+
+    const oldError = await danglingRefs("/tmp/gitomic-batch", {
+      run: async (args) => ({
+        stdout: Buffer.from(
+          args.includes("for-each-ref") ? `${raw} refs/heads/one\n${peeled} refs/heads/two\n` : `${raw} commit\n`,
+        ),
+        stderr: Buffer.alloc(0),
+        code: 0,
+      }),
+    }).then(
+      () => undefined,
+      (error: unknown) => error,
+    )
+    expect(oldError).toBeInstanceOf(Error)
+    expect((oldError as Error).message).toBe(
+      "git cat-file --batch-check answered 1 lines for 2 refs in /tmp/gitomic-batch",
+    )
+
+    const emptyError = await danglingRefs("/tmp/gitomic-batch", {
+      run: async (args) => ({
+        stdout: Buffer.from(args.includes("for-each-ref") ? `${raw} refs/heads/one\n${peeled} refs/heads/two\n` : ""),
+        stderr: Buffer.alloc(0),
+        code: 0,
+      }),
+    }).then(
+      () => undefined,
+      (error: unknown) => error,
+    )
+    expect(emptyError).toBeInstanceOf(Error)
+    expect((emptyError as Error).message).toBe(
+      "git cat-file --batch-check answered 0 lines for 2 refs in /tmp/gitomic-batch",
+    )
+  })
 
   test("does not misclassify a non-CAS update-ref error after a concurrent move", async () => {
     const wrapper = await createGitWrapper()

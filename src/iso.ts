@@ -4,11 +4,12 @@ import { readBlob, readCommit, readObject, readTree, resolveRef } from "isomorph
 import type { FsClient } from "isomorphic-git"
 
 import {
+  commitIdents,
   commitParents,
+  commitTimestamp,
   encodeBlob,
   encodeCommit,
   encodeTreeEntries,
-  commitIdents,
   formatCommitMessage,
   GENESIS_MESSAGE,
   INITIAL_TIMESTAMP,
@@ -202,7 +203,7 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
     }
     for (const [path, content] of input.changes) applyChange(root, path, content, blobs.get(path), modes.get(path))
     const tree = encodeTreeNode(root, objects)
-    const timestamp = parentResult.commit.committer.timestamp + 1
+    const timestamp = commitTimestamp(parentResult.commit.committer.timestamp, input.time)
     const commit = encodeCommit({
       tree,
       parents,

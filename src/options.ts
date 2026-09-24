@@ -102,3 +102,12 @@ function isInvalidRefCharacter(character: string): boolean {
   const codePoint = character.codePointAt(0) ?? 0
   return codePoint <= 0x20 || codePoint === 0x7f || "~^:?*[\\".includes(character)
 }
+
+/** The wall clock in unix seconds, gitomic's default {@link Clock}. */
+export const wallClock = (): number => Math.floor(Date.now() / 1000)
+
+export function normalizeClock(value: (() => number) | undefined): () => number {
+  if (value === undefined) return wallClock
+  if (typeof value !== "function") throw new TypeError("clock must be a function returning unix seconds as an integer")
+  return value
+}

@@ -138,6 +138,7 @@ describe("CAS contract: an all-zero expected means the ref must be absent (rulin
         writer: "w",
         instance: "3f9d1c02-5b7a-4e18-9c44-0a2b6d8e1f30",
         seq: 0,
+        time: 946_684_800,
       }
       const next = await target.backend.writeCommit(target.repo, input)
       const zero = "0".repeat(parent.length)
@@ -177,6 +178,7 @@ describe("the equivalence suite: parents and trailers serialize byte-identically
           ...identity,
           parent,
           seq: 0,
+          time: 946_684_800,
           message: "work",
           changes: new Map([["work.txt", "work\n"]]),
         })
@@ -185,6 +187,7 @@ describe("the equivalence suite: parents and trailers serialize byte-identically
           parent,
           parents: [parent, kept],
           seq: 1,
+          time: 946_684_800,
           message: "an event",
           changes: new Map<string, string | undefined>(),
           allowEmpty: true,

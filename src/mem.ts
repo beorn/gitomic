@@ -1,14 +1,15 @@
 import {
   assertRefUpdates,
-  leaseConflict,
+  commitIdents,
   commitParents,
+  commitTimestamp,
   encodeCommit,
   encodeFiles,
-  commitIdents,
   formatCommitMessage,
   GENESIS_MESSAGE,
   INITIAL_TIMESTAMP,
   isZeroOid,
+  leaseConflict,
   objectOid,
   parseCommit,
   refUnderPrefix,
@@ -140,7 +141,7 @@ export function createMemBackend(): GitomicBackend {
       }
     }
     const { tree } = encodeFiles(files)
-    const timestamp = parent.timestamp + 1
+    const timestamp = commitTimestamp(parent.timestamp, input.time)
     const commit = encodeCommit({
       tree: tree.oid,
       parents,

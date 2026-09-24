@@ -17,6 +17,7 @@ import { assertTrailers, cloneIdent, GENESIS_MESSAGE, GITOMIC_IDENT, validateOid
 import {
   assertWriter,
   DEFAULT_WRITER_LABEL,
+  normalizeClock,
   normalizePollInterval,
   normalizeRef,
   normalizeRetryBudget,
@@ -24,7 +25,7 @@ import {
   waitForPoll,
 } from "./options.js"
 import { createShellBackend } from "./shell.js"
-import type { CommitMeta, GitomicBackend, Ident, Oid, RefUpdate, Trailer } from "./types.js"
+import type { Clock, CommitMeta, GitomicBackend, Ident, Oid, RefUpdate, Trailer } from "./types.js"
 import { assertUtf8 } from "./utf8.js"
 
 /** One trailer as written: key, then value. Order and duplicates are kept. */
@@ -76,6 +77,8 @@ export type EventsOptions = {
   remote?: string
   backend?: GitomicBackend
   retryBudgetMs?: number
+  /** The clock this chain's events are dated by (unix seconds); the wall clock by default (25486). */
+  clock?: Clock
 }
 
 export type EventsRead = {
@@ -253,6 +256,7 @@ function toEvent(meta: CommitMeta, ref: string): Event {
 export async function openEvents(options: EventsOptions): Promise<Events> {
   if (options.writer !== undefined) assertWriter(options.writer)
   const committer = cloneIdent(options.committer, "committer") ?? GITOMIC_IDENT
+  const clock = normalizeClock(options.clock)
   const repo = options.repo
   const ref = normalizeRef(options.ref)
   const writer = options.writer ?? DEFAULT_WRITER_LABEL
@@ -381,6 +385,7 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
       const eventSeq = reserved[position] as number
       const oid = await backend.writeCommit(repo, {
         parent: previous,
+        time: clock(),
         parents: [previous, ...input.keeps],
         changes: new Map(),
         allowEmpty: true,
