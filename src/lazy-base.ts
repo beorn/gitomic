@@ -58,7 +58,19 @@ export function createLazyBase(backend: GitomicBackend, repo: string, parent: Oi
     try {
       read = await backend.readBlobs(repo, [...batch.keys()])
     } catch (error) {
-      for (const waiters of batch.values()) for (const waiter of waiters) waiter.reject(error)
+      // The backend names the oid it could not read; the reader wants the PATH that asked. Each waiter gets an
+      // error naming its own path, repo and commit, with the backend's error as the cause.
+      for (const [oid, waiters] of batch) {
+        for (const waiter of waiters) {
+          waiter.reject(
+            new Error(
+              `cannot read Git blob at ${JSON.stringify(waiter.path)} (${oid}) in ${JSON.stringify(repo)} at commit ${parent}: ` +
+                `${error instanceof Error ? error.message : String(error)}`,
+              { cause: error },
+            ),
+          )
+        }
+      }
       return
     }
     for (const [oid, waiters] of batch) {
