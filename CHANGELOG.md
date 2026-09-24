@@ -4,11 +4,18 @@
 
 ### Fixed
 
-- `gitomic project` no longer reports `already-current` over an index that holds
-  an older tree than the tip (25393). An index at one of the tip's last 64
-  first-parent ancestors is carried forward by the conditional two-way merge and
-  reported as `ProjectCheckoutOutcome.repairedIndexFrom` (CLI: ` repaired-from=<oid>`);
-  an index matching none of them exits 4 (`dirt-unverifiable`), changing nothing.
+- `gitomic project` and `gitomic apply --checkout` no longer report a checkout
+  current, or merge over it, while its index holds an older tree than the tip
+  (25393). Every projection first matches the index's tree id against the tip's
+  first-parent history (no depth limit) and carries a match forward with the
+  conditional two-way merge; a repaired projection reports `synchronized` with
+  `repairedIndexFrom` (CLI: `kind=synchronized … repaired-from=<oid>`), and an
+  index matching no ancestor exits 4 (`dirt-unverifiable`), changing nothing.
+
+### Deprecated
+
+- `RemoteFirstProjectionRequest.preTransactTip` is no longer consulted: the
+  history walk above subsumes it. It will be removed.
 
 ## 0.3.0 — 2026-09-23
 
