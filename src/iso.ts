@@ -127,30 +127,6 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
     return read
   }
 
-  const readFiles = async (repo: string, oid: Oid, prefix?: string): Promise<ReadonlyMap<string, BlobValue>> => {
-    const normalizedPrefix = prefix === undefined ? "" : normalizePrefix(prefix)
-    const gitdir = await resolveGitDir(repo)
-    const { commit } = await readCommit({ fs, gitdir, oid, cache })
-    const root = await loadTree(gitdir, commit.tree, "", normalizedPrefix)
-    const files = new Map<string, BlobValue>()
-    const visit = async (node: TreeNode, prefix: string): Promise<void> => {
-      await Promise.all(
-        [...node.entries].map(async ([name, entry]) => {
-          const path = prefix === "" ? name : `${prefix}/${name}`
-          if (entry.kind === "tree") {
-            await visit(entry, path)
-          } else if (entry.kind === "blob" && path.startsWith(normalizedPrefix)) {
-            const result = await readBlob({ fs, gitdir, oid: entry.oid, cache })
-            files.set(path, decodeBlob(result.blob))
-          }
-        }),
-      )
-    }
-    await visit(root, "")
-    assertGitPrefixMatched(files.size, repo, oid, normalizedPrefix)
-    return files
-  }
-
   /** The mode of `path`'s blob entry in the parent tree, or `undefined` when there is none. */
   const parentMode = (root: TreeNode, path: string): string | undefined => {
     let node: TreeNode | undefined = root
@@ -278,7 +254,6 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
     },
     readTree: listTree,
     readBlobs: readBlobBatch,
-    readFiles,
     readCommit: async (repo, oid) => {
       validateOid(oid)
       const gitdir = await resolveGitDir(repo)

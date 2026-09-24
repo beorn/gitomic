@@ -385,7 +385,7 @@ describe("acceptance: apply on an unchanged tree is still a no-op; empty commits
       await events.append([{ type: "two" }], { expect: first })
       const second = (await events.head()) as Oid
       expect(second, target.name).not.toBe(first)
-      expect((await target.backend.readFiles(target.repo, second)).size, target.name).toBe(0)
+      expect((await target.backend.readTree(target.repo, second)).size, target.name).toBe(0)
     })
   })
 })

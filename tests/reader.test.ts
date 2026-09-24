@@ -162,11 +162,11 @@ describe("read-only reader", () => {
       map.set("visible/add", "new")
       map.set("hidden/noise", "after")
     }, "after")
-    const readFiles = vi.fn(
+    const readTree = vi.fn(
       async (name: string, oid: string, prefix?: string) =>
-        new Map([...(await mem.readFiles(name, oid, prefix))].filter(([path]) => path.startsWith("visible/"))),
+        new Map([...(await mem.readTree(name, oid, prefix))].filter(([path]) => path.startsWith("visible/"))),
     )
-    const reader = await openReader({ repo, backend: { ...mem, readFiles } })
+    const reader = await openReader({ repo, backend: { ...mem, readTree } })
     expect(await reader.diff(first.oid, second.oid)).toEqual([
       { path: "visible/add", from: null, to: await writer.at(second.oid).oid("visible/add") },
       {
@@ -176,7 +176,7 @@ describe("read-only reader", () => {
       },
       { path: "visible/remove", from: await writer.at(first.oid).oid("visible/remove"), to: null },
     ])
-    expect(readFiles).toHaveBeenCalledTimes(2)
+    expect(readTree).toHaveBeenCalledTimes(2)
     expect(await reader.diff(second.oid, second.oid)).toEqual([])
   })
 

@@ -256,9 +256,9 @@ describe("public contract guards", () => {
         reads += 1
         return mem.readCommit(name, oid)
       },
-      readFiles: async (name, oid, prefix) => {
+      readTree: async (name, oid, prefix) => {
         reads += 1
-        return mem.readFiles(name, oid, prefix)
+        return mem.readTree(name, oid, prefix)
       },
     }
     const reader = await openReader({ repo, backend })

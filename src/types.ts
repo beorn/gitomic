@@ -179,23 +179,15 @@ export type GitomicBackend = {
   /**
    * Read the named blobs, by oid, in ONE read. The oids are deduplicated; an
    * oid the repository does not hold, or that is not a blob, throws naming it.
-   * A value is raw bytes when the blob is not valid UTF-8 (see `readFiles`).
-   */
-  readBlobs(repo: string, oids: readonly Oid[]): Promise<ReadonlyMap<Oid, BlobValue>>
-  /**
-   * Read the whole tree, or only paths matching a non-empty string prefix,
-   * with every value decoded: `readTree` followed by one `readBlobs` of all
-   * its oids. Snapshot reads use it; transactions read lazily through the two
-   * primitives above instead.
    *
-   * A value may be returned as raw bytes when the blob is not valid UTF-8.
-   * Such an entry is a first-class member of the tree — it counts for `keys`
-   * and `has`, and a transaction that never touches it carries it into the
-   * next commit untouched — but reading its VALUE still fails loudly, because
+   * A value is raw bytes when the blob is not valid UTF-8. Such an entry is a
+   * first-class member of the tree — it counts for `keys` and `has`, and a
+   * transaction that never touches it carries it into the next commit
+   * untouched — but reading its VALUE fails loudly at the read, because
    * gitomic v1 values remain UTF-8 strings. A backend that only ever returns
    * strings satisfies this signature unchanged.
    */
-  readFiles(repo: string, commit: Oid, prefix?: string): Promise<ReadonlyMap<string, BlobValue>>
+  readBlobs(repo: string, oids: readonly Oid[]): Promise<ReadonlyMap<Oid, BlobValue>>
   writeCommit(repo: string, input: CommitInput): Promise<Oid>
   compareAndSwap(repo: string, ref: string, next: Oid, expected: Oid): Promise<boolean>
   /**

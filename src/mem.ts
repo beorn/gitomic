@@ -122,15 +122,6 @@ export function createMemBackend(): GitomicBackend {
     return read
   }
 
-  const readFiles = async (name: string, commit: Oid, prefix?: string): Promise<ReadonlyMap<string, string>> => {
-    const found = getRepo(name).commits.get(commit)
-    if (found === undefined) throw new Error(`unknown commit: ${commit}`)
-    const normalizedPrefix = prefix === undefined ? "" : normalizePrefix(prefix)
-    const files = new Map([...found.files].filter(([path]) => path.startsWith(normalizedPrefix)))
-    assertGitPrefixMatched(files.size, name, commit, normalizedPrefix)
-    return files
-  }
-
   const writeCommit = async (name: string, input: CommitInput): Promise<Oid> => {
     const repo = getRepo(name)
     const parents = commitParents(input)
@@ -288,7 +279,6 @@ export function createMemBackend(): GitomicBackend {
       }),
     readTree,
     readBlobs,
-    readFiles,
     writeCommit,
     compareAndSwap,
     findTransaction,
