@@ -4,6 +4,17 @@
 
 ### Added
 
+- `GitomicBackend.readTree` and `readBlobs`, both REQUIRED members of the
+  backend contract: one listing (path, mode, oid — no value read) and one
+  batched read of blobs by oid. `transact` and `apply` read their base through
+  them — whole-tree strict on shape, lazy on values — so a write fetches the
+  blobs it names instead of decoding every blob of the tree on every attempt
+  (0.9 s and 175 MB per write on a 19,670-blob tree, measured). `apply`
+  prefetches its edit paths in one read; reads issued in one microtask
+  coalesce into one read. `readFiles` remains as the composite Snapshot reads
+  use. All four known implementers are updated (shell, mem, iso, and one
+  out-of-tree wrapper that projects the shell listing); any other backend must
+  add both members.
 - Author and committer as data (`Ident = { name, email }`). `open` and
   `openEvents` take a `committer`; `transact`, `apply`, and the events `transact`
   and `append` take a per-call `author`, which defaults to the committer.
