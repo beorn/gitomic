@@ -159,11 +159,34 @@ export type CommitMeta = {
 /** A changed projected blob identity; mode-only changes are not represented. */
 export type Change = { path: string; from: Oid | null; to: Oid | null }
 
+/** One regular blob of a tree listing: its object id and its mode. */
+export type TreeEntry = { readonly oid: Oid; readonly mode: "100644" | "100755" }
+
+/** A tree's regular blobs by path, with no value decoded: what a transaction is strict about. */
+export type TreeListing = ReadonlyMap<string, TreeEntry>
+
 export type GitomicBackend = {
   head(repo: string, ref: string): Promise<Oid>
   readCommit(repo: string, oid: Oid): Promise<CommitMeta>
   /**
-   * Read the whole tree, or only paths matching a non-empty string prefix.
+   * List the whole tree, or only paths matching a non-empty string prefix:
+   * every regular blob's path, mode and oid, with NO value read. This is the
+   * base a transaction is strict about — a symlink, gitlink or non-NFC path
+   * fails here — and the only whole-tree read a write performs. A non-empty
+   * prefix that matches nothing throws `GitPrefixNotFoundError`.
+   */
+  readTree(repo: string, commit: Oid, prefix?: string): Promise<TreeListing>
+  /**
+   * Read the named blobs, by oid, in ONE read. The oids are deduplicated; an
+   * oid the repository does not hold, or that is not a blob, throws naming it.
+   * A value is raw bytes when the blob is not valid UTF-8 (see `readFiles`).
+   */
+  readBlobs(repo: string, oids: readonly Oid[]): Promise<ReadonlyMap<Oid, BlobValue>>
+  /**
+   * Read the whole tree, or only paths matching a non-empty string prefix,
+   * with every value decoded: `readTree` followed by one `readBlobs` of all
+   * its oids. Snapshot reads use it; transactions read lazily through the two
+   * primitives above instead.
    *
    * A value may be returned as raw bytes when the blob is not valid UTF-8.
    * Such an entry is a first-class member of the tree — it counts for `keys`

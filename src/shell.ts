@@ -34,6 +34,8 @@ import type {
   Oid,
   PublishResult,
   RefUpdate,
+  TreeEntry,
+  TreeListing,
 } from "./types.js"
 import { decodeBlob, decodeUtf8 } from "./utf8.js"
 
@@ -128,6 +130,8 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
       }
       return parseCommit(oid, output.subarray(newline + 1, newline + 1 + size))
     },
+    readTree: async (repo, commit, prefix) => readTree(await resolveGitDir(repo), commit, prefix),
+    readBlobs: async (repo, oids) => readBlobs(await resolveGitDir(repo), oids),
     readFiles: async (repo, commit, prefix) => readFiles(await resolveGitDir(repo), commit, prefix),
     // A completed commit is unreferenced until the compare-and-swap below adopts
     // it. Gitomic writes NO ref to protect that window: Git's default gc grace
@@ -434,10 +438,11 @@ async function head(repo: string, ref: string): Promise<Oid> {
   return text(await git(repo, ["rev-parse", "--verify", ref]))
 }
 
-async function readFiles(repo: string, commit: Oid, prefix?: string): Promise<ReadonlyMap<string, BlobValue>> {
+/** One `ls-tree -r`: every regular blob under the prefix, no value read. STATE's 19,670 entries list in ~20 ms. */
+async function readTree(repo: string, commit: Oid, prefix?: string): Promise<TreeListing> {
   const normalizedPrefix = prefix === undefined ? "" : normalizePrefix(prefix)
   const listing = await git(repo, ["ls-tree", "-r", "-z", "--full-tree", commit])
-  const entries: Array<{ oid: Oid; path: string }> = []
+  const entries = new Map<string, TreeEntry>()
   for (const record of decodeUtf8(listing, "Git tree paths").split("\0")) {
     if (!record) continue
     const separator = record.indexOf("\t")
@@ -452,42 +457,65 @@ async function readFiles(repo: string, commit: Oid, prefix?: string): Promise<Re
     }
     if (!path.startsWith(normalizedPrefix)) continue
     assertRegularBlob(path, mode, type)
-    entries.push({ oid, path })
+    entries.set(path, { oid, mode: mode === "100755" ? "100755" : "100644" })
   }
-  assertGitPrefixMatched(entries.length, repo, commit, normalizedPrefix)
-  if (entries.length === 0) return new Map()
-
-  const output = await git(repo, ["cat-file", "--batch"], {
-    input: `${entries.map((entry) => entry.oid).join("\n")}\n`,
-  })
-  return parseBatch(entries, output)
+  assertGitPrefixMatched(entries.size, repo, commit, normalizedPrefix)
+  return entries
 }
 
-function parseBatch(
-  entries: ReadonlyArray<{ oid: Oid; path: string }>,
-  output: Buffer,
-): ReadonlyMap<string, BlobValue> {
+/** One `cat-file --batch` for the distinct oids; a missing object or a non-blob fails naming the oid. */
+async function readBlobs(repo: string, oids: readonly Oid[]): Promise<ReadonlyMap<Oid, BlobValue>> {
+  const distinct = [...new Set(oids)]
+  if (distinct.length === 0) return new Map()
+  for (const oid of distinct) validateOid(oid, "readBlobs needs valid Git object ids")
+  const output = await git(repo, ["cat-file", "--batch"], { input: `${distinct.join("\n")}\n` })
+  return parseBatch(distinct, output)
+}
+
+/** The listing with every value read: `readTree`, then one `readBlobs` of all its oids. */
+async function readFiles(repo: string, commit: Oid, prefix?: string): Promise<ReadonlyMap<string, BlobValue>> {
+  const listing = await readTree(repo, commit, prefix)
+  if (listing.size === 0) return new Map()
+  const blobs = await readBlobs(
+    repo,
+    [...listing.values()].map((entry) => entry.oid),
+  )
   const files = new Map<string, BlobValue>()
+  for (const [path, entry] of listing) {
+    const value = blobs.get(entry.oid)
+    if (value === undefined) {
+      throw new Error(`git cat-file --batch returned no blob ${entry.oid} for ${JSON.stringify(path)}`)
+    }
+    files.set(path, value)
+  }
+  return files
+}
+
+function parseBatch(oids: readonly Oid[], output: Buffer): ReadonlyMap<Oid, BlobValue> {
+  const blobs = new Map<Oid, BlobValue>()
   let offset = 0
-  for (const entry of entries) {
+  for (const oid of oids) {
     const newline = output.indexOf(0x0a, offset)
     if (newline < 0) throw new Error("git cat-file --batch returned a truncated header")
     const header = output.toString("utf8", offset, newline)
+    if (header === `${oid} missing`) {
+      throw new Error(`git cat-file --batch: object ${oid} is missing from the repository`)
+    }
     const match = /^([0-9a-f]+) blob ([0-9]+)$/.exec(header)
-    if (match === null || match[1] !== entry.oid) {
-      throw new Error(`git cat-file --batch returned an unexpected object: ${header}`)
+    if (match === null || match[1] !== oid) {
+      throw new Error(`git cat-file --batch returned an unexpected object for ${oid}: ${header}`)
     }
     const size = Number(match[2])
     const start = newline + 1
     const end = start + size
     if (!Number.isSafeInteger(size) || size < 0 || end >= output.length || output[end] !== 0x0a) {
-      throw new Error(`git cat-file --batch returned a malformed blob for ${entry.oid}`)
+      throw new Error(`git cat-file --batch returned a malformed blob for ${oid}`)
     }
-    files.set(entry.path, decodeBlob(output.subarray(start, end)))
+    blobs.set(oid, decodeBlob(output.subarray(start, end)))
     offset = end + 1
   }
   if (offset !== output.length) throw new Error("git cat-file --batch returned trailing data")
-  return files
+  return blobs
 }
 
 async function writeCommit(repo: string, input: CommitInput): Promise<Oid> {
