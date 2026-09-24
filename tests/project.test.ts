@@ -10,6 +10,7 @@ import { join } from "node:path"
 import { afterAll, afterEach, beforeEach, describe, expect, test, vi } from "vitest"
 
 import { main } from "../src/bin.js"
+import { indexBaseAmongAncestors, STALE_INDEX_SEARCH_DEPTH } from "../src/project.js"
 import {
   projectCheckout,
   projectRemoteFirstFastForward,
@@ -245,6 +246,136 @@ describe("gitomic project and checkout synchronization", () => {
       expect(readFileSync(join(checkout, "bystander.md"), "utf8")).toBe("# local uncommitted edit\n")
       expect(readFileSync(join(checkout, "untracked.md"), "utf8")).toBe("# local untracked file\n")
       expect(worktreeDirtyPaths(checkout)).toEqual(["bystander.md", "untracked.md"])
+    })
+  })
+
+  /**
+   * 25393: a commit hook advanced the ref, then its checkout update was refused (another git held index.lock), so
+   * the index and tree stayed at the parent: `git status` shows the commit's whole inverse delta. Once the commit
+   * was pushed, `project` said already-current over that stale index, because it judged only the ref.
+   */
+  describe("Witness 6: an index left at the pre-advance tree is carried forward, never reported current", () => {
+    function commitThenLeaveIndexAtParent(checkout: string): { parent: string; head: string } {
+      const parent = git(checkout, "rev-parse", "HEAD")
+      writeFileSync(join(checkout, "tracked.md"), "# committed by the hook\n")
+      writeFileSync(join(checkout, "added.md"), "# added by the hook\n")
+      git(checkout, "add", "tracked.md", "added.md")
+      git(checkout, "commit", "-qm", "hook commit")
+      const head = git(checkout, "rev-parse", "HEAD")
+      // The refused worktree update: the ref moved, the index and tree did not.
+      git(checkout, "read-tree", "-m", "-u", head, parent)
+      expect(worktreeDirtyPaths(checkout)).toEqual(["added.md", "tracked.md"])
+      return { parent, head }
+    }
+
+    test("after the commit is pushed, project repairs the index to HEAD and reports it", async () => {
+      const { checkout } = remoteFixture()
+      const { parent, head } = commitThenLeaveIndexAtParent(checkout)
+      git(checkout, "push", "-q", "origin", "main")
+
+      const result = await runCli(["project", checkout])
+      expect(result.code).toBe(0)
+      expect(result.stdout).toContain(`repaired-from=${parent}`)
+      expect(git(checkout, "rev-parse", "HEAD")).toBe(head)
+      expect(worktreeDirtyPaths(checkout)).toEqual([])
+      expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# committed by the hook\n")
+      expect(readFileSync(join(checkout, "added.md"), "utf8")).toBe("# added by the hook\n")
+    })
+
+    test("when origin has moved on, project repairs the index and then fast-forwards", async () => {
+      const { checkout, landAtOrigin } = remoteFixture()
+      const { parent } = commitThenLeaveIndexAtParent(checkout)
+      git(checkout, "push", "-q", "origin", "main")
+      const landed = landAtOrigin("bystander.md", "# landed after the hook\n")
+
+      const result = await runCli(["project", checkout])
+      expect(result.code).toBe(0)
+      expect(result.stdout).toContain("kind=synchronized")
+      expect(result.stdout).toContain(`repaired-from=${parent}`)
+      expect(git(checkout, "rev-parse", "HEAD")).toBe(landed)
+      expect(worktreeDirtyPaths(checkout)).toEqual([])
+    })
+
+    test("unrelated dirt survives the repair exactly", async () => {
+      const { checkout } = remoteFixture()
+      commitThenLeaveIndexAtParent(checkout)
+      git(checkout, "push", "-q", "origin", "main")
+      writeFileSync(join(checkout, "bystander.md"), "# local uncommitted edit\n")
+      writeFileSync(join(checkout, "untracked.md"), "# local untracked file\n")
+
+      const result = await runCli(["project", checkout])
+      expect(result.code).toBe(0)
+      expect(worktreeDirtyPaths(checkout)).toEqual(["bystander.md", "untracked.md"])
+      expect(readFileSync(join(checkout, "bystander.md"), "utf8")).toBe("# local uncommitted edit\n")
+    })
+
+    test("an edit on top of the stale tree refuses, exit 4, and changes nothing", async () => {
+      const { checkout } = remoteFixture()
+      const { head } = commitThenLeaveIndexAtParent(checkout)
+      git(checkout, "push", "-q", "origin", "main")
+      writeFileSync(join(checkout, "tracked.md"), "# a local edit nobody committed\n")
+      const indexBefore = git(checkout, "write-tree")
+
+      const result = await runCli(["project", checkout])
+      expect(result.code).toBe(4)
+      expect(result.stderr).toContain("kind=worktree-update-refused")
+      expect(git(checkout, "rev-parse", "HEAD")).toBe(head)
+      expect(git(checkout, "write-tree")).toBe(indexBefore)
+      expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# a local edit nobody committed\n")
+    })
+
+    test("an index two commits behind is repaired from tip~2", async () => {
+      const { checkout } = remoteFixture()
+      const { parent } = commitThenLeaveIndexAtParent(checkout)
+      // A later landing that commits without the index, as `gitomic apply` does.
+      const tree = git(checkout, "rev-parse", "HEAD^{tree}")
+      const later = git(checkout, "commit-tree", tree, "-p", "HEAD", "-m", "later landing")
+      git(checkout, "update-ref", "refs/heads/main", later)
+      git(checkout, "push", "-q", "origin", "main")
+
+      const result = await runCli(["project", checkout])
+      expect(result.code).toBe(0)
+      expect(result.stdout).toContain(`repaired-from=${parent}`)
+      expect(git(checkout, "rev-parse", "HEAD~2")).toBe(parent)
+      expect(worktreeDirtyPaths(checkout)).toEqual([])
+    })
+
+    test("staged changes matching no ancestor refuse, exit 4, and are never called current", async () => {
+      const { checkout } = remoteFixture()
+      writeFileSync(join(checkout, "tracked.md"), "# staged by hand\n")
+      git(checkout, "add", "tracked.md")
+      const indexBefore = git(checkout, "write-tree")
+
+      const result = await runCli(["project", checkout])
+      expect(result.code).toBe(4)
+      expect(result.stderr).toContain("kind=dirt-unverifiable")
+      expect(result.stderr).toContain(`first-parent ancestors`)
+      expect(result.stdout).not.toContain("already-current")
+      expect(git(checkout, "write-tree")).toBe(indexBefore)
+      expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# staged by hand\n")
+    })
+
+    test("the search is bounded: an index older than the bound reads none-within-bound, never at-tip", () => {
+      const { checkout } = remoteFixture()
+      const { parent, head } = commitThenLeaveIndexAtParent(checkout)
+      expect(indexBaseAmongAncestors(checkout, head, 1)).toMatchObject({ kind: "ancestor", ancestor: parent, depth: 1 })
+      const tree = git(checkout, "rev-parse", "HEAD^{tree}")
+      const later = git(checkout, "commit-tree", tree, "-p", "HEAD", "-m", "later landing")
+      expect(indexBaseAmongAncestors(checkout, later, 1)).toEqual({ kind: "none-within-bound", bound: 1 })
+      expect(STALE_INDEX_SEARCH_DEPTH).toBe(64)
+    })
+
+    test("HEAD at the tip over a stale index is never already-current, even to the library", () => {
+      const { checkout } = remoteFixture()
+      const { head } = commitThenLeaveIndexAtParent(checkout)
+      const outcome = synchronizeCheckoutToCommit({
+        repoRoot: checkout,
+        from: head,
+        to: head,
+        ref: "refs/heads/main",
+        expectedDirtyPaths: worktreeDirtyPaths(checkout),
+      })
+      expect(outcome.kind).toBe("dirt-unverifiable")
     })
   })
 
