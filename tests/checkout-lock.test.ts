@@ -181,33 +181,38 @@ describe("the checkout lock", () => {
     expect(result.stderr).toContain('got "stdin"')
   })
 
-  test("under Node, project and apply --checkout exit 6 naming the verb, the reason and the cure; other verbs run", async () => {
-    // This suite's runner is Node, so the in-process CLI is the Node runtime.
-    const { bare, checkout } = fixture()
-    const chunks: string[] = []
-    const stderr = { write: (chunk: string) => chunks.push(chunk) }
-    const stdout = { write: (chunk: string) => chunks.push(chunk) }
-    async function* empty(): AsyncGenerator<string> {}
+  // The in-process CLI runs on whatever runs Vitest. This package's own runner
+  // is Node; a host that runs Vitest under Bun loads the lock and cannot see the
+  // refusal in process, so there `smoke:node` over the built package covers it.
+  test.runIf(!("Bun" in globalThis))(
+    "under Node, project and apply --checkout exit 6 naming the verb, the reason and the cure; other verbs run",
+    async () => {
+      const { bare, checkout } = fixture()
+      const chunks: string[] = []
+      const stderr = { write: (chunk: string) => chunks.push(chunk) }
+      const stdout = { write: (chunk: string) => chunks.push(chunk) }
+      async function* empty(): AsyncGenerator<string> {}
 
-    const projected = await main(["project", checkout], { stdin: empty(), stdout, stderr })
-    expect(projected).toBe(6)
-    const text = chunks.join("")
-    expect(text).toContain("project needs Bun: the checkout lock takes flock(2) through bun:ffi")
-    expect(text).toContain("Node has no flock API")
-    expect(text).toContain("run `gitomic project` under Bun")
-    expect(text).toContain("kind=runtime-unsupported")
+      const projected = await main(["project", checkout], { stdin: empty(), stdout, stderr })
+      expect(projected).toBe(6)
+      const text = chunks.join("")
+      expect(text).toContain("project needs Bun: the checkout lock takes flock(2) through bun:ffi")
+      expect(text).toContain("Node has no flock API")
+      expect(text).toContain("run `gitomic project` under Bun")
+      expect(text).toContain("kind=runtime-unsupported")
 
-    chunks.length = 0
-    const applied = await main(["apply", `${bare}#main`, "-m", "node", "--checkout", checkout, "rm", "tracked.md"], {
-      stdin: empty(),
-      stdout,
-      stderr,
-    })
-    expect(applied).toBe(6)
-    expect(chunks.join("")).toContain("apply --checkout needs Bun")
+      chunks.length = 0
+      const applied = await main(["apply", `${bare}#main`, "-m", "node", "--checkout", checkout, "rm", "tracked.md"], {
+        stdin: empty(),
+        stdout,
+        stderr,
+      })
+      expect(applied).toBe(6)
+      expect(chunks.join("")).toContain("apply --checkout needs Bun")
 
-    chunks.length = 0
-    expect(await main(["read", `${bare}#main`, "tracked.md"], { stdin: empty(), stdout, stderr })).toBe(0)
-    expect(chunks.join("")).toBe("# original\n")
-  })
+      chunks.length = 0
+      expect(await main(["read", `${bare}#main`, "tracked.md"], { stdin: empty(), stdout, stderr })).toBe(0)
+      expect(chunks.join("")).toBe("# original\n")
+    },
+  )
 })
