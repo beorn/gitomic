@@ -9,7 +9,15 @@ import { delimiter, join } from "node:path"
 
 import { describe, expect, test } from "vitest"
 
-import { apply, createShellBackend, danglingRefs, isMissingObjectFetchError, open, openReader } from "../src/index.js"
+import {
+  apply,
+  Conflict,
+  createShellBackend,
+  danglingRefs,
+  isMissingObjectFetchError,
+  open,
+  openReader,
+} from "../src/index.js"
 import type { GitomicBackend } from "../src/index.js"
 import { createIsoBackend } from "../src/iso.js"
 import { isRemoteCompareAndSwapRejection } from "../src/shell.js"
@@ -764,6 +772,85 @@ describe.sequential("shell backend failure boundaries", () => {
       await wrapper.cleanup()
     }
   })
+
+  /** @failure A rival that moved the ref after the remote advertised it made an atomic publish "unknown", so a CAS loop stopped instead of replaying. */
+  test("an atomic remote publish that loses its lease inside receive-pack is a Conflict on that ref", async () => {
+    const pair = await createRemoteRepos()
+    try {
+      const tree = await git(pair.remote, "rev-parse", `${pair.initial}^{tree}`)
+      const rival = await git(pair.remote, "commit-tree", tree, "-p", pair.initial, "-m", "rival")
+      const mine = await git(pair.left, "commit-tree", tree, "-p", pair.initial, "-m", "mine")
+      // The rival lands after the push read the remote's tips and before receive-pack
+      // takes its ref locks: the lease is checked there, and the whole atomic push fails.
+      const hook = join(pair.remote, "hooks", "pre-receive")
+      await writeFile(
+        hook,
+        [
+          "#!/bin/sh",
+          "unset GIT_QUARANTINE_PATH GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES",
+          `git update-ref refs/heads/main ${rival} ${pair.initial}`,
+        ].join("\n"),
+      )
+      await chmod(hook, 0o755)
+
+      const refused = createShellBackend().publish!(
+        pair.left,
+        [{ ref: "refs/heads/main", expect: pair.initial, oid: mine }],
+        "origin",
+      )
+      await expect(refused).rejects.toBeInstanceOf(Conflict)
+      await expect(refused).rejects.toMatchObject({ refs: ["refs/heads/main"] })
+      await expect(refused).rejects.toThrow(`refs/heads/main is at ${rival}`)
+      expect(await git(pair.remote, "rev-parse", "refs/heads/main")).toBe(rival)
+    } finally {
+      await pair.cleanup()
+    }
+  }, 30_000)
+
+  /** @failure A lost-lease reading that ignored a row's other reason would call a hook refusal contention and replay into it. */
+  test("an atomic publish with any non-lease rejection stays an error, even when receive-pack names a lost lease", async () => {
+    const pair = await createRemoteRepos()
+    const directory = await mkdtemp(join(tmpdir(), "gitomic-atomic-mixed-"))
+    const realGit = spawnSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).stdout.trim()
+    const bin = join(directory, "bin")
+    await mkdir(bin)
+    await writeFile(
+      join(bin, "git"),
+      [
+        "#!/usr/bin/env node",
+        'const { spawnSync } = require("node:child_process")',
+        "const args = process.argv.slice(2)",
+        'if (args.includes("push")) {',
+        '  process.stdout.write(`To origin\n!\t${"1".repeat(40)}:refs/heads/main\t[remote rejected] (atomic transaction failed)\n!\t${"1".repeat(40)}:refs/heads/side\t[remote rejected] (pre-receive hook declined)\nDone\n`)',
+        '  process.stderr.write(`remote: error: cannot lock ref \'refs/heads/main\': is at ${"3".repeat(40)} but expected ${"4".repeat(40)}\\n`)',
+        "  process.exit(1)",
+        "}",
+        'const result = spawnSync(process.env.GITOMIC_REAL_GIT, args, { stdio: "inherit" })',
+        "process.exit(result.status ?? 1)",
+      ].join("\n"),
+    )
+    await chmod(join(bin, "git"), 0o755)
+    const restore = replaceEnvironment({
+      GITOMIC_REAL_GIT: realGit,
+      PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`,
+    })
+    try {
+      const refused = createShellBackend().publish!(
+        pair.left,
+        [
+          { ref: "refs/heads/main", expect: pair.initial, oid: "1".repeat(40) },
+          { ref: "refs/heads/side", expect: "0".repeat(40), oid: "1".repeat(40) },
+        ],
+        "origin",
+      )
+      await expect(refused).rejects.toThrow("pre-receive hook declined")
+      await expect(refused).rejects.not.toBeInstanceOf(Conflict)
+    } finally {
+      restore()
+      await rm(directory, { recursive: true, force: true })
+      await pair.cleanup()
+    }
+  }, 30_000)
 
   test("classifies both client-side and server-side lease losses as CAS contention", () => {
     expect(isRemoteCompareAndSwapRejection("!\trefs/heads/main:refs/heads/main\t[rejected] (stale info)\nDone\n")).toBe(

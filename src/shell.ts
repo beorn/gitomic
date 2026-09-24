@@ -1177,6 +1177,21 @@ async function readExactRefs(
   return tips
 }
 
+function isStaleLease(summary: string): boolean {
+  return summary === "[rejected] (stale info)" || summary === "[remote rejected] (incorrect old value provided)"
+}
+
+/** The refs receive-pack reports it could not lock because their value was not the lease's. */
+function remoteLostLeases(stderr: string): ReadonlySet<string> {
+  const lost = new Set<string>()
+  for (const match of stderr.matchAll(
+    /^remote: error: cannot lock ref '([^']+)': (?:is at [0-9a-f]+ but expected [0-9a-f]+|reference already exists|reference is missing but expected [0-9a-f]+)\s*$/gm,
+  )) {
+    if (match[1] !== undefined) lost.add(match[1])
+  }
+  return lost
+}
+
 /**
  * MULTI, remotely: ONE `push --atomic`, a lease per ref, exactly as git does it:
  * no pre-read, and no local ref touched (in remote mode reads go through
@@ -1217,13 +1232,19 @@ async function publishRemote(
     fates.set(spec.slice(spec.indexOf(":") + 1), { flag, summary: summary ?? "" })
   }
   if (result.code !== 0) {
+    const lostInReceivePack = remoteLostLeases(result.stderr.toString("utf8"))
+    const rejected = [...fates.values()].filter(({ flag }) => flag === "!")
+    // A rival that moved a ref after the remote advertised it loses the lease
+    // inside receive-pack: git names that ref on stderr and, being atomic,
+    // rejects every row as "(atomic transaction failed)". Nothing landed.
+    const atomicLeaseLoss =
+      rejected.length > 0 &&
+      rejected.every(
+        ({ summary }) => summary === "[remote rejected] (atomic transaction failed)" || isStaleLease(summary),
+      )
     const stale = updates.filter(({ ref }) => {
       const fate = fates.get(ref)
-      return (
-        fate?.flag === "!" &&
-        (fate.summary === "[rejected] (stale info)" ||
-          fate.summary === "[remote rejected] (incorrect old value provided)")
-      )
+      return fate?.flag === "!" && (isStaleLease(fate.summary) || (atomicLeaseLoss && lostInReceivePack.has(ref)))
     })
     if (stale.length === 0) throw new Error(`git push failed (${result.code})${detail ? `: ${detail}` : ""}`)
     const observed = await observeRemote(
