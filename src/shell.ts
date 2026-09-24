@@ -1033,16 +1033,53 @@ async function findTransaction(
   return undefined
 }
 
+/**
+ * One `cannot lock ref` line of git's stderr. `reporter` is the text before it on the same line
+ * ("fatal: ", "fatal: prepare: ", "remote: error: ", "git fetch failed (1): error: "), which says
+ * which git process refused; `form` is why:
+ * - "moved": the ref is at `at`, not the `expected` value its lease named;
+ * - "exists": a create found the ref already there;
+ * - "missing": the ref is absent although a value was expected;
+ * - "held": another writer holds the ref's `.lock` file.
+ */
+export type RefLockFailure = Readonly<{
+  reporter: string
+  ref: string
+  form: "moved" | "exists" | "missing" | "held"
+  at?: string
+  expected?: string
+}>
+
+const REF_LOCK_FAILURE =
+  /^(.*?)cannot lock ref '([^']+)': (?:is at ([0-9a-f]+) but expected ([0-9a-f]+)|(reference already exists)|reference is missing but expected ([0-9a-f]+)|(Unable to create '[^']*\.lock': File exists\.?))\s*$/gm
+
+/** Every `cannot lock ref` line in git's stderr, in order; the one reading of that text in this file. */
+export function parseRefLockFailures(text: string): RefLockFailure[] {
+  return [...text.matchAll(REF_LOCK_FAILURE)].map((match): RefLockFailure => {
+    const [, reporter = "", ref = "", at, expected, exists, missingExpected, held] = match
+    if (at !== undefined && expected !== undefined) return { reporter, ref, form: "moved", at, expected }
+    if (exists !== undefined) return { reporter, ref, form: "exists" }
+    if (missingExpected !== undefined) return { reporter, ref, form: "missing", expected: missingExpected }
+    if (held !== undefined) return { reporter, ref, form: "held" }
+    throw new Error(`cannot lock ref line matched with no reason: ${match[0]}`)
+  })
+}
+
+/** Reported by a local update-ref: "fatal: " or "fatal: <phase>: " (update-ref --stdin's prepare/commit). */
+function reportedByUpdateRef(failure: RefLockFailure): boolean {
+  return /^fatal: (?:\w+: )?$/.test(failure.reporter)
+}
+
+function isFullOid(oid: string | undefined): boolean {
+  return oid !== undefined && (oid.length === 40 || oid.length === 64)
+}
+
 function isCompareAndSwapRejection(detail: string): boolean {
-  return (
-    /cannot lock ref .*: is at [0-9a-f]+ but expected [0-9a-f]+/.test(detail) ||
-    /cannot lock ref .*: reference already exists/.test(detail) ||
-    /cannot lock ref .*: reference is missing but expected [0-9a-f]+/.test(detail)
-  )
+  return parseRefLockFailures(detail).some(({ form }) => form !== "held")
 }
 
 function isTransientRefLockContention(detail: string): boolean {
-  return /cannot lock ref .*\.lock['"]?: File exists\.?/.test(detail)
+  return parseRefLockFailures(detail).some(({ form }) => form === "held")
 }
 
 function parseTransactionHistory(output: Buffer): Array<{ oid: Oid; message: string }> {
@@ -1121,12 +1158,18 @@ async function compareAndSwapRemote(
   return true
 }
 
-/** A lease lost between the read and the re-run, as update-ref reports it, anchored. */
-const LOST_AT =
-  /^fatal: (?:\w+: )?cannot lock ref '([^']+)': is at ([0-9a-f]{40}|[0-9a-f]{64}) but expected (?:[0-9a-f]{40}|[0-9a-f]{64})$/m
+/** A lease lost between the read and the re-run, as update-ref reports it. */
+function lostAt(detail: string): RefLockFailure | undefined {
+  return parseRefLockFailures(detail).find(
+    (failure) =>
+      failure.form === "moved" && reportedByUpdateRef(failure) && isFullOid(failure.at) && isFullOid(failure.expected),
+  )
+}
 
-/** Another writer holds this ref's lock: the one lock-failure text read, anchored. */
-const LOCK_HELD = /^fatal: (?:\w+: )?cannot lock ref '([^']+)': Unable to create '[^']*\.lock': File exists\.?$/m
+/** Another writer holds this ref's lock, as update-ref reports it. */
+function lockHeldBy(detail: string): RefLockFailure | undefined {
+  return parseRefLockFailures(detail).find((failure) => failure.form === "held" && reportedByUpdateRef(failure))
+}
 
 function outcomesOf(updates: readonly RefUpdate[], unchanged: ReadonlySet<string>): PublishResult {
   return {
@@ -1184,9 +1227,9 @@ async function publishLocal(
       ].join("\n"),
     })
   const lockHeld = (detail: string) => {
-    const held = LOCK_HELD.exec(detail)
-    if (held === null) return undefined
-    const ref = held[1] as string
+    const held = lockHeldBy(detail)
+    if (held === undefined) return undefined
+    const ref = held.ref
     const update = updates.find((candidate) => candidate.ref === ref)
     if (update === undefined) return undefined
     return leaseConflict([{ ref, expect: update.expect, observed: "locked" }])
@@ -1221,10 +1264,10 @@ async function publishLocal(
   const held = lockHeld(secondDetail)
   if (held !== undefined) throw held
   // A rival moved a ref between the read and the re-run: final, and a Conflict.
-  const movedAgain = LOST_AT.exec(secondDetail)
-  const movedUpdate = movedAgain === null ? undefined : updates.find(({ ref }) => ref === movedAgain[1])
-  if (movedAgain !== null && movedUpdate !== undefined) {
-    throw leaseConflict([{ ref: movedUpdate.ref, expect: movedUpdate.expect, observed: movedAgain[2] as string }])
+  const movedAgain = lostAt(secondDetail)
+  const movedUpdate = movedAgain === undefined ? undefined : updates.find(({ ref }) => ref === movedAgain.ref)
+  if (movedAgain?.at !== undefined && movedUpdate !== undefined) {
+    throw leaseConflict([{ ref: movedUpdate.ref, expect: movedUpdate.expect, observed: movedAgain.at }])
   }
   throw failed(second.code, secondDetail)
 }
@@ -1254,13 +1297,11 @@ function isStaleLease(summary: string): boolean {
 
 /** The refs receive-pack reports it could not lock because their value was not the lease's. */
 function remoteLostLeases(stderr: string): ReadonlySet<string> {
-  const lost = new Set<string>()
-  for (const match of stderr.matchAll(
-    /^remote: error: cannot lock ref '([^']+)': (?:is at [0-9a-f]+ but expected [0-9a-f]+|reference already exists|reference is missing but expected [0-9a-f]+)\s*$/gm,
-  )) {
-    if (match[1] !== undefined) lost.add(match[1])
-  }
-  return lost
+  return new Set(
+    parseRefLockFailures(stderr)
+      .filter(({ reporter, form }) => reporter === "remote: error: " && form !== "held")
+      .map(({ ref }) => ref),
+  )
 }
 
 /**
@@ -1467,13 +1508,11 @@ const FETCH_RACE_ATTEMPTS = 3
  */
 function lostFetchedRefRace(error: unknown, namespace: string): "moved" | "held" | undefined {
   const detail = error instanceof Error ? error.message : ""
-  const lost = [
-    ...detail.matchAll(
-      /(?:^|: )error: cannot lock ref '([^']+)': (?:is at [0-9a-f]+ but expected [0-9a-f]+|reference is missing but expected [0-9a-f]+|(Unable to create '[^']*\.lock': File exists\.?))$/gm,
-    ),
-  ].map((match) => ({ ref: match[1] ?? "", held: match[2] !== undefined }))
+  const lost = parseRefLockFailures(detail).filter(
+    ({ reporter, form }) => /(?:^|: )error: $/.test(reporter) && form !== "exists",
+  )
   if (lost.length === 0 || !lost.every(({ ref }) => ref.startsWith(namespace))) return undefined
-  return lost.some(({ held }) => held) ? "held" : "moved"
+  return lost.some(({ form }) => form === "held") ? "held" : "moved"
 }
 
 /** A short jittered wait, so a retry does not land inside the lock window of the fetch that holds it. */
