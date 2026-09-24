@@ -975,7 +975,8 @@ async function runProject(args: string[], stdout: CliWriter, stderr: CliWriter):
   })
 
   if (outcome.ok) {
-    const repaired = outcome.repairedIndexFrom === undefined ? "" : ` repaired-from=${outcome.repairedIndexFrom}`
+    const repairedFrom = outcome.kind === "synchronized" ? outcome.repairedIndexFrom : undefined
+    const repaired = repairedFrom === undefined ? "" : ` repaired-from=${repairedFrom}`
     stdout.write(`kind=${outcome.kind} local=${outcome.localTip ?? ""} to=${outcome.to ?? ""}${repaired}\n`)
     return OK
   }

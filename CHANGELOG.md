@@ -9,7 +9,7 @@
   (25393). Every projection first matches the index's tree id against the tip's
   first-parent history (no depth limit) and carries a match forward with the
   conditional two-way merge; a repaired projection reports `synchronized` with
-  `repairedIndexFrom` (CLI: `kind=synchronized … repaired-from=<oid>`), and an
+  `repairedIndexFrom` on that variant only (CLI: `kind=synchronized … repaired-from=<oid>`), and an
   index matching no ancestor exits 4 (`dirt-unverifiable`), changing nothing.
 
 ### Deprecated

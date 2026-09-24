@@ -682,8 +682,6 @@ export interface ProjectCheckoutRequest {
 export type ProjectCheckoutOutcome = RemoteFirstProjectionOutcome & {
   readonly to?: string | undefined
   readonly localTip?: string | undefined
-  /** The parent whose tree the index still held; the projection carried it forward to the local tip first (25393). */
-  readonly repairedIndexFrom?: string | undefined
 }
 
 /**
