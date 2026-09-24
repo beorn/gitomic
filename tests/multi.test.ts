@@ -333,6 +333,22 @@ describe("remote: one atomic push, one fetch", () => {
     }
   }
 
+  test("staging writes no local or remote application ref until its one remote publish", async () => {
+    const pair = await remotePair()
+    try {
+      const backend = createShellBackend()
+      const events = await openEvents({ repo: pair.local.repo, ref: CHAIN, remote: "origin", backend })
+      const staged = await events.stage([{ type: "created" }], { expect: null })
+      expect(await tipOf(pair.local.repo, backend, CHAIN)).toBeUndefined()
+      expect(await tipOf(pair.origin.repo, backend, CHAIN)).toBeUndefined()
+      await expect(staged.publish()).resolves.toMatchObject({ head: staged.head, retries: 0 })
+      expect(await tipOf(pair.origin.repo, backend, CHAIN)).toBe(staged.head)
+      expect(await tipOf(pair.local.repo, backend, CHAIN)).toBeUndefined()
+    } finally {
+      await pair.cleanup()
+    }
+  })
+
   test("a rival CAS on the remote branch refuses the whole remote append; nothing lands there", async () => {
     const pair = await remotePair()
     try {

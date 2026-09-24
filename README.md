@@ -330,10 +330,17 @@ never silently overwritten.
 | `events({ from?, limit?, order? })`                                     | Events after `from`, oldest first by default; `limit` defaults to 50, at most 1024.                                                                                          |
 | `transact(decide, message, { also? })`                                  | Read the chain, decide what to append, write it, compare-and-swap; on a race, re-run `decide` on the winner's events. Over 1024 events it throws rather than decide on part. |
 | `append(inputs, { expect, also? })`                                     | Write at exactly `expect`; a moved tip throws `Conflict`.                                                                                                                    |
+| `stage(inputs, { expect, author? })`                                    | Write event commits locally without moving a ref; return their `head`, events and a single-use `publish({ also? })` handle.                                                     |
 | `watch({ signal, pollIntervalMs? })`                                    | Yield each batch of new events; a jump of over 1024 throws.                                                                                                                  |
 | `listRefs(prefix, { repo, remote? })`                                   | Every ref under a prefix and its tip: `for-each-ref`, or `ls-remote --refs` against a remote.                                                                                |
 | `chainsUnder(prefix, { repo, remote?, limit? })`                        | Every chain under a prefix, read in one walk; with `remote`, one fetch first.                                                                                                |
 | `fetchRefs(prefixOrRefs, { repo, remote })`                             | Every ref under a prefix, or the named refs, with their objects, in one `git fetch`.                                                                                         |
+
+`stage` lets a caller use a new event's OID while preparing other chains. Its
+`publish` moves the staged chain and every `also` ref in one leased publish.
+It makes one attempt: a lost lease throws `Conflict`, and the caller must stage
+again from the new tip. A second publish on the same handle refuses. Staging
+does not read a remote or publish any ref.
 
 **Reads are batched.** On the shell backend, reading a 50-event chain takes
 two git processes, every chain under a prefix takes two with exactly one

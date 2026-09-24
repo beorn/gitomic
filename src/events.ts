@@ -99,6 +99,15 @@ export type Appended = {
   readonly retries: number
 }
 
+/** Locally written event commits awaiting one leased, atomic publication. */
+export type StagedEvents = {
+  readonly ref: string
+  readonly expect: Oid | null
+  readonly head: Oid
+  readonly events: readonly Event[]
+  publish(options?: { also?: readonly AlsoRef[] }): Promise<Appended>
+}
+
 export type Events = {
   /** The chain tip, or null when the ref does not exist yet. */
   head(): Promise<Oid | null>
@@ -113,6 +122,8 @@ export type Events = {
     inputs: readonly EventInput[],
     options: { expect: Oid | null; also?: readonly AlsoRef[]; author?: Ident },
   ): Promise<Appended>
+  /** Write commits locally without moving refs; publish the run once at the named tip. */
+  stage(inputs: readonly EventInput[], options: { expect: Oid | null; author?: Ident }): Promise<StagedEvents>
   watch(options: { signal: AbortSignal; pollIntervalMs?: number }): AsyncIterable<Event[]>
 }
 
@@ -253,6 +264,7 @@ function toEvent(meta: CommitMeta, ref: string): Event {
   }
 }
 
+// oxlint-disable-next-line typescript/require-await -- Promise-typed open rejects validation errors, never throws synchronously.
 export async function openEvents(options: EventsOptions): Promise<Events> {
   if (options.writer !== undefined) assertWriter(options.writer)
   const committer = cloneIdent(options.committer, "committer") ?? GITOMIC_IDENT
@@ -506,6 +518,27 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
           }
         },
       })
+    },
+    async stage(inputs, { expect, author: named }) {
+      if (inputs.length === 0) throw new TypeError("stage needs at least one event")
+      const author = cloneIdent(named, "author") ?? committer
+      const expected = expect === null ? null : validateOid(expect, "stage expect must be an event id or null")
+      const base = expected ?? (await genesisOf())
+      const { next, written } = await writeRun(base, expected === null, inputs, [], author)
+      let attempted = false
+      return {
+        ref,
+        expect: expected,
+        head: next,
+        events: written,
+        async publish(options = {}) {
+          if (attempted) throw new Error(`${label}: staged events already attempted publication`)
+          attempted = true
+          const published = await publishWith(shapeAlso(options.also))(next, expected)
+          if (!published) throw new Conflict(`${label}: staged events lost their expected tip`, { refs: [ref] })
+          return { head: next, events: written, retries: 0 }
+        },
+      }
     },
     async *watch(watchOptions) {
       const pollIntervalMs = normalizePollInterval(watchOptions.pollIntervalMs)

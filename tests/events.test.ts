@@ -70,6 +70,94 @@ describe("an absent chain", () => {
   })
 })
 
+describe("a staged event chain publishes once through the existing atomic ref path (25041)", () => {
+  test("new chains keep their commits without moving a ref until publish, on every backend", async () => {
+    await withTargets(async (target) => {
+      const kept = await workCommit(target, "staged-work.txt")
+      const events = await openEvents({ repo: target.repo, ref: CHAIN, backend: target.backend })
+      await expect(events.stage([], { expect: null })).rejects.toThrow(/at least one event/u)
+      await expect(events.stage([{ type: "opened", props: [["Event", "forged"]] }], { expect: null })).rejects.toThrow(
+        /reserved/u,
+      )
+      const staged = await events.stage([{ type: "opened", keeps: [kept] }], { expect: null })
+      expect(await events.head(), target.name).toBeNull()
+      expect((await target.backend.readCommit(target.repo, staged.head)).parents.at(-1), target.name).toBe(kept)
+      expect(
+        staged.events.map((event) => event.id),
+        target.name,
+      ).toEqual([staged.head])
+      await expect(staged.publish()).resolves.toMatchObject({ head: staged.head, retries: 0 })
+      expect(await events.head(), target.name).toBe(staged.head)
+      await expect(staged.publish()).rejects.toThrow(/already attempted publication/u)
+    })
+  })
+
+  test("an existing tip can be staged; a moved tip refuses without retrying", async () => {
+    await withTargets(async (target) => {
+      const events = await openEvents({ repo: target.repo, ref: CHAIN, backend: target.backend })
+      const first = await events.append([{ type: "opened" }], { expect: null })
+      const second = await events.stage([{ type: "checked" }], { expect: first.head })
+      await expect(second.publish()).resolves.toMatchObject({ head: second.head, retries: 0 })
+      const stale = await events.stage([{ type: "failed" }], { expect: second.head })
+      const winner = await events.append([{ type: "merged" }], { expect: second.head })
+      await expect(stale.publish()).rejects.toBeInstanceOf(Conflict)
+      expect(await events.head(), target.name).toBe(winner.head)
+      await expect(events.append([{ type: "notified" }], { expect: winner.head })).resolves.toMatchObject({
+        retries: 0,
+      })
+    })
+  })
+
+  test("one publish creates staged chains and leased-deletes old refs, or changes none", async () => {
+    await withTargets(async (target) => {
+      const old = await openEvents({ repo: target.repo, ref: "refs/events/old", backend: target.backend })
+      const oldTip = (await old.append([{ type: "record" }], { expect: null })).head as Oid
+      const queue = await openEvents({ repo: target.repo, ref: "refs/events/queue", backend: target.backend })
+      const change = await openEvents({ repo: target.repo, ref: "refs/events/change", backend: target.backend })
+      const stagedQueue = await queue.stage([{ type: "created" }], { expect: null })
+      const stagedChange = await change.stage([{ type: "opened", props: [["Queue", stagedQueue.head]] }], {
+        expect: null,
+      })
+      await stagedQueue.publish({
+        also: [
+          { ref: stagedChange.ref, expect: null, oid: stagedChange.head },
+          { ref: "refs/events/old", expect: oldTip, oid: null },
+        ],
+      })
+      expect(await queue.head(), target.name).toBe(stagedQueue.head)
+      expect(await change.head(), target.name).toBe(stagedChange.head)
+      expect(await old.head(), target.name).toBeNull()
+
+      const staleOld = await openEvents({ repo: target.repo, ref: "refs/events/stale-old", backend: target.backend })
+      const staleTip = (await staleOld.append([{ type: "record" }], { expect: null })).head as Oid
+      const blockedQueue = await openEvents({
+        repo: target.repo,
+        ref: "refs/events/blocked-queue",
+        backend: target.backend,
+      })
+      const blockedChange = await openEvents({
+        repo: target.repo,
+        ref: "refs/events/blocked-change",
+        backend: target.backend,
+      })
+      const stagedBlockedQueue = await blockedQueue.stage([{ type: "created" }], { expect: null })
+      const stagedBlockedChange = await blockedChange.stage([{ type: "opened" }], { expect: null })
+      const actualOld = (await staleOld.append([{ type: "record" }], { expect: staleTip })).head
+      await expect(
+        stagedBlockedQueue.publish({
+          also: [
+            { ref: stagedBlockedChange.ref, expect: null, oid: stagedBlockedChange.head },
+            { ref: "refs/events/stale-old", expect: staleTip, oid: null },
+          ],
+        }),
+      ).rejects.toBeInstanceOf(Conflict)
+      expect(await blockedQueue.head(), target.name).toBeNull()
+      expect(await blockedChange.head(), target.name).toBeNull()
+      expect(await staleOld.head(), target.name).toBe(actualOld)
+    })
+  })
+})
+
 describe("acceptance: a transacted event reads back with its trailers and its kept commit as a parent", () => {
   test("on shell, iso and mem", async () => {
     await withTargets(async (target) => {
