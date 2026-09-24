@@ -56,6 +56,7 @@ export { identProblem } from "./git-object.js"
 export type { Edit } from "./edits.js"
 export { matchGlob } from "./glob.js"
 export {
+  batchCheck,
   createShellBackend,
   danglingRefs,
   DEFAULT_REMOTE_TIMEOUT_MS,
@@ -63,6 +64,8 @@ export {
   runGit,
   type DanglingRef,
   type DanglingRefsOptions,
+  type BatchCheckOptions,
+  type BatchCheckResult,
   type GitResult,
   type RunGitOptions,
   type ShellBackendOptions,

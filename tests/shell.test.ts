@@ -9,7 +9,15 @@ import { delimiter, join } from "node:path"
 
 import { describe, expect, test } from "vitest"
 
-import { apply, createShellBackend, danglingRefs, isMissingObjectFetchError, open, openReader } from "../src/index.js"
+import {
+  apply,
+  batchCheck,
+  createShellBackend,
+  danglingRefs,
+  isMissingObjectFetchError,
+  open,
+  openReader,
+} from "../src/index.js"
 import type { GitomicBackend } from "../src/index.js"
 import { createIsoBackend } from "../src/iso.js"
 import { isRemoteCompareAndSwapRejection } from "../src/shell.js"
@@ -675,6 +683,61 @@ describe.sequential("shell backend failure boundaries", () => {
     } finally {
       await pair.cleanup()
     }
+  })
+
+  test("checks raw and peeled names in one ordered batch and refuses malformed answers", async () => {
+    const raw = "1".repeat(40)
+    const peeled = "2".repeat(40)
+    const absent = "3".repeat(40)
+    const names = [raw, `${raw}^{commit}`, absent]
+    const calls: Array<{ args: readonly string[]; input: string | Buffer | undefined }> = []
+    const run = async (args: readonly string[], options?: { input?: string | Buffer }) => {
+      calls.push({ args, input: options?.input })
+      return {
+        stdout: Buffer.from(`${raw} tag\n${peeled} commit\n${absent} missing\n`),
+        stderr: Buffer.alloc(0),
+        code: 0,
+      }
+    }
+    expect(await batchCheck("/tmp/gitomic-batch", names, { run })).toEqual([
+      { input: raw, oid: raw, type: "tag" },
+      { input: `${raw}^{commit}`, oid: peeled, type: "commit" },
+      { input: absent, missing: true },
+    ])
+    expect(calls).toEqual([
+      {
+        args: ["-C", "/tmp/gitomic-batch", "cat-file", "--batch-check=%(objectname) %(objecttype)"],
+        input: `${names.join("\n")}\n`,
+      },
+    ])
+
+    await expect(
+      batchCheck("/tmp/gitomic-batch", names, {
+        run: async () => ({ stdout: Buffer.from(`${raw} tag\n`), stderr: Buffer.alloc(0), code: 0 }),
+      }),
+    ).rejects.toThrow(/answered 1 lines for 3 names/u)
+    await expect(
+      batchCheck("/tmp/gitomic-batch", [raw], {
+        run: async () => ({ stdout: Buffer.from(`${raw} potato\n`), stderr: Buffer.alloc(0), code: 0 }),
+      }),
+    ).rejects.toThrow(/malformed answer/u)
+
+    const oldError = await danglingRefs("/tmp/gitomic-batch", {
+      run: async (args) => ({
+        stdout: Buffer.from(
+          args.includes("for-each-ref") ? `${raw} refs/heads/one\n${peeled} refs/heads/two\n` : `${raw} commit\n`,
+        ),
+        stderr: Buffer.alloc(0),
+        code: 0,
+      }),
+    }).then(
+      () => undefined,
+      (error: unknown) => error,
+    )
+    expect(oldError).toBeInstanceOf(Error)
+    expect((oldError as Error).message).toBe(
+      "git cat-file --batch-check answered 1 lines for 2 refs in /tmp/gitomic-batch",
+    )
   })
 
   test("does not misclassify a non-CAS update-ref error after a concurrent move", async () => {
