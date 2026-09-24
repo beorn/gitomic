@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks"
 import childProcess, { type ChildProcess } from "node:child_process"
 import { randomUUID } from "node:crypto"
 import { mkdtemp, rm, writeFile } from "node:fs/promises"
@@ -45,6 +46,8 @@ export type GitResult = {
 }
 
 type GitOptions = {
+  /** Exact environment base for a shell-backend command. Omit to inherit process.env. */
+  baseEnv?: NodeJS.ProcessEnv | undefined
   env?: NodeJS.ProcessEnv
   input?: string | Buffer
   /** Stop the command, and every process it started, after this many milliseconds. */
@@ -52,10 +55,27 @@ type GitOptions = {
 }
 
 /** Options for {@link runGit}. */
-export type RunGitOptions = GitOptions
+export type RunGitOptions = Omit<GitOptions, "baseEnv">
+
+/** One local ref whose named object is absent from the repository. */
+export type DanglingRef = Readonly<{ ref: string; oid: string }>
+
+/** A function-local command seam for {@link danglingRefs}. */
+export type DanglingRefsOptions = Readonly<{
+  run?: (args: readonly string[], options?: RunGitOptions) => Promise<GitResult>
+}>
 
 /** Options for {@link createShellBackend}. */
 export type ShellBackendOptions = {
+  /** Git executable used for every shell-backend command. A bare name resolves through `baseEnv`'s PATH. Defaults to `git`. */
+  gitExecutable?: string
+  /**
+   * Exact base environment for every command this backend spawns. Unlike
+   * `runGit(..., { env })`, omitted keys do not fall through to process.env.
+   * Gitomic snapshots defined entries at construction and applies its prompt
+   * and locale pins last.
+   */
+  baseEnv?: Readonly<NodeJS.ProcessEnv>
   /**
    * Limit, in milliseconds, for each fetch from and push to a remote. A command
    * past it rejects with `GitTimeout`. Defaults to 20 000.
@@ -65,10 +85,13 @@ export type ShellBackendOptions = {
 
 /** The default limit for one fetch or push to a remote. */
 export const DEFAULT_REMOTE_TIMEOUT_MS = 20_000
+const DANGLING_REF_SCAN_TIMEOUT_MS = 30_000
 /** How long a stopped process group gets between SIGTERM and SIGKILL. */
 const GROUP_STOP_GRACE_MS = 2_000
 
 const DURABLE_GIT_CONFIG = ["-c", "core.fsync=loose-object,reference", "-c", "core.fsyncMethod=fsync"] as const
+const shellExecutable = new AsyncLocalStorage<string>()
+const selectedGit = (): string => shellExecutable.getStore() ?? "git"
 
 export function createShellBackend(options: ShellBackendOptions = {}): GitomicBackend {
   return createShellRuntime(options).backend
@@ -80,18 +103,21 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
   refStorage(repo: string): Promise<"files" | "native">
   objectFormat(repo: string): Promise<"sha1" | "sha256">
 } {
+  const executable = options.gitExecutable ?? "git"
+  if (executable.trim() === "") throw new TypeError("gitExecutable must name a Git executable")
   const remoteTimeoutMs = normalizeTimeoutMs(options.remoteTimeoutMs ?? DEFAULT_REMOTE_TIMEOUT_MS, "remoteTimeoutMs")
-  const resolveGitDir = createGitDirResolver()
+  const baseEnv = snapshotEnvironment(options.baseEnv)
+  const resolveGitDir = createGitDirResolver(baseEnv)
   const refStorages = new Map<string, Promise<"files" | "native">>()
   const objectFormats = new Map<string, Promise<"sha1" | "sha256">>()
   const genesisByGitDir = new Map<string, Promise<Oid>>()
   const refStorage = async (repo: string): Promise<"files" | "native"> =>
-    resolveRefStorage(await resolveGitDir(repo), refStorages)
+    resolveRefStorage(await resolveGitDir(repo), refStorages, baseEnv)
   const objectFormat = async (repo: string): Promise<"sha1" | "sha256"> => {
     const gitdir = await resolveGitDir(repo)
     let format = objectFormats.get(gitdir)
     if (format === undefined) {
-      format = git(gitdir, ["rev-parse", "--show-object-format=storage"]).then((output) => {
+      format = git(gitdir, ["rev-parse", "--show-object-format=storage"], { baseEnv }).then((output) => {
         const value = text(output)
         if (value !== "sha1" && value !== "sha256") {
           throw new Error(`unsupported Git object format: ${JSON.stringify(value)}`)
@@ -108,10 +134,13 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
     }
   }
   const backend: GitomicBackend = {
-    head: async (repo, ref) => head(await resolveGitDir(repo), ref),
+    head: async (repo, ref) => head(await resolveGitDir(repo), ref, baseEnv),
     readCommit: async (repo, oid) => {
       validateOid(oid)
-      const output = await git(await resolveGitDir(repo), ["cat-file", "--batch"], { input: `${oid}\n` })
+      const output = await git(await resolveGitDir(repo), ["cat-file", "--batch"], {
+        baseEnv,
+        input: `${oid}\n`,
+      })
       const newline = output.indexOf(0x0a)
       const header = output.toString("utf8", 0, newline < 0 ? output.length : newline)
       const match = /^([0-9a-f]+) commit (\d+)$/.exec(header)
@@ -128,7 +157,7 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
       }
       return parseCommit(oid, output.subarray(newline + 1, newline + 1 + size))
     },
-    readFiles: async (repo, commit, prefix) => readFiles(await resolveGitDir(repo), commit, prefix),
+    readFiles: async (repo, commit, prefix) => readFiles(await resolveGitDir(repo), commit, prefix, baseEnv),
     // A completed commit is unreferenced until the compare-and-swap below adopts
     // it. Gitomic writes NO ref to protect that window: Git's default gc grace
     // (`gc.pruneExpire = 2.weeks.ago`) already covers a gap that is milliseconds
@@ -143,18 +172,22 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
     // object instead of moving the ref (see the pruned-mid-flight test in
     // tests/concurrency.test.ts). To close the hole rather than accept it, a
     // reachability ref belongs here — and the README claim must change with it.
-    writeCommit: async (repo, input) => writeCommit(await resolveGitDir(repo), input),
-    compareAndSwap: async (repo, ref, next, expected) => compareAndSwap(await resolveGitDir(repo), ref, next, expected),
+    writeCommit: async (repo, input) => writeCommit(await resolveGitDir(repo), input, baseEnv),
+    compareAndSwap: async (repo, ref, next, expected) =>
+      compareAndSwap(await resolveGitDir(repo), ref, next, expected, baseEnv),
     findTransaction: async (repo, tip, base, instance, seq) =>
-      findTransaction(await resolveGitDir(repo), tip, base, instance, seq),
-    fetchRemote: async (repo, ref, remote) => fetchRemote(await resolveGitDir(repo), ref, remote, remoteTimeoutMs),
-    listRefs: async (repo, prefix, remote) => listRefs(await resolveGitDir(repo), prefix, remote, remoteTimeoutMs),
-    readHistory: async (repo, tips, historyOptions) => readHistory(await resolveGitDir(repo), tips, historyOptions),
+      findTransaction(await resolveGitDir(repo), tip, base, instance, seq, baseEnv),
+    fetchRemote: async (repo, ref, remote) =>
+      fetchRemote(await resolveGitDir(repo), ref, remote, remoteTimeoutMs, baseEnv),
+    listRefs: async (repo, prefix, remote) =>
+      listRefs(await resolveGitDir(repo), prefix, remote, remoteTimeoutMs, baseEnv),
+    readHistory: async (repo, tips, historyOptions) =>
+      readHistory(await resolveGitDir(repo), tips, historyOptions, baseEnv),
     writeGenesis: async (repo) => {
       const gitdir = await resolveGitDir(repo)
       let genesis = genesisByGitDir.get(gitdir)
       if (genesis === undefined) {
-        genesis = writeGenesis(gitdir, await objectFormat(repo))
+        genesis = writeGenesis(gitdir, await objectFormat(repo), baseEnv)
         genesisByGitDir.set(gitdir, genesis)
       }
       try {
@@ -165,18 +198,34 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
       }
     },
     compareAndSwapRemote: async (repo, ref, next, expected, remote) =>
-      compareAndSwapRemote(await resolveGitDir(repo), ref, next, expected, remote, remoteTimeoutMs),
+      compareAndSwapRemote(await resolveGitDir(repo), ref, next, expected, remote, remoteTimeoutMs, baseEnv),
     publish: async (repo, updates, remote) =>
       remote === undefined
-        ? publishLocal(await resolveGitDir(repo), assertRefUpdates(updates))
-        : publishRemote(await resolveGitDir(repo), assertRefUpdates(updates), remote, remoteTimeoutMs),
-    fetchRefs: async (repo, refs, remote) => fetchRefs(await resolveGitDir(repo), refs, remote, remoteTimeoutMs),
+        ? publishLocal(await resolveGitDir(repo), assertRefUpdates(updates), baseEnv)
+        : publishRemote(await resolveGitDir(repo), assertRefUpdates(updates), remote, remoteTimeoutMs, baseEnv),
+    fetchRefs: async (repo, refs, remote) =>
+      fetchRefs(await resolveGitDir(repo), refs, remote, remoteTimeoutMs, baseEnv),
   }
-  return { backend, resolveGitDir, refStorage, objectFormat }
+  // Each backend owns its executable even when two backends run concurrently.
+  // Keeping the selection in the async call chain lets the Git plumbing below
+  // use one runner without adding an executable argument to every operation.
+  const inRuntime = <T>(work: () => Promise<T>): Promise<T> => shellExecutable.run(executable, work)
+  const selectedBackend = Object.fromEntries(
+    Object.entries(backend).map(([name, operation]) => {
+      const invoke = (operation as (...args: unknown[]) => Promise<unknown>).bind(backend)
+      return [name, (...args: unknown[]) => inRuntime(() => invoke(...args))]
+    }),
+  ) as GitomicBackend
+  return {
+    backend: selectedBackend,
+    resolveGitDir: (repo) => inRuntime(() => resolveGitDir(repo)),
+    refStorage: (repo) => inRuntime(() => refStorage(repo)),
+    objectFormat: (repo) => inRuntime(() => objectFormat(repo)),
+  }
 }
 
-async function optionalRef(repo: string, ref: string): Promise<Oid | undefined> {
-  const result = await run("git", gitArgs(repo, ["rev-parse", "--verify", "--quiet", ref]))
+async function optionalRef(repo: string, ref: string, baseEnv?: NodeJS.ProcessEnv): Promise<Oid | undefined> {
+  const result = await run(selectedGit(), gitArgs(repo, ["rev-parse", "--verify", "--quiet", ref]), { baseEnv })
   if (result.code === 1 && result.stdout.length === 0) return undefined
   if (result.code !== 0) {
     const detail = result.stderr.toString("utf8").trim()
@@ -210,12 +259,67 @@ export async function runCommand(
   return run(command, args, options)
 }
 
+/** Git's stable C-locale texts for a fetch stopped by a locally dangling ref. */
+export function isMissingObjectFetchError(detail: string): boolean {
+  return /\bbad object refs\/|did not send all necessary objects/u.test(detail)
+}
+
+/**
+ * Every local ref whose named object is missing, from one explicit-format ref
+ * listing and one ordered cat-file batch. A failed scan throws and never reads
+ * as an empty result.
+ */
+export async function danglingRefs(
+  repository: string,
+  options: DanglingRefsOptions = {},
+): Promise<readonly DanglingRef[]> {
+  const invoke = options.run ?? runGit
+  const at = ["-C", resolve(repository)] as const
+  const listArgs = [...at, "for-each-ref", "--format=%(objectname) %(refname)"]
+  const listed = await invoke(listArgs, { timeoutMs: DANGLING_REF_SCAN_TIMEOUT_MS })
+  if (listed.code !== 0) throw commandFailure(repository, listArgs, listed)
+  const refs = listed.stdout
+    .toString("utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => {
+      const space = line.indexOf(" ")
+      if (space <= 0 || space === line.length - 1) {
+        throw new Error(`git for-each-ref returned a malformed row in ${repository}: ${JSON.stringify(line)}`)
+      }
+      return {
+        oid: validateOid(line.slice(0, space), "git for-each-ref returned a malformed id"),
+        ref: line.slice(space + 1),
+      }
+    })
+  if (refs.length === 0) return []
+  const checkArgs = [...at, "cat-file", "--batch-check=%(objectname) %(objecttype)"]
+  const checked = await invoke(checkArgs, {
+    input: `${refs.map(({ oid }) => oid).join("\n")}\n`,
+    timeoutMs: DANGLING_REF_SCAN_TIMEOUT_MS,
+  })
+  if (checked.code !== 0) throw commandFailure(repository, checkArgs, checked)
+  const answers = checked.stdout.toString("utf8").split("\n").filter(Boolean)
+  if (answers.length !== refs.length) {
+    throw new Error(
+      `git cat-file --batch-check answered ${answers.length} lines for ${refs.length} refs in ${repository}`,
+    )
+  }
+  return refs.filter(({ oid }, index) => answers[index] === `${oid} missing`)
+}
+
+function commandFailure(repository: string, args: readonly string[], result: GitResult): Error {
+  const detail = result.stderr.toString("utf8").trim() || result.stdout.toString("utf8").trim()
+  const shown = args[0] === "-C" ? args.slice(2) : args
+  return new Error(`git ${shown.join(" ")} failed (${result.code}) in ${repository}${detail ? `: ${detail}` : ""}`)
+}
+
 async function run(command: string, args: readonly string[], options: GitOptions = {}): Promise<GitResult> {
   const timeoutMs = options.timeoutMs === undefined ? undefined : normalizeTimeoutMs(options.timeoutMs, "timeoutMs")
-  return new Promise((resolveResult, reject) => {
+  return new Promise((resolve, reject) => {
     const bounded = timeoutMs !== undefined && process.platform !== "win32"
     const child = childProcess.spawn(command, args, {
-      env: { ...process.env, ...options.env, GIT_TERMINAL_PROMPT: "0", LC_ALL: "C" },
+      env: { ...(options.baseEnv ?? process.env), ...options.env, GIT_TERMINAL_PROMPT: "0", LC_ALL: "C" },
       stdio: ["pipe", "pipe", "pipe"],
       // A bounded command leads its own process group, so the limit reaches
       // the helpers Git starts (ssh, index-pack) and not only Git itself.
@@ -256,7 +360,7 @@ async function run(command: string, args: readonly string[], options: GitOptions
           // The command finished inside its limit; only a helper it started
           // still holds the output pipes, so the command's own result stands.
           abandonHelpers()
-          settle(() => resolveResult(result(exited)))
+          settle(() => resolve(result(exited)))
           return
         }
         timedOut = true
@@ -276,7 +380,7 @@ async function run(command: string, args: readonly string[], options: GitOptions
     })
     child.once("close", (code) => {
       if (timedOut) return
-      settle(() => resolveResult(result(code)))
+      settle(() => resolve(result(code)))
     })
     child.stdin.on("error", (error: NodeJS.ErrnoException) => {
       // A command stopped at its limit closes stdin under a pending write; the
@@ -290,6 +394,11 @@ async function run(command: string, args: readonly string[], options: GitOptions
   })
 }
 
+function snapshotEnvironment(source: Readonly<NodeJS.ProcessEnv> | undefined): NodeJS.ProcessEnv | undefined {
+  if (source === undefined) return undefined
+  return Object.fromEntries(Object.entries(source).filter((entry): entry is [string, string] => entry[1] !== undefined))
+}
+
 function normalizeTimeoutMs(value: number, name: string): number {
   if (!Number.isFinite(value) || value <= 0) {
     throw new TypeError(`${name} must be a positive number of milliseconds`)
@@ -301,7 +410,8 @@ function normalizeTimeoutMs(value: number, name: string): number {
 function describeGitCommand(command: string, args: readonly string[]): string {
   const rest = [...args]
   while (rest.length > 0) {
-    const option = rest[0]!
+    const option = rest[0]
+    if (option === undefined) throw new Error("git command argument unexpectedly missing")
     if (option === "--git-dir" || option === "-C" || option === "-c") {
       rest.splice(0, 2)
     } else if (option.startsWith("--git-dir=")) {
@@ -371,16 +481,18 @@ function durableGitArgs(repo: string, args: readonly string[]): string[] {
   return gitArgs(repo, [...DURABLE_GIT_CONFIG, ...args])
 }
 
-export function createGitDirResolver(): (repo: string) => Promise<string> {
+export function createGitDirResolver(baseEnv?: NodeJS.ProcessEnv): (repo: string) => Promise<string> {
   const cache = new Map<string, Promise<string>>()
   let supportedVersion: Promise<void> | undefined
   return (repo) => {
     const locator = resolve(repo)
     let gitdir = cache.get(locator)
     if (gitdir === undefined) {
-      supportedVersion ??= requireSupportedGit()
+      supportedVersion ??= requireSupportedGit(baseEnv)
       gitdir = supportedVersion
-        .then(async () => run("git", ["-C", locator, "rev-parse", "--path-format=absolute", "--git-common-dir"]))
+        .then(async () =>
+          run(selectedGit(), ["-C", locator, "rev-parse", "--path-format=absolute", "--git-common-dir"], { baseEnv }),
+        )
         .then((result) => {
           if (result.code !== 0) {
             const detail = result.stderr.toString("utf8").trim()
@@ -394,8 +506,14 @@ export function createGitDirResolver(): (repo: string) => Promise<string> {
   }
 }
 
-async function requireSupportedGit(): Promise<void> {
-  const result = await run("git", ["--version"])
+async function requireSupportedGit(baseEnv?: NodeJS.ProcessEnv): Promise<void> {
+  const executable = selectedGit()
+  let result: GitResult
+  try {
+    result = await run(executable, ["--version"], { baseEnv })
+  } catch (error) {
+    throw new Error(`Git executable ${JSON.stringify(executable)} cannot run: ${String(error)}`, { cause: error })
+  }
   const output = result.stdout.toString("utf8").trim()
   const match = /^git version (\d+)\.(\d+)(?:[.\s]|$)/.exec(output)
   const major = Number(match?.[1])
@@ -403,13 +521,13 @@ async function requireSupportedGit(): Promise<void> {
   if (result.code !== 0 || match === null || major < 2 || (major === 2 && minor < 36)) {
     const found = output || result.stderr.toString("utf8").trim() || "unknown version"
     throw new Error(
-      `Git 2.36 or newer is required for durable object and ref writes; found ${JSON.stringify(found)}. Upgrade Git, then open the store again.`,
+      `Git 2.36 or newer is required for durable object and ref writes; ${JSON.stringify(executable)} reported ${JSON.stringify(found)}. Upgrade Git, then open the store again.`,
     )
   }
 }
 
 async function git(repo: string, args: readonly string[], options: GitOptions = {}): Promise<Buffer> {
-  const result = await run("git", gitArgs(repo, args), options)
+  const result = await run(selectedGit(), gitArgs(repo, args), options)
   if (result.code !== 0) {
     const detail = result.stderr.toString("utf8").trim()
     throw new Error(`git ${args[0] ?? "command"} failed (${result.code})${detail ? `: ${detail}` : ""}`)
@@ -418,7 +536,7 @@ async function git(repo: string, args: readonly string[], options: GitOptions = 
 }
 
 async function gitWrite(repo: string, args: readonly string[], options: GitOptions = {}): Promise<Buffer> {
-  const result = await run("git", durableGitArgs(repo, args), options)
+  const result = await run(selectedGit(), durableGitArgs(repo, args), options)
   if (result.code !== 0) {
     const detail = result.stderr.toString("utf8").trim()
     throw new Error(`git ${args[0] ?? "command"} failed (${result.code})${detail ? `: ${detail}` : ""}`)
@@ -430,13 +548,18 @@ function text(buffer: Buffer): string {
   return buffer.toString("utf8").trim()
 }
 
-async function head(repo: string, ref: string): Promise<Oid> {
-  return text(await git(repo, ["rev-parse", "--verify", ref]))
+async function head(repo: string, ref: string, baseEnv?: NodeJS.ProcessEnv): Promise<Oid> {
+  return text(await git(repo, ["rev-parse", "--verify", ref], { baseEnv }))
 }
 
-async function readFiles(repo: string, commit: Oid, prefix?: string): Promise<ReadonlyMap<string, BlobValue>> {
+async function readFiles(
+  repo: string,
+  commit: Oid,
+  prefix?: string,
+  baseEnv?: NodeJS.ProcessEnv,
+): Promise<ReadonlyMap<string, BlobValue>> {
   const normalizedPrefix = prefix === undefined ? "" : normalizePrefix(prefix)
-  const listing = await git(repo, ["ls-tree", "-r", "-z", "--full-tree", commit])
+  const listing = await git(repo, ["ls-tree", "-r", "-z", "--full-tree", commit], { baseEnv })
   const entries: Array<{ oid: Oid; path: string }> = []
   for (const record of decodeUtf8(listing, "Git tree paths").split("\0")) {
     if (!record) continue
@@ -458,6 +581,7 @@ async function readFiles(repo: string, commit: Oid, prefix?: string): Promise<Re
   if (entries.length === 0) return new Map()
 
   const output = await git(repo, ["cat-file", "--batch"], {
+    baseEnv,
     input: `${entries.map((entry) => entry.oid).join("\n")}\n`,
   })
   return parseBatch(entries, output)
@@ -490,7 +614,7 @@ function parseBatch(
   return files
 }
 
-async function writeCommit(repo: string, input: CommitInput): Promise<Oid> {
+async function writeCommit(repo: string, input: CommitInput, baseEnv?: NodeJS.ProcessEnv): Promise<Oid> {
   const parents = commitParents(input)
   const idents = commitIdents(input)
   const message = formatCommitMessage(
@@ -505,16 +629,26 @@ async function writeCommit(repo: string, input: CommitInput): Promise<Oid> {
   // the event path (two processes: read the parent, write the commit), and it
   // lands the same object the index path would have built.
   if (input.changes.size === 0) {
-    const [tree, parentTime] = text(await git(repo, ["show", "-s", "--format=%T%x00%ct", input.parent])).split("\0")
-    return commitTree(repo, validateOid(tree, "invalid parent tree id"), parents, Number(parentTime), message, idents)
+    const [tree, parentTime] = text(
+      await git(repo, ["show", "-s", "--format=%T%x00%ct", input.parent], { baseEnv }),
+    ).split("\0")
+    return commitTree(
+      repo,
+      validateOid(tree, "invalid parent tree id"),
+      parents,
+      Number(parentTime),
+      message,
+      idents,
+      baseEnv,
+    )
   }
   const indexDir = await mkdtemp(join(tmpdir(), "gitomic-index-"))
   const index = join(indexDir, "index")
   const indexEnv = { GIT_INDEX_FILE: index }
   try {
-    await gitWrite(repo, ["read-tree", input.parent], { env: indexEnv })
+    await gitWrite(repo, ["read-tree", input.parent], { baseEnv, env: indexEnv })
     const changes = [...input.changes]
-    const executables = await parentExecutables(repo, indexEnv, changes)
+    const executables = await parentExecutables(repo, indexEnv, changes, baseEnv)
     const blobFiles: string[] = []
     for (const [position, [, content]] of changes.entries()) {
       if (content === undefined) continue
@@ -527,6 +661,7 @@ async function writeCommit(repo: string, input: CommitInput): Promise<Oid> {
         ? ""
         : text(
             await gitWrite(repo, ["hash-object", "-w", "--stdin-paths", "--no-filters"], {
+              baseEnv,
               input: `${blobFiles.join("\n")}\n`,
             }),
           )
@@ -549,12 +684,13 @@ async function writeCommit(repo: string, input: CommitInput): Promise<Oid> {
       )
     }
     await gitWrite(repo, ["update-index", "--add", "-z", "--index-info"], {
+      baseEnv,
       env: indexEnv,
       input: Buffer.concat(indexInfo),
     })
-    const tree = text(await gitWrite(repo, ["write-tree"], { env: indexEnv }))
-    const parentTime = Number(text(await git(repo, ["show", "-s", "--format=%ct", input.parent])))
-    return commitTree(repo, tree, parents, parentTime, message, idents)
+    const tree = text(await gitWrite(repo, ["write-tree"], { baseEnv, env: indexEnv }))
+    const parentTime = Number(text(await git(repo, ["show", "-s", "--format=%ct", input.parent], { baseEnv })))
+    return await commitTree(repo, tree, parents, parentTime, message, idents, baseEnv)
   } finally {
     await rm(indexDir, { recursive: true, force: true })
   }
@@ -568,10 +704,11 @@ async function parentExecutables(
   repo: string,
   indexEnv: NodeJS.ProcessEnv,
   changes: readonly (readonly [string, string | undefined])[],
+  baseEnv?: NodeJS.ProcessEnv,
 ): Promise<ReadonlySet<string>> {
   const executables = new Set<string>()
   if (!changes.some(([, content]) => content !== undefined)) return executables
-  const listing = await git(repo, ["ls-files", "--stage", "-z"], { env: indexEnv })
+  const listing = await git(repo, ["ls-files", "--stage", "-z"], { baseEnv, env: indexEnv })
   for (const record of listing.toString("utf8").split("\0")) {
     if (!record.startsWith("100755 ")) continue
     const tab = record.indexOf("\t")
@@ -593,11 +730,12 @@ async function commitTree(
   parentTime: number,
   message: string,
   idents: { readonly author: Ident; readonly committer: Ident },
+  baseEnv?: NodeJS.ProcessEnv,
 ): Promise<Oid> {
   const timestamp = Number.isFinite(parentTime) ? parentTime + 1 : 1
   const args = ["commit-tree", tree]
   for (const parent of parents) args.push("-p", parent)
-  return text(await gitWrite(repo, args, { env: identityEnv(timestamp, idents), input: message }))
+  return text(await gitWrite(repo, args, { baseEnv, env: identityEnv(timestamp, idents), input: message }))
 }
 
 /**
@@ -627,10 +765,14 @@ function identityEnv(
  * git always has, so this is one `commit-tree`; the same bytes on every run
  * give the same oid, which is what makes it idempotent.
  */
-async function writeGenesis(repo: string, format: "sha1" | "sha256"): Promise<Oid> {
+async function writeGenesis(repo: string, format: "sha1" | "sha256", baseEnv?: NodeJS.ProcessEnv): Promise<Oid> {
   const emptyTree = objectOid("tree", Buffer.alloc(0), format)
   return text(
-    await gitWrite(repo, ["commit-tree", emptyTree], { env: identityEnv(INITIAL_TIMESTAMP), input: GENESIS_MESSAGE }),
+    await gitWrite(repo, ["commit-tree", emptyTree], {
+      baseEnv,
+      env: identityEnv(INITIAL_TIMESTAMP),
+      input: GENESIS_MESSAGE,
+    }),
   )
 }
 
@@ -645,13 +787,14 @@ async function listRefs(
   prefix: string,
   remote: string | undefined,
   timeoutMs: number,
+  baseEnv?: NodeJS.ProcessEnv,
 ): Promise<ReadonlyMap<string, Oid>> {
   if (typeof prefix !== "string" || !prefix.startsWith("refs/")) {
     throw new TypeError(`listRefs prefix must start with refs/: ${JSON.stringify(prefix)}`)
   }
   const pairs: Array<[string, Oid]> = []
   if (remote === undefined) {
-    const output = await git(repo, ["for-each-ref", "--format=%(objectname) %(refname)", prefix])
+    const output = await git(repo, ["for-each-ref", "--format=%(objectname) %(refname)", prefix], { baseEnv })
     for (const line of decodeUtf8(output, "git for-each-ref").split("\n")) {
       if (line === "") continue
       const space = line.indexOf(" ")
@@ -659,7 +802,7 @@ async function listRefs(
     }
   } else {
     const patterns = prefix.endsWith("/") ? [`${prefix}*`] : [prefix, `${prefix}/*`]
-    const output = await git(repo, ["ls-remote", "--refs", remote, ...patterns], { timeoutMs })
+    const output = await git(repo, ["ls-remote", "--refs", remote, ...patterns], { baseEnv, timeoutMs })
     for (const line of decodeUtf8(output, "git ls-remote").split("\n")) {
       if (line === "") continue
       const tab = line.indexOf("\t")
@@ -667,6 +810,11 @@ async function listRefs(
     }
   }
   const matching = pairs.filter(([ref]) => refUnderPrefix(ref, prefix))
+  const seen = new Set<string>()
+  for (const [ref] of matching) {
+    if (seen.has(ref)) throw new Error(`git ref listing returned duplicate ref ${ref}`)
+    seen.add(ref)
+  }
   return new Map(matching.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
 }
 
@@ -682,20 +830,25 @@ async function readHistory(
   repo: string,
   tips: readonly Oid[],
   options: { readonly exclude?: readonly Oid[]; readonly limit?: number } = {},
+  baseEnv?: NodeJS.ProcessEnv,
 ): Promise<CommitMeta[]> {
   if (tips.length === 0) return []
   for (const tip of tips) validateOid(tip, "invalid history tip")
   const exclude = (options.exclude ?? []).map((oid) => `^${validateOid(oid, "invalid history exclusion")}`)
   const limit = options.limit === undefined ? [] : [`--max-count=${options.limit}`]
-  const output = await git(repo, [
-    "rev-list",
-    "--first-parent",
-    ...limit,
-    "--no-commit-header",
-    "--format=%H%x00%P%x00%ct%x00%an%x00%ae%x00%cn%x00%ce%x00%B%x00",
-    ...tips,
-    ...exclude,
-  ])
+  const output = await git(
+    repo,
+    [
+      "rev-list",
+      "--first-parent",
+      ...limit,
+      "--no-commit-header",
+      "--format=%H%x00%P%x00%ct%x00%an%x00%ae%x00%cn%x00%ce%x00%B%x00",
+      ...tips,
+      ...exclude,
+    ],
+    { baseEnv },
+  )
   const fields = decodeUtf8(output, "git rev-list history").split("\0")
   const trailing = fields.pop()
   if (trailing?.trim()) throw new Error("git rev-list returned trailing history data")
@@ -714,8 +867,14 @@ async function readHistory(
   return commits
 }
 
-async function compareAndSwap(repo: string, ref: string, next: Oid, expected: Oid): Promise<boolean> {
-  const result = await run("git", durableGitArgs(repo, ["update-ref", ref, next, expected]))
+async function compareAndSwap(
+  repo: string,
+  ref: string,
+  next: Oid,
+  expected: Oid,
+  baseEnv?: NodeJS.ProcessEnv,
+): Promise<boolean> {
+  const result = await run(selectedGit(), durableGitArgs(repo, ["update-ref", ref, next, expected]), { baseEnv })
   if (result.code === 0) return true
   const detail = result.stderr.toString("utf8").trim()
   if (isCompareAndSwapRejection(detail) || isTransientRefLockContention(detail)) return false
@@ -725,17 +884,20 @@ async function compareAndSwap(repo: string, ref: string, next: Oid, expected: Oi
 async function resolveRefStorage(
   repo: string,
   pending: Map<string, Promise<"files" | "native">>,
+  baseEnv?: NodeJS.ProcessEnv,
 ): Promise<"files" | "native"> {
   let storage = pending.get(repo)
   if (storage === undefined) {
-    storage = run("git", gitArgs(repo, ["config", "--get", "extensions.refStorage"])).then((result) => {
-      if (result.code === 1) return "files"
-      if (result.code !== 0) {
-        const detail = result.stderr.toString("utf8").trim()
-        throw new Error(`cannot inspect Git ref storage${detail ? `: ${detail}` : ""}`)
-      }
-      return text(result.stdout) === "files" ? "files" : "native"
-    })
+    storage = run(selectedGit(), gitArgs(repo, ["config", "--get", "extensions.refStorage"]), { baseEnv }).then(
+      (result) => {
+        if (result.code === 1) return "files"
+        if (result.code !== 0) {
+          const detail = result.stderr.toString("utf8").trim()
+          throw new Error(`cannot inspect Git ref storage${detail ? `: ${detail}` : ""}`)
+        }
+        return text(result.stdout) === "files" ? "files" : "native"
+      },
+    )
     pending.set(repo, storage)
   }
   try {
@@ -746,8 +908,14 @@ async function resolveRefStorage(
   }
 }
 
-async function deleteRef(repo: string, ref: string, oid: Oid, failure: string): Promise<void> {
-  const result = await run("git", durableGitArgs(repo, ["update-ref", "-d", ref, oid]))
+async function deleteRef(
+  repo: string,
+  ref: string,
+  oid: Oid,
+  failure: string,
+  baseEnv?: NodeJS.ProcessEnv,
+): Promise<void> {
+  const result = await run(selectedGit(), durableGitArgs(repo, ["update-ref", "-d", ref, oid]), { baseEnv })
   if (result.code !== 0) {
     const detail = result.stderr.toString("utf8").trim()
     throw new Error(`${failure}${detail ? `: ${detail}` : ""}`)
@@ -760,18 +928,23 @@ async function findTransaction(
   base: Oid,
   instance: string,
   seq: number,
+  baseEnv?: NodeJS.ProcessEnv,
 ): Promise<Oid | undefined> {
   // `^base` is the stop condition: the sought commit is a child of `base`, so
   // one process reads only what arrived after it, however deep the history is.
-  const output = await git(repo, [
-    "rev-list",
-    "--first-parent",
-    `--max-count=${TRANSACTION_SEARCH_LIMIT + 1}`,
-    "--no-commit-header",
-    "--format=%H%x00%B%x00",
-    tip,
-    `^${base}`,
-  ])
+  const output = await git(
+    repo,
+    [
+      "rev-list",
+      "--first-parent",
+      `--max-count=${TRANSACTION_SEARCH_LIMIT + 1}`,
+      "--no-commit-header",
+      "--format=%H%x00%B%x00",
+      tip,
+      `^${base}`,
+    ],
+    { baseEnv },
+  )
   const commits = parseTransactionHistory(output)
   for (const commit of commits.slice(0, TRANSACTION_SEARCH_LIMIT)) {
     if (transactionMatches(commit.message, instance, seq)) return commit.oid
@@ -813,19 +986,26 @@ function parseTransactionHistory(output: Buffer): Array<{ oid: Oid; message: str
   return commits
 }
 
-async function fetchRemote(repo: string, ref: string, remote: string, timeoutMs: number): Promise<Oid> {
+async function fetchRemote(
+  repo: string,
+  ref: string,
+  remote: string,
+  timeoutMs: number,
+  baseEnv?: NodeJS.ProcessEnv,
+): Promise<Oid> {
   const scratch = `refs/gitomic/fetch/${randomUUID()}`
   let fetched: Oid | undefined
   try {
     await gitWrite(repo, ["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", remote, `${ref}:${scratch}`], {
+      baseEnv,
       timeoutMs,
     })
-    fetched = await head(repo, scratch)
+    fetched = await head(repo, scratch, baseEnv)
     return fetched
   } finally {
-    const temporary = fetched ?? (await optionalRef(repo, scratch))
+    const temporary = fetched ?? (await optionalRef(repo, scratch, baseEnv))
     if (temporary !== undefined) {
-      await deleteRef(repo, scratch, temporary, `cannot release temporary fetch ref ${scratch}`)
+      await deleteRef(repo, scratch, temporary, `cannot release temporary fetch ref ${scratch}`, baseEnv)
     }
   }
 }
@@ -837,12 +1017,18 @@ async function compareAndSwapRemote(
   expected: Oid,
   remote: string,
   timeoutMs: number,
+  baseEnv?: NodeJS.ProcessEnv,
 ): Promise<boolean> {
-  const result = await run(
-    "git",
-    durableGitArgs(repo, ["push", "--porcelain", `--force-with-lease=${ref}:${expected}`, remote, `${next}:${ref}`]),
-    { timeoutMs },
-  )
+  let result: GitResult
+  try {
+    result = await run(
+      selectedGit(),
+      durableGitArgs(repo, ["push", "--porcelain", `--force-with-lease=${ref}:${expected}`, remote, `${next}:${ref}`]),
+      { baseEnv, timeoutMs },
+    )
+  } catch (error) {
+    throw remoteWriteOutcomeUnknown([{ ref, expect: expected }], error)
+  }
   if (result.code !== 0) {
     const detail = `${result.stdout.toString("utf8")}\n${result.stderr.toString("utf8")}`.trim()
     if (isRemoteCompareAndSwapRejection(detail)) return false
@@ -850,9 +1036,9 @@ async function compareAndSwapRemote(
   }
   // Keep the local cache in step. A ref created by this push may not exist
   // locally yet: an all-zero expected then means "absent here too".
-  const local = await optionalRef(repo, ref)
+  const local = await optionalRef(repo, ref, baseEnv)
   if (local === expected || (local === undefined && isZeroOid(expected))) {
-    await compareAndSwap(repo, ref, next, expected)
+    await compareAndSwap(repo, ref, next, expected, baseEnv)
   }
   return true
 }
@@ -897,9 +1083,14 @@ function outcomesOf(updates: readonly RefUpdate[], unchanged: ReadonlySet<string
  * lines, and its failure is final. That is one process on success and at most
  * three on failure.
  */
-async function publishLocal(repo: string, updates: readonly RefUpdate[]): Promise<PublishResult> {
+async function publishLocal(
+  repo: string,
+  updates: readonly RefUpdate[],
+  baseEnv?: NodeJS.ProcessEnv,
+): Promise<PublishResult> {
   const attempt = (unchanged: ReadonlySet<string>) =>
-    run("git", durableGitArgs(repo, ["update-ref", "--stdin"]), {
+    run(selectedGit(), durableGitArgs(repo, ["update-ref", "--stdin"]), {
+      baseEnv,
       input: [
         "start",
         ...updates.map(({ ref, expect, oid }) =>
@@ -934,6 +1125,7 @@ async function publishLocal(repo: string, updates: readonly RefUpdate[]): Promis
   const current = await readExactRefs(
     repo,
     updates.map(({ ref }) => ref),
+    baseEnv,
   )
   const lost = updates
     .map(({ ref, expect, oid }) => ({ ref, expect, oid, tip: current.get(ref) }))
@@ -960,8 +1152,12 @@ async function publishLocal(repo: string, updates: readonly RefUpdate[]): Promis
 }
 
 /** Exactly these refs and their tips, in ONE `for-each-ref`; an absent ref is simply missing. */
-async function readExactRefs(repo: string, refs: readonly string[]): Promise<ReadonlyMap<string, Oid>> {
-  const output = await git(repo, ["for-each-ref", "--format=%(objectname) %(refname)", ...refs])
+async function readExactRefs(
+  repo: string,
+  refs: readonly string[],
+  baseEnv?: NodeJS.ProcessEnv,
+): Promise<ReadonlyMap<string, Oid>> {
+  const output = await git(repo, ["for-each-ref", "--format=%(objectname) %(refname)", ...refs], { baseEnv })
   const wanted = new Set(refs)
   const tips = new Map<string, Oid>()
   for (const line of decodeUtf8(output, "git for-each-ref").split("\n")) {
@@ -990,6 +1186,7 @@ async function publishRemote(
   updates: readonly RefUpdate[],
   remote: string,
   timeoutMs: number,
+  baseEnv?: NodeJS.ProcessEnv,
 ): Promise<PublishResult> {
   const args = [
     "push",
@@ -999,7 +1196,12 @@ async function publishRemote(
     remote,
     ...updates.map(({ ref, oid }) => (oid === null ? `:${ref}` : `${oid}:${ref}`)),
   ]
-  const result = await run("git", durableGitArgs(repo, args), { timeoutMs })
+  let result: GitResult
+  try {
+    result = await run(selectedGit(), durableGitArgs(repo, args), { baseEnv, timeoutMs })
+  } catch (error) {
+    throw remoteWriteOutcomeUnknown(updates, error)
+  }
   const detail = `${result.stdout.toString("utf8")}\n${result.stderr.toString("utf8")}`.trim()
   const fates = new Map<string, { flag: string; summary: string }>()
   for (const line of result.stdout.toString("utf8").split("\n")) {
@@ -1022,6 +1224,7 @@ async function publishRemote(
       remote,
       stale.map(({ ref }) => ref),
       timeoutMs,
+      baseEnv,
     )
     throw leaseConflict(stale.map(({ ref, expect }) => ({ ref, expect, observed: observed(ref) })))
   }
@@ -1053,8 +1256,9 @@ async function observeRemote(
   remote: string,
   refs: readonly string[],
   timeoutMs: number,
+  baseEnv?: NodeJS.ProcessEnv,
 ): Promise<(ref: string) => string> {
-  const result = await run("git", durableGitArgs(repo, ["ls-remote", remote, ...refs]), { timeoutMs })
+  const result = await run(selectedGit(), durableGitArgs(repo, ["ls-remote", remote, ...refs]), { baseEnv, timeoutMs })
   if (result.code !== 0) {
     const reason = `unread: git ls-remote failed (${result.code}): ${result.stderr.toString("utf8").trim()}`
     return () => reason
@@ -1066,6 +1270,77 @@ async function observeRemote(
     if (oid !== undefined && name !== undefined && refs.includes(name)) tips.set(name, oid)
   }
   return (ref) => tips.get(ref) ?? "absent"
+}
+
+function remoteWriteOutcomeUnknown(updates: readonly Pick<RefUpdate, "ref" | "expect">[], cause: unknown): Error {
+  const leases = updates.map(({ ref, expect }) => `${ref} expected ${expect}`).join("; ")
+  return new Error(
+    `remote write outcome is unknown for ${leases}; inspect the remote refs at their expected object ids before retrying`,
+    { cause },
+  )
+}
+
+async function diagnoseMissingObjectFetch(
+  repo: string,
+  remote: string,
+  original: unknown,
+  baseEnv?: NodeJS.ProcessEnv,
+): Promise<never> {
+  const message = original instanceof Error ? original.message : String(original)
+  if (!isMissingObjectFetchError(message)) throw original
+  const invoke = (args: readonly string[], options: RunGitOptions = {}) =>
+    run(selectedGit(), args, { ...options, baseEnv })
+  let dangling: readonly DanglingRef[]
+  try {
+    dangling = await danglingRefs(repo, { run: invoke })
+  } catch (diagnosis) {
+    throw new AggregateError(
+      [original, diagnosis],
+      `${message}; dangling-ref diagnosis failed: ${diagnosis instanceof Error ? diagnosis.message : String(diagnosis)}`,
+      { cause: original },
+    )
+  }
+  if (dangling.length === 0) throw original
+
+  const refs = dangling.map(({ ref }) => ref)
+  let advertised: GitResult
+  try {
+    advertised = await invoke(["-C", repo, "ls-remote", "--refs", remote, ...refs], {
+      timeoutMs: DANGLING_REF_SCAN_TIMEOUT_MS,
+    })
+    if (advertised.code !== 0) {
+      throw commandFailure(repo, ["ls-remote", "--refs", remote, ...refs], advertised)
+    }
+  } catch (diagnosis) {
+    throw new AggregateError(
+      [original, diagnosis],
+      `${message}; dangling-ref remote diagnosis failed: ${diagnosis instanceof Error ? diagnosis.message : String(diagnosis)}`,
+      { cause: original },
+    )
+  }
+  const remoteTips = new Map<string, string>()
+  try {
+    for (const line of advertised.stdout.toString("utf8").split("\n")) {
+      if (line === "") continue
+      const tab = line.indexOf("\t")
+      if (tab <= 0) throw new Error(`git ls-remote returned a malformed row: ${JSON.stringify(line)}`)
+      const ref = line.slice(tab + 1)
+      if (refs.includes(ref)) {
+        remoteTips.set(ref, validateOid(line.slice(0, tab), "git ls-remote returned a malformed id"))
+      }
+    }
+  } catch (diagnosis) {
+    throw new AggregateError(
+      [original, diagnosis],
+      `${message}; dangling-ref remote diagnosis failed: ${diagnosis instanceof Error ? diagnosis.message : String(diagnosis)}`,
+      { cause: original },
+    )
+  }
+  const facts = dangling
+    .map(({ ref, oid }) => `${ref} local=${oid} ${remote}=${remoteTips.get(ref) ?? "absent"} object missing locally`)
+    .join("; ")
+  const cure = dangling.map(({ ref, oid }) => `git update-ref -d ${ref} ${oid}`).join("; ")
+  throw new Error(`${facts}\nCure: ${cure}, then fetch again`, { cause: original })
 }
 
 /**
@@ -1096,6 +1371,7 @@ async function fetchRefs(
   refs: string | readonly string[],
   remote: string,
   timeoutMs: number,
+  baseEnv?: NodeJS.ProcessEnv,
 ): Promise<ReadonlyMap<string, Oid>> {
   const namespace = fetchedNamespace(remote)
   const local = (ref: string) => `${namespace}${ref.slice("refs/".length)}`
@@ -1117,20 +1393,27 @@ async function fetchRefs(
   // as listRefs includes it; the result is filtered by the same prefix rule.
   const refspecs =
     prefix === undefined ? named.map((ref) => `+${ref}:${local(ref)}`) : [`+${prefix}*:${local(prefix)}*`]
-  const output = await git(
-    repo,
-    [
-      "fetch",
-      "--verbose",
-      "--porcelain",
-      "--no-tags",
-      "--no-write-fetch-head",
-      ...(prefix === undefined ? [] : ["--prune"]),
-      remote,
-      ...refspecs,
-    ],
-    { timeoutMs },
-  )
+  let output: Buffer
+  try {
+    output = await git(
+      repo,
+      [
+        "fetch",
+        "--verbose",
+        "--porcelain",
+        "--no-tags",
+        "--no-write-fetch-head",
+        "--refmap=",
+        ...(prefix === undefined ? [] : ["--prune"]),
+        remote,
+        ...refspecs,
+      ],
+      { baseEnv, timeoutMs },
+    )
+  } catch (error) {
+    await diagnoseMissingObjectFetch(repo, remote, error, baseEnv)
+    throw error
+  }
   const tips = new Map<string, Oid>()
   for (const line of decodeUtf8(output, "git fetch --porcelain").split("\n")) {
     if (line === "") continue

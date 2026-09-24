@@ -151,6 +151,10 @@ export async function main(argv: string[], io: CliIo = {}): Promise<number> {
   try {
     const verb = args.shift()
     if (verb === undefined) throw new UsageError(`missing verb; expected one of ${VERBS.join(", ")}`)
+    if (verb === "--help" || verb === "-h") {
+      stdout.write(`Usage: gitomic <verb> <repo>#<ref> [args] [flags]\n\nVerbs: ${VERBS.join(", ")}\n`)
+      return OK
+    }
     switch (verb) {
       case "read":
         return await runRead(args, stdout, backend)
@@ -190,7 +194,7 @@ export type CliIo = {
   backend?: GitomicBackend
 }
 
-const VERBS = ["read", "ls", "grep", "log", "diff", "write", "rm", "mv", "apply", "project"] as const
+export const VERBS = ["read", "ls", "grep", "log", "diff", "write", "rm", "mv", "apply", "project"] as const
 
 const OK = 0
 const RUNTIME_ERROR = 1

@@ -142,13 +142,19 @@ describe("gitomic CLI — the repository's gate and one exit-code table", () => 
   test("with no identity anywhere the write still lands, authored by the committer, and stderr says why", async () => {
     vi.stubEnv("GIT_AUTHOR_NAME", undefined)
     vi.stubEnv("GIT_AUTHOR_EMAIL", undefined)
+    vi.stubEnv("GIT_COMMITTER_NAME", undefined)
+    vi.stubEnv("GIT_COMMITTER_EMAIL", undefined)
     vi.stubEnv("EMAIL", undefined)
     vi.stubEnv("GIT_CONFIG_GLOBAL", "/dev/null")
     vi.stubEnv("GIT_CONFIG_NOSYSTEM", "1")
-    // Refuse auto-detection from the host name, so the case is the same on every machine.
-    vi.stubEnv("GIT_CONFIG_COUNT", "1")
+    // Empty the worktree's local identity too; GIT_CONFIG_GLOBAL does not mask it.
+    vi.stubEnv("GIT_CONFIG_COUNT", "3")
     vi.stubEnv("GIT_CONFIG_KEY_0", "user.useConfigOnly")
     vi.stubEnv("GIT_CONFIG_VALUE_0", "true")
+    vi.stubEnv("GIT_CONFIG_KEY_1", "user.name")
+    vi.stubEnv("GIT_CONFIG_VALUE_1", "")
+    vi.stubEnv("GIT_CONFIG_KEY_2", "user.email")
+    vi.stubEnv("GIT_CONFIG_VALUE_2", "")
     const result = await run(backend, ["write", address(), "-m", "anonymous", `docs/a.md=${await file("a.md", "a\n")}`])
     expect(result.code).toBe(0)
     expect(result.stderr).toMatch(

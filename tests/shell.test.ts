@@ -3,17 +3,17 @@
 // @consumer default shell-backend users and optional iso reader users
 
 import { spawnSync } from "node:child_process"
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { chmod, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { delimiter, join } from "node:path"
 
 import { describe, expect, test } from "vitest"
 
-import { apply, createShellBackend, open, openReader } from "../src/index.js"
+import { apply, createShellBackend, danglingRefs, isMissingObjectFetchError, open, openReader } from "../src/index.js"
 import type { GitomicBackend } from "../src/index.js"
 import { createIsoBackend } from "../src/iso.js"
 import { isRemoteCompareAndSwapRejection } from "../src/shell.js"
-import { appendEmptyHistory, createBareRepo, git, gitWithInput } from "./helpers/git.js"
+import { appendEmptyHistory, createBareRepo, createRemoteRepos, git, gitWithInput } from "./helpers/git.js"
 
 const TRANSACTION_SEARCH_LIMIT = 1_024
 const gitInitHelp = spawnSync("git", ["init", "-h"], { encoding: "utf8" })
@@ -57,6 +57,8 @@ async function createGitWrapper(): Promise<{
       "const args = process.argv.slice(2)",
       "const log = process.env.GITOMIC_GIT_ENV_LOG",
       'if (log) appendFileSync(log, `${process.env.LC_ALL ?? "<unset>"}\\n`)',
+      "const fullLog = process.env.GITOMIC_GIT_FULL_ENV_LOG",
+      "if (fullLog) appendFileSync(fullLog, `${JSON.stringify({ GIT_DIR: process.env.GIT_DIR, GIT_TERMINAL_PROMPT: process.env.GIT_TERMINAL_PROMPT, LC_ALL: process.env.LC_ALL })}\\n`)",
       'if (args[0] === "--version") {',
       '  process.stdout.write(`git version ${process.env.GITOMIC_FAKE_GIT_VERSION ?? "2.39.0"}\\n`)',
       "  process.exit(0)",
@@ -64,6 +66,14 @@ async function createGitWrapper(): Promise<{
       'if (args.includes("--git-common-dir")) {',
       "  process.stdout.write(`${process.env.GITOMIC_FAKE_GITDIR}\\n`)",
       "  process.exit(0)",
+      "}",
+      'if (args.includes("ls-remote") && process.env.GITOMIC_FAKE_LS_REMOTE !== undefined) {',
+      "  process.stdout.write(process.env.GITOMIC_FAKE_LS_REMOTE)",
+      "  process.exit(0)",
+      "}",
+      'if (args.includes("push") && process.env.GITOMIC_HANG_PUSH === "true") {',
+      "  setInterval(() => {}, 1000)",
+      "  return",
       "}",
       'const updateRef = args.indexOf("update-ref")',
       "if (updateRef >= 0 && process.env.GITOMIC_UPDATE_REF_ERROR) {",
@@ -481,6 +491,189 @@ describe.sequential("shell backend failure boundaries", () => {
     } finally {
       restore()
       await wrapper.cleanup()
+    }
+  })
+
+  test("uses a snapshotted exact backend environment and applies its pins last", async () => {
+    const wrapper = await createGitWrapper()
+    const expected = "1".repeat(40)
+    const restore = replaceEnvironment({ GIT_DIR: "/ambient/poison" })
+    const baseEnv: NodeJS.ProcessEnv = {
+      GITOMIC_FAKE_GITDIR: "/tmp/gitomic-fake.git",
+      GITOMIC_FAKE_HEAD: expected,
+      GITOMIC_GIT_FULL_ENV_LOG: wrapper.log,
+      GIT_TERMINAL_PROMPT: "1",
+      LC_ALL: "caller-locale",
+      PATH: `${wrapper.bin}${delimiter}${process.env.PATH ?? ""}`,
+    }
+    const backend = createShellBackend({ baseEnv })
+    baseEnv.GIT_DIR = "/mutated/after-construction"
+    baseEnv.LC_ALL = "mutated-locale"
+    try {
+      await expect(backend.head("ignored", "refs/heads/main")).resolves.toBe(expected)
+      const environments = (await readFile(wrapper.log, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as Record<string, string>)
+      expect(environments.length).toBeGreaterThan(0)
+      expect(environments).toEqual(environments.map(() => ({ GIT_TERMINAL_PROMPT: "0", LC_ALL: "C" })))
+    } finally {
+      restore()
+      await wrapper.cleanup()
+    }
+  })
+
+  test("uses one selected executable for the version probe, repository resolution, reads and writes", async () => {
+    const pair = await createRemoteRepos()
+    const directory = await mkdtemp(join(tmpdir(), "gitomic-selected-git-"))
+    const selected = join(directory, "selected-git")
+    const calls = join(directory, "calls.jsonl")
+    const native = spawnSync("which", ["git"], { encoding: "utf8" }).stdout.trim()
+    expect(native).not.toBe("")
+    await symlink(process.execPath, join(directory, "node"))
+    await writeFile(
+      selected,
+      [
+        "#!/usr/bin/env node",
+        'const { appendFileSync } = require("node:fs")',
+        'const { spawnSync } = require("node:child_process")',
+        `appendFileSync(${JSON.stringify(calls)}, JSON.stringify(process.argv.slice(2)) + "\\n")`,
+        `const result = spawnSync(${JSON.stringify(native)}, process.argv.slice(2), { stdio: "inherit" })`,
+        "if (result.error) throw result.error",
+        "process.exit(result.status ?? 1)",
+      ].join("\n"),
+      { mode: 0o755 },
+    )
+    try {
+      const backend = createShellBackend({ gitExecutable: "selected-git", baseEnv: { PATH: directory } })
+      expect(await backend.head(pair.left, "refs/heads/main")).toBe(pair.initial)
+      expect((await backend.readHistory!(pair.left, [pair.initial], { limit: 1 }))[0]?.oid).toBe(pair.initial)
+      expect((await backend.listRefs!(pair.left, "refs/heads/", "origin")).get("refs/heads/main")).toBe(pair.initial)
+      await expect(
+        backend.publish!(pair.left, [{ ref: "refs/yrd/selected-git-test", expect: "0".repeat(40), oid: pair.initial }]),
+      ).resolves.toBeDefined()
+      const argv = (await readFile(calls, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as string[])
+      expect(argv.some((args) => args.includes("--version"))).toBe(true)
+      expect(argv.some((args) => args.includes("--git-common-dir"))).toBe(true)
+      expect(argv.some((args) => args.includes("update-ref"))).toBe(true)
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+      await pair.cleanup()
+    }
+  })
+
+  test("names an unusable selected executable at the first Git command", async () => {
+    await expect(
+      createShellBackend({ gitExecutable: "missing-gitomic-executable", baseEnv: { PATH: "/nonexistent" } }).head(
+        "ignored",
+        "refs/heads/main",
+      ),
+    ).rejects.toThrow("missing-gitomic-executable")
+  })
+
+  test("keeps selected executables separate across concurrent backends", async () => {
+    const first = await createGitWrapper()
+    const second = await createGitWrapper()
+    try {
+      await Promise.all([
+        rename(join(first.bin, "git"), join(first.bin, "selected-one")),
+        rename(join(second.bin, "git"), join(second.bin, "selected-two")),
+        symlink(process.execPath, join(first.bin, "node")),
+        symlink(process.execPath, join(second.bin, "node")),
+      ])
+      const one = createShellBackend({
+        gitExecutable: "selected-one",
+        baseEnv: { PATH: first.bin, GITOMIC_FAKE_GITDIR: "/tmp/one.git", GITOMIC_FAKE_HEAD: "1".repeat(40) },
+      })
+      const two = createShellBackend({
+        gitExecutable: "selected-two",
+        baseEnv: { PATH: second.bin, GITOMIC_FAKE_GITDIR: "/tmp/two.git", GITOMIC_FAKE_HEAD: "2".repeat(40) },
+      })
+      await expect(
+        Promise.all([one.head("ignored", "refs/heads/main"), two.head("ignored", "refs/heads/main")]),
+      ).resolves.toEqual(["1".repeat(40), "2".repeat(40)])
+    } finally {
+      await first.cleanup()
+      await second.cleanup()
+    }
+  })
+
+  test.each([
+    ["malformed", "broken refs/heads/main\n", /malformed id/u],
+    [
+      "duplicate",
+      `${"1".repeat(40)}\trefs/heads/main\n${"2".repeat(40)}\trefs/heads/main\n`,
+      /duplicate ref refs\/heads\/main/u,
+    ],
+  ])("refuses a %s remote ref listing", async (_kind, listing, expected) => {
+    const wrapper = await createGitWrapper()
+    try {
+      const backend = createShellBackend({
+        baseEnv: {
+          GITOMIC_FAKE_GITDIR: "/tmp/gitomic-fake.git",
+          GITOMIC_FAKE_LS_REMOTE: listing,
+          PATH: `${wrapper.bin}${delimiter}${process.env.PATH ?? ""}`,
+        },
+      })
+      await expect(backend.listRefs?.("ignored", "refs/heads/", "origin")).rejects.toThrow(expected)
+    } finally {
+      await wrapper.cleanup()
+    }
+  })
+
+  test("reports a timed-out remote write as unknown with every lease", async () => {
+    const wrapper = await createGitWrapper()
+    const ref = "refs/yrd/main/task/one"
+    const expected = "1".repeat(40)
+    try {
+      const backend = createShellBackend({
+        baseEnv: {
+          GITOMIC_FAKE_GITDIR: "/tmp/gitomic-fake.git",
+          GITOMIC_HANG_PUSH: "true",
+          PATH: `${wrapper.bin}${delimiter}${process.env.PATH ?? ""}`,
+        },
+        remoteTimeoutMs: 10,
+      })
+      await expect(
+        backend.publish?.("ignored", [{ ref, expect: expected, oid: "2".repeat(40) }], "origin"),
+      ).rejects.toThrow(`remote write outcome is unknown for ${ref} expected ${expected}`)
+    } finally {
+      await wrapper.cleanup()
+    }
+  })
+
+  test("owns the dangling-ref scan and turns Git's C-locale fetch pair into the established cure", async () => {
+    const pair = await createRemoteRepos()
+    try {
+      const tree = await git(pair.left, "rev-parse", `${pair.initial}^{tree}`)
+      const lost = await git(pair.left, "commit-tree", tree, "-p", pair.initial, "-m", "lost record")
+      const ref = "refs/yrd/main/task/lost@abc"
+      await git(pair.left, "update-ref", ref, lost)
+      await git(pair.left, "pack-refs", "--all")
+      await rm(join(pair.left, "objects", lost.slice(0, 2), lost.slice(2)))
+      expect(await danglingRefs(pair.left)).toEqual([{ ref, oid: lost }])
+
+      const advanced = await git(pair.remote, "commit-tree", tree, "-p", pair.initial, "-m", "remote advanced")
+      await git(pair.remote, "update-ref", "refs/heads/main", advanced)
+      const backend = createShellBackend()
+      const error = await backend.fetchRefs?.(pair.left, "refs/heads/main", "origin").then(
+        () => undefined,
+        (failure: unknown) => failure,
+      )
+      expect(error).toBeInstanceOf(Error)
+      if (!(error instanceof Error)) throw new Error("dangling fetch unexpectedly succeeded")
+      expect(error.message).toContain(`${ref} local=${lost} origin=absent object missing locally`)
+      expect(error.message).toContain(`git update-ref -d ${ref} ${lost}`)
+      const cause = error.cause instanceof Error ? error.cause.message : ""
+      for (const text of ["bad object refs/", "did not send all necessary objects"]) {
+        expect(cause).toContain(text)
+        expect(isMissingObjectFetchError(text)).toBe(true)
+      }
+    } finally {
+      await pair.cleanup()
     }
   })
 
