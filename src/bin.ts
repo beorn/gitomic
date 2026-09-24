@@ -1,5 +1,7 @@
 #!/usr/bin/env bun
+import { spawnSync } from "node:child_process"
 import { readFile } from "node:fs/promises"
+import { resolve } from "node:path"
 
 import { type Address, parseAddress } from "./address.js"
 import { assertTrailers, identProblem, validateOid } from "./git-object.js"
@@ -15,7 +17,9 @@ import {
   projectRemoteFirstFastForward,
   repositoryCandidate,
   runGit,
+  synchronizeCheckoutToCommit,
   worktreeDirtyPaths,
+  type CheckoutSyncOutcome,
   type Committed,
   type CommitMeta,
   type Edit,
@@ -23,6 +27,7 @@ import {
   type Ident,
   type Oid,
   type OpenOptions,
+  type RemoteFirstProjectionOutcome,
   type Snapshot,
   type Trailer,
 } from "./index.js"
@@ -136,8 +141,10 @@ import { decodeUtf8 } from "./utf8.js"
  *   ref unchanged.
  * - `4` a {@link CandidateRefused}: the repository's gate refused the write.
  *   Its reasons, then one machine line `code=candidate-refused base=<oid>
- *   reasons=<JSON array>`. Tree and ref unchanged. Or, for `project`, a
- *   stranded-local-commits or landed-but-unsynchronized refusal.
+ *   reasons=<JSON array>`. Tree and ref unchanged. Or, for `project`, an
+ *   unsynchronized or stranded checkout (stranded-local-commits,
+ *   landed-but-unsynchronized, worktree-update-refused, dirt-changed,
+ *   dirt-unverifiable).
  *
  * Deliberately not built here (need new grammar or library plumbing this CLI
  * does not add): `read --log`, `commit <checkout>`.
@@ -400,6 +407,7 @@ async function runWrite(
   const message = requireStringFlag(flags, "-m", "-m <message>")
   const writer = optionalStringFlag(flags, "--writer")
   const checkoutPath = optionalStringFlag(flags, "--checkout")
+  const expectedDirtyPaths = checkoutPath !== undefined ? worktreeDirtyPaths(checkoutPath) : []
   const pairs = parsePathFilePairs(positionals.slice(1))
   const knownPaths = new Set(pairs.map((pair) => pair.path))
   const expect = parseExpectPairs(repeated.get("--expect") ?? [])
@@ -420,10 +428,18 @@ async function runWrite(
   }
 
   const committed = await apply(store, base, edits, message, await writeOptions(attribution, repository, stderr))
+  let projectionOutcome: ProjectOutcomeReceipt | undefined
   if (checkoutPath !== undefined) {
-    await projectAfterWrite(checkoutPath, committed.oid, repository, base, stderr)
+    projectionOutcome = await projectAfterWrite(
+      checkoutPath,
+      committed.oid,
+      repository,
+      base,
+      expectedDirtyPaths,
+      stderr,
+    )
   }
-  writeReceipt(stdout, stderr, committed, flags.get("--json") === true)
+  writeReceipt(stdout, stderr, committed, flags.get("--json") === true, projectionOutcome)
   return OK
 }
 
@@ -560,6 +576,7 @@ async function runApply(
   }
   if (message === undefined) throw new UsageError("missing -m <message>")
   const attribution = parseAttribution(author, trailers)
+  const expectedDirtyPaths = checkoutPath !== undefined ? worktreeDirtyPaths(checkoutPath) : []
 
   using repository = await openAddressFor(address, backend)
   const store = await open({ ...repository, ...(writer === undefined ? {} : { writer }) })
@@ -570,10 +587,18 @@ async function runApply(
     edits.push(await parseClause(clause, snapshot, stdin, address))
   }
   const committed = await apply(store, startBase, edits, message, await writeOptions(attribution, repository, stderr))
+  let projectionOutcome: ProjectOutcomeReceipt | undefined
   if (checkoutPath !== undefined) {
-    await projectAfterWrite(checkoutPath, committed.oid, repository, startBase, stderr)
+    projectionOutcome = await projectAfterWrite(
+      checkoutPath,
+      committed.oid,
+      repository,
+      startBase,
+      expectedDirtyPaths,
+      stderr,
+    )
   }
-  writeReceipt(stdout, stderr, committed, asJson)
+  writeReceipt(stdout, stderr, committed, asJson, projectionOutcome)
   return OK
 }
 
@@ -803,10 +828,57 @@ async function removalPrecondition(
  * line goes to stderr as `report: <line>`, so stdout stays the bare oid. A
  * refusal is unaffected: facts only on stderr, exit 3 or 4.
  */
-function writeReceipt(stdout: CliWriter, stderr: CliWriter, committed: Committed, asJson: boolean): void {
+type ProjectOutcomeReceipt = { readonly ok: boolean; readonly kind: string; readonly error?: string }
+
+function isSameRepository(pathA: string, pathB: string): boolean {
+  if (resolve(pathA) === resolve(pathB)) return true
+  try {
+    const resA = spawnSync("git", ["-C", pathA, "rev-parse", "--path-format=absolute", "--git-common-dir"], {
+      encoding: "utf8",
+    })
+    const resB = spawnSync("git", ["-C", pathB, "rev-parse", "--path-format=absolute", "--git-common-dir"], {
+      encoding: "utf8",
+    })
+    if ((resA.status ?? 1) === 0 && (resB.status ?? 1) === 0) {
+      const gitDirA = (resA.stdout ?? "").trim()
+      const gitDirB = (resB.stdout ?? "").trim()
+      if (gitDirA.length > 0 && gitDirA === gitDirB) return true
+    }
+  } catch {
+    // ignore
+  }
+  return false
+}
+
+/**
+ * A write verb's success output: the committed oid on its own line, or — with
+ * `--json` — a one-line `{"oid":…,"retries":…,"report":[…]}` receipt of the oid,
+ * how many CAS retries the landing took, and the repository gate's report (the
+ * output contract for an agent scripting the door). In plain mode each report
+ * line goes to stderr as `report: <line>`, so stdout stays the bare oid. A
+ * refusal is unaffected: facts only on stderr, exit 3 or 4.
+ *
+ * When `--checkout` is given, the `--json` receipt also carries `projection: <kind>`
+ * so a caller can inspect the projection outcome directly.
+ */
+function writeReceipt(
+  stdout: CliWriter,
+  stderr: CliWriter,
+  committed: Committed,
+  asJson: boolean,
+  projectionOutcome?: ProjectOutcomeReceipt,
+): void {
   const report = committed.report ?? []
   if (asJson) {
-    stdout.write(`${JSON.stringify({ oid: committed.oid, retries: committed.retries, report })}\n`)
+    const receipt: Record<string, unknown> = {
+      oid: committed.oid,
+      retries: committed.retries,
+      report,
+    }
+    if (projectionOutcome !== undefined) {
+      receipt.projection = projectionOutcome.kind
+    }
+    stdout.write(`${JSON.stringify(receipt)}\n`)
     return
   }
   stdout.write(`${committed.oid}\n`)
@@ -818,21 +890,37 @@ async function projectAfterWrite(
   to: Oid,
   repository: OpenOptions,
   startBase: Oid,
+  expectedDirtyPaths: readonly string[],
   stderr: CliWriter,
-): Promise<void> {
-  const dirtyPaths = worktreeDirtyPaths(checkoutPath)
+): Promise<ProjectOutcomeReceipt> {
   const storeRef = repository.ref.startsWith("refs/heads/") ? repository.ref : `refs/heads/${repository.ref}`
-  const outcome = await projectRemoteFirstFastForward({
-    repoRoot: checkoutPath,
-    to,
-    ref: storeRef,
-    remote: repository.remote ?? "origin",
-    expectedDirtyPaths: dirtyPaths,
-    preTransactTip: startBase,
-  })
+  const isLocal = isSameRepository(checkoutPath, repository.repo)
+
+  let outcome: CheckoutSyncOutcome | RemoteFirstProjectionOutcome
+  if (isLocal) {
+    outcome = synchronizeCheckoutToCommit({
+      repoRoot: checkoutPath,
+      from: startBase,
+      to,
+      ref: storeRef,
+      expectedDirtyPaths,
+    })
+  } else {
+    outcome = await projectRemoteFirstFastForward({
+      repoRoot: checkoutPath,
+      to,
+      ref: storeRef,
+      remote: repository.remote ?? "origin",
+      expectedDirtyPaths,
+      preTransactTip: startBase,
+    })
+  }
+
   if (!outcome.ok) {
     stderr.write(`gitomic: projection failed: ${outcome.error}\nkind=${outcome.kind}\n`)
+    return { ok: false, kind: outcome.kind, error: outcome.error }
   }
+  return { ok: true, kind: outcome.kind }
 }
 
 async function runProject(args: string[], stdout: CliWriter, stderr: CliWriter): Promise<number> {
@@ -846,7 +934,15 @@ async function runProject(args: string[], stdout: CliWriter, stderr: CliWriter):
   const remote = optionalStringFlag(flags, "--remote") ?? "origin"
   let ref = optionalStringFlag(flags, "--ref") ?? "refs/heads/main"
   if (!ref.startsWith("refs/heads/")) ref = `refs/heads/${ref}`
-  const timeoutMs = flags.get("--timeout") ? Number(flags.get("--timeout")) : undefined
+
+  const timeoutRaw = flags.get("--timeout")
+  let timeoutMs: number | undefined
+  if (timeoutRaw !== undefined) {
+    if (typeof timeoutRaw !== "string" || !/^\d+$/u.test(timeoutRaw) || Number(timeoutRaw) <= 0) {
+      throw new UsageError(`--timeout must be a positive integer in milliseconds, got ${JSON.stringify(timeoutRaw)}`)
+    }
+    timeoutMs = Number(timeoutRaw)
+  }
 
   const outcome = await projectCheckout({
     repoRoot: checkoutPath,
@@ -860,12 +956,20 @@ async function runProject(args: string[], stdout: CliWriter, stderr: CliWriter):
     return OK
   }
 
-  if (outcome.kind === "stranded-local-commits" || outcome.kind === "landed-but-unsynchronized") {
+  const UNSYNCHRONIZED_KINDS = new Set([
+    "stranded-local-commits",
+    "landed-but-unsynchronized",
+    "worktree-update-refused",
+    "dirt-changed",
+    "dirt-unverifiable",
+  ])
+
+  if (UNSYNCHRONIZED_KINDS.has(outcome.kind)) {
     const localOnlyStr =
       outcome.kind === "stranded-local-commits" ? ` localOnly=${JSON.stringify(outcome.localOnly)}` : ""
-    stderr.write(
-      `${outcome.error}\nkind=${outcome.kind} local=${outcome.localTip} to=${outcome.landedOid}${localOnlyStr}\n`,
-    )
+    const localTipStr = outcome.localTip ?? ""
+    const toStr = "landedOid" in outcome ? outcome.landedOid : (outcome.to ?? "")
+    stderr.write(`${outcome.error}\nkind=${outcome.kind} local=${localTipStr} to=${toStr}${localOnlyStr}\n`)
     return CANDIDATE_REFUSED
   }
 
