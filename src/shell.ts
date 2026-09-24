@@ -1366,6 +1366,19 @@ export function fetchedNamespace(remote: string): string {
   return `refs/gitomic/fetched/${key}/`
 }
 
+const FETCH_RACE_ATTEMPTS = 3
+
+/** A fetch that failed only because a concurrent fetch in the same repository raced it for a ref in `namespace`. */
+function lostFetchedRefRace(error: unknown, namespace: string): boolean {
+  const detail = error instanceof Error ? error.message : ""
+  const refs = [
+    ...detail.matchAll(
+      /(?:^|: )error: cannot lock ref '([^']+)': (?:is at [0-9a-f]+ but expected [0-9a-f]+|reference is missing but expected [0-9a-f]+|Unable to create '[^']*\.lock': File exists\.?)$/gm,
+    ),
+  ].map((match) => match[1] ?? "")
+  return refs.length > 0 && refs.every((ref) => ref.startsWith(namespace))
+}
+
 /**
  * ONE `git fetch --verbose --porcelain` of every ref under a prefix, or of exactly
  * the named refs, into {@link fetchedNamespace}. Verbose porcelain prints a line
@@ -1400,26 +1413,29 @@ async function fetchRefs(
   // as listRefs includes it; the result is filtered by the same prefix rule.
   const refspecs =
     prefix === undefined ? named.map((ref) => `+${ref}:${local(ref)}`) : [`+${prefix}*:${local(prefix)}*`]
-  let output: Buffer
-  try {
-    output = await git(
-      repo,
-      [
-        "fetch",
-        "--verbose",
-        "--porcelain",
-        "--no-tags",
-        "--no-write-fetch-head",
-        "--refmap=",
-        ...(prefix === undefined ? [] : ["--prune"]),
-        remote,
-        ...refspecs,
-      ],
-      { baseEnv, timeoutMs },
-    )
-  } catch (error) {
-    await diagnoseMissingObjectFetch(repo, remote, error, baseEnv)
-    throw error
+  const fetchArgs = [
+    "fetch",
+    "--verbose",
+    "--porcelain",
+    "--no-tags",
+    "--no-write-fetch-head",
+    "--refmap=",
+    ...(prefix === undefined ? [] : ["--prune"]),
+    remote,
+    ...refspecs,
+  ]
+  let output: Buffer | undefined
+  for (let attempt = 1; output === undefined; attempt++) {
+    try {
+      output = await git(repo, fetchArgs, { baseEnv, timeoutMs })
+    } catch (error) {
+      // Another fetch in this repository moved or held one of our private
+      // fetched refs between this fetch's read and its lock. The namespace is
+      // only a cache of remote tips, so fetching again reads them afresh.
+      if (attempt < FETCH_RACE_ATTEMPTS && lostFetchedRefRace(error, namespace)) continue
+      await diagnoseMissingObjectFetch(repo, remote, error, baseEnv)
+      throw error
+    }
   }
   const tips = new Map<string, Oid>()
   for (const line of decodeUtf8(output, "git fetch --porcelain").split("\n")) {
