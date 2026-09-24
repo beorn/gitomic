@@ -534,9 +534,9 @@ describe("gitomic CLI — history reads", () => {
     let files = 0
     const failingFilter: GitomicBackend = {
       ...backend,
-      readFiles: async (repo, oid, prefix) => {
+      readTree: async (repo, oid, prefix) => {
         if (++files === 3) throw new Error("later tree unavailable")
-        return backend.readFiles(repo, oid, prefix)
+        return backend.readTree(repo, oid, prefix)
       },
     }
     const filtered = await run(failingFilter, ["log", ADDRESS, "counter", "-n", "2", ...json])

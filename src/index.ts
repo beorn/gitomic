@@ -12,19 +12,11 @@ import {
   waitForPoll,
 } from "./options.js"
 import { CandidateRefused, Conflict, EditDoesNotApply, GitTimeout, RetriesExhausted } from "./errors.js"
-import { cloneCommitProvenance, cloneIdent, GITOMIC_IDENT, objectOid, validateOid } from "./git-object.js"
-import {
-  assertGitPrefixMatched,
-  assertTreeShape,
-  isGitPrefixNotFoundError,
-  isPublicPath,
-  normalizePath,
-  normalizePrefix,
-} from "./path.js"
-import { readLazyBase, type LazyBase } from "./lazy-base.js"
+import { cloneCommitProvenance, cloneIdent, GITOMIC_IDENT, validateOid } from "./git-object.js"
+import { assertTreeShape, isGitPrefixNotFoundError, normalizePath, normalizePrefix } from "./path.js"
+import { createLazyBase, readLazyBase, type LazyBase } from "./lazy-base.js"
 import { createShellBackend } from "./shell.js"
 import type {
-  BlobValue,
   Candidate,
   Trailer,
   Change,
@@ -44,7 +36,7 @@ import type {
   Store,
   Update,
 } from "./types.js"
-import { assertUtf8, decodeUtf8 } from "./utf8.js"
+import { assertUtf8 } from "./utf8.js"
 
 export { CandidateRefused, Conflict, EditDoesNotApply, GitTimeout, RetriesExhausted }
 export type { EditKind, PreconditionType } from "./errors.js"
@@ -399,49 +391,36 @@ function makeSnapshot(
   const pinned = (commit === undefined ? resolveCurrent().then(backendOid) : Promise.resolve(validateOid(commit))).then(
     (oid) => ({ oid, algorithm: oid.length === 64 ? ("sha256" as const) : ("sha1" as const) }),
   )
-  const loads = new Map<string, Promise<ReadonlyMap<string, BlobValue>>>()
-  const load = (prefix: string): Promise<ReadonlyMap<string, BlobValue>> => {
-    for (const [loadedPrefix, files] of loads) {
-      if (prefix.startsWith(loadedPrefix)) return files
+  // One lazy base per prefix read: the listing is scoped through readTree(prefix), and a value is fetched by oid
+  // only when `get` asks for it — `oid`, `has` and `keys` answer from the listing alone.
+  const loads = new Map<string, Promise<LazyBase>>()
+  const load = (prefix: string): Promise<LazyBase> => {
+    for (const [loadedPrefix, base] of loads) {
+      if (prefix.startsWith(loadedPrefix)) return base
     }
-    const files = pinned.then(async ({ oid }) => {
+    const base = pinned.then(async ({ oid }) => {
       try {
-        const scoped = checkedFiles(
-          await context.backend.readFiles(context.repo, oid, prefix === "" ? undefined : prefix),
-        )
-        assertGitPrefixMatched(
-          [...scoped.keys()].filter((path) => path.startsWith(prefix)).length,
-          context.repo,
-          oid,
-          prefix,
-        )
-        return scoped
+        return await readLazyBase(context.backend, context.repo, oid, prefix === "" ? undefined : prefix)
       } catch (error) {
-        if (prefix !== "" && isGitPrefixNotFoundError(error)) return new Map<string, BlobValue>()
+        if (prefix !== "" && isGitPrefixNotFoundError(error)) {
+          return createLazyBase(context.backend, context.repo, oid, new Map())
+        }
         throw error
       }
     })
-    loads.set(prefix, files)
-    return files
+    loads.set(prefix, base)
+    return base
   }
   return {
     async get(path) {
       const normalized = normalizePath(path)
-      return readValue((await load(normalized)).get(normalized), normalized)
+      return (await load(normalized)).get(normalized)
     },
     async oid(path) {
       const normalized = normalizePath(path)
-      const value = (await load(normalized)).get(normalized)
-      if (value === undefined) return undefined
-      // The oid is computed from the stored bytes directly — never through
-      // readValue — so it answers for a binary blob `get` would refuse to
-      // decode. A string round-trips to its UTF-8 bytes (gitomic's write
-      // guarantee), which is exactly the blob `apply`'s `expect` compares.
-      return objectOid(
-        "blob",
-        typeof value === "string" ? Buffer.from(value, "utf8") : Buffer.from(value),
-        (await pinned).algorithm,
-      )
+      // Straight from the listing — never through a decoded value — so it answers for a binary blob `get` would
+      // refuse, and it is exactly the blob `apply`'s `expect` compares.
+      return (await load(normalized)).oid(normalized)
     },
     async has(path) {
       const normalized = normalizePath(path)
@@ -449,8 +428,9 @@ function makeSnapshot(
     },
     async keys(prefix = "") {
       const normalized = normalizePrefix(prefix)
-      return [...(await load(normalized)).keys()]
-        .filter((path) => isPublicPath(path) && path.startsWith(normalized))
+      return (await load(normalized))
+        .publicPaths()
+        .filter((path) => path.startsWith(normalized))
         .sort()
     },
   }
@@ -470,31 +450,6 @@ async function* watchRef(context: ReaderContext, options: RefTipWatchOptions): A
     }
     if (!(await waitForPoll(pollIntervalMs, options.signal))) return
   }
-}
-
-/**
- * Validate the shape of a tree read, without forcing every value through UTF-8.
- *
- * Paths are still strict: `assertTreeShape` rejects reserved, colliding and
- * malformed paths for the whole tree. Values are checked only when the backend
- * already decoded them — a byte value is a blob gitomic cannot represent as a
- * v1 value, and refusing it HERE would make the entire tree unreadable and
- * every transaction on it impossible. The refusal moves to the point of use:
- * `get` on that path throws, while `keys`, `has`, `set` and `delete` work, and
- * an untouched binary blob rides into the next commit unchanged.
- */
-function checkedFiles(files: ReadonlyMap<string, BlobValue>): ReadonlyMap<string, BlobValue> {
-  assertTreeShape(files.keys())
-  for (const [path, content] of files) {
-    if (typeof content === "string") assertUtf8(content, `Git blob at ${JSON.stringify(path)}`)
-  }
-  return files
-}
-
-/** Decode one stored value at the point a caller actually reads it. */
-function readValue(value: BlobValue | undefined, path: string): string | undefined {
-  if (value === undefined || typeof value === "string") return value
-  return decodeUtf8(value, `Git blob at ${JSON.stringify(path)}`)
 }
 
 function assertNextTree(base: LazyBase, changes: ReadonlyMap<string, string | undefined>): void {

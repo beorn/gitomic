@@ -55,10 +55,11 @@ describe("mem backend", () => {
     expect(committed.oid).toMatch(/^[0-9a-f]{40}$/)
     expect(committed.oid).not.toBe(initial)
     expect(await store.at(committed.oid).get("hello.txt")).toBe("hello\n")
-    await expect(backend.readFiles("unit-test", committed.oid, "hello")).resolves.toEqual(
-      new Map([["hello.txt", "hello\n"]]),
-    )
-    await expect(backend.readFiles("unit-test", committed.oid, "missing/")).rejects.toThrow(
+    const listing = await backend.readTree("unit-test", committed.oid, "hello")
+    expect([...listing.keys()]).toEqual(["hello.txt"])
+    const helloOid = (listing.get("hello.txt") as { oid: string }).oid
+    expect((await backend.readBlobs("unit-test", [helloOid])).get(helloOid)).toBe("hello\n")
+    await expect(backend.readTree("unit-test", committed.oid, "missing/")).rejects.toThrow(
       /prefix "missing\/" matched no files.+repository "unit-test".+commit/iu,
     )
   })

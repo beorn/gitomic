@@ -22,6 +22,8 @@ export type LazyBase = {
   readonly listing: TreeListing
   readonly algorithm: "sha1" | "sha256"
   has(path: string): boolean
+  /** The blob oid at `path` from the listing — no value read, so it answers for a binary blob too. */
+  oid(path: string): Oid | undefined
   /** The public paths of the listing, unsorted. */
   publicPaths(): string[]
   /** The stored value at `path`, decoded and validated at this read; `undefined` when absent. */
@@ -34,8 +36,18 @@ export type LazyBase = {
 
 type Waiter = { readonly path: string; resolve(value: BlobValue): void; reject(error: unknown): void }
 
-export async function readLazyBase(backend: GitomicBackend, repo: string, parent: Oid): Promise<LazyBase> {
-  const listing = await backend.readTree(repo, parent)
+/** Read `commit`'s listing (whole, or one prefix's) and build the lazy base on it. */
+export async function readLazyBase(
+  backend: GitomicBackend,
+  repo: string,
+  commit: Oid,
+  prefix?: string,
+): Promise<LazyBase> {
+  return createLazyBase(backend, repo, commit, await backend.readTree(repo, commit, prefix))
+}
+
+/** A lazy base over a listing already read: shape-validated here, values fetched by oid on demand. */
+export function createLazyBase(backend: GitomicBackend, repo: string, parent: Oid, listing: TreeListing): LazyBase {
   assertTreeShape(listing.keys())
   const algorithm = parent.length === 64 ? "sha256" : "sha1"
   const memo = new Map<Oid, Promise<BlobValue>>()
@@ -97,6 +109,7 @@ export async function readLazyBase(backend: GitomicBackend, repo: string, parent
     listing,
     algorithm,
     has: (path) => listing.has(path),
+    oid: (path) => listing.get(path)?.oid,
     publicPaths: () => [...listing.keys()].filter(isPublicPath),
     async get(path) {
       const value = await stored(path)

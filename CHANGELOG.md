@@ -21,10 +21,16 @@
   blobs it names instead of decoding every blob of the tree on every attempt
   (0.9 s and 175 MB per write on a 19,670-blob tree, measured). `apply`
   prefetches its edit paths in one read; reads issued in one microtask
-  coalesce into one read. `readFiles` remains as the composite Snapshot reads
-  use. All four known implementers are updated (shell, mem, iso, and one
-  out-of-tree wrapper that projects the shell listing); any other backend must
-  add both members.
+  coalesce into one read. Snapshot reads the same lazy base through
+  `readTree(prefix)`, so `oid`, `has` and `keys` never read a blob. All four
+  known implementers are updated (shell, mem, iso, and one out-of-tree wrapper
+  that projects the shell listing); any other backend must add both members.
+
+### Removed
+
+- `GitomicBackend.readFiles`. Its two callers (transactions and Snapshot) read
+  through `readTree` and `readBlobs`; a backend that wrapped `readFiles` to
+  filter or observe reads wraps `readTree` instead.
 - Author and committer as data (`Ident = { name, email }`). `open` and
   `openEvents` take a `committer`; `transact`, `apply`, and the events `transact`
   and `append` take a per-call `author`, which defaults to the committer.
