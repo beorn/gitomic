@@ -398,14 +398,12 @@ async function prepareStore(options: OpenOptions): Promise<StoreContext> {
     if (fetchRemote === undefined || compareAndSwapRemote === undefined) {
       throw new TypeError("this backend cannot arbitrate remotely; omit remote or use the shell/iso backend")
     }
+    // The kept ref is derived state: a cache of origin's tip that another process sharing this repository may move
+    // at any moment. A lost cache update is never a failure: this attempt builds on `fetched`, and a stale kept
+    // ref costs the next attempt one refused lease and a refresh (hh 25615, @cto: a moved local ref is re-read).
     const syncLocal = async (fetched: Oid): Promise<void> => {
       const local = backendOid(await backend.head(repo, ref))
-      if (local !== fetched) {
-        const cached = await backend.compareAndSwap(repo, ref, fetched, local)
-        if (!cached && options.refresh === "on-rejection") {
-          throw new Error(`cannot refresh local cache ${ref} in ${JSON.stringify(repo)}: local ref moved`)
-        }
-      }
+      if (local !== fetched) await backend.compareAndSwap(repo, ref, fetched, local)
     }
     const refreshRemote = async (): Promise<Oid> => {
       const fetched = backendOid(await fetchRemote(repo, ref, remote))
@@ -430,13 +428,8 @@ async function prepareStore(options: OpenOptions): Promise<StoreContext> {
       }
       return { tip: backendOid(tip), tips }
     }
-    swap = async (next, expected) => {
-      const landed = await compareAndSwapRemote(repo, ref, next, expected, remote)
-      if (landed && options.refresh === "on-rejection" && (await readLocal()) !== next) {
-        throw new Error(`remote CAS accepted ${ref} at ${next}, but local cache in ${JSON.stringify(repo)} moved`)
-      }
-      return landed
-    }
+    // A lease the remote accepted is landed, whatever the kept copy did afterward (hh 25615).
+    swap = async (next, expected) => compareAndSwapRemote(repo, ref, next, expected, remote)
   }
   // With beside refs the publish is the backend's MULTI publish of the ref and every beside ref, or none. For
   // THIS door a Conflict naming any of them is a lost lease and returns false, so the loop re-reads and the
@@ -451,10 +444,10 @@ async function prepareStore(options: OpenOptions): Promise<StoreContext> {
       if (remote !== undefined && options.refresh === "on-rejection") {
         // Raw MULTI leaves local refs untouched for staged event publishers.
         // A Store's primary ref is its next attempt's kept base, so advance
-        // that cache after this Store's accepted atomic publish.
-        if (!(await backend.compareAndSwap(repo, ref, next, expected))) {
-          throw new Error(`remote MULTI accepted ${ref} at ${next}, but local cache in ${JSON.stringify(repo)} moved`)
-        }
+        // that cache after this Store's accepted atomic publish. If another
+        // process moved it first, the publish still landed: the next attempt
+        // re-reads the kept ref (hh 25615).
+        await backend.compareAndSwap(repo, ref, next, expected)
       }
       return true
     } catch (error) {

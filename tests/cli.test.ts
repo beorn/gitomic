@@ -293,6 +293,19 @@ describe("gitomic CLI — the kept copy per URL (--cache-dir, GITOMIC_CACHE_DIR)
     expect(await git(fixture.repo, "rev-parse", "main")).toBe(fixture.initial)
   })
 
+  test.each([
+    [["--cache-dir"], "--cache-dir requires a value"],
+    [["--cache-dir", "/tmp/one", "--cache-dir", "/tmp/two"], "--cache-dir may be given once"],
+  ] as const)("a malformed --cache-dir refuses as a usage error before any clone (%j)", async (extra, message) => {
+    // The flag goes last, so the value-less spelling has nothing after it to swallow.
+    const file = await fileWith("a.md", "first\n")
+    const result = await invoke(["apply", `${url}#main`, "-m", "a", "put", "a.md", file, ...extra])
+    expect(result.code).toBe(2)
+    expect(result.stderr).toContain(message)
+    expect(cloneTargets(result.trace)).toEqual([])
+    expect(await git(fixture.repo, "rev-parse", "main")).toBe(fixture.initial)
+  })
+
   test("an unwritable kept dir refuses loudly naming the path, and never falls back to a temporary clone", async () => {
     const locked = join(workdir, "locked")
     fs.mkdirSync(locked, { mode: 0o500 })

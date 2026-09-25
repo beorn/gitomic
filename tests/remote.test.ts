@@ -306,7 +306,134 @@ describe("remote arbitration", () => {
     }
   })
 
-  test("Store verifies an accepted MULTI receipt if its local cache CAS loses", async () => {
+  /**
+   * @failure hh 25615: km's on-rejection Store and the gitomic CLI (refresh "always") shared one kept copy; when the
+   *          CLI moved the kept ref between km's accepted push and its local check, a write that LANDED on origin
+   *          was reported "publication … unknown … local cache moved" (review2: 2 of 900). @cto's rule: a
+   *          publication whose lease the remote accepted is applied whatever the kept copy did afterward; the kept
+   *          copy is derived state, re-read on the next attempt, never reported as a failure.
+   */
+  describe("an on-rejection Store sharing its kept copy with an always writer (hh 25615)", () => {
+    /** Another process's write through the same kept copy, as the CLI makes it. */
+    async function otherWriterMoves(repo: string, path: string): Promise<void> {
+      const other = await open({ repo, ref: "main", remote: "origin", writer: "cli" })
+      await other.transact(async (map) => map.set(path, "from the other writer\n"), `other ${path}`)
+    }
+
+    test("an accepted push stands when the other writer moves the kept ref before the local check", async () => {
+      const fixture = await createRemoteRepos()
+      try {
+        const shell = createShellBackend()
+        const fetchRemote = vi.fn(shell.fetchRemote!)
+        let armed = true
+        const backend: GitomicBackend = {
+          ...shell,
+          fetchRemote,
+          async compareAndSwapRemote(...args) {
+            const landed = await shell.compareAndSwapRemote!(...args)
+            if (landed && armed) {
+              armed = false
+              await otherWriterMoves(fixture.left, "cli.md")
+            }
+            return landed
+          },
+        }
+        const store = await open({
+          repo: fixture.left,
+          ref: "main",
+          remote: "origin",
+          refresh: "on-rejection",
+          backend,
+        })
+        await store.transact(async (map) => map.set("km.md", "from km\n"), "km write")
+        // Accepted is landed: no "unknown" publication, so no receipt search re-fetches origin.
+        expect(fetchRemote).toHaveBeenCalledTimes(0)
+        expect(await git(fixture.remote, "show", "main:km.md")).toBe("from km")
+        expect(await git(fixture.remote, "show", "main:cli.md")).toBe("from the other writer")
+        // The next attempt re-reads the kept copy and lands on top of the other writer.
+        await store.transact(async (map) => map.set("km2.md", "again\n"), "km write 2")
+        expect(await git(fixture.remote, "show", "main:km2.md")).toBe("again")
+      } finally {
+        await fixture.cleanup()
+      }
+    })
+
+    test("an accepted MULTI stands when the other writer moves the kept ref before the cache update", async () => {
+      const fixture = await createRemoteRepos()
+      try {
+        const shell = createShellBackend()
+        const fetchRemote = vi.fn(shell.fetchRemote!)
+        let armed = true
+        const backend: GitomicBackend = {
+          ...shell,
+          fetchRemote,
+          async publish(...args) {
+            const published = await shell.publish!(...args)
+            if (armed) {
+              armed = false
+              await otherWriterMoves(fixture.left, "cli.md")
+            }
+            return published
+          },
+        }
+        const store = await open({
+          repo: fixture.left,
+          ref: "main",
+          remote: "origin",
+          refresh: "on-rejection",
+          backend,
+        })
+        await store.transact(async (map) => map.set("km.md", "from km\n"), "km multi", {
+          beside: ({ next }) => [{ ref: "refs/heads/companion", expect: null, oid: next }],
+        })
+        expect(fetchRemote).toHaveBeenCalledTimes(0)
+        expect(await git(fixture.remote, "show", "main:km.md")).toBe("from km")
+        expect(await git(fixture.remote, "show", "main:cli.md")).toBe("from the other writer")
+      } finally {
+        await fixture.cleanup()
+      }
+    })
+
+    test("a refresh proceeds when the other writer moves the kept ref under the cache update", async () => {
+      const fixture = await createRemoteRepos()
+      try {
+        // Origin moves first through another clone, so this Store's kept base is stale and its lease is refused.
+        await otherWriterMoves(fixture.right, "ahead.md")
+        const shell = createShellBackend()
+        let armed = true
+        const backend: GitomicBackend = {
+          ...shell,
+          async compareAndSwap(...args) {
+            if (armed) {
+              armed = false
+              await otherWriterMoves(fixture.left, "cli.md")
+            }
+            return shell.compareAndSwap(...args)
+          },
+        }
+        const store = await open({
+          repo: fixture.left,
+          ref: "main",
+          remote: "origin",
+          refresh: "on-rejection",
+          backend,
+        })
+        await store.transact(async (map) => map.set("km.md", "from km\n"), "km write")
+        for (const [path, content] of [
+          ["ahead.md", "from the other writer"],
+          ["cli.md", "from the other writer"],
+          ["km.md", "from km"],
+        ]) {
+          expect(await git(fixture.remote, "show", `main:${path}`)).toBe(content)
+        }
+      } finally {
+        await fixture.cleanup()
+      }
+    })
+  })
+
+  // hh 25615 (@cto): an accepted publication is landed whatever the kept copy did afterward; no receipt search.
+  test("an accepted MULTI stands when its local cache CAS loses, with no receipt search", async () => {
     const fixture = await createRemoteRepos()
     try {
       const shell = createShellBackend()
@@ -330,13 +457,13 @@ describe("remote arbitration", () => {
       })
       expect(result.oid).toBe(await git(fixture.remote, "rev-parse", "main"))
       expect(update).toHaveBeenCalledTimes(1)
-      expect(fetchRemote).toHaveBeenCalledTimes(1)
+      expect(fetchRemote).toHaveBeenCalledTimes(0)
     } finally {
       await fixture.cleanup()
     }
   })
 
-  test("Store reports a cache ref that keeps moving after accepted MULTI", async () => {
+  test("a cache ref that never takes the update costs only a re-read: every accepted MULTI lands", async () => {
     const fixture = await createRemoteRepos()
     try {
       const shell = createShellBackend()
@@ -347,12 +474,15 @@ describe("remote arbitration", () => {
         },
       }
       const store = await open({ repo: fixture.left, ref: "main", remote: "origin", refresh: "on-rejection", backend })
-      const outcome = store.transact(async (map) => map.set("multi", "landed"), "multi", {
+      await store.transact(async (map) => map.set("multi", "landed"), "multi", {
         beside: ({ next }) => [{ ref: "refs/heads/companion", expect: null, oid: next }],
       })
-      await expect(outcome).rejects.toBeInstanceOf(AggregateError)
-      await expect(outcome).rejects.toThrow(/local cache.*moved/)
       expect(await git(fixture.remote, "show", "main:multi")).toBe("landed")
+      // The kept ref stayed behind: the next attempt's lease is refused, it refreshes, and it lands.
+      await store.transact(async (map) => map.set("second", "landed too"), "second", {
+        beside: ({ next }) => [{ ref: "refs/heads/companion-2", expect: null, oid: next }],
+      })
+      expect(await git(fixture.remote, "show", "main:second")).toBe("landed too")
     } finally {
       await fixture.cleanup()
     }
