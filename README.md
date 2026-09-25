@@ -581,6 +581,16 @@ trusted: gitomic.trust = 3f9a1c… (local git config)
 
 Trust pins the declaration's text, not the scripts it names. A trusted `check = sh ./check.sh` runs whatever `check.sh` the repository holds later; direnv has the same property. Name commands by absolute paths outside the repository to close it: hh's STATE declaration names checks in CODE `main` (`/hh/dev/tools/…`), so no STATE commit can change the code that judges it.
 
+**Publishing through a remote.** A repository whose checkout is only a projection of a remote says so in the same file:
+
+```ini
+[publish]
+	remote = origin   # the remote writes land at
+	branch = main     # optional; default main
+```
+
+A write verb addressed to a checkout of it (a path, or a `file://` URL, to a non-bare repository) whose base declares `[publish]` for the addressed branch exits `2` and writes nothing, since it would land on the checkout's local ref and push nothing. The refusal names the address to use, read from the checkout's `remote.<remote>.url`: `gitomic apply '<url>#main' --base <oid> --writer '@seat' -m <message> put <path> <file>`; when that remote is not configured, it says so. A bare repository, a URL to one, and a branch `[publish]` does not name are written as before. The section is data and runs nothing, but it is part of the declaration, so adding it changes the blob and needs `gitomic trust` again.
+
 ### Projecting a checkout
 
 Writes land object-side, so a checkout of the written branch goes stale. `gitomic project <path>` fetches the branch (`--remote`, default `origin`; `--ref`, default `main`) and fast-forwards the checkout's index and working tree to it, preserving unrelated dirt; `apply --checkout <path>` does the same right after its write. One stdout line names the outcome: `kind=<kind> local=<oid> to=<oid>`.
@@ -597,7 +607,7 @@ Product output — content, paths, matches, the oid or receipt — goes to stdou
 | ---- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `0`  | ok                                                                                                                                                                                |
 | `1`  | a runtime/data error — a read miss, invalid UTF-8, a backend failure, `RetriesExhausted`; the subject names itself                                                                |
-| `2`  | a usage error — unknown verb, a missing or malformed argument or flag, a bad address                                                                                              |
+| `2`  | a usage error — unknown verb, a missing or malformed argument or flag, a bad address, a write to a `[publish]` checkout                                                           |
 | `3`  | a CAS precondition refusal (`EditDoesNotApply`), reported facts-only on stderr: the kind, path, expected and actual oids, and both commits — never an owner, role, or remediation |
 | `4`  | the repository's gate refused the write (`CandidateRefused`): its reasons, then one line `code=candidate-refused base=<oid> reasons=<JSON array>`; the ref does not move          |
 | `5`  | the checkout lock stayed busy past the wait — transient; nothing was written, then one line `kind=checkout-lock-busy path=<path>`                                                 |

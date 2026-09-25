@@ -109,6 +109,48 @@ async function untrustedDeclaration(options: RepositoryCandidateOptions, base: s
   )
 }
 
+/**
+ * Where a repository publishes: `[publish] remote = <name>` (and `branch`, default `main`) in the same declaration.
+ * It is data that runs nothing: it only makes a write addressed to a checkout of the repository refuse, since such a
+ * write lands on the checkout's local ref and pushes nothing.
+ */
+export type PublishDeclaration = { readonly remote: string; readonly branch: string }
+
+/** The `[publish]` the declaration at `base` makes, or `undefined` when it has no declaration or no such section. */
+export async function readPublishDeclaration(repo: string, base: string): Promise<PublishDeclaration | undefined> {
+  const result = await runGit([
+    "-C",
+    repo,
+    "config",
+    "--blob",
+    `${base}:${CANDIDATE_CONFIG}`,
+    "--get-regexp",
+    "^publish\\.",
+  ])
+  // Exit 1 with no output: no [publish] keys (the file may still declare [candidate]).
+  if (result.code === 1 && result.stdout.length === 0) return undefined
+  if (result.code !== 0) {
+    throw new Error(
+      `${CANDIDATE_CONFIG}: git config could not read it at ${base}: ${result.stderr.toString("utf8").trim()}`,
+    )
+  }
+  let remote: string | undefined
+  let branch = "main"
+  for (const line of decodeUtf8(result.stdout, CANDIDATE_CONFIG).split("\n")) {
+    if (line === "") continue
+    const space = line.indexOf(" ")
+    const key = space < 0 ? line : line.slice(0, space)
+    const value = space < 0 ? "" : line.slice(space + 1).trim()
+    if (key === "publish.remote") remote = value
+    else if (key === "publish.branch") branch = value
+    else throw new Error(`${CANDIDATE_CONFIG} at ${base}: unknown [publish] key '${key}' (allowed: remote, branch)`)
+  }
+  if (remote === undefined || remote === "" || branch === "") {
+    throw new Error(`${CANDIDATE_CONFIG} at ${base}: [publish] needs a remote name and a non-empty branch`)
+  }
+  return { remote, branch }
+}
+
 type Declaration = { derive?: string; check?: string; timeoutMs: number }
 
 /** The candidate that runs the repository's own declared derive and check commands. Shell-backed repositories only. */

@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { spawnSync } from "node:child_process"
 import { isAbsolute, resolve } from "node:path"
+import { fileURLToPath } from "node:url"
 
 import type { CheckoutLock } from "./checkout-lock.js"
 import { type Address, parseAddress } from "./address.js"
@@ -16,6 +17,7 @@ import {
   openRemoteRepository,
   projectCheckout,
   projectRemoteFirstFastForward,
+  readPublishDeclaration,
   readRepositoryDeclaration,
   repositoryCandidate,
   trustDeclaration,
@@ -157,7 +159,11 @@ import { decodeUtf8 } from "./utf8.js"
  *   transport/environment projection failure (fetch-failed,
  *   ancestry-unverifiable, ref-advance-refused, wrong-branch).
  * - `2` a usage error (unknown verb, a missing or malformed argument or
- *   flag, a bad address).
+ *   flag, a bad address). That includes a write verb addressed to a
+ *   checkout (a path, or a file:// URL, of a non-bare repository) whose
+ *   base declares `[publish]` in `.gitomic.conf`: it would land on the
+ *   checkout's local ref and push nothing, so it is refused naming the
+ *   remote's address. Tree and ref unchanged.
  * - `3` an {@link EditDoesNotApply} CAS precondition refusal, reported as
  *   facts only on stderr — never an owner, role, or remediation. Tree and
  *   ref unchanged.
@@ -455,6 +461,7 @@ async function runWrite(
   using repository = await openAddressFor(address, source)
   const store = await open({ ...repository, ...(writer === undefined ? {} : { writer }) })
   const base = await store.head()
+  await refuseCheckoutOfPublishedRepository(repository, store, base)
   const snapshot = store.at(base)
   const edits: Edit[] = []
   for (const { path, file } of pairs) {
@@ -505,6 +512,7 @@ async function runRm(args: string[], stdout: CliWriter, stderr: CliWriter, sourc
   using repository = await openAddressFor(address, source)
   const store = await open({ ...repository, ...(writer === undefined ? {} : { writer }) })
   const base = await store.head()
+  await refuseCheckoutOfPublishedRepository(repository, store, base)
   const snapshot = store.at(base)
   const edits: Edit[] = []
   for (const path of paths) {
@@ -535,6 +543,7 @@ async function runMv(args: string[], stdout: CliWriter, stderr: CliWriter, sourc
   using repository = await openAddressFor(address, source)
   const store = await open({ ...repository, ...(writer === undefined ? {} : { writer }) })
   const base = await store.head()
+  await refuseCheckoutOfPublishedRepository(repository, store, base)
   const expect = await store.at(base).oid(from)
   if (expect === undefined) throw new Error(`source path not found: ${JSON.stringify(from)} at ${address}`)
   const committed = await apply(
@@ -620,6 +629,7 @@ async function runApply(
   using repository = await openAddressFor(address, source)
   const store = await open({ ...repository, ...(writer === undefined ? {} : { writer }) })
   const startBase = base ?? (await store.head())
+  await refuseCheckoutOfPublishedRepository(repository, store, startBase)
   const snapshot = store.at(startBase)
   const edits: Edit[] = []
   for (const clause of splitClauses(queue)) {
@@ -1219,6 +1229,55 @@ async function runTrust(args: string[], stdout: CliWriter, source: AddressSource
 }
 
 // --- opening the address ---------------------------------------------------
+
+/**
+ * A write addressed to a checkout of a repository whose base declares `[publish]` lands on the checkout's local ref and
+ * pushes nothing (hh, 2026-09-25: `gitomic apply /hh#main` held every km write for 17 minutes). It is refused as an addressing
+ * error, exit 2, naming the one form that writes the remote. The declaration is read at the write's base, the commit the
+ * gate reads too. A checkout is a path or a file:// URL to a non-bare repository; a bare repository is where writes land,
+ * a URL to anything else is the remote, and a branch `[publish]` does not name is not refused.
+ */
+async function refuseCheckoutOfPublishedRepository(
+  repository: OpenedAddress,
+  store: { at(commit: Oid): Snapshot },
+  base: Oid,
+): Promise<void> {
+  const checkout =
+    repository.url === undefined
+      ? repository.repo
+      : repository.url.startsWith("file://")
+        ? fileURLToPath(repository.url)
+        : undefined
+  if (checkout === undefined || !(await store.at(base).has(CANDIDATE_CONFIG))) return
+  const publish = await readPublishDeclaration(repository.repo, base)
+  const branch = repository.ref.replace(/^refs\/heads\//u, "")
+  if (publish === undefined || publish.branch !== branch) return
+  const bare = await runGit(["-C", checkout, "rev-parse", "--is-bare-repository"])
+  if (bare.code !== 0) {
+    throw new Error(`cannot tell whether ${checkout} is a checkout: ${bare.stderr.toString("utf8").trim()}`)
+  }
+  if (bare.stdout.toString("utf8").trim() === "true") return
+  const declared = `${checkout} publishes through remote '${publish.remote}' (${CANDIDATE_CONFIG} [publish] at base ${base})`
+  const configured = await runGit(["-C", checkout, "config", "--get", `remote.${publish.remote}.url`])
+  if (configured.code === 1 && configured.stdout.length === 0) {
+    throw new UsageError(
+      `${declared}, but remote.${publish.remote}.url is not set in ${checkout}, so there is no address to name; ` +
+        `configure it, then write with gitomic apply '<remote.${publish.remote}.url>#${publish.branch}' --base <oid> ` +
+        "--writer '@seat' -m <message> put <path> <file>",
+    )
+  }
+  if (configured.code !== 0) {
+    throw new Error(
+      `cannot read remote.${publish.remote}.url in ${checkout}: ${configured.stderr.toString("utf8").trim()}`,
+    )
+  }
+  const url = configured.stdout.toString("utf8").trim()
+  throw new UsageError(
+    `${declared}, so a write addressed to the checkout would land on its local ${publish.branch} and push nothing. ` +
+      `Write to the remote instead: gitomic apply '${url}#${publish.branch}' --base <oid> --writer '@seat' ` +
+      "-m <message> put <path> <file>",
+  )
+}
 
 /** An opened address: the store options, plus the URL when `repo` is a throwaway clone of a remote. */
 type OpenedAddress = OpenOptions & Disposable & { readonly ref: string; readonly url?: string }

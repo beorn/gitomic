@@ -55,6 +55,7 @@ export {
   CANDIDATE_CONFIG,
   DEFAULT_CANDIDATE_TIMEOUT_MS,
   TRUST_CONFIG,
+  readPublishDeclaration,
   readRepositoryDeclaration,
   repositoryCandidate,
   trustDeclaration,
