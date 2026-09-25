@@ -37,7 +37,13 @@ export type Snapshot = Pick<GitMap, "get" | "has" | "keys"> & {
  * precondition-checking update can name the exact commit it refused on. A
  * callback that ignores the second argument behaves exactly as before.
  */
-export type Update = (map: GitMap, base: Oid) => Promise<void>
+/**
+ * What an attempt knows besides the tree: the tips of {@link TransactOptions.fetch}'s refs as this attempt read
+ * them. A listed ref the remote lacks is ABSENT from the map (`get` is undefined), never a throw; the store's own
+ * ref is not in it and stays strict (its absence fails the refresh).
+ */
+export type AttemptContext = { readonly tips: ReadonlyMap<string, Oid> }
+export type Update = (map: GitMap, base: Oid, attempt?: AttemptContext) => Promise<void>
 
 export type Committed = {
   oid: Oid
@@ -360,10 +366,11 @@ export type BesideAttempt = {
   /** The attempt's tree, for a beside ref that needs to read what was written. */
   readonly map: GitMap
   /**
-   * The tips of {@link TransactOptions.fetch}'s refs as this attempt read them (null: absent), read in the same
-   * fetch as the store's ref, so a beside ref's `expect` is one attempt old at most.
+   * The tips of {@link TransactOptions.fetch}'s refs as this attempt read them, in the same fetch as the store's
+   * ref, so a beside ref's `expect` is one attempt old at most. A listed ref the remote lacks is absent from the
+   * map (`get` is undefined): `beside` treats that as create, with a null expect.
    */
-  readonly tips: ReadonlyMap<string, Oid | null>
+  readonly tips: ReadonlyMap<string, Oid>
 }
 /**
  * Another ref to land in the SAME atomic publish as a transaction's commit:
@@ -390,10 +397,13 @@ export type TransactOptions = {
    */
   readonly beside?: (attempt: BesideAttempt) => Promise<readonly BesideRef[]> | readonly BesideRef[]
   /**
-   * Full names of refs whose tips every attempt reads afresh and hands to `beside` as `tips` (absent: null). On
-   * a remote store they ride the SAME fetch as the store's ref — one process per attempt, never one per ref;
-   * on a local store they are read from the repository. Refuses at the call for the store's own ref, a name
-   * outside `refs/`, a repeat, or a backend that cannot read them (remote: `fetchRefs`; local: `listRefs`).
+   * Full names of refs whose tips every attempt reads afresh and hands to `update` and `beside` as `tips`. On a
+   * remote store they ride the SAME `fetchRefs` call as the store's ref — one process per attempt, never one per
+   * ref; on a local store they are read from the repository. Absence is tolerated for the LISTED refs only: a
+   * listed ref the remote lacks is absent from `tips` (`get` is undefined), never a throw, while the store's
+   * own ref stays strict as always (the refresh fails when the remote lacks it). Refuses at the call for the
+   * store's own ref, a name outside `refs/`, a repeat, or a backend that cannot read them (remote: `fetchRefs`;
+   * local: `listRefs`).
    */
   readonly fetch?: readonly string[]
   /** Git's author for this one transaction. Defaults to the store's committer. */

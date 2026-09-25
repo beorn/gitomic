@@ -260,7 +260,7 @@ type StoreContext = {
   clock: Clock
   refresh(): Promise<Oid>
   /** `refresh` plus the tips of `fetch`'s refs (null: absent), read in the same fetch on a remote store. */
-  refreshWith(fetch: readonly string[]): Promise<{ readonly tip: Oid; readonly tips: ReadonlyMap<string, Oid | null> }>
+  refreshWith(fetch: readonly string[]): Promise<{ readonly tip: Oid; readonly tips: ReadonlyMap<string, Oid> }>
   publish(next: Oid, expected: Oid, beside: readonly RefUpdate[]): Promise<boolean>
   nextSeq(): number
 }
@@ -322,8 +322,11 @@ async function prepareStore(options: OpenOptions): Promise<StoreContext> {
       const tip = await refresh()
       const listRefs = backend.listRefs
       if (listRefs === undefined) throw new TypeError("fetch on a local store needs a backend with listRefs")
-      const tips = new Map<string, Oid | null>()
-      for (const name of fetch) tips.set(name, (await listRefs(repo, name)).get(name) ?? null)
+      const tips = new Map<string, Oid>()
+      for (const name of fetch) {
+        const found = (await listRefs(repo, name)).get(name)
+        if (found !== undefined) tips.set(name, found)
+      }
       return { tip, tips }
     }
     swap = async (next, expected) => backend.compareAndSwap(repo, ref, next, expected)
@@ -350,8 +353,12 @@ async function prepareStore(options: OpenOptions): Promise<StoreContext> {
       const tip = fetched.get(ref)
       if (tip === undefined) throw new Error(`${remote} does not have ${ref}`)
       await syncLocal(backendOid(tip))
-      const tips = new Map<string, Oid | null>()
-      for (const name of fetch) tips.set(name, fetched.get(name) ?? null)
+      // Absence is tolerated for the listed refs only: one the remote lacks stays out of the map.
+      const tips = new Map<string, Oid>()
+      for (const name of fetch) {
+        const found = fetched.get(name)
+        if (found !== undefined) tips.set(name, found)
+      }
       return { tip: backendOid(tip), tips }
     }
     swap = async (next, expected) => compareAndSwapRemote(repo, ref, next, expected, remote)
@@ -429,7 +436,7 @@ async function transact(
   // transaction, so they must share one `(instance, seq)` receipt.
   let seq: number | undefined
   // The tips `fetch` named, as the current attempt's refresh read them; empty when nothing was asked for.
-  let tips: ReadonlyMap<string, Oid | null> = new Map()
+  let tips: ReadonlyMap<string, Oid> = new Map()
   return runCasLoop<Oid, Committed>({
     label: `${context.repo} ${context.ref}`,
     retryBudgetMs: context.retryBudgetMs,
@@ -450,7 +457,7 @@ async function transact(
       const prefetch = (update as PrefetchingUpdate)[PREFETCH_PATHS]
       if (prefetch !== undefined) await base.prefetch(prefetch)
       const { map, changes, modeSources } = makeOverlay(base)
-      await update(map, parent)
+      await update(map, parent, { tips })
       const commitInput = (effective: ReadonlyMap<string, string | undefined>, commitMessage: string) => {
         seq ??= context.nextSeq()
         assertNextTree(base, effective)

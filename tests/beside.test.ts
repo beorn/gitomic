@@ -211,7 +211,7 @@ describe("beside: refs that land in the same atomic publish as the transaction",
     await backend.publish?.(fixture.right, [{ ref: ITEM, expect: "0".repeat(40), oid: itemTip }], "origin")
     const store = await open({ repo: fixture.left, ref: MAIN, writer: "left", backend, remote: "origin" })
     const spy = vi.spyOn(childProcess, "spawn")
-    const seen: ReadonlyMap<string, Oid | null>[] = []
+    const seen: ReadonlyMap<string, Oid>[] = []
     const committed = await store.transact(async (map) => map.set("a.md", "a\n"), "write a", {
       fetch: [LOG, ITEM],
       beside: (attempt) => {
@@ -224,7 +224,8 @@ describe("beside: refs that land in the same atomic publish as the transaction",
     })
     expect(committed.retries).toBe(0)
     expect(seen).toHaveLength(1)
-    expect(seen[0]?.get(LOG)).toBeNull()
+    expect(seen[0]?.has(LOG)).toBe(false)
+    expect(seen[0]?.get(LOG)).toBeUndefined()
     expect(seen[0]?.get(ITEM)).toBe(itemTip)
     // One attempt, one fetch process: the store's ref and both named refs together, the absent one tolerated.
     expect(fetchSpawns(spy)).toBe(1)
@@ -246,7 +247,7 @@ describe("beside: refs that land in the same atomic publish as the transaction",
     const store = await open({ repo: "beside-fetch-mem", ref: MAIN, writer: "rail", backend })
     const seed = await store.transact(async (map) => map.set("seed.md", "seed\n"), "seed")
     await backend.publish?.("beside-fetch-mem", [{ ref: ITEM, expect: "0".repeat(40), oid: seed.oid }])
-    let tips: ReadonlyMap<string, Oid | null> | undefined
+    let tips: ReadonlyMap<string, Oid> | undefined
     await store.transact(async (map) => map.set("a.md", "a\n"), "write a", {
       fetch: [LOG, ITEM],
       beside: (attempt) => {
@@ -254,9 +255,9 @@ describe("beside: refs that land in the same atomic publish as the transaction",
         return []
       },
     })
-    expect(tips?.get(LOG)).toBeNull()
+    expect(tips?.get(LOG)).toBeUndefined()
     expect(tips?.get(ITEM)).toBe(seed.oid)
-    let plain: ReadonlyMap<string, Oid | null> | undefined
+    let plain: ReadonlyMap<string, Oid> | undefined
     await store.transact(async (map) => map.set("b.md", "b\n"), "write b", {
       beside: (attempt) => {
         plain = attempt.tips
@@ -305,7 +306,7 @@ describe("beside: refs that land in the same atomic publish as the transaction",
       fetch: [LOG],
       beside: async (attempt) => {
         const at = attempt.tips.get(LOG)
-        if (at === null || at === undefined) throw new Error("the log tip was fetched")
+        if (at === undefined) throw new Error("the log tip was fetched")
         const reader = await openEvents({ repo: fixture.left, ref: LOG, backend })
         titles = (await reader.events({ at })).map((event) => event.title ?? "")
         return [{ ref: LOG, expect: at, oid: attempt.next }]
@@ -319,5 +320,58 @@ describe("beside: refs that land in the same atomic publish as the transaction",
         call[0] === "git" && ((call[1] as string[]).includes("fetch") || (call[1] as string[]).includes("ls-remote")),
     )
     expect(remoteCalls).toHaveLength(1)
+  })
+
+  test("absence is tolerated for the listed refs only: the store's own ref missing on the remote still fails the refresh", async () => {
+    const fixture = await createRemoteRepos()
+    cleanups.push(fixture.cleanup)
+    const backend = createShellBackend()
+    const FEATURE = "refs/heads/feature"
+    const seedStore = await open({ repo: fixture.left, ref: MAIN, writer: "left", backend, remote: "origin" })
+    const tip = (await seedStore.transact(async (map) => map.set("f.md", "f\n"), "seed")).oid
+    // The store's ref exists on the remote and locally when the store opens...
+    await backend.publish?.(fixture.left, [{ ref: FEATURE, expect: "0".repeat(40), oid: tip }], "origin")
+    await backend.publish?.(fixture.left, [{ ref: FEATURE, expect: "0".repeat(40), oid: tip }])
+    const store = await open({ repo: fixture.left, ref: FEATURE, writer: "left", backend, remote: "origin" })
+    // ...and the remote loses it before the write. A listed absent ref would be fine; this is not.
+    await backend.publish?.(fixture.left, [{ ref: FEATURE, expect: tip, oid: null }], "origin")
+    let ran = false
+    await expect(
+      store.transact(
+        async (map, _base, attempt) => {
+          ran = true
+          expect(attempt?.tips.get(LOG)).toBeUndefined()
+          map.set("g.md", "g\n")
+        },
+        "write g",
+        { fetch: [LOG] },
+      ),
+    ).rejects.toThrow(/origin does not have refs\/heads\/feature/u)
+    expect(ran).toBe(false)
+  })
+
+  test("update sees the same tips the attempt read, so an idempotency check can read a fetched tail before the commit", async () => {
+    const backend = createMemBackend()
+    const store = await open({ repo: "beside-update-tips", ref: MAIN, writer: "rail", backend })
+    const seed = await store.transact(async (map) => map.set("seed.md", "seed\n"), "seed")
+    await backend.publish?.("beside-update-tips", [{ ref: LOG, expect: "0".repeat(40), oid: seed.oid }])
+    const fromUpdate: (Oid | undefined)[] = []
+    const fromBeside: (Oid | undefined)[] = []
+    await store.transact(
+      async (map, _base, attempt) => {
+        fromUpdate.push(attempt?.tips.get(LOG))
+        map.set("h.md", "h\n")
+      },
+      "write h",
+      {
+        fetch: [LOG, ITEM],
+        beside: (attempt) => {
+          fromBeside.push(attempt.tips.get(LOG), attempt.tips.get(ITEM))
+          return []
+        },
+      },
+    )
+    expect(fromUpdate).toEqual([seed.oid])
+    expect(fromBeside).toEqual([seed.oid, undefined])
   })
 })

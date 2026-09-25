@@ -14,7 +14,8 @@
   function, `shapeRefUpdates`.
 - `fetch` on `Store.transact`: refs whose tips every attempt reads in the SAME
   fetch as the store's ref (remote) or from the repository (local), handed to
-  `beside` as `tips` with `null` for a ref that does not exist yet. `fetchRefs`
+  `update` (third argument) and `beside` as `tips`; a listed ref that does not
+  exist yet is absent from the map, while the store's own ref stays strict. `fetchRefs`
   takes `{ absent: "omit" }`: a named ref the remote lacks is fetched as a
   pattern and left out instead of failing the whole fetch. `events({ at })`
   reads a chain at a tip already fetched, with no remote round trip.
