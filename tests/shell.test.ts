@@ -696,8 +696,16 @@ describe.sequential("shell backend failure boundaries", () => {
       `error: cannot lock ref 'refs/gitomic/fetched/origin/heads/main': is at ${"3".repeat(40)} but expected ${"4".repeat(40)}`,
     ],
     [
-      "git 2.55's batched fetch",
+      "git 2.55's batched fetch, a rival moved it",
       "error: fetching ref refs/gitomic/fetched/origin/heads/main failed: incorrect old value provided",
+    ],
+    [
+      "git 2.55's batched fetch, a rival created it",
+      "error: fetching ref refs/gitomic/fetched/origin/heads/main failed: reference already exists",
+    ],
+    [
+      "git 2.55's batched fetch, a rival deleted it",
+      "error: fetching ref refs/gitomic/fetched/origin/heads/main failed: reference does not exist",
     ],
   ])(
     "retries a fetch that lost a fetched-ref race reported as %s and returns the remote tip",
@@ -823,6 +831,13 @@ describe.sequential("shell backend failure boundaries", () => {
       `git fetch failed (1): error: cannot lock ref 'refs/gitomic/fetched/origin/heads/main': reference is missing but expected ${a}`,
       `fatal: update_ref failed for ref 'refs/heads/x': cannot lock ref 'refs/heads/x': is at ${b} but expected ${a}`,
       "fatal: Unable to create '/r/.git/index.lock': File exists.",
+      // git 2.55's batched fetch words a per-ref transaction failure itself (builtin/fetch.c,
+      // "fetching ref %s failed: %s"); three of its six reasons are another writer's move (25850).
+      "error: fetching ref refs/gitomic/fetched/origin/heads/a failed: incorrect old value provided",
+      "git fetch failed (1): error: fetching ref refs/gitomic/fetched/origin/heads/b failed: reference already exists",
+      "error: fetching ref refs/gitomic/fetched/origin/heads/c failed: reference does not exist",
+      // Not a lease or a lock: no form, so its callers throw as they always did.
+      "error: fetching ref refs/gitomic/fetched/origin/heads/d failed: refname conflict",
     ]
     expect(parseRefLockFailures(lines.join("\n"))).toEqual([
       { reporter: "fatal: ", ref: "refs/heads/main", form: "moved", at: a, expected: b },
@@ -841,6 +856,9 @@ describe.sequential("shell backend failure boundaries", () => {
         at: b,
         expected: a,
       },
+      { reporter: "error: ", ref: "refs/gitomic/fetched/origin/heads/a", form: "moved" },
+      { reporter: "git fetch failed (1): error: ", ref: "refs/gitomic/fetched/origin/heads/b", form: "exists" },
+      { reporter: "error: ", ref: "refs/gitomic/fetched/origin/heads/c", form: "missing" },
     ])
     expect(parseRefLockFailures("fatal: Unable to create '/r/.git/index.lock': File exists.")).toEqual([])
     expect(parseRefLockFailures("")).toEqual([])

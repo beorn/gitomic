@@ -1039,7 +1039,7 @@ async function findTransaction(
  * One `cannot lock ref` line of git's stderr. `reporter` is the text before it on the same line
  * ("fatal: ", "fatal: prepare: ", "remote: error: ", "git fetch failed (1): error: "), which says
  * which git process refused; `form` is why:
- * - "moved": the ref is at `at`, not the `expected` value its lease named;
+ * - "moved": the ref is at `at`, not the `expected` value its lease named (a batched fetch's line names neither);
  * - "exists": a create found the ref already there;
  * - "missing": the ref is absent although a value was expected;
  * - "held": another writer holds the ref's `.lock` file.
@@ -1052,13 +1052,30 @@ export type RefLockFailure = Readonly<{
   expected?: string
 }>
 
+/**
+ * Two line shapes. `cannot lock ref '<ref>': <why>` is git's lock and lease refusal everywhere. git 2.55's batched
+ * fetch words a per-ref transaction failure as `fetching ref <ref> failed: <reason>` (builtin/fetch.c) with six
+ * reasons; the three that mean another writer acted first map onto the same forms, without the ids the first shape
+ * carries, and the other three (refname conflict, invalid new value, expected symref) match nothing (25850).
+ */
 const REF_LOCK_FAILURE =
-  /^(.*?)cannot lock ref '([^']+)': (?:is at ([0-9a-f]+) but expected ([0-9a-f]+)|(reference already exists)|reference is missing but expected ([0-9a-f]+)|(Unable to create '[^']*\.lock': File exists\.?))\s*$/gm
+  /^(.*?)(?:cannot lock ref '([^']+)': (?:is at ([0-9a-f]+) but expected ([0-9a-f]+)|(reference already exists)|reference is missing but expected ([0-9a-f]+)|(Unable to create '[^']*\.lock': File exists\.?))|fetching ref (\S+) failed: (incorrect old value provided|reference already exists|reference does not exist))\s*$/gm
 
-/** Every `cannot lock ref` line in git's stderr, in order; the one reading of that text in this file. */
+const FETCH_REF_FORM = {
+  "incorrect old value provided": "moved",
+  "reference already exists": "exists",
+  "reference does not exist": "missing",
+} as const
+
+/** Every ref lock or lease failure line in git's stderr, in order; the one reading of that text in this file. */
 export function parseRefLockFailures(text: string): RefLockFailure[] {
   return [...text.matchAll(REF_LOCK_FAILURE)].map((match): RefLockFailure => {
-    const [, reporter = "", ref = "", at, expected, exists, missingExpected, held] = match
+    const [, reporter = "", lockRef, at, expected, exists, missingExpected, held, fetchRef, fetchReason] = match
+    if (fetchRef !== undefined && fetchReason !== undefined) {
+      return { reporter, ref: fetchRef, form: FETCH_REF_FORM[fetchReason as keyof typeof FETCH_REF_FORM] }
+    }
+    if (lockRef === undefined) throw new Error(`ref lock failure line matched with no ref: ${match[0]}`)
+    const ref = lockRef
     if (at !== undefined && expected !== undefined) return { reporter, ref, form: "moved", at, expected }
     if (exists !== undefined) return { reporter, ref, form: "exists" }
     if (missingExpected !== undefined) return { reporter, ref, form: "missing", expected: missingExpected }
@@ -1533,24 +1550,14 @@ export function fetchedNamespace(remote: string): string {
 const FETCH_RACE_ATTEMPTS = 3
 
 /**
- * git 2.55's batched fetch reports a per-ref transaction failure in its own words, not as `cannot lock ref`: a rival
- * fetch that moved (or created) the ref first reads `fetching ref <ref> failed: incorrect old value provided` (25843).
- */
-const FETCH_REF_MOVED = /(?:^|: )error: fetching ref (\S+) failed: incorrect old value provided\s*$/gm
-
-/**
  * How a fetch lost a race with a concurrent fetch in the same repository for refs in `namespace`:
  * "moved" when the other fetch already moved a ref (retry at once), "held" when it still holds a
  * ref's lock (wait for it first). Undefined when the failure is anything else.
  */
 function lostFetchedRefRace(error: unknown, namespace: string): "moved" | "held" | undefined {
   const detail = error instanceof Error ? error.message : ""
-  const lost = [
-    ...parseRefLockFailures(detail).filter(
-      ({ reporter, form }) => /(?:^|: )error: $/.test(reporter) && form !== "exists",
-    ),
-    ...[...detail.matchAll(FETCH_REF_MOVED)].map(([, ref = ""]) => ({ ref, form: "moved" as const })),
-  ]
+  // A rival that moved, created or deleted the ref first all lost us the same race (@cto edf7bf44, 25850).
+  const lost = parseRefLockFailures(detail).filter(({ reporter }) => /(?:^|: )error: $/.test(reporter))
   if (lost.length === 0 || !lost.every(({ ref }) => ref.startsWith(namespace))) return undefined
   return lost.some(({ form }) => form === "held") ? "held" : "moved"
 }
