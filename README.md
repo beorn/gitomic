@@ -99,12 +99,29 @@ type CommitProvenance = { readonly actor: string; readonly session: string; read
 
 store.head(): Promise<string>            // newest commit id
 store.at(commit?: string): Snapshot      // read-only view there — lazy
-store.transact(fn: Update, message: string, options?: { readonly provenance?: CommitProvenance; readonly author?: Ident }): Promise<Committed>
+store.transact(fn: Update, message: string, options?: { readonly provenance?: CommitProvenance; readonly author?: Ident; readonly beside?: (attempt: BesideAttempt) => BesideRef[] | Promise<BesideRef[]> }): Promise<Committed>
 ```
 
 `transact` runs your update function and lands its writes as one commit, re-running it if another writer got there first. `message` is required — it becomes the commit message; say why, not what. The update function's second argument, `base`, is the commit oid it is running against on this attempt — a fresh tip on every re-run — so a precondition check can name the exact commit it refused on.
 
 Callers with independently verified original attribution may provide it as per-call `provenance`. Gitomic copies and validates its scalar fields before queueing the call, then records them in commit trailers, fixed through every retry; it never infers them from a writer label, process, environment, or store. Omitting provenance leaves that call unattributed even on a reused store. An unchanged transaction returns the existing commit without recording new attribution. This metadata is an audit record, never authority to write.
+
+### Refs beside the commit
+
+`transact` takes `beside`: a function the loop calls once per attempt, after
+that attempt's commit is written and before the compare-and-swap, with
+`{ next, base, map }` — the commit it will publish, the tip it was built on, and
+the attempt's tree. It returns `[{ ref, expect, oid }]` (`expect: null` means
+absent, `oid: null` deletes), and those refs land in the SAME atomic publish as
+the commit, or nothing does. A replay calls it again against the new commit and
+whatever tips it reads then; a noop attempt (nothing changed) never calls it.
+Any lost lease — the store's ref or a beside ref — is a retry within the same
+budget. This is the contrast with the events door's `also` (below): `also` is a
+static list, so a lost `also` lease is final; `beside` is recomputed, so it is
+just the next attempt. The budget's "another writer landed" extension reads the
+store's ref only. `beside` needs a backend with MULTI `publish` (shell, iso,
+mem); a non-empty `beside` on one without it refuses at the call, before any
+attempt, and a store that never passes `beside` runs on every backend as before.
 
 ### Author and committer
 

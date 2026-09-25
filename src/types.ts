@@ -342,8 +342,39 @@ export type Reader = {
   watch(options: RefTipWatchOptions): AsyncIterable<RefTipChange>
 }
 
+/** What one attempt built, handed to `beside` before the compare-and-swap. */
+export type BesideAttempt = {
+  /** The commit this attempt will publish. */
+  readonly next: Oid
+  /** The tip it was built on. */
+  readonly base: Oid
+  /** The attempt's tree, for a beside ref that needs to read what was written. */
+  readonly map: GitMap
+}
+/**
+ * Another ref to land in the SAME atomic publish as a transaction's commit:
+ * from `expect` (null: absent) to `oid`, or, with a null `oid`, deleted at
+ * `expect` (then a real id). See {@link TransactOptions.beside}.
+ */
+export type BesideRef = {
+  readonly ref: string
+  readonly expect: Oid | null
+  readonly oid: Oid | null
+}
 export type TransactOptions = {
   readonly provenance?: CommitProvenance
+  /**
+   * Refs that land in the SAME atomic publish as this transaction's commit
+   * (25312 E2a). Called once per attempt, after the commit is written and
+   * before the compare-and-swap, so it can name that commit (`next`) and the
+   * tips it read in this attempt; a replay calls it again against the new
+   * commit. A noop attempt (nothing changed) never calls it. Any lost lease,
+   * the ref's or a beside ref's, is a retry: this differs from gitomic/events'
+   * `also`, which is static and so final when lost — `beside` is recomputed
+   * against fresh tips every attempt. Needs a backend with MULTI `publish`;
+   * a non-empty option on one without it refuses at the transact call.
+   */
+  readonly beside?: (attempt: BesideAttempt) => Promise<readonly BesideRef[]> | readonly BesideRef[]
   /** Git's author for this one transaction. Defaults to the store's committer. */
   readonly author?: Ident
   /** Derive and check the candidate tree inside the write, before the CAS, on every attempt. */

@@ -14,6 +14,7 @@ import { randomUUID } from "node:crypto"
 import { runCasLoop } from "./engine.js"
 import { Conflict } from "./errors.js"
 import { assertTrailers, cloneIdent, GENESIS_MESSAGE, GITOMIC_IDENT, validateOid, zeroOid } from "./git-object.js"
+import { shapeRefUpdates, type AlsoRef } from "./ref-updates.js"
 import {
   assertWriter,
   DEFAULT_WRITER_LABEL,
@@ -127,18 +128,7 @@ export type Events = {
   watch(options: { signal: AbortSignal; pollIntervalMs?: number }): AsyncIterable<Event[]>
 }
 
-/**
- * Another ref to move in the SAME atomic publish as the event: from `expect`
- * (null: absent) to `oid`. A branch head beside the event that names it, say.
- * A null `oid` deletes the ref at `expect`, which must then be a real id.
- * If it lost its expectation, nothing lands and the append or transact throws
- * Conflict naming it; it is never retried.
- */
-export type AlsoRef = {
-  readonly ref: string
-  readonly expect: Oid | null
-  readonly oid: Oid | null
-}
+export type { AlsoRef } from "./ref-updates.js"
 
 export type ListRefsOptions = {
   repo: string
@@ -319,29 +309,7 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
         throw error
       }
     }
-  const shapeAlso = (also: readonly AlsoRef[] | undefined): RefUpdate[] => {
-    const seen = new Set<string>([ref])
-    return (also ?? []).map((update) => {
-      const alsoRef = normalizeRef(update.ref)
-      if (alsoRef === ref) throw new TypeError(`an also ref cannot be the chain itself: ${ref}`)
-      if (seen.has(alsoRef)) throw new TypeError(`also names ${alsoRef} more than once`)
-      seen.add(alsoRef)
-      if (update.oid === null) {
-        if (update.expect === null) throw new TypeError(`an also delete of ${alsoRef} needs the tip it removes`)
-        return {
-          ref: alsoRef,
-          expect: validateOid(update.expect, `also expect for ${alsoRef} must be a commit id`),
-          oid: null,
-        }
-      }
-      const oid = validateOid(update.oid, `also oid for ${alsoRef} must be a commit id or null`)
-      const expect =
-        update.expect === null
-          ? zeroOid(oid)
-          : validateOid(update.expect, `also expect for ${alsoRef} must be a commit id or null`)
-      return { ref: alsoRef, expect, oid }
-    })
-  }
+  const shapeAlso = (also: readonly AlsoRef[] | undefined): RefUpdate[] => shapeRefUpdates(ref, also, "also")
 
   const readChain = async (at: Oid, options: { from?: Oid; limit: number }) => {
     const history = await backend.readHistory(repo, [at], {

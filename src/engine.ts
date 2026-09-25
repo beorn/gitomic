@@ -5,7 +5,7 @@
  * contention, receipts and the retry budget, so there is exactly one of each.
  */
 import { Conflict, RetriesExhausted } from "./errors.js"
-import type { Oid } from "./types.js"
+import type { Oid, RefUpdate } from "./types.js"
 
 /** What one attempt decided against the tip it saw. */
 export type Attempt<R> =
@@ -19,6 +19,8 @@ export type Attempt<R> =
       /** The receipt that identifies this transaction if its acknowledgement is lost. */
       readonly instance: string
       readonly seq: number
+      /** Refs that land in the SAME atomic publish as `next`, recomputed by every attempt (the store door's `beside`). */
+      readonly beside?: readonly RefUpdate[]
       landed(oid: Oid, retries: number): R
     }
 
@@ -28,7 +30,8 @@ export type CasLoop<H, R> = {
   readonly retryBudgetMs: number
   /** The current tip. */
   refresh(): Promise<H>
-  publish(next: Oid, expected: H): Promise<boolean>
+  /** Move the tip from `expected` to `next`, with `beside` in the same atomic publish; false = a lost lease, retry. */
+  publish(next: Oid, expected: H, beside: readonly RefUpdate[]): Promise<boolean>
   /** Search `winner`'s first-parent chain, back to `base`, for this receipt. */
   findTransaction(winner: H, base: Oid, instance: string, seq: number): Promise<Oid | undefined>
   /** `retries` is how many contended publishes this transaction has lost so far. */
@@ -51,7 +54,7 @@ export async function runCasLoop<H, R>(loop: CasLoop<H, R>): Promise<R> {
 
     let publicationFailure: { cause: unknown; message: string } | undefined
     try {
-      if (await loop.publish(attempt.next, tip)) return attempt.landed(attempt.next, retries)
+      if (await loop.publish(attempt.next, tip, attempt.beside ?? [])) return attempt.landed(attempt.next, retries)
     } catch (cause) {
       // A Conflict is the tool naming a definite rejection: nothing landed, so
       // there is no unknown outcome to resolve and nothing to retry.
@@ -84,6 +87,9 @@ export async function runCasLoop<H, R>(loop: CasLoop<H, R>): Promise<R> {
     }
     // The ref advanced under us: a writer landed this round, so the race is
     // making progress — extend the budget rather than abandon a healthy burst.
+    // Only the loop's own ref counts: a lease lost on a `beside` ref alone does
+    // not extend the budget (every store write moves its ref, and a beside-only
+    // loss is the rare path), so a transaction that never lands still fails.
     if (winner !== tip) deadline = Date.now() + loop.retryBudgetMs
     if (Date.now() >= deadline) throw new RetriesExhausted(retries, loop.retryBudgetMs)
     await delayForRetry(retries)

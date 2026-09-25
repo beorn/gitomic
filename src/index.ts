@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto"
 
 import { applyEdits, editPaths, KEEP_MODE_OF, PREFETCH_PATHS, type Edit, type PrefetchingUpdate } from "./edits.js"
 import { runCasLoop } from "./engine.js"
+import { shapeRefUpdates } from "./ref-updates.js"
 import {
   assertWriter,
   DEFAULT_WRITER_LABEL,
@@ -23,6 +24,9 @@ import type {
   Clock,
   CommitMeta,
   CommitProvenance,
+  BesideAttempt,
+  BesideRef,
+  RefUpdate,
   Committed,
   GitMap,
   GitomicBackend,
@@ -106,6 +110,8 @@ export type {
   OpenOptions,
   OpenReaderOptions,
   PublishResult,
+  BesideAttempt,
+  BesideRef,
   Reader,
   RefTipChange,
   RefTipWatchOptions,
@@ -132,6 +138,7 @@ export async function open(options: OpenOptions): Promise<Store> {
       let provenance: CommitProvenance | undefined
       let author: Ident | undefined
       const candidate = options?.candidate
+      const beside = options?.beside
       const trailers =
         options?.trailers === undefined ? undefined : options.trailers.map(([key, value]) => [key, value] as const)
       try {
@@ -140,10 +147,18 @@ export async function open(options: OpenOptions): Promise<Store> {
         if (candidate !== undefined && typeof candidate !== "function") {
           throw new TypeError("candidate must be a function")
         }
+        if (beside !== undefined && typeof beside !== "function") {
+          throw new TypeError("beside must be a function")
+        }
+        // Refused at the call, before any attempt, and only for a store that asks: stores that never pass
+        // beside run on every backend as before.
+        if (beside !== undefined && context.backend.publish === undefined) {
+          throw new TypeError("beside needs a backend with publish (MULTI): the shell, iso or mem backend")
+        }
       } catch (error) {
         return Promise.reject(error)
       }
-      return enqueue(async () => transact(context, update, message, provenance, author, candidate, trailers))
+      return enqueue(async () => transact(context, update, message, provenance, author, candidate, trailers, beside))
     },
   }
 }
@@ -236,7 +251,7 @@ type StoreContext = {
   /** The clock every commit of this store is dated by, in unix seconds (25486). */
   clock: Clock
   refresh(): Promise<Oid>
-  publish(next: Oid, expected: Oid): Promise<boolean>
+  publish(next: Oid, expected: Oid, beside: readonly RefUpdate[]): Promise<boolean>
   nextSeq(): number
 }
 
@@ -265,10 +280,10 @@ async function prepareStore(options: OpenOptions): Promise<StoreContext> {
   const clock = normalizeClock(options.clock)
   const remote = options.remote
   let refresh: () => Promise<Oid>
-  let publish: (next: Oid, expected: Oid) => Promise<boolean>
+  let swap: (next: Oid, expected: Oid) => Promise<boolean>
   if (remote === undefined) {
     refresh = async () => backendOid(await backend.head(repo, ref))
-    publish = async (next, expected) => backend.compareAndSwap(repo, ref, next, expected)
+    swap = async (next, expected) => backend.compareAndSwap(repo, ref, next, expected)
   } else {
     const fetchRemote = backend.fetchRemote
     const compareAndSwapRemote = backend.compareAndSwapRemote
@@ -281,7 +296,23 @@ async function prepareStore(options: OpenOptions): Promise<StoreContext> {
       if (local !== fetched) await backend.compareAndSwap(repo, ref, fetched, local)
       return fetched
     }
-    publish = async (next, expected) => compareAndSwapRemote(repo, ref, next, expected, remote)
+    swap = async (next, expected) => compareAndSwapRemote(repo, ref, next, expected, remote)
+  }
+  // With beside refs the publish is the backend's MULTI publish of the ref and every beside ref, or none. For
+  // THIS door a Conflict naming any of them is a lost lease and returns false, so the loop re-reads and the
+  // attempt is rebuilt against fresh tips (the events door treats a lost `also` lease as final, because `also`
+  // is static). The receipt search stays on the ref: the beside refs landed with it or not at all.
+  const publish = async (next: Oid, expected: Oid, beside: readonly RefUpdate[]): Promise<boolean> => {
+    if (beside.length === 0) return swap(next, expected)
+    const multi = backend.publish
+    if (multi === undefined) throw new TypeError("beside needs a backend with publish (MULTI)")
+    try {
+      await multi(repo, [{ ref, expect: expected, oid: next }, ...beside], remote)
+      return true
+    } catch (error) {
+      if (error instanceof Conflict) return false
+      throw error
+    }
   }
   await refresh()
   return { repo, ref, writer, instance, committer, backend, retryBudgetMs, clock, refresh, publish, nextSeq }
@@ -314,6 +345,7 @@ async function transact(
   author?: Ident,
   candidate?: Candidate,
   trailers?: readonly Trailer[],
+  beside?: (attempt: BesideAttempt) => Promise<readonly BesideRef[]> | readonly BesideRef[],
 ): Promise<Committed> {
   if (typeof message !== "string" || message.trim().length === 0) {
     throw new TypeError("message must say why this transaction exists")
@@ -381,12 +413,16 @@ async function transact(
       const effective = removeNoopChanges(base, changes)
       if (effective.size === 0) return { kind: "noop", result: withReport({ oid: parent, retries }) }
       const next = backendOid(await context.backend.writeCommit(context.repo, commitInput(effective, message.trim())))
+      // After the commit, before the CAS, once per attempt: a replay calls it again with the new commit.
+      const besideRefs =
+        beside === undefined ? [] : shapeRefUpdates(context.ref, await beside({ next, base: parent, map }), "beside")
       return {
         kind: "write",
         next,
         base: parent,
         instance: context.instance,
         seq: seq as number,
+        ...(besideRefs.length === 0 ? {} : { beside: besideRefs }),
         landed: (oid, retries) => withReport({ oid: backendOid(oid), retries }),
       }
     },

@@ -4,6 +4,15 @@
 
 ### Added
 
+- `beside` on `Store.transact` (25312 E2a): a per-attempt function returning
+  refs that land in the SAME atomic publish as the transaction's commit. It is
+  called after the commit is written and before the compare-and-swap, with the
+  commit, its base and the attempt's tree; a replay calls it again; a noop
+  attempt never does. Any lost lease is a retry, unlike the events door's
+  static `also`, which is final when lost. Needs a MULTI `publish` backend and
+  refuses at the call otherwise. The `also`/`beside` validation is one
+  function, `shapeRefUpdates`.
+
 - `authoredPaths` on `CheckoutSyncRequest` and `RemoteFirstProjectionRequest`
   (25350 S3): "paths whose checkout content IS this landing" — a write authored
   in the checkout lands files the caller already wrote. The projection proves
