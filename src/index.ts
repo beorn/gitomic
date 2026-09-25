@@ -26,6 +26,7 @@ import type {
   CommitProvenance,
   BesideAttempt,
   BesideRef,
+  FetchRefsOptions,
   RefUpdate,
   Committed,
   GitMap,
@@ -112,6 +113,7 @@ export type {
   PublishResult,
   BesideAttempt,
   BesideRef,
+  FetchRefsOptions,
   Reader,
   RefTipChange,
   RefTipWatchOptions,
@@ -139,6 +141,7 @@ export async function open(options: OpenOptions): Promise<Store> {
       let author: Ident | undefined
       const candidate = options?.candidate
       const beside = options?.beside
+      let fetch: readonly string[] | undefined
       const trailers =
         options?.trailers === undefined ? undefined : options.trailers.map(([key, value]) => [key, value] as const)
       try {
@@ -155,10 +158,13 @@ export async function open(options: OpenOptions): Promise<Store> {
         if (beside !== undefined && context.backend.publish === undefined) {
           throw new TypeError("beside needs a backend with publish (MULTI): the shell, iso or mem backend")
         }
+        fetch = shapeFetch(context, options?.fetch)
       } catch (error) {
         return Promise.reject(error)
       }
-      return enqueue(async () => transact(context, update, message, provenance, author, candidate, trailers, beside))
+      return enqueue(async () =>
+        transact(context, update, message, provenance, author, candidate, trailers, beside, fetch),
+      )
     },
   }
 }
@@ -248,11 +254,39 @@ type StoreContext = {
   backend: GitomicBackend
   /** How long a transaction keeps retrying a contended CAS before giving up (ms). */
   retryBudgetMs: number
+  /** The remote this store arbitrates against, when it has one. */
+  remote?: string
   /** The clock every commit of this store is dated by, in unix seconds (25486). */
   clock: Clock
   refresh(): Promise<Oid>
+  /** `refresh` plus the tips of `fetch`'s refs (null: absent), read in the same fetch on a remote store. */
+  refreshWith(fetch: readonly string[]): Promise<{ readonly tip: Oid; readonly tips: ReadonlyMap<string, Oid | null> }>
   publish(next: Oid, expected: Oid, beside: readonly RefUpdate[]): Promise<boolean>
   nextSeq(): number
+}
+/** Validate `TransactOptions.fetch` at the call: full names, not the store's ref, no repeats, a backend that can read them. */
+function shapeFetch(context: StoreContext, fetch: readonly string[] | undefined): readonly string[] | undefined {
+  if (fetch === undefined) return undefined
+  if (!Array.isArray(fetch)) throw new TypeError("fetch must be an array of full ref names")
+  const seen = new Set<string>()
+  const shaped = fetch.map((name) => {
+    if (typeof name !== "string" || !name.startsWith("refs/")) {
+      throw new TypeError(`fetch ref must be a full refs/ name: ${JSON.stringify(name)}`)
+    }
+    const ref = normalizeRef(name)
+    if (ref === context.ref) throw new TypeError(`a fetch ref cannot be the store's own ref: ${ref}`)
+    if (seen.has(ref)) throw new TypeError(`fetch names ${ref} more than once`)
+    seen.add(ref)
+    return ref
+  })
+  if (shaped.length === 0) return undefined
+  if (context.remote !== undefined && context.backend.fetchRefs === undefined) {
+    throw new TypeError("fetch on a remote store needs a backend with fetchRefs: the shell backend")
+  }
+  if (context.remote === undefined && context.backend.listRefs === undefined) {
+    throw new TypeError("fetch on a local store needs a backend with listRefs: the shell or mem backend")
+  }
+  return shaped
 }
 
 type ReaderContext = {
@@ -280,9 +314,18 @@ async function prepareStore(options: OpenOptions): Promise<StoreContext> {
   const clock = normalizeClock(options.clock)
   const remote = options.remote
   let refresh: () => Promise<Oid>
+  let refreshWith: StoreContext["refreshWith"]
   let swap: (next: Oid, expected: Oid) => Promise<boolean>
   if (remote === undefined) {
     refresh = async () => backendOid(await backend.head(repo, ref))
+    refreshWith = async (fetch) => {
+      const tip = await refresh()
+      const listRefs = backend.listRefs
+      if (listRefs === undefined) throw new TypeError("fetch on a local store needs a backend with listRefs")
+      const tips = new Map<string, Oid | null>()
+      for (const name of fetch) tips.set(name, (await listRefs(repo, name)).get(name) ?? null)
+      return { tip, tips }
+    }
     swap = async (next, expected) => backend.compareAndSwap(repo, ref, next, expected)
   } else {
     const fetchRemote = backend.fetchRemote
@@ -290,11 +333,26 @@ async function prepareStore(options: OpenOptions): Promise<StoreContext> {
     if (fetchRemote === undefined || compareAndSwapRemote === undefined) {
       throw new TypeError("this backend cannot arbitrate remotely; omit remote or use the shell/iso backend")
     }
-    refresh = async () => {
-      const fetched = backendOid(await fetchRemote(repo, ref, remote))
+    const syncLocal = async (fetched: Oid): Promise<void> => {
       const local = backendOid(await backend.head(repo, ref))
       if (local !== fetched) await backend.compareAndSwap(repo, ref, fetched, local)
+    }
+    refresh = async () => {
+      const fetched = backendOid(await fetchRemote(repo, ref, remote))
+      await syncLocal(fetched)
       return fetched
+    }
+    // One fetch for the store's ref and every `fetch` ref: the store's ref must be there, the others may not.
+    refreshWith = async (fetch) => {
+      const fetchRefs = backend.fetchRefs
+      if (fetchRefs === undefined) throw new TypeError("fetch on a remote store needs a backend with fetchRefs")
+      const fetched = await fetchRefs(repo, [ref, ...fetch], remote, { absent: "omit" })
+      const tip = fetched.get(ref)
+      if (tip === undefined) throw new Error(`${remote} does not have ${ref}`)
+      await syncLocal(backendOid(tip))
+      const tips = new Map<string, Oid | null>()
+      for (const name of fetch) tips.set(name, fetched.get(name) ?? null)
+      return { tip: backendOid(tip), tips }
     }
     swap = async (next, expected) => compareAndSwapRemote(repo, ref, next, expected, remote)
   }
@@ -315,7 +373,21 @@ async function prepareStore(options: OpenOptions): Promise<StoreContext> {
     }
   }
   await refresh()
-  return { repo, ref, writer, instance, committer, backend, retryBudgetMs, clock, refresh, publish, nextSeq }
+  return {
+    repo,
+    ref,
+    writer,
+    instance,
+    committer,
+    backend,
+    retryBudgetMs,
+    clock,
+    ...(remote === undefined ? {} : { remote }),
+    refresh,
+    refreshWith,
+    publish,
+    nextSeq,
+  }
 }
 
 async function prepareReader(options: OpenReaderOptions): Promise<ReaderContext> {
@@ -346,6 +418,7 @@ async function transact(
   candidate?: Candidate,
   trailers?: readonly Trailer[],
   beside?: (attempt: BesideAttempt) => Promise<readonly BesideRef[]> | readonly BesideRef[],
+  fetch?: readonly string[],
 ): Promise<Committed> {
   if (typeof message !== "string" || message.trim().length === 0) {
     throw new TypeError("message must say why this transaction exists")
@@ -355,10 +428,19 @@ async function transact(
   // Allocated once and reused across replays: every attempt is the SAME
   // transaction, so they must share one `(instance, seq)` receipt.
   let seq: number | undefined
+  // The tips `fetch` named, as the current attempt's refresh read them; empty when nothing was asked for.
+  let tips: ReadonlyMap<string, Oid | null> = new Map()
   return runCasLoop<Oid, Committed>({
     label: `${context.repo} ${context.ref}`,
     retryBudgetMs: context.retryBudgetMs,
-    refresh: context.refresh,
+    refresh:
+      fetch === undefined
+        ? context.refresh
+        : async () => {
+            const read = await context.refreshWith(fetch)
+            tips = read.tips
+            return read.tip
+          },
     publish: context.publish,
     findTransaction: async (winner, base, instance, attemptSeq) =>
       context.backend.findTransaction(context.repo, winner, base, instance, attemptSeq),
@@ -415,7 +497,9 @@ async function transact(
       const next = backendOid(await context.backend.writeCommit(context.repo, commitInput(effective, message.trim())))
       // After the commit, before the CAS, once per attempt: a replay calls it again with the new commit.
       const besideRefs =
-        beside === undefined ? [] : shapeRefUpdates(context.ref, await beside({ next, base: parent, map }), "beside")
+        beside === undefined
+          ? []
+          : shapeRefUpdates(context.ref, await beside({ next, base: parent, map, tips }), "beside")
       return {
         kind: "write",
         next,

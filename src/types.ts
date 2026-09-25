@@ -257,11 +257,20 @@ export type GitomicBackend = {
    * Fetch every ref under a prefix, or exactly the named refs, from `remote` in
    * ONE git process, and return each ref's tip under its original name. It
    * writes only gitomic's private namespace `refs/gitomic/fetched/<remote-key>/`,
-   * never an application ref. A named ref missing on the remote throws.
+   * never an application ref. A named ref missing on the remote throws, unless
+   * `absent: "omit"`: then it is left out of the result (still one process; the
+   * store's per-attempt `fetch` of refs that may not exist yet uses this).
    */
-  fetchRefs?(repo: string, refs: string | readonly string[], remote: string): Promise<ReadonlyMap<string, Oid>>
+  fetchRefs?(
+    repo: string,
+    refs: string | readonly string[],
+    remote: string,
+    options?: FetchRefsOptions,
+  ): Promise<ReadonlyMap<string, Oid>>
 }
 
+/** How `fetchRefs` treats a named ref the remote does not have. */
+export type FetchRefsOptions = { readonly absent?: "throw" | "omit" }
 /**
  * One ref of a MULTI publish: move `ref` from `expect` (all-zero: absent) to
  * `oid`, or, with a null `oid`, delete it at `expect`.
@@ -350,6 +359,11 @@ export type BesideAttempt = {
   readonly base: Oid
   /** The attempt's tree, for a beside ref that needs to read what was written. */
   readonly map: GitMap
+  /**
+   * The tips of {@link TransactOptions.fetch}'s refs as this attempt read them (null: absent), read in the same
+   * fetch as the store's ref, so a beside ref's `expect` is one attempt old at most.
+   */
+  readonly tips: ReadonlyMap<string, Oid | null>
 }
 /**
  * Another ref to land in the SAME atomic publish as a transaction's commit:
@@ -375,6 +389,13 @@ export type TransactOptions = {
    * a non-empty option on one without it refuses at the transact call.
    */
   readonly beside?: (attempt: BesideAttempt) => Promise<readonly BesideRef[]> | readonly BesideRef[]
+  /**
+   * Full names of refs whose tips every attempt reads afresh and hands to `beside` as `tips` (absent: null). On
+   * a remote store they ride the SAME fetch as the store's ref — one process per attempt, never one per ref;
+   * on a local store they are read from the repository. Refuses at the call for the store's own ref, a name
+   * outside `refs/`, a repeat, or a backend that cannot read them (remote: `fetchRefs`; local: `listRefs`).
+   */
+  readonly fetch?: readonly string[]
   /** Git's author for this one transaction. Defaults to the store's committer. */
   readonly author?: Ident
   /** Derive and check the candidate tree inside the write, before the CAS, on every attempt. */

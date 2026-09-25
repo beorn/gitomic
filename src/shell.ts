@@ -218,8 +218,8 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
       remote === undefined
         ? publishLocal(await resolveGitDir(repo), assertRefUpdates(updates), baseEnv)
         : publishRemote(await resolveGitDir(repo), assertRefUpdates(updates), remote, remoteTimeoutMs, baseEnv),
-    fetchRefs: async (repo, refs, remote) =>
-      fetchRefs(await resolveGitDir(repo), refs, remote, remoteTimeoutMs, baseEnv),
+    fetchRefs: async (repo, refs, remote, options) =>
+      fetchRefs(await resolveGitDir(repo), refs, remote, remoteTimeoutMs, baseEnv, options?.absent ?? "throw"),
   }
   // Each backend owns its executable even when two backends run concurrently.
   // Keeping the selection in the async call chain lets the Git plumbing below
@@ -1565,6 +1565,7 @@ async function fetchRefs(
   remote: string,
   timeoutMs: number,
   baseEnv?: NodeJS.ProcessEnv,
+  absent: "throw" | "omit" = "throw",
 ): Promise<ReadonlyMap<string, Oid>> {
   const namespace = fetchedNamespace(remote)
   const local = (ref: string) => `${namespace}${ref.slice("refs/".length)}`
@@ -1584,8 +1585,12 @@ async function fetchRefs(
   }
   // `prefix*` rather than `prefix/*`, so a ref named exactly `prefix` is included,
   // as listRefs includes it; the result is filtered by the same prefix rule.
+  // A named ref that may not exist is fetched as the pattern `ref*`, which git matches to nothing without an
+  // error; the result is then filtered back to the exact names, so an over-match lands only in the namespace.
   const refspecs =
-    prefix === undefined ? named.map((ref) => `+${ref}:${local(ref)}`) : [`+${prefix}*:${local(prefix)}*`]
+    prefix === undefined
+      ? named.map((ref) => (absent === "omit" ? `+${ref}*:${local(ref)}*` : `+${ref}:${local(ref)}`))
+      : [`+${prefix}*:${local(prefix)}*`]
   const fetchArgs = [
     "fetch",
     "--verbose",
@@ -1634,10 +1639,13 @@ async function fetchRefs(
     if (flag === "!") throw new Error(`git fetch rejected ${localRef}: ${line}`)
     tips.set(`refs/${localRef.slice(namespace.length)}`, validateOid(next, "git fetch returned a malformed id"))
   }
-  for (const ref of named) {
-    if (!tips.has(ref)) throw new Error(`git fetch did not report ${ref} from ${remote}`)
+  if (absent === "throw") {
+    for (const ref of named) {
+      if (!tips.has(ref)) throw new Error(`git fetch did not report ${ref} from ${remote}`)
+    }
   }
-  const matching = [...tips].filter(([ref]) => prefix === undefined || refUnderPrefix(ref, prefix))
+  const exact = new Set(named)
+  const matching = [...tips].filter(([ref]) => (prefix === undefined ? exact.has(ref) : refUnderPrefix(ref, prefix)))
   return new Map(matching.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
 }
 

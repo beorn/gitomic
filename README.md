@@ -123,6 +123,16 @@ store's ref only. `beside` needs a backend with MULTI `publish` (shell, iso,
 mem); a non-empty `beside` on one without it refuses at the call, before any
 attempt, and a store that never passes `beside` runs on every backend as before.
 
+`fetch: ["refs/..."]` beside it names refs whose tips every attempt reads afresh
+and hands to `beside` as `tips` (a map to the id, or `null` when the ref does not
+exist yet). On a remote store they ride the SAME `git fetch` as the store's ref,
+one process per attempt and never one per ref, a missing one tolerated; on a
+local store they are read from the repository. It refuses at the call for the
+store's own ref, a name outside `refs/`, a repeat, or a backend that cannot read
+them. `fetchRefs` itself takes `{ absent: "omit" }` for the same tolerance, and
+the events door's `events({ at })` reads a chain at such a fetched tip without
+another round trip.
+
 ### Author and committer
 
 Git records two people on every commit, and gitomic takes both as data:
