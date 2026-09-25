@@ -96,7 +96,7 @@ export type EventsRead = {
   order?: "oldest-first" | "newest-first"
 }
 
-/** Decide what to append, given every event on the chain at this attempt's tip. */
+/** Decide what to append, given every event after `from` at this attempt's tip, or the whole chain without `from`. */
 export type Decide = (events: readonly Event[]) => readonly EventInput[] | Promise<readonly EventInput[]>
 
 export type Appended = {
@@ -120,10 +120,15 @@ export type Events = {
   head(): Promise<Oid | null>
   events(options?: EventsRead): Promise<Event[]>
   /**
-   * Read every event, decide, append, and replay on a lost race. `message` names
-   * the transaction in errors. A chain over 1024 events is refused, not truncated.
+   * Read every event after `from` (or from genesis), decide, append, and replay
+   * on a lost race. `message` names the transaction in errors. A span over
+   * 1024 events after `from` is refused, not truncated.
    */
-  transact(decide: Decide, message: string, options?: { also?: readonly AlsoRef[]; author?: Ident }): Promise<Appended>
+  transact(
+    decide: Decide,
+    message: string,
+    options?: { also?: readonly AlsoRef[]; author?: Ident; from?: Oid },
+  ): Promise<Appended>
   /** Append at exactly `expect` (null = the chain must not exist); throws Conflict on a moved tip. */
   append(
     inputs: readonly EventInput[],
@@ -429,6 +434,10 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
       const why = assertLine(typeof message === "string" ? message.trim() : message, "message")
       const author = cloneIdent(transactOptions.author, "author") ?? committer
       const publish = publishWith(shapeAlso(transactOptions.also))
+      const from =
+        transactOptions.from === undefined
+          ? undefined
+          : validateOid(transactOptions.from, "transact from must be an event id")
       const reserved: number[] = []
       return runCasLoop<Oid | null, Appended>({
         // `message` names the transaction in the loop's errors; each event's own
@@ -439,7 +448,10 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
         publish,
         findTransaction,
         attempt: async (at, retries) => {
-          const current = at === null ? [] : (await readWhole(at)).events.reverse()
+          if (at === null && from !== undefined) {
+            throw new Error(`${ref} has no chain tip to reach event ${from}; refusing a partial read.`)
+          }
+          const current = at === null ? [] : (await readWhole(at, from)).events.reverse()
           const inputs = await decide(current)
           if (inputs.length === 0) return { kind: "noop", result: { head: at, events: [], retries } }
           const base = at ?? (await genesisOf())

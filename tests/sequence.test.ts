@@ -6,10 +6,57 @@
  */
 import { describe, expect, test, vi } from "vitest"
 import { open } from "../src/index.js"
+import { createIsoBackend } from "../src/iso.js"
 import { createMemBackend } from "../src/mem.js"
+import { createShellBackend } from "../src/shell.js"
 import type { GitomicBackend } from "../src/types.js"
+import { createBareRepo } from "./helpers/git.js"
 
 describe("Store.transactSequence", () => {
+  test("shell, iso and mem keep three attributed steps in one publication", async () => {
+    const shell = await createBareRepo()
+    const iso = await createBareRepo()
+    const targets: { repo: string; backend: GitomicBackend }[] = [
+      { repo: shell.repo, backend: createShellBackend() },
+      { repo: iso.repo, backend: createIsoBackend() },
+      { repo: "sequence-parity-mem", backend: createMemBackend() },
+    ]
+    try {
+      for (const { repo, backend } of targets) {
+        const publish = vi.spyOn(backend, "publish")
+        const store = await open({ repo, ref: "main", backend, writer: "sequence", clock: () => 1_700_000_000 })
+        const parent = await store.head()
+        const landed = await store.transactSequence(
+          async (attempt) => {
+            const steps = []
+            for (let index = 1; index <= 3; index++) {
+              steps.push(
+                await attempt.step(async (map) => map.set(`step-${index}.md`, String(index)), `step ${index}`, {
+                  author: { name: `Actor ${index}`, email: `actor${index}@example.test` },
+                  provenance: { actor: `actor-${index}`, session: "sequence-test", generation: index },
+                }),
+              )
+            }
+            return steps
+          },
+          { beside: ({ next }) => [{ ref: "refs/sequence/parity", expect: null, oid: next }] },
+        )
+        expect(publish).toHaveBeenCalledTimes(1)
+        let previous = parent
+        for (const [index, step] of landed.value.entries()) {
+          const meta = await backend.readCommit(repo, step.oid)
+          expect(meta.parent).toBe(previous)
+          expect(meta.author.name).toBe(`Actor ${index + 1}`)
+          expect(meta.provenance?.actor).toBe(`actor-${index + 1}`)
+          previous = step.oid
+        }
+        expect(landed.oid).toBe(previous)
+      }
+    } finally {
+      await shell.cleanup()
+      await iso.cleanup()
+    }
+  })
   test("keeps each accepted step, discards a refused step, and publishes once", async () => {
     const backend = createMemBackend()
     const publish = vi.spyOn(backend, "publish")

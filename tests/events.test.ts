@@ -66,6 +66,11 @@ describe("an absent chain", () => {
       const events = await openEvents({ repo: target.repo, ref: CHAIN, backend: target.backend })
       expect(await events.head(), target.name).toBeNull()
       expect(await events.events(), target.name).toEqual([])
+      const unrelated = await workCommit(target, "unrelated-before-chain.txt")
+      await expect(
+        events.transact(() => [], "missing bounded chain", { from: unrelated }),
+        target.name,
+      ).rejects.toThrow("refusing a partial read")
     })
   })
 })
@@ -596,6 +601,83 @@ describe("readHistory returns exactly what readCommit returns (ruling C: Reader.
 
 describe("reads that must reach a boundary refuse loudly when they do not (CTO verdict number 1)", () => {
   const many = (count: number): EventInput[] => Array.from({ length: count }, (_, index) => ({ type: `e${index}` }))
+
+  test("transact reads after its bound, including an empty tail, and refuses an unreachable bound on every backend", async () => {
+    await withTargets(async (target) => {
+      const chain = await openEvents({ repo: target.repo, ref: CHAIN, backend: target.backend })
+      const first = await chain.append([{ type: "before" }], { expect: null })
+      if (first.head === null) throw new Error("first append produced no head")
+      const second = await chain.append([{ type: "after" }], { expect: first.head })
+      const seen: string[][] = []
+      await chain.transact(
+        (events) => {
+          seen.push(events.map((event) => event.type))
+          return [{ type: "bounded" }]
+        },
+        "read the tail",
+        { from: first.head },
+      )
+      await chain.transact(
+        (events) => {
+          seen.push(events.map((event) => event.type))
+          return [{ type: "at tip" }]
+        },
+        "read an empty tail",
+        { from: (await chain.head()) as Oid },
+      )
+      expect(seen, target.name).toEqual([["after"], []])
+      let decided = false
+      const unreachable = await workCommit(target, "unrelated.txt")
+      await expect(
+        chain.transact(
+          () => {
+            decided = true
+            return []
+          },
+          "unreachable bound",
+          { from: unreachable },
+        ),
+      ).rejects.toThrow("refusing a partial read")
+      expect(decided, target.name).toBe(false)
+      expect(second.head, target.name).not.toBe(first.head)
+    })
+  })
+
+  test("a lost race re-decides after the same bound on every backend", async () => {
+    await withTargets(async (target) => {
+      const first = await openEvents({ repo: target.repo, ref: CHAIN, backend: target.backend })
+      const second = await openEvents({ repo: target.repo, ref: CHAIN, backend: target.backend })
+      const base = await first.append([{ type: "before" }], { expect: null })
+      if (base.head === null) throw new Error("base append produced no head")
+      let entered: () => void = () => {}
+      let release: () => void = () => {}
+      const inside = new Promise<void>((resolve) => {
+        entered = resolve
+      })
+      const mayLand = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      const seen: string[][] = []
+      const pending = second.transact(
+        async (events) => {
+          seen.push(events.map((event) => event.type))
+          if (seen.length === 1) {
+            entered()
+            await mayLand
+          }
+          return [{ type: "second" }]
+        },
+        "bounded race",
+        { from: base.head },
+      )
+      await inside
+      await first.append([{ type: "winner" }], { expect: base.head })
+      release()
+      const result = await pending
+      expect(result.retries, target.name).toBeGreaterThanOrEqual(1)
+      expect(seen, target.name).toEqual([[], ["winner"]])
+    })
+  })
 
   test("transact on a chain longer than 1024 events throws naming the ref and the bound; 1024 still works", async () => {
     const backend = createMemBackend()
