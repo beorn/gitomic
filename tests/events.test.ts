@@ -308,6 +308,55 @@ describe("the equivalence suite: parents and trailers serialize byte-identically
 })
 
 describe("acceptance: a race re-runs decide on the winner's events and writes the loser's input once", () => {
+  test("a single-ref event conflict re-reads and retries the chain", async () => {
+    const base = createMemBackend()
+    if (base.publish === undefined) throw new Error("memory backend cannot publish")
+    const repo = "events-single-ref-retry"
+    let attempts = 0
+    const backend: GitomicBackend = {
+      ...base,
+      publish: async (...args) => {
+        attempts++
+        if (attempts === 1) {
+          throw new Conflict(`lease lost, nothing published: ${CHAIN} is at locked, not absent`, { refs: [CHAIN] })
+        }
+        return base.publish!(...args)
+      },
+    }
+    const chain = await openEvents({ repo, ref: CHAIN, backend })
+    const result = await chain.transact(() => [{ type: "opened" }], "single chain retry")
+    expect(attempts).toBe(2)
+    expect(result.retries).toBe(1)
+    expect((await chain.events()).map((event) => event.type)).toEqual(["opened"])
+  })
+
+  /** @failure 25708: a refused change-ref lease inside an atomic target publish was retried without reaching Yrd. */
+  test("an atomic event and target publish reports its chain lease refusal", async () => {
+    const base = createMemBackend()
+    if (base.publish === undefined) throw new Error("memory backend cannot publish")
+    const repo = "events-atomic-refusal"
+    const head = await workCommit({ name: "mem", repo, backend: base, cleanup: async () => {} }, "head.txt")
+    let attempts = 0
+    const backend: GitomicBackend = {
+      ...base,
+      publish: async (...args) => {
+        attempts++
+        if (attempts === 1) {
+          throw new Conflict(`lease lost, nothing published: ${CHAIN} is at locked, not absent`, { refs: [CHAIN] })
+        }
+        return base.publish!(...args)
+      },
+    }
+    const chain = await openEvents({ repo, ref: CHAIN, backend })
+    await expect(
+      chain.transact(() => [{ type: "merged" }], "publish with target", {
+        also: [{ ref: "refs/heads/main", expect: head, oid: head }],
+      }),
+    ).rejects.toBeInstanceOf(Conflict)
+    expect(attempts).toBe(1)
+    expect(await chain.head()).toBeNull()
+  })
+
   test("two writers on one chain (mem)", async () => {
     const backend = createMemBackend()
     const repo = "events-race"
