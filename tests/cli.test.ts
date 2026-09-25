@@ -269,7 +269,7 @@ describe("gitomic CLI — the kept copy per URL (--cache-dir, GITOMIC_CACHE_DIR)
   })
 
   test("no flag and no env (or an empty env) keeps today's temporary clone, removed on exit", async () => {
-    for (const env of [{}, { GITOMIC_CACHE_DIR: "" }]) {
+    for (const env of [{}, { GITOMIC_CACHE_DIR: "" }] as Record<string, string>[]) {
       const result = await put(`note-${invocation}.md`, "temporary\n", env)
       expect(result).toMatchObject({ code: 0, stderr: "" })
       const targets = cloneTargets(result.trace)
