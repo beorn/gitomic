@@ -350,6 +350,59 @@ const KEPT_LOCK_PAUSES_MS = [50, 150] as const
 
 const KEPT_COPY: Record<RefSwap, KeptCopy> = { swapped: "advanced", moved: "moved", locked: "locked" }
 
+/**
+ * Refresh a kept copy: read `remote`'s tip of `ref` without moving any ref, then advance the kept `ref` in `repo` to
+ * it, and answer that tip. This is the one kept-copy refresh: a remote Store's refresh runs it, and a caller keeping
+ * its own copy of the same remote (a reader's base) calls it instead of repeating it (hh 25615, @cto 3d3de4f6).
+ *
+ * The kept ref is derived state that other processes sharing the repository may move at any moment. One that moved
+ * is theirs and is left alone; one whose ref lock is held is waited out for about 200 ms, then the refresh fails
+ * naming the lock file and its removal. Gitomic never removes a lock.
+ */
+export async function refreshKeptCopy(options: {
+  readonly repo: string
+  readonly ref: string
+  readonly remote: string
+  readonly backend?: GitomicBackend
+}): Promise<Oid> {
+  const backend = options.backend ?? createShellBackend()
+  const ref = normalizeRef(options.ref)
+  const fetchRemote = backend.fetchRemote
+  if (fetchRemote === undefined) {
+    throw new TypeError(
+      `this backend cannot refresh the kept copy of ${JSON.stringify(options.repo)}: it has no fetchRemote`,
+    )
+  }
+  const fetched = backendOid(await fetchRemote(options.repo, ref, options.remote))
+  await syncKeptRef(backend, options.repo, ref, fetched)
+  return fetched
+}
+
+// The kept ref is derived state: a cache of origin's tip that another process sharing this repository may move at any
+// moment. A lost cache update is never a failure: the caller builds on `fetched`, and a stale kept ref costs the next
+// attempt one refused lease and a refresh (hh 25615, @cto: a moved local ref is re-read). A "locked" answer is not
+// another writer: its ref lock is held. A live holder finishes in milliseconds; a lock left by a Git process killed
+// mid-update never does, and absorbing it would cost every later write a refused lease and a fetch. So it is retried
+// briefly, then named, before any push (hh 25615, review2 P3, @cto bb1f7b51).
+async function syncKeptRef(backend: GitomicBackend, repo: string, ref: string, fetched: Oid): Promise<void> {
+  const local = backendOid(await backend.head(repo, ref))
+  if (local === fetched) return
+  for (const pause of [...KEPT_LOCK_PAUSES_MS, undefined]) {
+    if ((await backend.compareAndSwap(repo, ref, fetched, local)) !== "locked") return
+    if (pause === undefined) break
+    await new Promise((resolve) => {
+      // raw-lifecycle-ok: this refresh-owned pause is awaited and cannot outlive its caller.
+      setTimeout(resolve, pause)
+    })
+  }
+  // Still locked at the end of the window. A ref that moved meanwhile was another writer's: skip, as above.
+  if (backendOid(await backend.head(repo, ref)) !== local) return
+  throw new Error(
+    `kept copy ${JSON.stringify(repo)} cannot move ${ref} from ${local} to ${fetched}, and no other writer moved it: ` +
+      `${ref}.lock in its git directory is held; if no git process is running there, remove it`,
+  )
+}
+
 type ReaderContext = {
   repo: string
   ref: string
@@ -413,35 +466,8 @@ async function prepareStore(options: OpenOptions): Promise<StoreContext> {
     if (fetchRemote === undefined || compareAndSwapRemote === undefined) {
       throw new TypeError("this backend cannot arbitrate remotely; omit remote or use the shell/iso backend")
     }
-    // The kept ref is derived state: a cache of origin's tip that another process sharing this repository may move
-    // at any moment. A lost cache update is never a failure: this attempt builds on `fetched`, and a stale kept
-    // ref costs the next attempt one refused lease and a refresh (hh 25615, @cto: a moved local ref is re-read).
-    // A "locked" answer is not another writer: its ref lock is held. A live holder finishes in milliseconds; a lock
-    // left by a Git process killed mid-update never does, and absorbing it would cost every later write a refused
-    // lease and a fetch. So it is retried briefly, then named, before any push (hh 25615, review2 P3, @cto bb1f7b51).
-    const syncLocal = async (fetched: Oid): Promise<void> => {
-      const local = backendOid(await backend.head(repo, ref))
-      if (local === fetched) return
-      for (const pause of [...KEPT_LOCK_PAUSES_MS, undefined]) {
-        if ((await backend.compareAndSwap(repo, ref, fetched, local)) !== "locked") return
-        if (pause === undefined) break
-        await new Promise((resolve) => {
-          // raw-lifecycle-ok: this refresh-owned pause is awaited and cannot outlive its caller.
-          setTimeout(resolve, pause)
-        })
-      }
-      // Still locked at the end of the window. A ref that moved meanwhile was another writer's: skip, as above.
-      if (backendOid(await backend.head(repo, ref)) !== local) return
-      throw new Error(
-        `kept copy ${JSON.stringify(repo)} cannot move ${ref} from ${local} to ${fetched}, and no other writer moved it: ` +
-          `${ref}.lock in its git directory is held; if no git process is running there, remove it`,
-      )
-    }
-    const refreshRemote = async (): Promise<Oid> => {
-      const fetched = backendOid(await fetchRemote(repo, ref, remote))
-      await syncLocal(fetched)
-      return fetched
-    }
+    const syncLocal = (fetched: Oid): Promise<void> => syncKeptRef(backend, repo, ref, fetched)
+    const refreshRemote = (): Promise<Oid> => refreshKeptCopy({ repo, ref, remote, backend })
     refresh = async (reason) =>
       options.refresh === "on-rejection" && reason === "initial" ? readKept() : refreshRemote()
     // One fetch for the store's ref and every `fetch` ref: the store's ref must be there, the others may not.

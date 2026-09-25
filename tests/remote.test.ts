@@ -8,7 +8,14 @@ import { chmod, readFile, unlink, writeFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
 import { pathToFileURL } from "node:url"
 
-import { createShellBackend, open, openReader, openRemoteRepository, RetriesExhausted } from "../src/index.js"
+import {
+  createShellBackend,
+  open,
+  openReader,
+  openRemoteRepository,
+  refreshKeptCopy,
+  RetriesExhausted,
+} from "../src/index.js"
 import { createIsoBackend } from "../src/iso.js"
 import type { GitMap, GitomicBackend } from "../src/index.js"
 import { createBareRepo, createRemoteRepos, git } from "./helpers/git.js"
@@ -479,6 +486,37 @@ describe("remote arbitration", () => {
         "refs/heads/main.lock in its git directory is held; if no git process is running there, remove it",
       )
       expect(await git(fixture.remote, "rev-parse", "main")).toBe(first.oid)
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  // @cto 3d3de4f6: the one kept-copy refresh is public, so a caller keeping its own copy calls it instead of a second
+  // implementation. It is the same function a remote Store's refresh runs.
+  test("refreshKeptCopy advances a kept copy to the remote tip and answers the tip", async () => {
+    const fixture = await createRemoteRepos()
+    try {
+      const writer = await open({ repo: fixture.right, ref: "main", remote: "origin" })
+      const landed = await writer.transact(async (map) => map.set("ahead", "origin moved"), "move origin")
+      expect(await refreshKeptCopy({ repo: fixture.left, ref: "main", remote: "origin" })).toBe(landed.oid)
+      expect(await git(fixture.left, "rev-parse", "main")).toBe(landed.oid)
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  test("refreshKeptCopy names a stale lock on the kept ref and leaves it for the caller to remove", async () => {
+    const fixture = await createRemoteRepos()
+    try {
+      const writer = await open({ repo: fixture.right, ref: "main", remote: "origin" })
+      await writer.transact(async (map) => map.set("ahead", "origin moved"), "move origin")
+      const lock = join(fixture.left, "refs/heads/main.lock")
+      await writeFile(lock, "")
+      await expect(refreshKeptCopy({ repo: fixture.left, ref: "main", remote: "origin" })).rejects.toThrow(
+        "refs/heads/main.lock in its git directory is held; if no git process is running there, remove it",
+      )
+      expect(fs.existsSync(lock)).toBe(true)
+      expect(await git(fixture.left, "rev-parse", "main")).toBe(fixture.initial)
     } finally {
       await fixture.cleanup()
     }

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- `refreshKeptCopy({ repo, ref, remote, backend? })`: the one kept-copy refresh, exported. It reads `remote`'s tip without moving a ref, advances the kept `ref` to it (a ref another process moved is left alone; a held ref lock is waited out for about 200 ms, then named), and answers the tip. A remote Store's refresh runs the same function, so a caller keeping its own copy of the remote calls it instead of carrying a second implementation.
+
 ## 0.6.0 — 2026-09-25
 
 ### Changed (breaking for custom backends)
