@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## 0.6.0 — 2026-09-25
+
+### Changed (breaking for custom backends)
+
+- `GitomicBackend.compareAndSwap` answers the new union `RefSwap` (`"swapped" | "moved" | "locked"`) instead of a boolean, and `GitomicBackend.compareAndSwapRemote` answers `{ landed: false } | { landed: true, kept: RefSwap }`. Callers that only want landed compare against `"swapped"`. A held ref lock is no longer indistinguishable from a lost lease. A backend or wrapper that returned `true`/`false` fails to typecheck until it answers the new shape.
+
+### Added
+
+- `Committed.kept` and `SequenceResult.kept`, typed `KeptCopy`: on a remote Store in either refresh mode, what its kept ref did after the publish landed — `"advanced"`, `"moved"` by another process, or `"locked"`. Absent when the publish touched no kept ref.
+
+### Fixed
+
+- A remote Store whose kept ref is locked (a `.lock` left by a Git process killed mid-update) retries for about 200 ms, then fails the refresh before any push, naming the lock file, instead of silently paying a refused lease and a fetch on every later write.
+
 ## 0.5.0 — 2026-09-25
 
 ### Added

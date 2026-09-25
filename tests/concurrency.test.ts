@@ -117,13 +117,13 @@ describe("semantic CAS replay", () => {
         const backend: GitomicBackend = {
           ...shell,
           async compareAndSwap(repo, ref, next, expected) {
-            const landed = await shell.compareAndSwap(repo, ref, next, expected)
-            if (landed && hideFirstAcknowledgement) {
+            const swapped = await shell.compareAndSwap(repo, ref, next, expected)
+            if (swapped === "swapped" && hideFirstAcknowledgement) {
               hideFirstAcknowledgement = false
               if (acknowledgement === "throw") throw new Error("local CAS acknowledgement lost")
-              return false
+              return "moved"
             }
-            return landed
+            return swapped
           },
         }
         const store = await open({
@@ -162,7 +162,7 @@ describe("semantic CAS replay", () => {
         async compareAndSwap(repo, ref, next, expected) {
           if (refuseFirstPublish) {
             refuseFirstPublish = false
-            return false
+            return "moved"
           }
           return await shell.compareAndSwap(repo, ref, next, expected)
         },

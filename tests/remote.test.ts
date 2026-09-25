@@ -208,9 +208,9 @@ describe("remote arbitration", () => {
           ...shell,
           fetchRemote,
           async compareAndSwapRemote(...args) {
-            expect(await shell.compareAndSwapRemote!(...args)).toBe(true)
+            expect((await shell.compareAndSwapRemote!(...args)).landed).toBe(true)
             if (acknowledgement === "throw") throw new Error("accepted; acknowledgement lost")
-            return false
+            return { landed: false }
           },
         }
         const store = await open({
@@ -445,7 +445,7 @@ describe("remote arbitration", () => {
         async compareAndSwap(...args) {
           if (denyCacheOnce) {
             denyCacheOnce = false
-            return false
+            return "moved"
           }
           return shell.compareAndSwap(...args)
         },
@@ -456,6 +456,7 @@ describe("remote arbitration", () => {
         beside: ({ next }) => [{ ref: "refs/heads/companion", expect: null, oid: next }],
       })
       expect(result.oid).toBe(await git(fixture.remote, "rev-parse", "main"))
+      expect(result.kept).toBe("moved")
       expect(update).toHaveBeenCalledTimes(1)
       expect(fetchRemote).toHaveBeenCalledTimes(0)
     } finally {
@@ -463,26 +464,61 @@ describe("remote arbitration", () => {
     }
   })
 
-  test("a cache ref that never takes the update costs only a re-read: every accepted MULTI lands", async () => {
+  // hh 25615 (review2 P3, @cto bb1f7b51): a git process killed mid-update-ref leaves the kept ref's lock behind, and
+  // nobody can move that ref again. The write it was refreshing for stands and says so; the next refresh names the
+  // lock instead of absorbing it into a refused lease and a fetch on every later write.
+  test("a stale lock on the kept ref is named at the next refresh; the write before it stands", async () => {
     const fixture = await createRemoteRepos()
     try {
+      const store = await open({ repo: fixture.left, ref: "main", remote: "origin", refresh: "on-rejection" })
+      await writeFile(join(fixture.left, "refs/heads/main.lock"), "")
+      const first = await store.transact(async (map) => map.set("first", "landed"), "first")
+      expect(first.oid).toBe(await git(fixture.remote, "rev-parse", "main"))
+      expect(first.kept).toBe("locked")
+      await expect(store.transact(async (map) => map.set("second", "refused"), "second")).rejects.toThrow(
+        "refs/heads/main.lock in its git directory is held; if no git process is running there, remove it",
+      )
+      expect(await git(fixture.remote, "rev-parse", "main")).toBe(first.oid)
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  // @cto bb1f7b51: `kept` is the same fact in the default refresh mode, never hidden there.
+  test("a default-refresh Store reports its kept ref after a landed push", async () => {
+    const fixture = await createRemoteRepos()
+    try {
+      const store = await open({ repo: fixture.left, ref: "main", remote: "origin" })
+      const landed = await store.transact(async (map) => map.set("always", "landed"), "always")
+      expect(landed.kept).toBe("advanced")
+      expect(await git(fixture.left, "rev-parse", "main")).toBe(landed.oid)
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  // A live holder releases its lock within milliseconds: the refresh waits it out, and the write lands.
+  test("a kept-ref lock released inside the refresh window costs a pause, never a failure", async () => {
+    const fixture = await createRemoteRepos()
+    try {
+      const lock = join(fixture.left, "refs/heads/main.lock")
       const shell = createShellBackend()
+      let releaseOnLocked = false
       const backend: GitomicBackend = {
         ...shell,
-        async compareAndSwap() {
-          return false
+        async compareAndSwap(...args) {
+          const swapped = await shell.compareAndSwap(...args)
+          if (swapped === "locked" && releaseOnLocked) await unlink(lock)
+          return swapped
         },
       }
       const store = await open({ repo: fixture.left, ref: "main", remote: "origin", refresh: "on-rejection", backend })
-      await store.transact(async (map) => map.set("multi", "landed"), "multi", {
-        beside: ({ next }) => [{ ref: "refs/heads/companion", expect: null, oid: next }],
-      })
-      expect(await git(fixture.remote, "show", "main:multi")).toBe("landed")
-      // The kept ref stayed behind: the next attempt's lease is refused, it refreshes, and it lands.
-      await store.transact(async (map) => map.set("second", "landed too"), "second", {
-        beside: ({ next }) => [{ ref: "refs/heads/companion-2", expect: null, oid: next }],
-      })
+      await writeFile(lock, "")
+      await store.transact(async (map) => map.set("first", "landed"), "first")
+      releaseOnLocked = true
+      const second = await store.transact(async (map) => map.set("second", "landed too"), "second")
       expect(await git(fixture.remote, "show", "main:second")).toBe("landed too")
+      expect(second.kept).toBe("advanced")
     } finally {
       await fixture.cleanup()
     }
@@ -559,12 +595,12 @@ describe("remote arbitration", () => {
             if (contention && publishes === 1) {
               await other.transact(async (map) => map.set("earlier", "winner"), "win first race")
             }
-            const landed = await shell.compareAndSwapRemote!(repo, ref, next, expected, remote)
-            if (!landed) return false
+            const pushed = await shell.compareAndSwapRemote!(repo, ref, next, expected, remote)
+            if (!pushed.landed) return pushed
             landedOid = next
             await other.transact(async (map) => map.set("later", "winner"), "advance after receipt")
             if (acknowledgement === "throw") throw new Error("accepted; acknowledgement lost")
-            return false
+            return { landed: false }
           },
         }
         const store = await open({ repo: fixture.left, ref: "main", remote: "origin", backend })
