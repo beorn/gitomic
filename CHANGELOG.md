@@ -2,7 +2,13 @@
 
 ## Unreleased
 
+## 0.5.0 — 2026-09-25
+
 ### Added
+
+- `Store.transactSequence` builds ordered content commits in one compare-and-swap attempt and publishes their final tip with optional side refs atomically. Each awaited step gets a fresh overlay, its own message, attribution and candidate gate; a rejected step leaves earlier steps intact. A lost lease replays the sequence against fresh tips, while a no-op step creates no commit.
+- Event chains can `stage` commits before one atomic publication, and `transact` can decide from a bounded `from` tip without silently truncating the tail.
+- Remote transactions can refresh after a rejected compare-and-swap to find an uncertain push's receipt before replay.
 
 - `beside` on `Store.transact` (25312 E2a): a per-attempt function returning
   refs that land in the SAME atomic publish as the transaction's commit. It is
@@ -45,6 +51,7 @@
 
 ### Fixed
 
+- A confirmed remote lease loss is distinguished from an uncertain push, and a chain-only rival is retried within the transaction budget.
 - A fetch that loses the fetched-ref lock race to another fetch in the same
   repository waits 25-99 ms before retrying while the rival still holds the
   lock, and after its last attempt the error says how many times it lost,

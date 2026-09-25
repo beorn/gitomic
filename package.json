@@ -1,6 +1,6 @@
 {
   "name": "gitomic",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Atomic, merge-free state commits over git: compare-and-swap on a ref with semantic replay.",
   "keywords": [
     "atomic",

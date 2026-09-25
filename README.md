@@ -104,6 +104,18 @@ store.transact(fn: Update, message: string, options?: { readonly provenance?: Co
 
 `transact` runs your update function and lands its writes as one commit, re-running it if another writer got there first. `message` is required — it becomes the commit message; say why, not what. The update function's second argument, `base`, is the commit oid it is running against on this attempt — a fresh tip on every re-run — so a precondition check can name the exact commit it refused on.
 
+`transactSequence` keeps several ordered commits in one attempt and moves the ref only once:
+
+```ts
+const result = await store.transactSequence(async ({ step }) => {
+  const first = await step(async (map) => map.set("one.md", "First"), "write one")
+  const second = await step(async (map) => map.set("two.md", "Second"), "write two")
+  return [first, second]
+})
+```
+
+Each awaited `step` sees the prior successful step's tree and takes its own `author`, `provenance`, trailers and candidate gate. A thrown step leaves that step's overlay out; the caller may catch it and continue. A step that changes nothing makes no commit. The returned `value` is the callback's result, `oid` is the final published tip, and `retries` counts lost-lease replays. If another writer moves the ref, gitomic reruns the whole callback against fresh tips; derive each step from the attempt rather than retaining a stale map. `options.fetch` reads named refs with the attempt, and `options.beside` stages side refs once after the steps for the same atomic publish. The sequence requires a backend with multi-ref `publish` when it has side refs.
+
 Callers with independently verified original attribution may provide it as per-call `provenance`. Gitomic copies and validates its scalar fields before queueing the call, then records them in commit trailers, fixed through every retry; it never infers them from a writer label, process, environment, or store. Omitting provenance leaves that call unattributed even on a reused store. An unchanged transaction returns the existing commit without recording new attribution. This metadata is an audit record, never authority to write.
 
 ### Refs beside the commit
