@@ -403,6 +403,9 @@ async function prepareStore(options: OpenOptions): Promise<StoreContext> {
       }
       return { tip, tips }
     }
+    // A local store has no kept copy: its ref IS the store. "moved" and "locked" are both a lost lease here, and the
+    // loop re-reads and retries within its budget, as before RefSwap existed; the held-lock throw is the kept copy's
+    // (the remote branch's refresh), not this ref's (hh 25615, @cto P4).
     swap = async (next, expected) => (await backend.compareAndSwap(repo, ref, next, expected)) === "swapped" && {}
   } else {
     const fetchRemote = backend.fetchRemote
