@@ -330,31 +330,46 @@ describe("acceptance: a race re-runs decide on the winner's events and writes th
     expect((await chain.events()).map((event) => event.type)).toEqual(["opened"])
   })
 
-  /** @failure 25708: a refused change-ref lease inside an atomic target publish was retried without reaching Yrd. */
-  test("an atomic event and target publish reports its chain lease refusal", async () => {
+  /**
+   * @failure 25708 (@cto a8b9146d): a rival on the chain alone leaves every `also` lease untouched, so an atomic
+   * event and target publish re-decides and lands; a lost `also` lease, alone or beside the chain, is the caller's
+   * typed Conflict naming that ref.
+   */
+  test.each([
+    { lost: [CHAIN], lands: true },
+    { lost: ["refs/heads/main"], lands: false },
+    { lost: [CHAIN, "refs/heads/main"], lands: false },
+  ])("an atomic event and target publish that loses $lost: lands after a retry = $lands", async ({ lost, lands }) => {
     const base = createMemBackend()
     if (base.publish === undefined) throw new Error("memory backend cannot publish")
-    const repo = "events-atomic-refusal"
+    const repo = `events-atomic-${lost.length}-${lands ? "lands" : "refused"}`
     const head = await workCommit({ name: "mem", repo, backend: base, cleanup: async () => {} }, "head.txt")
+    await base.publish(repo, [{ ref: "refs/heads/main", expect: "0".repeat(head.length), oid: head }])
     let attempts = 0
     const backend: GitomicBackend = {
       ...base,
       publish: async (...args) => {
         attempts++
         if (attempts === 1) {
-          throw new Conflict(`lease lost, nothing published: ${CHAIN} is at locked, not absent`, { refs: [CHAIN] })
+          throw new Conflict(`lease lost, nothing published: ${lost.join(", ")}`, { refs: lost })
         }
         return base.publish!(...args)
       },
     }
     const chain = await openEvents({ repo, ref: CHAIN, backend })
-    await expect(
-      chain.transact(() => [{ type: "merged" }], "publish with target", {
-        also: [{ ref: "refs/heads/main", expect: head, oid: head }],
-      }),
-    ).rejects.toBeInstanceOf(Conflict)
-    expect(attempts).toBe(1)
-    expect(await chain.head()).toBeNull()
+    const run = chain.transact(() => [{ type: "merged" }], "publish with target", {
+      also: [{ ref: "refs/heads/main", expect: head, oid: head }],
+    })
+    if (lands) {
+      const result = await run
+      expect(attempts).toBe(2)
+      expect(result.retries).toBe(1)
+      expect((await chain.events()).map((event) => event.type)).toEqual(["merged"])
+    } else {
+      await expect(run).rejects.toThrow("refs/heads/main")
+      expect(attempts).toBe(1)
+      expect(await chain.head()).toBeNull()
+    }
   })
 
   test("two writers on one chain (mem)", async () => {

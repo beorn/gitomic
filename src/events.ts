@@ -298,12 +298,13 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
   }
 
   /**
-   * One atomic publish of the event ref plus every `also` ref. With no `also`
-   * refs, a chain-only lease conflict returns false so the event loop can
-   * re-read and retry. With any `also` ref, even a chain-only Conflict reaches
-   * the caller: the caller owns the meaning of the whole atomic publication
-   * and must record its refusal. The backend's Conflict names the ref and its
-   * expected and observed values. Other failures remain the backend's Error.
+   * One atomic publish of the event ref plus every `also` ref. A conflict that
+   * names the chain alone returns false, so the loop re-reads and re-decides:
+   * every `also` lease is untouched, and the next atomic publish re-checks each
+   * of them. A conflict naming any `also` ref is final and reaches the caller
+   * as the typed Conflict naming that ref, even alongside the chain (@cto
+   * a8b9146d, 25708). The backend names every rejected ref with its expected
+   * and observed values. Other failures remain the backend's Error.
    */
   const publishWith =
     (also: readonly RefUpdate[]) =>
@@ -314,17 +315,7 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
       } catch (error) {
         // The tool named each lost lease. A lost `also` ref is final: a retry
         // would find it just as stale. The chain alone is the usual race.
-        // A multi-ref publication has a caller-owned outcome for the whole
-        // atomic write. Report even a chain-only refusal to that caller; a
-        // private retry would hide a refused target publish from its journal.
-        if (
-          also.length === 0 &&
-          error instanceof Conflict &&
-          error.refs.length > 0 &&
-          error.refs.every((lost) => lost === ref)
-        ) {
-          return false
-        }
+        if (error instanceof Conflict && error.refs.length > 0 && error.refs.every((lost) => lost === ref)) return false
         throw error
       }
     }
