@@ -100,7 +100,7 @@ describe("public contract guards", () => {
     const mem = createMemBackend()
     // A ref that never moves and a CAS that never succeeds: no writer ever lands,
     // so the budget never resets and the transaction must give up once time runs out.
-    const backend: GitomicBackend = { ...mem, compareAndSwap: async () => false }
+    const backend: GitomicBackend = { ...mem, compareAndSwap: async () => "moved" as const }
     const store = await open({
       repo: "retry-limit",
       ref: "main",

@@ -1,5 +1,5 @@
 import { createShellBackend, open } from "../../src/index.js"
-import type { GitomicBackend } from "../../src/index.js"
+import type { GitomicBackend, RefSwap } from "../../src/index.js"
 
 const repo = process.argv[2]
 if (repo === undefined) throw new TypeError("repo argument is required")
@@ -7,9 +7,9 @@ if (repo === undefined) throw new TypeError("repo argument is required")
 const shell = createShellBackend()
 const backend: GitomicBackend = {
   ...shell,
-  async compareAndSwap(_repo, _ref, next): Promise<boolean> {
+  async compareAndSwap(_repo, _ref, next): Promise<RefSwap> {
     process.stdout.write(`${JSON.stringify({ next })}\n`)
-    return await new Promise<boolean>(() => undefined)
+    return await new Promise<RefSwap>(() => undefined)
   },
 }
 const store = await open({ repo, ref: "main", writer: "crash-writer", backend })

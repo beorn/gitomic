@@ -136,7 +136,7 @@ describe("transact reads only the base values it names (mem, 20,000 entries)", (
           // Another writer lands on the same ref between this attempt's read and its publish.
           const other = await open({ repo, ref, writer: "other", backend: mem })
           await other.transact(async (map) => map.set(notePath(1), "moved by the other writer\n"), "move under it")
-          return false
+          return "moved"
         }
         return recorded.backend.compareAndSwap(repo, ref, next, expected)
       },

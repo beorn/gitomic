@@ -29,10 +29,12 @@ import type {
   GitMap,
   GitomicBackend,
   Ident,
+  KeptCopy,
   Oid,
   OpenOptions,
   OpenReaderOptions,
   Reader,
+  RefSwap,
   RefTipChange,
   RefTipWatchOptions,
   Snapshot,
@@ -107,6 +109,7 @@ export type {
   GitMap,
   GitomicBackend,
   Ident,
+  KeptCopy,
   Oid,
   OpenOptions,
   OpenReaderOptions,
@@ -118,6 +121,7 @@ export type {
   Reader,
   RefTipChange,
   RefTipWatchOptions,
+  RefSwap,
   RefUpdate,
   Snapshot,
   SequenceAttempt,
@@ -188,6 +192,7 @@ export async function open(options: OpenOptions): Promise<Store> {
           oid: completed.oid,
           retries: completed.retries,
           ...(completed.value.report === undefined ? {} : { report: completed.value.report }),
+          ...(completed.kept === undefined ? {} : { kept: completed.kept }),
         }
       })
     },
@@ -310,7 +315,8 @@ type StoreContext = {
   refresh(reason: "initial" | "after-rejection" | "after-unknown"): Promise<Oid>
   /** `refresh` plus the tips of `fetch`'s refs (null: absent), read in the same fetch on a remote store. */
   refreshWith(fetch: readonly string[]): Promise<{ readonly tip: Oid; readonly tips: ReadonlyMap<string, Oid> }>
-  publish(next: Oid, expected: Oid, beside: readonly RefUpdate[]): Promise<boolean>
+  /** false = a lost lease, retry; otherwise landed, with what the kept ref did when the publish moved it. */
+  publish(next: Oid, expected: Oid, beside: readonly RefUpdate[]): Promise<false | { readonly kept?: KeptCopy }>
   nextSeq(): number
 }
 /** Validate `TransactOptions.fetch` at the call: full names, not the store's ref, no repeats, a backend that can read them. */
@@ -337,6 +343,11 @@ function shapeFetch(context: StoreContext, fetch: readonly string[] | undefined)
   }
   return shaped
 }
+
+// Pauses between retries of a kept-copy update refused by a held ref lock: about 200 ms in all (hh 25615).
+const KEPT_LOCK_PAUSES_MS = [50, 150] as const
+
+const KEPT_COPY: Record<RefSwap, KeptCopy> = { swapped: "advanced", moved: "moved", locked: "locked" }
 
 type ReaderContext = {
   repo: string
@@ -377,7 +388,7 @@ async function prepareStore(options: OpenOptions): Promise<StoreContext> {
   }
   let refresh: StoreContext["refresh"]
   let refreshWith: StoreContext["refreshWith"]
-  let swap: (next: Oid, expected: Oid) => Promise<boolean>
+  let swap: (next: Oid, expected: Oid) => Promise<false | { readonly kept?: KeptCopy }>
   if (remote === undefined) {
     refresh = readLocal
     refreshWith = async (fetch) => {
@@ -391,7 +402,7 @@ async function prepareStore(options: OpenOptions): Promise<StoreContext> {
       }
       return { tip, tips }
     }
-    swap = async (next, expected) => backend.compareAndSwap(repo, ref, next, expected)
+    swap = async (next, expected) => (await backend.compareAndSwap(repo, ref, next, expected)) === "swapped" && {}
   } else {
     const fetchRemote = backend.fetchRemote
     const compareAndSwapRemote = backend.compareAndSwapRemote
@@ -401,9 +412,26 @@ async function prepareStore(options: OpenOptions): Promise<StoreContext> {
     // The kept ref is derived state: a cache of origin's tip that another process sharing this repository may move
     // at any moment. A lost cache update is never a failure: this attempt builds on `fetched`, and a stale kept
     // ref costs the next attempt one refused lease and a refresh (hh 25615, @cto: a moved local ref is re-read).
+    // A "locked" answer is not another writer: its ref lock is held. A live holder finishes in milliseconds; a lock
+    // left by a Git process killed mid-update never does, and absorbing it would cost every later write a refused
+    // lease and a fetch. So it is retried briefly, then named, before any push (hh 25615, review2 P3, @cto bb1f7b51).
     const syncLocal = async (fetched: Oid): Promise<void> => {
       const local = backendOid(await backend.head(repo, ref))
-      if (local !== fetched) await backend.compareAndSwap(repo, ref, fetched, local)
+      if (local === fetched) return
+      for (const pause of [...KEPT_LOCK_PAUSES_MS, undefined]) {
+        if ((await backend.compareAndSwap(repo, ref, fetched, local)) !== "locked") return
+        if (pause === undefined) break
+        await new Promise((resolve) => {
+          // raw-lifecycle-ok: this refresh-owned pause is awaited and cannot outlive its caller.
+          setTimeout(resolve, pause)
+        })
+      }
+      // Still locked at the end of the window. A ref that moved meanwhile was another writer's: skip, as above.
+      if (backendOid(await backend.head(repo, ref)) !== local) return
+      throw new Error(
+        `kept copy ${JSON.stringify(repo)} cannot move ${ref} from ${local} to ${fetched}, and no other writer moved it: ` +
+          `${ref}.lock in its git directory is held; if no git process is running there, remove it`,
+      )
     }
     const refreshRemote = async (): Promise<Oid> => {
       const fetched = backendOid(await fetchRemote(repo, ref, remote))
@@ -428,14 +456,21 @@ async function prepareStore(options: OpenOptions): Promise<StoreContext> {
       }
       return { tip: backendOid(tip), tips }
     }
-    // A lease the remote accepted is landed, whatever the kept copy did afterward (hh 25615).
-    swap = async (next, expected) => compareAndSwapRemote(repo, ref, next, expected, remote)
+    // A lease the remote accepted is landed, whatever the kept copy did afterward; the result carries it (hh 25615).
+    swap = async (next, expected) => {
+      const pushed = await compareAndSwapRemote(repo, ref, next, expected, remote)
+      return pushed.landed && { kept: KEPT_COPY[pushed.kept] }
+    }
   }
   // With beside refs the publish is the backend's MULTI publish of the ref and every beside ref, or none. For
   // THIS door a Conflict naming any of them is a lost lease and returns false, so the loop re-reads and the
   // attempt is rebuilt against fresh tips (the events door treats a lost `also` lease as final, because `also`
   // is static). The receipt search stays on the ref: the beside refs landed with it or not at all.
-  const publish = async (next: Oid, expected: Oid, beside: readonly RefUpdate[]): Promise<boolean> => {
+  const publish = async (
+    next: Oid,
+    expected: Oid,
+    beside: readonly RefUpdate[],
+  ): Promise<false | { readonly kept?: KeptCopy }> => {
     if (beside.length === 0) return swap(next, expected)
     const multi = backend.publish
     if (multi === undefined) throw new TypeError("beside needs a backend with publish (MULTI)")
@@ -446,10 +481,10 @@ async function prepareStore(options: OpenOptions): Promise<StoreContext> {
         // A Store's primary ref is its next attempt's kept base, so advance
         // that cache after this Store's accepted atomic publish. If another
         // process moved it first, the publish still landed: the next attempt
-        // re-reads the kept ref (hh 25615).
-        await backend.compareAndSwap(repo, ref, next, expected)
+        // re-reads the kept ref, and the result says what happened (hh 25615).
+        return { kept: KEPT_COPY[await backend.compareAndSwap(repo, ref, next, expected)] }
       }
-      return true
+      return {}
     } catch (error) {
       if (error instanceof Conflict) return false
       throw error
@@ -501,6 +536,9 @@ async function transactSequenceBody<R>(
   // throws never changes the unpublished head; the caller may catch and continue.
   const seqs: number[] = []
   let tips: ReadonlyMap<string, Oid> = new Map()
+  // What the kept ref did after the publish that landed this transaction; a receipt found after a lost
+  // acknowledgement leaves it unknown.
+  let kept: KeptCopy | undefined
   return runCasLoop<Oid, SequenceResult<R>>({
     label: `${context.repo} ${context.ref}`,
     retryBudgetMs: context.retryBudgetMs,
@@ -512,7 +550,11 @@ async function transactSequenceBody<R>(
             tips = read.tips
             return read.tip
           },
-    publish: context.publish,
+    publish: async (next, expected, beside) => {
+      const published = await context.publish(next, expected, beside)
+      kept = published === false ? undefined : published.kept
+      return published !== false
+    },
     findTransaction: async (winner, base, instance, seq) =>
       context.backend.findTransaction(context.repo, winner, base, instance, seq),
     attempt: async (parent, retries) => {
@@ -627,7 +669,7 @@ async function transactSequenceBody<R>(
         instance: context.instance,
         seq: lastCommittedSeq,
         ...(beside.length === 0 ? {} : { beside }),
-        landed: (oid, retries) => ({ value, oid: backendOid(oid), retries }),
+        landed: (oid, retries) => ({ value, oid: backendOid(oid), retries, ...(kept === undefined ? {} : { kept }) }),
       }
     },
   })

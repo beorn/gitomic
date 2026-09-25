@@ -36,7 +36,7 @@ async function publishEverywhere(
   for (const { repo, backend } of targets) {
     const parent = await backend.head(repo, "refs/heads/main")
     const next = await backend.writeCommit(repo, { ...input, parent })
-    expect(await backend.compareAndSwap(repo, "refs/heads/main", next, parent)).toBe(true)
+    expect(await backend.compareAndSwap(repo, "refs/heads/main", next, parent)).toBe("swapped")
     oids.push(next)
   }
   return oids

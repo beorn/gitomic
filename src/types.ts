@@ -45,9 +45,21 @@ export type Snapshot = Pick<GitMap, "get" | "has" | "keys"> & {
 export type AttemptContext = { readonly tips: ReadonlyMap<string, Oid> }
 export type Update = (map: GitMap, base: Oid, attempt?: AttemptContext) => Promise<void>
 
+/** How a ref compare-and-swap ended; see {@link GitomicBackend.compareAndSwap}. */
+export type RefSwap = "swapped" | "moved" | "locked"
+
+/**
+ * What a remote Store's kept ref (its local cache of origin's tip) did after a publish origin accepted: "advanced"
+ * to the landed commit; "moved" by another process first (the next attempt re-reads it); or "locked", its ref lock
+ * held, which the next refresh reports by failing. The publish landed in every case.
+ */
+export type KeptCopy = "advanced" | "moved" | "locked"
+
 export type Committed = {
   oid: Oid
   retries: number
+  /** What the kept ref did after this publish landed; absent when the publish touched no kept ref (a local store). */
+  kept?: KeptCopy
   /** What the candidate reported for the tree that landed (never a refusal); absent without a candidate. */
   report?: readonly string[]
 }
@@ -202,7 +214,12 @@ export type GitomicBackend = {
    */
   readBlobs(repo: string, oids: readonly Oid[]): Promise<ReadonlyMap<Oid, BlobValue>>
   writeCommit(repo: string, input: CommitInput): Promise<Oid>
-  compareAndSwap(repo: string, ref: string, next: Oid, expected: Oid): Promise<boolean>
+  /**
+   * Move `ref` from `expected` to `next`. "swapped" when it moved; "moved" when the ref was not at `expected` (a lost
+   * lease: re-read and retry); "locked" when its ref lock was held, so nobody could move it (a live holder finishes
+   * in milliseconds, a lock left by a killed Git process never does). A backend without locks never answers "locked".
+   */
+  compareAndSwap(repo: string, ref: string, next: Oid, expected: Oid): Promise<RefSwap>
   /**
    * Search `head`'s first-parent chain for one store instance's transaction.
    *
@@ -239,7 +256,18 @@ export type GitomicBackend = {
     tips: readonly Oid[],
     options?: { readonly exclude?: readonly Oid[]; readonly limit?: number },
   ): Promise<CommitMeta[]>
-  compareAndSwapRemote?(repo: string, ref: string, next: Oid, expected: Oid, remote: string): Promise<boolean>
+  /**
+   * A leased push of `next` to `remote`: `landed: false` is a lease origin refused. A landed push also moves the
+   * local ref, a cache of origin, and `kept` says how that went: "swapped" to `next`; "moved", left alone because it
+   * was not at `expected`; or "locked". The push landed whatever `kept` says.
+   */
+  compareAndSwapRemote?(
+    repo: string,
+    ref: string,
+    next: Oid,
+    expected: Oid,
+    remote: string,
+  ): Promise<{ readonly landed: false } | { readonly landed: true; readonly kept: RefSwap }>
   /**
    * MULTI: move every ref in `updates`, or none. `expect` is a lease, not an
    * assertion. Per ref, three outcomes: updated (was at expect, now at oid),
@@ -445,7 +473,13 @@ export type SequenceOptions<R> = {
   ) => Promise<readonly BesideRef[]> | readonly BesideRef[]
 }
 
-export type SequenceResult<R> = { readonly value: R; readonly oid: Oid; readonly retries: number }
+export type SequenceResult<R> = {
+  readonly value: R
+  readonly oid: Oid
+  readonly retries: number
+  /** What the kept ref did after this publish landed; absent when the publish touched no kept ref (a local store). */
+  readonly kept?: KeptCopy
+}
 
 export type Store = {
   head(): Promise<Oid>
