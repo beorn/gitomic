@@ -85,6 +85,12 @@ export type EventsOptions = {
 export type EventsRead = {
   /** Read only events newer than this event id (exclusive). */
   from?: Oid
+  /**
+   * Read the chain whose tip is this event instead of the ref's current tip: a tip another read already
+   * fetched (a store's per-attempt `fetch` list), so the read costs no remote round trip and sees exactly
+   * that state. Nothing is fetched; the commits must be in the repository.
+   */
+  at?: Oid
   limit?: number
   /** Chronological (oldest first) by default. */
   order?: "oldest-first" | "newest-first"
@@ -413,7 +419,7 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
     async events(read = {}) {
       const limit = normalizeLimit(read.limit)
       const from = read.from === undefined ? undefined : validateOid(read.from, "events from must be an event id")
-      const at = await tip()
+      const at = read.at === undefined ? await tip() : validateOid(read.at, "events at must be an event id")
       if (at === null) return []
       const { events } = await readChain(at, { ...(from === undefined ? {} : { from }), limit })
       // The walk is newest-first.

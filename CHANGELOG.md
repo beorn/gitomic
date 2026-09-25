@@ -12,6 +12,13 @@
   static `also`, which is final when lost. Needs a MULTI `publish` backend and
   refuses at the call otherwise. The `also`/`beside` validation is one
   function, `shapeRefUpdates`.
+- `fetch` on `Store.transact`: refs whose tips every attempt reads in the SAME
+  fetch as the store's ref (remote) or from the repository (local), handed to
+  `update` (third argument) and `beside` as `tips`; a listed ref that does not
+  exist yet is absent from the map, while the store's own ref stays strict. `fetchRefs`
+  takes `{ absent: "omit" }`: a named ref the remote lacks is fetched as a
+  pattern and left out instead of failing the whole fetch. `events({ at })`
+  reads a chain at a tip already fetched, with no remote round trip.
 
 - `authoredPaths` on `CheckoutSyncRequest` and `RemoteFirstProjectionRequest`
   (25350 S3): "paths whose checkout content IS this landing" — a write authored
