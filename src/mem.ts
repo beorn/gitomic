@@ -1,3 +1,6 @@
+// The backend contract is Promise-returning, and mem answers from memory with nothing to await; an `async` method
+// keeps a throw a rejection, as every other backend's is (hh 25615, @cto P4).
+/* eslint-disable @typescript-eslint/require-await */
 import {
   assertRefUpdates,
   commitIdents,
