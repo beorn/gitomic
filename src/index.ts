@@ -250,7 +250,7 @@ type StoreContext = {
   retryBudgetMs: number
   /** The clock every commit of this store is dated by, in unix seconds (25486). */
   clock: Clock
-  refresh(): Promise<Oid>
+  refresh(reason: "initial" | "after-rejection" | "after-unknown"): Promise<Oid>
   publish(next: Oid, expected: Oid, beside: readonly RefUpdate[]): Promise<boolean>
   nextSeq(): number
 }
@@ -279,10 +279,23 @@ async function prepareStore(options: OpenOptions): Promise<StoreContext> {
   const retryBudgetMs = normalizeRetryBudget(options.retryBudgetMs)
   const clock = normalizeClock(options.clock)
   const remote = options.remote
-  let refresh: () => Promise<Oid>
+  if (options.refresh !== undefined && options.refresh !== "always" && options.refresh !== "on-rejection") {
+    throw new TypeError(`refresh must be "always" or "on-rejection", got ${String(options.refresh)}`)
+  }
+  const readLocal = async (): Promise<Oid> => backendOid(await backend.head(repo, ref))
+  const readKept = async (): Promise<Oid> => {
+    try {
+      const oid = await readLocal()
+      await backend.readCommit(repo, oid)
+      return oid
+    } catch (cause) {
+      throw new Error(`cannot read local ref ${ref} in ${JSON.stringify(repo)}`, { cause })
+    }
+  }
+  let refresh: StoreContext["refresh"]
   let swap: (next: Oid, expected: Oid) => Promise<boolean>
   if (remote === undefined) {
-    refresh = async () => backendOid(await backend.head(repo, ref))
+    refresh = readLocal
     swap = async (next, expected) => backend.compareAndSwap(repo, ref, next, expected)
   } else {
     const fetchRemote = backend.fetchRemote
@@ -290,13 +303,26 @@ async function prepareStore(options: OpenOptions): Promise<StoreContext> {
     if (fetchRemote === undefined || compareAndSwapRemote === undefined) {
       throw new TypeError("this backend cannot arbitrate remotely; omit remote or use the shell/iso backend")
     }
-    refresh = async () => {
+    const refreshRemote = async (): Promise<Oid> => {
       const fetched = backendOid(await fetchRemote(repo, ref, remote))
       const local = backendOid(await backend.head(repo, ref))
-      if (local !== fetched) await backend.compareAndSwap(repo, ref, fetched, local)
+      if (local !== fetched) {
+        const cached = await backend.compareAndSwap(repo, ref, fetched, local)
+        if (!cached && options.refresh === "on-rejection") {
+          throw new Error(`cannot refresh local cache ${ref} in ${JSON.stringify(repo)}: local ref moved`)
+        }
+      }
       return fetched
     }
-    swap = async (next, expected) => compareAndSwapRemote(repo, ref, next, expected, remote)
+    refresh = async (reason) =>
+      options.refresh === "on-rejection" && reason === "initial" ? readKept() : refreshRemote()
+    swap = async (next, expected) => {
+      const landed = await compareAndSwapRemote(repo, ref, next, expected, remote)
+      if (landed && options.refresh === "on-rejection" && (await readLocal()) !== next) {
+        throw new Error(`remote CAS accepted ${ref} at ${next}, but local cache in ${JSON.stringify(repo)} moved`)
+      }
+      return landed
+    }
   }
   // With beside refs the publish is the backend's MULTI publish of the ref and every beside ref, or none. For
   // THIS door a Conflict naming any of them is a lost lease and returns false, so the loop re-reads and the
@@ -308,13 +334,21 @@ async function prepareStore(options: OpenOptions): Promise<StoreContext> {
     if (multi === undefined) throw new TypeError("beside needs a backend with publish (MULTI)")
     try {
       await multi(repo, [{ ref, expect: expected, oid: next }, ...beside], remote)
+      if (remote !== undefined && options.refresh === "on-rejection") {
+        // Raw MULTI leaves local refs untouched for staged event publishers.
+        // A Store's primary ref is its next attempt's kept base, so advance
+        // that cache after this Store's accepted atomic publish.
+        if (!(await backend.compareAndSwap(repo, ref, next, expected))) {
+          throw new Error(`remote MULTI accepted ${ref} at ${next}, but local cache in ${JSON.stringify(repo)} moved`)
+        }
+      }
       return true
     } catch (error) {
       if (error instanceof Conflict) return false
       throw error
     }
   }
-  await refresh()
+  await refresh("initial")
   return { repo, ref, writer, instance, committer, backend, retryBudgetMs, clock, refresh, publish, nextSeq }
 }
 

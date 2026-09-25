@@ -9,6 +9,7 @@ import { dirname, join } from "node:path"
 import { pathToFileURL } from "node:url"
 
 import { createShellBackend, open, openReader, openRemoteRepository, RetriesExhausted } from "../src/index.js"
+import { createIsoBackend } from "../src/iso.js"
 import type { GitMap, GitomicBackend } from "../src/index.js"
 import { createBareRepo, createRemoteRepos, git } from "./helpers/git.js"
 
@@ -111,6 +112,234 @@ describe("owned remote repositories", () => {
 })
 
 describe("remote arbitration", () => {
+  test("default Store still fetches before open and transact", async () => {
+    const fixture = await createRemoteRepos()
+    try {
+      const shell = createShellBackend()
+      const fetchRemote = vi.fn(shell.fetchRemote!)
+      const store = await open({
+        repo: fixture.left,
+        ref: "main",
+        remote: "origin",
+        backend: { ...shell, fetchRemote },
+      })
+      await store.transact(async (map) => map.set("default", "fresh"), "default policy")
+      expect(fetchRemote).toHaveBeenCalledTimes(2)
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  // #25693: the first write must not pay for a fetch; only a lost lease can make the kept ref stale.
+  test.each([
+    ["shell", createShellBackend],
+    ["iso", createIsoBackend],
+  ] as const)(
+    "%s opt-in store uses one push per uncontended write and refreshes after rejection",
+    async (_name, backendFactory) => {
+      const fixture = await createRemoteRepos()
+      try {
+        const base = backendFactory()
+        const fetchRemote = vi.fn(base.fetchRemote!)
+        const compareAndSwapRemote = vi.fn(base.compareAndSwapRemote!)
+        const store = await open({
+          repo: fixture.left,
+          ref: "main",
+          remote: "origin",
+          refresh: "on-rejection",
+          backend: { ...base, fetchRemote, compareAndSwapRemote },
+        })
+        await store.transact(async (map) => map.set("count", "1"), "first")
+        await store.transact(async (map) => map.set("count", "2"), "second")
+        expect(fetchRemote).toHaveBeenCalledTimes(0)
+        expect(compareAndSwapRemote).toHaveBeenCalledTimes(2)
+        expect(await base.head(fixture.left, "refs/heads/main")).toBe(await git(fixture.remote, "rev-parse", "main"))
+
+        const rival = await open({ repo: fixture.right, ref: "main", remote: "origin" })
+        await rival.transact(async (map) => map.set("rival", "landed"), "rival")
+        let attempts = 0
+        const result = await store.transact(async (map) => {
+          attempts += 1
+          map.set("count", String(Number((await map.get("count")) ?? "0") + 1))
+        }, "replay")
+        expect(result.retries).toBe(1)
+        expect(attempts).toBe(2)
+        expect(fetchRemote).toHaveBeenCalledTimes(1)
+        expect(compareAndSwapRemote).toHaveBeenCalledTimes(4)
+        expect(await git(fixture.remote, "show", "main:rival")).toBe("landed")
+        expect(await git(fixture.remote, "show", "main:count")).toBe("3")
+
+        const newer = await rival.transact(async (map) => map.set("newer", "remote"), "newer remote tip")
+        expect(await store.head()).toBe(result.oid)
+        expect(await store.head()).not.toBe(newer.oid)
+        expect(fetchRemote).toHaveBeenCalledTimes(1)
+      } finally {
+        await fixture.cleanup()
+      }
+    },
+  )
+
+  test.each(["false", "throw"])(
+    "on-rejection store refreshes before searching a %s acknowledgement receipt",
+    async (acknowledgement) => {
+      const fixture = await createRemoteRepos()
+      try {
+        const shell = createShellBackend()
+        const fetchRemote = vi.fn(shell.fetchRemote!)
+        const backend: GitomicBackend = {
+          ...shell,
+          fetchRemote,
+          async compareAndSwapRemote(...args) {
+            expect(await shell.compareAndSwapRemote!(...args)).toBe(true)
+            if (acknowledgement === "throw") throw new Error("accepted; acknowledgement lost")
+            return false
+          },
+        }
+        const store = await open({
+          repo: fixture.left,
+          ref: "main",
+          remote: "origin",
+          refresh: "on-rejection",
+          backend,
+        })
+        const update = vi.fn(async (map: GitMap) => map.set("receipt", "once"))
+        const result = await store.transact(update, "receipt")
+        expect(result.oid).toBe(await git(fixture.remote, "rev-parse", "main"))
+        expect(update).toHaveBeenCalledTimes(1)
+        expect(fetchRemote).toHaveBeenCalledTimes(1)
+      } finally {
+        await fixture.cleanup()
+      }
+    },
+  )
+
+  test.each([
+    ["shell", createShellBackend],
+    ["iso", createIsoBackend],
+  ] as const)("%s accepted MULTI publish advances the kept local ref", async (_name, backendFactory) => {
+    const fixture = await createRemoteRepos()
+    try {
+      const base = backendFactory()
+      const fetchRemote = vi.fn(base.fetchRemote!)
+      const publish = vi.fn(base.publish!)
+      const backend = { ...base, fetchRemote, publish }
+      const store = await open({
+        repo: fixture.left,
+        ref: "main",
+        remote: "origin",
+        refresh: "on-rejection",
+        backend,
+      })
+      const result = await store.transact(async (map) => map.set("multi", "landed"), "multi", {
+        beside: ({ next }) => [{ ref: "refs/heads/companion", expect: null, oid: next }],
+      })
+      expect(await backend.head(fixture.left, "refs/heads/main")).toBe(result.oid)
+      expect(await git(fixture.left, "for-each-ref", "refs/heads/companion")).toBe("")
+      expect(await git(fixture.remote, "rev-parse", "main")).toBe(result.oid)
+      await store.transact(async (map) => map.set("following", "one push"), "following")
+      expect(fetchRemote).toHaveBeenCalledTimes(0)
+      expect(publish).toHaveBeenCalledTimes(1)
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  test("on-rejection open names a missing kept ref instead of fetching it", async () => {
+    const fixture = await createRemoteRepos()
+    try {
+      await git(fixture.left, "update-ref", "-d", "refs/heads/main")
+      const shell = createShellBackend()
+      const fetchRemote = vi.fn(shell.fetchRemote!)
+      await expect(
+        open({
+          repo: fixture.left,
+          ref: "main",
+          remote: "origin",
+          refresh: "on-rejection",
+          backend: { ...shell, fetchRemote },
+        }),
+      ).rejects.toThrow(`cannot read local ref refs/heads/main in ${JSON.stringify(fixture.left)}`)
+      expect(fetchRemote).toHaveBeenCalledTimes(0)
+      expect(await git(fixture.remote, "rev-parse", "main")).toBe(fixture.initial)
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  test("on-rejection open names an unreadable kept commit object", async () => {
+    const fixture = await createRemoteRepos()
+    try {
+      const shell = createShellBackend()
+      const fetchRemote = vi.fn(shell.fetchRemote!)
+      const backend: GitomicBackend = {
+        ...shell,
+        fetchRemote,
+        async readCommit(repo, oid) {
+          if (oid === fixture.initial) throw new Error("object missing")
+          return shell.readCommit(repo, oid)
+        },
+      }
+      await expect(
+        open({ repo: fixture.left, ref: "main", remote: "origin", refresh: "on-rejection", backend }),
+      ).rejects.toThrow(`cannot read local ref refs/heads/main in ${JSON.stringify(fixture.left)}`)
+      expect(fetchRemote).toHaveBeenCalledTimes(0)
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  test("Store verifies an accepted MULTI receipt if its local cache CAS loses", async () => {
+    const fixture = await createRemoteRepos()
+    try {
+      const shell = createShellBackend()
+      const fetchRemote = vi.fn(shell.fetchRemote!)
+      let denyCacheOnce = true
+      const backend: GitomicBackend = {
+        ...shell,
+        fetchRemote,
+        async compareAndSwap(...args) {
+          if (denyCacheOnce) {
+            denyCacheOnce = false
+            return false
+          }
+          return shell.compareAndSwap(...args)
+        },
+      }
+      const store = await open({ repo: fixture.left, ref: "main", remote: "origin", refresh: "on-rejection", backend })
+      const update = vi.fn(async (map: GitMap) => map.set("multi", "once"))
+      const result = await store.transact(update, "multi", {
+        beside: ({ next }) => [{ ref: "refs/heads/companion", expect: null, oid: next }],
+      })
+      expect(result.oid).toBe(await git(fixture.remote, "rev-parse", "main"))
+      expect(update).toHaveBeenCalledTimes(1)
+      expect(fetchRemote).toHaveBeenCalledTimes(1)
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  test("Store reports a cache ref that keeps moving after accepted MULTI", async () => {
+    const fixture = await createRemoteRepos()
+    try {
+      const shell = createShellBackend()
+      const backend: GitomicBackend = {
+        ...shell,
+        async compareAndSwap() {
+          return false
+        },
+      }
+      const store = await open({ repo: fixture.left, ref: "main", remote: "origin", refresh: "on-rejection", backend })
+      const outcome = store.transact(async (map) => map.set("multi", "landed"), "multi", {
+        beside: ({ next }) => [{ ref: "refs/heads/companion", expect: null, oid: next }],
+      })
+      await expect(outcome).rejects.toBeInstanceOf(AggregateError)
+      await expect(outcome).rejects.toThrow(/local cache.*moved/)
+      expect(await git(fixture.remote, "show", "main:multi")).toBe("landed")
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
   // AC2: mocked remote reads cannot detect shell.fetchRemote rewinding an ahead application ref.
   test.each(["caller-owned", "URL-owned"])(
     "reader preserves an unpublished %s branch while observing origin",

@@ -29,7 +29,7 @@ export type CasLoop<H, R> = {
   readonly label: string
   readonly retryBudgetMs: number
   /** The current tip. */
-  refresh(): Promise<H>
+  refresh(reason: "initial" | "after-rejection" | "after-unknown"): Promise<H>
   /** Move the tip from `expected` to `next`, with `beside` in the same atomic publish; false = a lost lease, retry. */
   publish(next: Oid, expected: H, beside: readonly RefUpdate[]): Promise<boolean>
   /** Search `winner`'s first-parent chain, back to `base`, for this receipt. */
@@ -47,8 +47,10 @@ export async function runCasLoop<H, R>(loop: CasLoop<H, R>): Promise<R> {
   // writer landed): a burst that keeps landing someone is never abandoned, while
   // a transaction that makes no progress for the whole budget fails loudly.
   let deadline = Date.now() + loop.retryBudgetMs
+  let refreshedWinner: { tip: H } | undefined
   while (true) {
-    const tip = await loop.refresh()
+    const tip = refreshedWinner === undefined ? await loop.refresh("initial") : refreshedWinner.tip
+    refreshedWinner = undefined
     const attempt = await loop.attempt(tip, retries)
     if (attempt.kind === "noop") return attempt.result
 
@@ -73,7 +75,7 @@ export async function runCasLoop<H, R>(loop: CasLoop<H, R>): Promise<R> {
     // attempt.
     let winner: H
     try {
-      winner = await loop.refresh()
+      winner = await loop.refresh(publicationFailure === undefined ? "after-rejection" : "after-unknown")
       const landed = await loop.findTransaction(winner, attempt.base, attempt.instance, attempt.seq)
       if (landed !== undefined) return attempt.landed(landed, retries)
     } catch (verificationError) {
@@ -92,6 +94,7 @@ export async function runCasLoop<H, R>(loop: CasLoop<H, R>): Promise<R> {
     // loss is the rare path), so a transaction that never lands still fails.
     if (winner !== tip) deadline = Date.now() + loop.retryBudgetMs
     if (Date.now() >= deadline) throw new RetriesExhausted(retries, loop.retryBudgetMs)
+    refreshedWinner = { tip: winner }
     await delayForRetry(retries)
   }
 }

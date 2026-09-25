@@ -297,6 +297,14 @@ export type OpenOptions = {
    */
   committer?: Ident
   remote?: string
+  /**
+   * Remote Store refresh policy. `always` (default) fetches before opening and
+   * each transaction. `on-rejection` starts each transaction from the kept
+   * local ref and fetches after a rejected or uncertain publish, before
+   * receipt verification or replay. Use only when a leased push can arbitrate
+   * a stale local base. `head()` reads the kept local ref in both modes.
+   */
+  refresh?: "always" | "on-rejection"
   backend?: GitomicBackend
   /**
    * The clock this store dates its commits by, in unix seconds (an integer).
