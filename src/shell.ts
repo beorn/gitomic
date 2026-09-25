@@ -1544,7 +1544,9 @@ const FETCH_REF_MOVED = /(?:^|: )error: fetching ref (\S+) failed: incorrect old
 function lostFetchedRefRace(error: unknown, namespace: string): "moved" | "held" | undefined {
   const detail = error instanceof Error ? error.message : ""
   const lost = [
-    ...parseRefLockFailures(detail).filter(({ reporter, form }) => /(?:^|: )error: $/.test(reporter) && form !== "exists"),
+    ...parseRefLockFailures(detail).filter(
+      ({ reporter, form }) => /(?:^|: )error: $/.test(reporter) && form !== "exists",
+    ),
     ...[...detail.matchAll(FETCH_REF_MOVED)].map(([, ref = ""]) => ({ ref, form: "moved" as const })),
   ]
   if (lost.length === 0 || !lost.every(({ ref }) => ref.startsWith(namespace))) return undefined

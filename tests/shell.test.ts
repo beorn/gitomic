@@ -691,55 +691,65 @@ describe.sequential("shell backend failure boundaries", () => {
    * 2.55's batched fetch words the same loss differently, and Yrd's two concurrent queue readers threw on it (25843).
    */
   test.each([
-    ["a locked ref", `error: cannot lock ref 'refs/gitomic/fetched/origin/heads/main': is at ${"3".repeat(40)} but expected ${"4".repeat(40)}`],
-    ["git 2.55's batched fetch", "error: fetching ref refs/gitomic/fetched/origin/heads/main failed: incorrect old value provided"],
-  ])("retries a fetch that lost a fetched-ref race reported as %s and returns the remote tip", async (_form, line) => {
-    const pair = await createRemoteRepos()
-    const directory = await mkdtemp(join(tmpdir(), "gitomic-fetch-race-"))
-    const realGit = spawnSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).stdout.trim()
-    const bin = join(directory, "bin")
-    const fetches = join(directory, "fetches.log")
-    await mkdir(bin)
-    await writeFile(
-      join(bin, "git"),
-      [
-        "#!/usr/bin/env node",
-        'const { appendFileSync, existsSync } = require("node:fs")',
-        'const { spawnSync } = require("node:child_process")',
-        "const args = process.argv.slice(2)",
-        'if (args.includes("fetch") && !existsSync(process.env.GITOMIC_RACE_LOG)) {',
-        '  appendFileSync(process.env.GITOMIC_RACE_LOG, "lost\\n")',
-        '  process.stderr.write(`${process.env.GITOMIC_RACE_LINE}\\n`)',
-        "  process.exit(1)",
-        "}",
-        'if (args.includes("fetch")) appendFileSync(process.env.GITOMIC_RACE_LOG, "fetched\\n")',
-        'const result = spawnSync(process.env.GITOMIC_REAL_GIT, args, { stdio: "inherit" })',
-        "process.exit(result.status ?? 1)",
-      ].join("\n"),
-    )
-    await chmod(join(bin, "git"), 0o755)
-    const restore = replaceEnvironment({
-      GITOMIC_RACE_LOG: fetches,
-      GITOMIC_RACE_LINE: line,
-      GITOMIC_REAL_GIT: realGit,
-      PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`,
-    })
-    const timers = vi.spyOn(globalThis, "setTimeout")
-    try {
-      const tips = await createShellBackend().fetchRefs?.(pair.left, ["refs/heads/main"], "origin")
-      expect(tips).toEqual(new Map([["refs/heads/main", pair.initial]]))
-      expect((await readFile(fetches, "utf8")).trim().split("\n")).toEqual(["lost", "fetched"])
-      // A moved ref is already settled, so its retry does not wait.
-      expect(timers.mock.calls.filter(([, delay]) => typeof delay === "number" && delay >= 25 && delay < 100)).toEqual(
-        [],
+    [
+      "a locked ref",
+      `error: cannot lock ref 'refs/gitomic/fetched/origin/heads/main': is at ${"3".repeat(40)} but expected ${"4".repeat(40)}`,
+    ],
+    [
+      "git 2.55's batched fetch",
+      "error: fetching ref refs/gitomic/fetched/origin/heads/main failed: incorrect old value provided",
+    ],
+  ])(
+    "retries a fetch that lost a fetched-ref race reported as %s and returns the remote tip",
+    async (_form, line) => {
+      const pair = await createRemoteRepos()
+      const directory = await mkdtemp(join(tmpdir(), "gitomic-fetch-race-"))
+      const realGit = spawnSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).stdout.trim()
+      const bin = join(directory, "bin")
+      const fetches = join(directory, "fetches.log")
+      await mkdir(bin)
+      await writeFile(
+        join(bin, "git"),
+        [
+          "#!/usr/bin/env node",
+          'const { appendFileSync, existsSync } = require("node:fs")',
+          'const { spawnSync } = require("node:child_process")',
+          "const args = process.argv.slice(2)",
+          'if (args.includes("fetch") && !existsSync(process.env.GITOMIC_RACE_LOG)) {',
+          '  appendFileSync(process.env.GITOMIC_RACE_LOG, "lost\\n")',
+          "  process.stderr.write(`${process.env.GITOMIC_RACE_LINE}\\n`)",
+          "  process.exit(1)",
+          "}",
+          'if (args.includes("fetch")) appendFileSync(process.env.GITOMIC_RACE_LOG, "fetched\\n")',
+          'const result = spawnSync(process.env.GITOMIC_REAL_GIT, args, { stdio: "inherit" })',
+          "process.exit(result.status ?? 1)",
+        ].join("\n"),
       )
-    } finally {
-      timers.mockRestore()
-      restore()
-      await rm(directory, { recursive: true, force: true })
-      await pair.cleanup()
-    }
-  }, 30_000)
+      await chmod(join(bin, "git"), 0o755)
+      const restore = replaceEnvironment({
+        GITOMIC_RACE_LOG: fetches,
+        GITOMIC_RACE_LINE: line,
+        GITOMIC_REAL_GIT: realGit,
+        PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`,
+      })
+      const timers = vi.spyOn(globalThis, "setTimeout")
+      try {
+        const tips = await createShellBackend().fetchRefs?.(pair.left, ["refs/heads/main"], "origin")
+        expect(tips).toEqual(new Map([["refs/heads/main", pair.initial]]))
+        expect((await readFile(fetches, "utf8")).trim().split("\n")).toEqual(["lost", "fetched"])
+        // A moved ref is already settled, so its retry does not wait.
+        expect(
+          timers.mock.calls.filter(([, delay]) => typeof delay === "number" && delay >= 25 && delay < 100),
+        ).toEqual([])
+      } finally {
+        timers.mockRestore()
+        restore()
+        await rm(directory, { recursive: true, force: true })
+        await pair.cleanup()
+      }
+    },
+    30_000,
+  )
 
   /** @failure A fetch that kept losing the lock race retried at once and then threw git's bare lock error, hiding that it had retried. */
   test("waits between attempts while a rival holds the fetched-ref lock, and says how often it lost", async () => {
