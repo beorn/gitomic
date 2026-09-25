@@ -686,8 +686,14 @@ describe.sequential("shell backend failure boundaries", () => {
     }
   })
 
-  /** @failure Two fetches racing for one fetched-namespace ref made the loser throw, abandoning a queue round. */
-  test("retries a fetch that lost a fetched-ref lock race and returns the remote tip", async () => {
+  /**
+   * @failure Two fetches racing for one fetched-namespace ref made the loser throw, abandoning a queue round; git
+   * 2.55's batched fetch words the same loss differently, and Yrd's two concurrent queue readers threw on it (25843).
+   */
+  test.each([
+    ["a locked ref", `error: cannot lock ref 'refs/gitomic/fetched/origin/heads/main': is at ${"3".repeat(40)} but expected ${"4".repeat(40)}`],
+    ["git 2.55's batched fetch", "error: fetching ref refs/gitomic/fetched/origin/heads/main failed: incorrect old value provided"],
+  ])("retries a fetch that lost a fetched-ref race reported as %s and returns the remote tip", async (_form, line) => {
     const pair = await createRemoteRepos()
     const directory = await mkdtemp(join(tmpdir(), "gitomic-fetch-race-"))
     const realGit = spawnSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).stdout.trim()
@@ -703,7 +709,7 @@ describe.sequential("shell backend failure boundaries", () => {
         "const args = process.argv.slice(2)",
         'if (args.includes("fetch") && !existsSync(process.env.GITOMIC_RACE_LOG)) {',
         '  appendFileSync(process.env.GITOMIC_RACE_LOG, "lost\\n")',
-        '  process.stderr.write(`error: cannot lock ref \'${process.env.GITOMIC_RACE_REF}\': is at ${"3".repeat(40)} but expected ${"4".repeat(40)}\\n`)',
+        '  process.stderr.write(`${process.env.GITOMIC_RACE_LINE}\\n`)',
         "  process.exit(1)",
         "}",
         'if (args.includes("fetch")) appendFileSync(process.env.GITOMIC_RACE_LOG, "fetched\\n")',
@@ -714,7 +720,7 @@ describe.sequential("shell backend failure boundaries", () => {
     await chmod(join(bin, "git"), 0o755)
     const restore = replaceEnvironment({
       GITOMIC_RACE_LOG: fetches,
-      GITOMIC_RACE_REF: "refs/gitomic/fetched/origin/heads/main",
+      GITOMIC_RACE_LINE: line,
       GITOMIC_REAL_GIT: realGit,
       PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`,
     })

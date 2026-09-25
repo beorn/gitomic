@@ -1531,15 +1531,22 @@ export function fetchedNamespace(remote: string): string {
 const FETCH_RACE_ATTEMPTS = 3
 
 /**
+ * git 2.55's batched fetch reports a per-ref transaction failure in its own words, not as `cannot lock ref`: a rival
+ * fetch that moved (or created) the ref first reads `fetching ref <ref> failed: incorrect old value provided` (25843).
+ */
+const FETCH_REF_MOVED = /(?:^|: )error: fetching ref (\S+) failed: incorrect old value provided\s*$/gm
+
+/**
  * How a fetch lost a race with a concurrent fetch in the same repository for refs in `namespace`:
  * "moved" when the other fetch already moved a ref (retry at once), "held" when it still holds a
  * ref's lock (wait for it first). Undefined when the failure is anything else.
  */
 function lostFetchedRefRace(error: unknown, namespace: string): "moved" | "held" | undefined {
   const detail = error instanceof Error ? error.message : ""
-  const lost = parseRefLockFailures(detail).filter(
-    ({ reporter, form }) => /(?:^|: )error: $/.test(reporter) && form !== "exists",
-  )
+  const lost = [
+    ...parseRefLockFailures(detail).filter(({ reporter, form }) => /(?:^|: )error: $/.test(reporter) && form !== "exists"),
+    ...[...detail.matchAll(FETCH_REF_MOVED)].map(([, ref = ""]) => ({ ref, form: "moved" as const })),
+  ]
   if (lost.length === 0 || !lost.every(({ ref }) => ref.startsWith(namespace))) return undefined
   return lost.some(({ form }) => form === "held") ? "held" : "moved"
 }
