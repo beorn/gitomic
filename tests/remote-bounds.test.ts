@@ -292,6 +292,42 @@ describe("a kept remote repository", () => {
     }
   })
 
+  // hh 25519: removeFailedBuild after a seeded build had a witness only for openTemporary.
+  test("a seeded build that fails after its clone leaves no temporary build behind", async () => {
+    const checkout = await createWorktreeRepo()
+    const root = await mkdtemp(join(tmpdir(), "gitomic-kept-failed-"))
+    const cacheDir = join(root, "remotes")
+    const bin = join(root, "bin")
+    const realGit = spawnSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).stdout.trim()
+    try {
+      await mkdir(bin)
+      // Every Git command runs as usual except the build's `remote set-url`, which fails once the clone exists.
+      await writeFile(
+        join(bin, "git"),
+        `#!/bin/sh\ncase " $* " in *" remote set-url "*) echo "fatal: set-url refused" >&2; exit 1 ;; esac\nexec '${realGit}' "$@"\n`,
+      )
+      await chmod(join(bin, "git"), 0o755)
+      const child = await runInChild(
+        [
+          `  await gitomic.openRemoteRepository(${JSON.stringify(STALLING_SOURCE)}, {`,
+          `    cacheDir: ${JSON.stringify(cacheDir)},`,
+          `    seed: ${JSON.stringify(checkout.repo)},`,
+          "  })",
+          "  outcome = { ok: true }",
+        ].join("\n"),
+        { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}` },
+        15_000,
+      )
+
+      expect(child.result, child.output).toMatchObject({ ok: false })
+      expect(String(child.result?.message)).toContain("git remote failed (exit 1): fatal: set-url refused")
+      expect(await readdir(cacheDir)).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+      await checkout.cleanup()
+    }
+  })
+
   test("two opens racing build one kept repository and leave no temporary build behind", async () => {
     const fixture = await createBareRepo()
     const cacheDir = join(await mkdtemp(join(tmpdir(), "gitomic-kept-race-")), "remotes")
