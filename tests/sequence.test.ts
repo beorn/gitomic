@@ -7,6 +7,7 @@
 import { describe, expect, test, vi } from "vitest"
 import { open } from "../src/index.js"
 import { createMemBackend } from "../src/mem.js"
+import type { GitomicBackend } from "../src/types.js"
 
 describe("Store.transactSequence", () => {
   test("keeps each accepted step, discards a refused step, and publishes once", async () => {
@@ -47,5 +48,78 @@ describe("Store.transactSequence", () => {
     expect(await store.at(landed.oid).get("one.md")).toBe("one")
     expect(await store.at(landed.oid).get("three.md")).toBe("three")
     expect(publish).toHaveBeenCalledTimes(1)
+  })
+
+  test("a lost lease replays the whole chain with stable step receipts", async () => {
+    const backend = createMemBackend()
+    const repo = "sequence-replay"
+    const store = await open({ repo, ref: "main", backend, writer: "sequence" })
+    const rival = await open({ repo, ref: "main", backend, writer: "rival" })
+    const attempts: string[][] = []
+    let intruded = false
+    const landed = await store.transactSequence(
+      async (attempt) => {
+        const first = await attempt.step(async (map) => map.set("one.md", "one"), "first")
+        const second = await attempt.step(async (map) => map.set("two.md", "two"), "second")
+        attempts.push([first.oid, second.oid])
+        return { first, second }
+      },
+      {
+        beside: async ({ next }) => {
+          if (!intruded) {
+            intruded = true
+            await rival.transact(async (map) => map.set("rival.md", "rival"), "rival advances")
+          }
+          return [{ ref: "refs/sequence/replay", expect: null, oid: next }]
+        },
+      },
+    )
+    expect(landed.retries).toBe(1)
+    expect(attempts).toHaveLength(2)
+    const first = attempts[0]
+    const replay = attempts[1]
+    if (
+      first === undefined ||
+      replay === undefined ||
+      first[0] === undefined ||
+      first[1] === undefined ||
+      replay[0] === undefined ||
+      replay[1] === undefined
+    ) {
+      throw new Error("both attempts must write both commits")
+    }
+    expect((await backend.readCommit(repo, first[0])).seq).toBe((await backend.readCommit(repo, replay[0])).seq)
+    expect((await backend.readCommit(repo, first[1])).seq).toBe((await backend.readCommit(repo, replay[1])).seq)
+    expect(await store.at(landed.oid).get("rival.md")).toBe("rival")
+    expect(await store.at(landed.oid).get("one.md")).toBe("one")
+    expect(await store.at(landed.oid).get("two.md")).toBe("two")
+  })
+
+  test("a lost publication acknowledgement resolves the final receipt without replay", async () => {
+    const backend = createMemBackend()
+    let publications = 0
+    const flaky: GitomicBackend = {
+      ...backend,
+      async publish(repo, updates, remote) {
+        publications++
+        await backend.publish?.(repo, updates, remote)
+        throw new Error("acknowledgement lost")
+      },
+    }
+    const store = await open({ repo: "sequence-unknown", ref: "main", backend: flaky, writer: "sequence" })
+    let runs = 0
+    const landed = await store.transactSequence(
+      async (attempt) => {
+        runs++
+        await attempt.step(async (map) => map.set("one.md", "one"), "first")
+        return attempt.step(async (map) => map.set("two.md", "two"), "second")
+      },
+      { beside: ({ next }) => [{ ref: "refs/sequence/unknown", expect: null, oid: next }] },
+    )
+    expect(publications).toBe(1)
+    expect(runs).toBe(1)
+    expect(landed.oid).toBe(await store.head())
+    expect(await store.at(landed.oid).get("one.md")).toBe("one")
+    expect(await store.at(landed.oid).get("two.md")).toBe("two")
   })
 })

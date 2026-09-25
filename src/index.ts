@@ -525,88 +525,96 @@ async function transactSequenceBody<R>(
     attempt: async (parent, retries) => {
       let current = parent
       let position = 0
+      let stepInFlight = false
       let lastMap: GitMap | undefined
       let lastCommittedSeq: number | undefined
       const value = await run({
         base: parent,
         tips,
         step: async (update, message, stepOptions) => {
-          if (typeof message !== "string" || message.trim().length === 0) {
-            throw new TypeError("message must say why this transaction exists")
-          }
-          assertUtf8(message, "message")
-          if (message.includes("\0")) {
-            throw new TypeError("message cannot contain NUL because Git commit messages forbid it")
-          }
-          const candidate = stepOptions?.candidate
-          if (candidate !== undefined && typeof candidate !== "function") {
-            throw new TypeError("candidate must be a function")
-          }
-          const provenance = cloneCommitProvenance(stepOptions?.provenance)
-          const author = cloneIdent(stepOptions?.author, "author")
-          const trailers = stepOptions?.trailers
-          const index = position++
-          // The same slot keeps the same receipt even if earlier steps become
-          // noops or are refused when this attempt is replayed on a new tip.
-          const seq = (seqs[index] ??= context.nextSeq())
-          const stepBase = current
-          const base = await readLazyBase(context.backend, context.repo, stepBase)
-          const prefetch = (update as PrefetchingUpdate)[PREFETCH_PATHS]
-          if (prefetch !== undefined) await base.prefetch(prefetch)
-          const { map, changes, modeSources } = makeOverlay(base)
-          await update(map, stepBase, { tips })
-          const commitInput = (effective: ReadonlyMap<string, string | undefined>, commitMessage: string) => {
-            assertNextTree(base, effective)
-            return {
-              parent: stepBase,
-              time: context.clock(),
-              changes: effective,
-              ...(modeSources.size === 0 ? {} : { modeSources }),
-              message: commitMessage,
-              writer: context.writer,
-              instance: context.instance,
-              seq,
-              ...(provenance === undefined ? {} : { provenance }),
-              ...(trailers === undefined ? {} : { trailers }),
-              author: author ?? context.committer,
-              committer: context.committer,
+          if (stepInFlight) throw new Error("sequence steps must be awaited in order")
+          stepInFlight = true
+          try {
+            if (typeof message !== "string" || message.trim().length === 0) {
+              throw new TypeError("message must say why this transaction exists")
             }
-          }
-          let report: readonly string[] | undefined
-          if (candidate !== undefined) {
-            const changed = [...removeNoopChanges(base, changes).keys()].sort()
-            const verdict = await candidate({
-              base: stepBase,
-              changed,
-              map,
-              readBase: (path) => base.get(path),
-              materialize: async () =>
-                backendOid(
-                  await context.backend.writeCommit(
-                    context.repo,
-                    commitInput(removeNoopChanges(base, changes), `gitomic candidate for: ${message.trim()}`),
+            assertUtf8(message, "message")
+            if (message.includes("\0")) {
+              throw new TypeError("message cannot contain NUL because Git commit messages forbid it")
+            }
+            const candidate = stepOptions?.candidate
+            if (candidate !== undefined && typeof candidate !== "function") {
+              throw new TypeError("candidate must be a function")
+            }
+            const provenance = cloneCommitProvenance(stepOptions?.provenance)
+            const author = cloneIdent(stepOptions?.author, "author")
+            const trailers = stepOptions?.trailers
+            const index = position++
+            // The same slot keeps the same receipt even if earlier steps become
+            // noops or are refused when this attempt is replayed on a new tip.
+            const seq = (seqs[index] ??= context.nextSeq())
+            const stepBase = current
+            const base = await readLazyBase(context.backend, context.repo, stepBase)
+            const prefetch = (update as PrefetchingUpdate)[PREFETCH_PATHS]
+            if (prefetch !== undefined) await base.prefetch(prefetch)
+            const { map, changes, modeSources } = makeOverlay(base)
+            await update(map, stepBase, { tips })
+            const commitInput = (effective: ReadonlyMap<string, string | undefined>, commitMessage: string) => {
+              assertNextTree(base, effective)
+              return {
+                parent: stepBase,
+                time: context.clock(),
+                changes: effective,
+                ...(modeSources.size === 0 ? {} : { modeSources }),
+                message: commitMessage,
+                writer: context.writer,
+                instance: context.instance,
+                seq,
+                ...(provenance === undefined ? {} : { provenance }),
+                ...(trailers === undefined ? {} : { trailers }),
+                author: author ?? context.committer,
+                committer: context.committer,
+              }
+            }
+            let report: readonly string[] | undefined
+            if (candidate !== undefined) {
+              const changed = [...removeNoopChanges(base, changes).keys()].sort()
+              const verdict = await candidate({
+                base: stepBase,
+                changed,
+                map,
+                readBase: (path) => base.get(path),
+                materialize: async () =>
+                  backendOid(
+                    await context.backend.writeCommit(
+                      context.repo,
+                      commitInput(removeNoopChanges(base, changes), `gitomic candidate for: ${message.trim()}`),
+                    ),
                   ),
-                ),
-            })
-            if (verdict?.refuse !== undefined && verdict.refuse.length > 0) {
-              throw new CandidateRefused([...verdict.refuse], stepBase)
+              })
+              if (verdict?.refuse !== undefined && verdict.refuse.length > 0) {
+                throw new CandidateRefused([...verdict.refuse], stepBase)
+              }
+              report = verdict?.report === undefined ? [] : [...verdict.report]
             }
-            report = verdict?.report === undefined ? [] : [...verdict.report]
-          }
-          const effective = removeNoopChanges(base, changes)
-          if (effective.size === 0) {
+            const effective = removeNoopChanges(base, changes)
+            if (effective.size === 0) {
+              lastMap = map
+              return { oid: current, committed: false, ...(report === undefined ? {} : { report }) }
+            }
+            const next = backendOid(
+              await context.backend.writeCommit(context.repo, commitInput(effective, message.trim())),
+            )
+            current = next
             lastMap = map
-            return { oid: current, committed: false, ...(report === undefined ? {} : { report }) }
+            lastCommittedSeq = seq
+            return { oid: next, committed: true, ...(report === undefined ? {} : { report }) }
+          } finally {
+            stepInFlight = false
           }
-          const next = backendOid(
-            await context.backend.writeCommit(context.repo, commitInput(effective, message.trim())),
-          )
-          current = next
-          lastMap = map
-          lastCommittedSeq = seq
-          return { oid: next, committed: true, ...(report === undefined ? {} : { report }) }
         },
       })
+      if (stepInFlight) throw new Error("sequence run returned before its last step finished")
       if (current === parent) return { kind: "noop", result: { value, oid: parent, retries } }
       if (lastMap === undefined || lastCommittedSeq === undefined) {
         throw new Error("sequence wrote a commit without a step map and receipt")
