@@ -979,6 +979,58 @@ describe.sequential("shell backend failure boundaries", () => {
     }
   }, 30_000)
 
+  /** @failure 25708: GitHub put the ref's lost lease in porcelain stdout, leaving stderr with only a generic push failure. */
+  test("classifies GitHub's porcelain cannot-lock-ref only after the remote confirms its actual oid", async () => {
+    const pair = await createRemoteRepos()
+    const directory = await mkdtemp(join(tmpdir(), "gitomic-porcelain-lease-"))
+    const bin = join(directory, "bin")
+    await mkdir(bin)
+    const realGit = spawnSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).stdout.trim()
+    const ref = "refs/heads/main"
+    const tree = await git(pair.remote, "rev-parse", `${pair.initial}^{tree}`)
+    const rival = await git(pair.remote, "commit-tree", tree, "-p", pair.initial, "-m", "rival")
+    const mine = await git(pair.left, "commit-tree", tree, "-p", pair.initial, "-m", "mine")
+    await git(pair.remote, "update-ref", ref, rival, pair.initial)
+    await writeFile(
+      join(bin, "git"),
+      [
+        "#!/usr/bin/env node",
+        'const { spawnSync } = require("node:child_process")',
+        "const args = process.argv.slice(2)",
+        'if (args.includes("push")) {',
+        "  process.stdout.write(`To https://github.com/beorn/hh-dev.git\\n!\\t${process.env.GITOMIC_MINE}:${process.env.GITOMIC_REF}\\t[remote rejected] (cannot lock ref '${process.env.GITOMIC_REF}': is at ${process.env.GITOMIC_RIVAL} but expected ${process.env.GITOMIC_EXPECT})\\nDone\\n`)",
+        "  process.stderr.write(\"error: failed to push some refs to 'https://github.com/beorn/hh-dev.git'\\n\")",
+        "  process.exit(1)",
+        "}",
+        'const result = spawnSync(process.env.GITOMIC_REAL_GIT, args, { stdio: "inherit" })',
+        "process.exit(result.status ?? 1)",
+      ].join("\n"),
+    )
+    await chmod(join(bin, "git"), 0o755)
+    const restore = replaceEnvironment({
+      GITOMIC_EXPECT: pair.initial,
+      GITOMIC_MINE: mine,
+      GITOMIC_REAL_GIT: realGit,
+      GITOMIC_REF: ref,
+      GITOMIC_RIVAL: rival,
+      PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`,
+    })
+    try {
+      const refused = createShellBackend().publish!(pair.left, [{ ref, expect: pair.initial, oid: mine }], "origin")
+      await expect(refused).rejects.toBeInstanceOf(Conflict)
+      await expect(refused).rejects.toMatchObject({ refs: [ref] })
+      await expect(refused).rejects.toThrow(`${ref} is at ${rival}`)
+      process.env.GITOMIC_RIVAL = pair.initial
+      const unproven = createShellBackend().publish!(pair.left, [{ ref, expect: pair.initial, oid: mine }], "origin")
+      await expect(unproven).rejects.not.toBeInstanceOf(Conflict)
+      await expect(unproven).rejects.toThrow(`a fresh remote read found ${rival}`)
+    } finally {
+      restore()
+      await rm(directory, { recursive: true, force: true })
+      await pair.cleanup()
+    }
+  }, 30_000)
+
   /** @failure A lost-lease reading that ignored a row's other reason would call a hook refusal contention and replay into it. */
   test("an atomic publish with any non-lease rejection stays an error, even when receive-pack names a lost lease", async () => {
     const pair = await createRemoteRepos()

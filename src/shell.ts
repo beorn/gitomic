@@ -1295,6 +1295,15 @@ function isStaleLease(summary: string): boolean {
   return summary === "[rejected] (stale info)" || summary === "[remote rejected] (incorrect old value provided)"
 }
 
+/** GitHub can put receive-pack's exact lost lease in the porcelain row, not stderr. */
+function porcelainLostLease(summary: string, ref: string, expect: Oid): Oid | undefined {
+  const match =
+    /^\[remote rejected\] \(cannot lock ref '([^']+)': is at ([0-9a-f]{40}|[0-9a-f]{64}) but expected ([0-9a-f]{40}|[0-9a-f]{64})\)$/u.exec(
+      summary,
+    )
+  return match?.[1] === ref && match[3] === expect ? match[2] : undefined
+}
+
 /** The refs receive-pack reports it could not lock because their value was not the lease's. */
 function remoteLostLeases(stderr: string): ReadonlySet<string> {
   return new Set(
@@ -1345,6 +1354,12 @@ async function publishRemote(
   }
   if (result.code !== 0) {
     const lostInReceivePack = remoteLostLeases(result.stderr.toString("utf8"))
+    const porcelainLost = new Map(
+      updates.flatMap(({ ref, expect }) => {
+        const actual = porcelainLostLease(fates.get(ref)?.summary ?? "", ref, expect)
+        return actual === undefined ? [] : [[ref, actual] as const]
+      }),
+    )
     const rejected = [...fates.values()].filter(({ flag }) => flag === "!")
     // A rival that moved a ref after the remote advertised it loses the lease
     // inside receive-pack: git names that ref on stderr and, being atomic,
@@ -1352,11 +1367,17 @@ async function publishRemote(
     const atomicLeaseLoss =
       rejected.length > 0 &&
       rejected.every(
-        ({ summary }) => summary === "[remote rejected] (atomic transaction failed)" || isStaleLease(summary),
+        ({ summary }) =>
+          summary === "[remote rejected] (atomic transaction failed)" ||
+          isStaleLease(summary) ||
+          updates.some(({ ref }) => porcelainLost.has(ref) && fates.get(ref)?.summary === summary),
       )
     const stale = updates.filter(({ ref }) => {
       const fate = fates.get(ref)
-      return fate?.flag === "!" && (isStaleLease(fate.summary) || (atomicLeaseLoss && lostInReceivePack.has(ref)))
+      return (
+        fate?.flag === "!" &&
+        (isStaleLease(fate.summary) || porcelainLost.has(ref) || (atomicLeaseLoss && lostInReceivePack.has(ref)))
+      )
     })
     if (stale.length === 0) throw new Error(`git push failed (${result.code})${detail ? `: ${detail}` : ""}`)
     const observed = await observeRemote(
@@ -1366,6 +1387,14 @@ async function publishRemote(
       timeoutMs,
       baseEnv,
     )
+    for (const { ref } of stale) {
+      const reported = porcelainLost.get(ref)
+      if (reported !== undefined && observed(ref) !== reported) {
+        throw new Error(
+          `git push reported ${ref} at ${reported}, but a fresh remote read found ${observed(ref)}; cannot prove the rejected lease: ${detail}`,
+        )
+      }
+    }
     throw leaseConflict(stale.map(({ ref, expect }) => ({ ref, expect, observed: observed(ref) })))
   }
   return {
