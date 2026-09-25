@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { spawnSync } from "node:child_process"
-import { resolve } from "node:path"
+import { isAbsolute, resolve } from "node:path"
 
 import type { CheckoutLock } from "./checkout-lock.js"
 import { type Address, parseAddress } from "./address.js"
@@ -188,32 +188,39 @@ export async function main(argv: string[], io: CliIo = {}): Promise<number> {
     const verb = args.shift()
     if (verb === undefined) throw new UsageError(`missing verb; expected one of ${VERBS.join(", ")}`)
     if (verb === "--help" || verb === "-h") {
-      stdout.write(`Usage: gitomic <verb> <repo>#<ref> [args] [flags]\n\nVerbs: ${VERBS.join(", ")}\n`)
+      stdout.write(
+        `Usage: gitomic <verb> <repo>#<ref> [args] [flags]\n\nVerbs: ${VERBS.join(", ")}\n\n${CACHE_DIR_HELP}`,
+      )
       return OK
+    }
+    const cacheDir = remoteCacheDir(args, io.env ?? process.env)
+    const source: AddressSource = {
+      ...(backend === undefined ? {} : { backend }),
+      ...(cacheDir === undefined ? {} : { cacheDir }),
     }
     switch (verb) {
       case "read":
-        return await runRead(args, stdout, backend)
+        return await runRead(args, stdout, source)
       case "ls":
-        return await runLs(args, stdout, backend)
+        return await runLs(args, stdout, source)
       case "grep":
-        return await runGrep(args, stdout, stderr, backend)
+        return await runGrep(args, stdout, stderr, source)
       case "log":
-        return await runLog(args, stdout, stderr, backend)
+        return await runLog(args, stdout, stderr, source)
       case "diff":
-        return await runDiff(args, stdout, backend)
+        return await runDiff(args, stdout, source)
       case "write":
-        return await runWrite(args, stdin, stdout, stderr, backend)
+        return await runWrite(args, stdin, stdout, stderr, source)
       case "rm":
-        return await runRm(args, stdout, stderr, backend)
+        return await runRm(args, stdout, stderr, source)
       case "mv":
-        return await runMv(args, stdout, stderr, backend)
+        return await runMv(args, stdout, stderr, source)
       case "apply":
-        return await runApply(args, stdin, stdout, stderr, backend)
+        return await runApply(args, stdin, stdout, stderr, source)
       case "project":
         return await runProject(args, stdout, stderr)
       case "trust":
-        return await runTrust(args, stdout, backend)
+        return await runTrust(args, stdout, source)
       default:
         throw new UsageError(`unknown verb: ${JSON.stringify(verb)}; expected one of ${VERBS.join(", ")}`)
     }
@@ -230,6 +237,8 @@ export type CliIo = {
   stdout?: CliWriter
   stderr?: CliWriter
   backend?: GitomicBackend
+  /** The environment `GITOMIC_CACHE_DIR` is read from; `process.env` when absent. */
+  env?: Readonly<Record<string, string | undefined>>
 }
 
 export const VERBS = ["read", "ls", "grep", "log", "diff", "write", "rm", "mv", "apply", "project", "trust"] as const
@@ -245,12 +254,12 @@ const HISTORY_SCAN_LIMIT = 1_024
 
 // --- read verbs --------------------------------------------------------
 
-async function runRead(args: string[], stdout: CliWriter, backend: GitomicBackend | undefined): Promise<number> {
+async function runRead(args: string[], stdout: CliWriter, source: AddressSource): Promise<number> {
   const { positionals, flags } = extractFlags(args, { "--at": "value" })
   const address = requirePositional(positionals, 0, "<address>")
   const path = requirePositional(positionals, 1, "<path>")
   const at: Oid | undefined = optionalStringFlag(flags, "--at")
-  using repository = await openAddressFor(address, backend)
+  using repository = await openAddressFor(address, source)
   const reader = await openReader(repository)
   const value = await reader.at(at).get(path)
   if (value === undefined) throw new Error(`path not found: ${JSON.stringify(path)} at ${describeAddress(address, at)}`)
@@ -258,30 +267,25 @@ async function runRead(args: string[], stdout: CliWriter, backend: GitomicBacken
   return OK
 }
 
-async function runLs(args: string[], stdout: CliWriter, backend: GitomicBackend | undefined): Promise<number> {
+async function runLs(args: string[], stdout: CliWriter, source: AddressSource): Promise<number> {
   const { positionals, flags } = extractFlags(args, { "--at": "value" })
   const address = requirePositional(positionals, 0, "<address>")
   const glob = positionals.at(1)
   const at: Oid | undefined = optionalStringFlag(flags, "--at")
-  using repository = await openAddressFor(address, backend)
+  using repository = await openAddressFor(address, source)
   const reader = await openReader(repository)
   for (const key of await matchingKeys(reader.at(at), glob)) stdout.write(`${key}\n`)
   return OK
 }
 
-async function runGrep(
-  args: string[],
-  stdout: CliWriter,
-  stderr: CliWriter,
-  backend: GitomicBackend | undefined,
-): Promise<number> {
+async function runGrep(args: string[], stdout: CliWriter, stderr: CliWriter, source: AddressSource): Promise<number> {
   const { positionals, flags } = extractFlags(args, { "--at": "value" })
   const address = requirePositional(positionals, 0, "<address>")
   const pattern = requirePositional(positionals, 1, "<pattern>")
   const glob = positionals.at(2)
   const at: Oid | undefined = optionalStringFlag(flags, "--at")
   const regex = compilePattern(pattern)
-  using repository = await openAddressFor(address, backend)
+  using repository = await openAddressFor(address, source)
   const reader = await openReader(repository)
   const snapshot = reader.at(at)
   for (const path of await matchingKeys(snapshot, glob)) {
@@ -302,12 +306,7 @@ async function runGrep(
   return OK
 }
 
-async function runLog(
-  args: string[],
-  stdout: CliWriter,
-  stderr: CliWriter,
-  backend: GitomicBackend | undefined,
-): Promise<number> {
+async function runLog(args: string[], stdout: CliWriter, stderr: CliWriter, source: AddressSource): Promise<number> {
   const { positionals, flags } = extractFlags(args, { "--at": "value", "-n": "value", "--json": "boolean" })
   const address = requirePositional(positionals, 0, "<address>")
   assertNoExtraPositionals(positionals, 2, "<addr> [glob]", "log")
@@ -324,7 +323,7 @@ async function runLog(
     throw new UsageError("-n must be a positive integer no greater than 1024")
   }
   try {
-    using repository = await openAddressFor(address, backend)
+    using repository = await openAddressFor(address, source)
     const reader = await openReader(repository)
     from ??= await reader.head()
     const history = await reader.log({ from, limit: glob === undefined ? limit : HISTORY_SCAN_LIMIT })
@@ -365,7 +364,7 @@ async function runLog(
   }
 }
 
-async function runDiff(args: string[], stdout: CliWriter, backend: GitomicBackend | undefined): Promise<number> {
+async function runDiff(args: string[], stdout: CliWriter, source: AddressSource): Promise<number> {
   const { positionals, flags } = extractFlags(args, { "--base": "value", "--at": "value", "--json": "boolean" })
   const address = requirePositional(positionals, 0, "<address>")
   assertNoExtraPositionals(positionals, 2, "<addr> [glob]", "diff")
@@ -374,7 +373,7 @@ async function runDiff(args: string[], stdout: CliWriter, backend: GitomicBacken
   if (base === undefined) throw new UsageError("missing --base <oid>")
   let to = historyOidFlag(flags, "--at")
   try {
-    using repository = await openAddressFor(address, backend)
+    using repository = await openAddressFor(address, source)
     const reader = await openReader(repository)
     to ??= await reader.head()
     const changes = (await reader.diff(base, to)).filter(({ path }) => glob === undefined || matchGlob(glob, path))
@@ -427,7 +426,7 @@ async function runWrite(
   stdin: CliStdin,
   stdout: CliWriter,
   stderr: CliWriter,
-  backend: GitomicBackend | undefined,
+  source: AddressSource,
 ): Promise<number> {
   const { positionals, flags, repeated } = extractFlags(args, {
     "-m": "value",
@@ -453,7 +452,7 @@ async function runWrite(
   assertTargetsKnown("--create", create, knownPaths, "written")
   for (const path of create) assertNotContradictoryPrecondition(path, expect.has(path), true)
 
-  using repository = await openAddressFor(address, backend)
+  using repository = await openAddressFor(address, source)
   const store = await open({ ...repository, ...(writer === undefined ? {} : { writer }) })
   const base = await store.head()
   const snapshot = store.at(base)
@@ -480,12 +479,7 @@ async function runWrite(
   return OK
 }
 
-async function runRm(
-  args: string[],
-  stdout: CliWriter,
-  stderr: CliWriter,
-  backend: GitomicBackend | undefined,
-): Promise<number> {
+async function runRm(args: string[], stdout: CliWriter, stderr: CliWriter, source: AddressSource): Promise<number> {
   const { positionals, flags, repeated } = extractFlags(args, {
     "-m": "value",
     "--writer": "value",
@@ -508,7 +502,7 @@ async function runRm(
   const expect = parseExpectPairs(repeated.get("--expect") ?? [])
   assertTargetsKnown("--expect", expect.keys(), seen, "removed")
 
-  using repository = await openAddressFor(address, backend)
+  using repository = await openAddressFor(address, source)
   const store = await open({ ...repository, ...(writer === undefined ? {} : { writer }) })
   const base = await store.head()
   const snapshot = store.at(base)
@@ -523,12 +517,7 @@ async function runRm(
   return OK
 }
 
-async function runMv(
-  args: string[],
-  stdout: CliWriter,
-  stderr: CliWriter,
-  backend: GitomicBackend | undefined,
-): Promise<number> {
+async function runMv(args: string[], stdout: CliWriter, stderr: CliWriter, source: AddressSource): Promise<number> {
   const { positionals, flags, repeated } = extractFlags(args, {
     "-m": "value",
     "--writer": "value",
@@ -543,7 +532,7 @@ async function runMv(
   const message = requireStringFlag(flags, "-m", "-m <message>")
   const writer = optionalStringFlag(flags, "--writer")
 
-  using repository = await openAddressFor(address, backend)
+  using repository = await openAddressFor(address, source)
   const store = await open({ ...repository, ...(writer === undefined ? {} : { writer }) })
   const base = await store.head()
   const expect = await store.at(base).oid(from)
@@ -568,7 +557,7 @@ async function runApply(
   stdin: CliStdin,
   stdout: CliWriter,
   stderr: CliWriter,
-  backend: GitomicBackend | undefined,
+  source: AddressSource,
 ): Promise<number> {
   const queue = [...args]
   const address = queue.shift()
@@ -628,7 +617,7 @@ async function runApply(
   using _heldThroughProjection = checkoutLock
   const expectedDirtyPaths = checkoutPath !== undefined ? worktreeDirtyPaths(checkoutPath) : []
 
-  using repository = await openAddressFor(address, backend)
+  using repository = await openAddressFor(address, source)
   const store = await open({ ...repository, ...(writer === undefined ? {} : { writer }) })
   const startBase = base ?? (await store.head())
   const snapshot = store.at(startBase)
@@ -1211,11 +1200,11 @@ async function readStdin(stdin: CliStdin): Promise<string> {
 // --- trust -------------------------------------------------------------------
 
 /** Print the declaration at the address's tip, then record its blob as trusted (the order the verb promises). */
-async function runTrust(args: string[], stdout: CliWriter, backend: GitomicBackend | undefined): Promise<number> {
+async function runTrust(args: string[], stdout: CliWriter, source: AddressSource): Promise<number> {
   const { positionals } = extractFlags(args, {})
   const address = requirePositional(positionals, 0, "<address>")
   if (positionals.length > 1) throw new UsageError(`trust takes one <address>; got ${positionals.length} arguments`)
-  using repository = await openAddressFor(address, backend)
+  using repository = await openAddressFor(address, source)
   const tip = await (await openReader(repository)).head()
   const declaration = await readRepositoryDeclaration(repository.repo, tip)
   if (declaration === undefined) {
@@ -1235,15 +1224,49 @@ async function runTrust(args: string[], stdout: CliWriter, backend: GitomicBacke
 type OpenedAddress = OpenOptions & Disposable & { readonly ref: string; readonly url?: string }
 
 /** One CLI selection point; a failed local open never selects a remote. */
-async function openAddressFor(address: string, backend: GitomicBackend | undefined): Promise<OpenedAddress> {
+/** What a verb opens its address with: an injected backend, or the kept-copy directory for a URL address. */
+type AddressSource = { readonly backend?: GitomicBackend; readonly cacheDir?: string }
+
+async function openAddressFor(address: string, { backend, cacheDir }: AddressSource): Promise<OpenedAddress> {
   const { repo, ref } = parseAddressOrUsageError(address)
   const local = { repo, ref, ...(backend === undefined ? {} : { backend }), [Symbol.dispose]() {} }
   if (backend !== undefined) return local
   const drivePath = /^[A-Za-z]:[\\\\/]/.test(repo)
   const remote = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(repo) || (!drivePath && /^[^/\\\\:]+:/.test(repo))
   if (!remote) return local
-  const repository = await openRemoteRepository(repo)
+  // Given a kept-copy directory, a refusal to open it (unwritable, foreign or non-bare) propagates:
+  // never a silent fall back to a temporary clone.
+  const repository = await openRemoteRepository(repo, cacheDir === undefined ? {} : { cacheDir })
   return { ...repository, ref, url: repo, [Symbol.dispose]: () => repository[Symbol.dispose]() }
+}
+
+const CACHE_DIR_HELP =
+  "--cache-dir <dir> (or GITOMIC_CACHE_DIR): keep one bare repository per URL address in <dir>, created if absent,\n" +
+  "so a URL is cloned once and later commands fetch only what changed. The copy is keyed by the URL text: another\n" +
+  "spelling of the same remote makes a second copy. Without it, each command clones to a temporary directory.\n"
+
+/**
+ * The kept-copy directory for URL addresses: `--cache-dir <dir>` (removed from `args`), else `GITOMIC_CACHE_DIR`;
+ * an empty variable is unset. It must be absolute: seats run from many working directories, and a relative one
+ * would scatter copies. Unset: a temporary clone per command, removed on exit.
+ */
+function remoteCacheDir(args: string[], env: Readonly<Record<string, string | undefined>>): string | undefined {
+  const at = args.indexOf("--cache-dir")
+  let dir: string | undefined
+  let origin = "GITOMIC_CACHE_DIR"
+  if (at !== -1) {
+    dir = args[at + 1]
+    if (dir === undefined) throw new UsageError("--cache-dir requires a value")
+    args.splice(at, 2)
+    if (args.includes("--cache-dir")) throw new UsageError("--cache-dir may be given once")
+    origin = "--cache-dir"
+  } else {
+    const fromEnv = env["GITOMIC_CACHE_DIR"]
+    dir = fromEnv === "" ? undefined : fromEnv
+  }
+  if (dir === undefined) return undefined
+  if (!isAbsolute(dir)) throw new UsageError(`${origin} must be an absolute path, got ${JSON.stringify(dir)}`)
+  return dir
 }
 
 function parseAddressOrUsageError(address: string): Address {

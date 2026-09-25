@@ -72,6 +72,9 @@ async function openTemporary(
   const repo = join(parent, "repo.git")
   try {
     await build(source, repo, seed, timeoutMs)
+    // Disposal removes it, but a process killed first leaves it behind: a temporary clone never starts a
+    // background gc on storage nobody owns any more.
+    await gitOrThrow(source, ["--git-dir", repo, "config", "gc.auto", "0"], timeoutMs)
   } catch (failure) {
     removeFailedBuild(source, parent, failure)
     throw failure

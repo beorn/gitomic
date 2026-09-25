@@ -3,6 +3,7 @@
 // @consumer file-level-door CLI users — any agent or script reading and writing one repo by address, with no checkout
 
 import { Buffer } from "node:buffer"
+import { createHash } from "node:crypto"
 import childProcess, { execFile } from "node:child_process"
 import fs from "node:fs"
 import { mkdtemp, rm, writeFile } from "node:fs/promises"
@@ -183,6 +184,155 @@ describe("gitomic CLI — remote opening", () => {
     } finally {
       clone.mockRestore()
     }
+  })
+})
+
+/**
+ * @failure Every STATE write through the CLI cloned the whole remote (280 MB, 14 to 23 s; 21 clones an hour on
+ *          hh's host) because the CLI opened URL addresses with no kept copy, while km's transport keeps one per
+ *          URL (hh 25615, @cto ruling A: an opt-in kept copy, never a silent fall back to a temporary clone).
+ */
+describe("gitomic CLI — the kept copy per URL (--cache-dir, GITOMIC_CACHE_DIR)", () => {
+  let fixture: Awaited<ReturnType<typeof createBareRepo>>
+  let url: string
+  let scratch: string
+  let traces: string
+  let invocation = 0
+  beforeEach(async () => {
+    fixture = await createBareRepo()
+    url = pathToFileURL(fixture.repo).href
+    scratch = join(workdir, "owned-tmp")
+    fs.mkdirSync(scratch)
+    traces = join(workdir, "traces")
+    fs.mkdirSync(traces)
+  })
+  afterEach(async () => {
+    await fixture.cleanup()
+  })
+
+  const keptName = () => `${createHash("sha256").update(url).digest("hex")}.git`
+
+  /** The source CLI in its own process, as a seat runs it, with git's trace2 events recorded per invocation. */
+  function invoke(args: string[], env: Record<string, string> = {}) {
+    const trace = join(traces, `${invocation++}.jsonl`)
+    return promisify(execFile)("bun", [fileURLToPath(new URL("../src/bin.ts", import.meta.url)), ...args], {
+      cwd: workdir,
+      env: { ...process.env, TMPDIR: scratch, GIT_TERMINAL_PROMPT: "0", GIT_TRACE2_EVENT: trace, ...env },
+      encoding: "utf8",
+    }).then(
+      (result) => ({ code: 0, ...result, trace }),
+      (error: { code?: number; stdout?: string; stderr?: string }) => ({
+        code: error.code ?? -1,
+        stdout: error.stdout ?? "",
+        stderr: error.stderr ?? "",
+        trace,
+      }),
+    )
+  }
+
+  /** The target directory of every `git clone` the invocation ran. */
+  function cloneTargets(trace: string): string[] {
+    if (!fs.existsSync(trace)) return []
+    return fs
+      .readFileSync(trace, "utf8")
+      .split("\n")
+      .filter((line) => line.includes('"event":"start"'))
+      .map((line) => (JSON.parse(line) as { argv: string[] }).argv)
+      .filter((argv) => argv[1] === "clone")
+      .map((argv) => argv.at(-1) ?? "")
+  }
+
+  async function put(path: string, content: string, env: Record<string, string>, extra: string[] = []) {
+    return invoke(["apply", `${url}#main`, ...extra, "-m", path, "put", path, await fileWith(path, content)], env)
+  }
+
+  test("with GITOMIC_CACHE_DIR, an apply clones into the kept dir, never a temporary one, and later ones clone nothing", async () => {
+    const cacheDir = join(workdir, "kept")
+    const first = await put("a.md", "first\n", { GITOMIC_CACHE_DIR: cacheDir })
+    expect(first).toMatchObject({ code: 0, stderr: "" })
+    expect(cloneTargets(first.trace).every((target) => target.startsWith(cacheDir))).toBe(true)
+    const later = await put("b.md", "second\n", { GITOMIC_CACHE_DIR: cacheDir })
+    expect(later).toMatchObject({ code: 0, stderr: "" })
+    expect(cloneTargets(later.trace)).toEqual([])
+    expect(fs.readdirSync(cacheDir).filter((name) => !name.startsWith("."))).toEqual([keptName()])
+    expect(fs.readdirSync(scratch)).toEqual([])
+    expect(await git(fixture.repo, "show", "main:b.md")).toBe("second")
+  })
+
+  test("--cache-dir wins over GITOMIC_CACHE_DIR", async () => {
+    const fromEnv = join(workdir, "from-env")
+    const fromFlag = join(workdir, "from-flag")
+    const result = await put("a.md", "first\n", { GITOMIC_CACHE_DIR: fromEnv }, ["--cache-dir", fromFlag])
+    expect(result).toMatchObject({ code: 0, stderr: "" })
+    expect(fs.readdirSync(fromFlag).filter((name) => !name.startsWith("."))).toEqual([keptName()])
+    expect(fs.existsSync(fromEnv)).toBe(false)
+  })
+
+  test("no flag and no env (or an empty env) keeps today's temporary clone, removed on exit", async () => {
+    for (const env of [{}, { GITOMIC_CACHE_DIR: "" }]) {
+      const result = await put(`note-${invocation}.md`, "temporary\n", env)
+      expect(result).toMatchObject({ code: 0, stderr: "" })
+      const targets = cloneTargets(result.trace)
+      expect(targets).toHaveLength(1)
+      expect(targets[0]?.startsWith(scratch)).toBe(true)
+      expect(fs.readdirSync(scratch)).toEqual([])
+    }
+  })
+
+  test.each([
+    [["--cache-dir", "kept"], {}, '--cache-dir must be an absolute path, got "kept"'],
+    [[], { GITOMIC_CACHE_DIR: "./kept" }, 'GITOMIC_CACHE_DIR must be an absolute path, got "./kept"'],
+  ] as const)("a relative kept dir refuses naming it, before any clone (%j %j)", async (extra, env, message) => {
+    const result = await put("a.md", "first\n", env, [...extra])
+    expect(result.code).toBe(2)
+    expect(result.stderr).toContain(message)
+    expect(cloneTargets(result.trace)).toEqual([])
+    expect(await git(fixture.repo, "rev-parse", "main")).toBe(fixture.initial)
+  })
+
+  test("an unwritable kept dir refuses loudly naming the path, and never falls back to a temporary clone", async () => {
+    const locked = join(workdir, "locked")
+    fs.mkdirSync(locked, { mode: 0o500 })
+    try {
+      const cacheDir = join(locked, "kept")
+      const result = await put("a.md", "first\n", { GITOMIC_CACHE_DIR: cacheDir })
+      expect(result.code).toBe(1)
+      expect(result.stderr).toContain(cacheDir)
+      expect(cloneTargets(result.trace)).toEqual([])
+      expect(fs.readdirSync(scratch)).toEqual([])
+      expect(await git(fixture.repo, "rev-parse", "main")).toBe(fixture.initial)
+    } finally {
+      fs.chmodSync(locked, 0o700)
+    }
+  })
+
+  test("two concurrent applies on one kept copy both land, and git fsck stays clean", async () => {
+    const cacheDir = join(workdir, "kept")
+    const pair = await Promise.all([
+      put("a.md", "first\n", { GITOMIC_CACHE_DIR: cacheDir }),
+      put("b.md", "second\n", { GITOMIC_CACHE_DIR: cacheDir }),
+    ])
+    for (const result of pair) expect(result).toMatchObject({ code: 0, stderr: "" })
+    expect(await git(fixture.repo, "show", "main:a.md")).toBe("first")
+    expect(await git(fixture.repo, "show", "main:b.md")).toBe("second")
+    expect(fs.readdirSync(cacheDir).filter((name) => !name.startsWith("."))).toEqual([keptName()])
+    await git(join(cacheDir, keptName()), "fsck", "--no-progress")
+    await git(fixture.repo, "fsck", "--no-progress")
+  })
+
+  test("a CLI apply concurrent with a library Store refreshing the same kept copy (km's shape) both land", async () => {
+    const cacheDir = join(workdir, "kept")
+    expect(await put("seed.md", "seed\n", { GITOMIC_CACHE_DIR: cacheDir })).toMatchObject({ code: 0 })
+    const kept = join(cacheDir, keptName())
+    const store = await open({ repo: kept, ref: "main", remote: "origin", writer: "km", refresh: "always" })
+    const [cli] = await Promise.all([
+      put("cli.md", "from the CLI\n", { GITOMIC_CACHE_DIR: cacheDir }),
+      store.transact(async (map) => map.set("store.md", "from the store\n"), "store write"),
+    ])
+    expect(cli).toMatchObject({ code: 0, stderr: "" })
+    expect(await git(fixture.repo, "show", "main:cli.md")).toBe("from the CLI")
+    expect(await git(fixture.repo, "show", "main:store.md")).toBe("from the store")
+    await git(kept, "fsck", "--no-progress")
   })
 })
 

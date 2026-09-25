@@ -54,6 +54,24 @@ describe("owned remote repositories", () => {
     }
   })
 
+  /**
+   * @failure 186 /tmp/gitomic-remote-* clones outlived their processes on hh's host (hh 25615); a surviving
+   *          temporary clone must never start a background gc on storage nobody owns.
+   */
+  test("a temporary clone sets gc.auto=0 so a surviving one never collects garbage", async () => {
+    const fixture = await createBareRepo()
+    try {
+      const repository = await openRemoteRepository(pathToFileURL(fixture.repo).href)
+      try {
+        expect(await git(repository.repo, "config", "--get", "gc.auto")).toBe("0")
+      } finally {
+        repository[Symbol.dispose]()
+      }
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
   test("failed clone cleans its allocation and preserves a simultaneous cleanup failure", async () => {
     const fixture = await createBareRepo()
     const source = pathToFileURL(join(fixture.repo, "missing.git")).href
