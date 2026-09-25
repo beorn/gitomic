@@ -81,6 +81,7 @@ export {
   type ShellBackendOptions,
 } from "./shell.js"
 export { openRemoteRepository, type OpenedRemoteRepository, type OpenRemoteRepositoryOptions } from "./repository.js"
+export { normalizeRef } from "./options.js"
 export { parseOwnershipManifest } from "./ownership-manifest.js"
 export {
   checkedOutRef,
