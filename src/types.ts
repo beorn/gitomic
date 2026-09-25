@@ -422,8 +422,38 @@ export type TransactOptions = {
   readonly trailers?: readonly Trailer[]
 }
 
+/** One unpublished step in a sequence. A thrown step leaves the prior steps intact. */
+export type SequenceStep = {
+  readonly oid: Oid
+  readonly committed: boolean
+  readonly report?: readonly string[]
+}
+
+export type SequenceAttempt = {
+  /** The published tip this attempt started from. */
+  readonly base: Oid
+  readonly tips: ReadonlyMap<string, Oid>
+  /** Each call gets a fresh overlay on the preceding successful step. */
+  step(update: Update, message: string, options?: Omit<TransactOptions, "fetch" | "beside">): Promise<SequenceStep>
+}
+
+export type SequenceOptions<R> = {
+  readonly fetch?: readonly string[]
+  /** Stage refs once, after all steps. This only runs when at least one step wrote a commit. */
+  readonly beside?: (
+    attempt: BesideAttempt & { readonly value: R },
+  ) => Promise<readonly BesideRef[]> | readonly BesideRef[]
+}
+
+export type SequenceResult<R> = { readonly value: R; readonly oid: Oid; readonly retries: number }
+
 export type Store = {
   head(): Promise<Oid>
   at(commit?: Oid): Snapshot
   transact(update: Update, message: string, options?: TransactOptions): Promise<Committed>
+  /** Build several ordered commits, then publish their final tip and side refs in one CAS attempt. */
+  transactSequence<R>(
+    run: (attempt: SequenceAttempt) => Promise<R>,
+    options?: SequenceOptions<R>,
+  ): Promise<SequenceResult<R>>
 }

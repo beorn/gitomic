@@ -24,8 +24,6 @@ import type {
   Clock,
   CommitMeta,
   CommitProvenance,
-  BesideAttempt,
-  BesideRef,
   RefUpdate,
   Committed,
   GitMap,
@@ -38,9 +36,12 @@ import type {
   RefTipChange,
   RefTipWatchOptions,
   Snapshot,
+  SequenceAttempt,
+  SequenceOptions,
+  SequenceResult,
+  SequenceStep,
   Store,
   Trailer,
-  Update,
 } from "./types.js"
 import { assertUtf8 } from "./utf8.js"
 
@@ -119,6 +120,10 @@ export type {
   RefTipWatchOptions,
   RefUpdate,
   Snapshot,
+  SequenceAttempt,
+  SequenceOptions,
+  SequenceResult,
+  SequenceStep,
   Trailer,
   Store,
   TransactOptions,
@@ -162,8 +167,52 @@ export async function open(options: OpenOptions): Promise<Store> {
       } catch (error) {
         return Promise.reject(error)
       }
-      return enqueue(async () =>
-        transact(context, update, message, provenance, author, candidate, trailers, beside, fetch),
+      return enqueue(async () => {
+        const completed = await transactSequenceBody<SequenceStep>(
+          context,
+          async (attempt) =>
+            attempt.step(update, message, {
+              ...(provenance === undefined ? {} : { provenance }),
+              ...(author === undefined ? {} : { author }),
+              ...(candidate === undefined ? {} : { candidate }),
+              ...(trailers === undefined ? {} : { trailers }),
+            }),
+          {
+            ...(fetch === undefined ? {} : { fetch }),
+            ...(beside === undefined
+              ? {}
+              : { beside: ({ next, base, map, tips }) => beside({ next, base, map, tips }) }),
+          },
+        )
+        return {
+          oid: completed.oid,
+          retries: completed.retries,
+          ...(completed.value.report === undefined ? {} : { report: completed.value.report }),
+        }
+      })
+    },
+    transactSequence: (run, options) => {
+      if (typeof run !== "function") return Promise.reject(new TypeError("sequence run must be a function"))
+      const beside = options?.beside
+      if (beside !== undefined && typeof beside !== "function") {
+        return Promise.reject(new TypeError("beside must be a function"))
+      }
+      if (beside !== undefined && context.backend.publish === undefined) {
+        return Promise.reject(
+          new TypeError("beside needs a backend with publish (MULTI): the shell, iso or mem backend"),
+        )
+      }
+      let fetch: readonly string[] | undefined
+      try {
+        fetch = shapeFetch(context, options?.fetch)
+      } catch (error) {
+        return Promise.reject(error)
+      }
+      return enqueue(() =>
+        transactSequenceBody(context, run, {
+          ...(fetch === undefined ? {} : { fetch }),
+          ...(beside === undefined ? {} : { beside }),
+        }),
       )
     },
   }
@@ -450,105 +499,134 @@ async function prepareReader(options: OpenReaderOptions): Promise<ReaderContext>
   return { repo, ref, backend, refresh }
 }
 
-async function transact(
+async function transactSequenceBody<R>(
   context: StoreContext,
-  update: Update,
-  message: string,
-  provenance?: CommitProvenance,
-  author?: Ident,
-  candidate?: Candidate,
-  trailers?: readonly Trailer[],
-  beside?: (attempt: BesideAttempt) => Promise<readonly BesideRef[]> | readonly BesideRef[],
-  fetch?: readonly string[],
-): Promise<Committed> {
-  if (typeof message !== "string" || message.trim().length === 0) {
-    throw new TypeError("message must say why this transaction exists")
-  }
-  assertUtf8(message, "message")
-  if (message.includes("\0")) throw new TypeError("message cannot contain NUL because Git commit messages forbid it")
-  // Allocated once and reused across replays: every attempt is the SAME
-  // transaction, so they must share one `(instance, seq)` receipt.
-  let seq: number | undefined
-  // The tips `fetch` named, as the current attempt's refresh read them; empty when nothing was asked for.
+  run: (attempt: SequenceAttempt) => Promise<R>,
+  options: SequenceOptions<R>,
+): Promise<SequenceResult<R>> {
+  // Position, not attempt, identifies a step across CAS replays. A step that
+  // throws never changes the unpublished head; the caller may catch and continue.
+  const seqs: number[] = []
   let tips: ReadonlyMap<string, Oid> = new Map()
-  return runCasLoop<Oid, Committed>({
+  return runCasLoop<Oid, SequenceResult<R>>({
     label: `${context.repo} ${context.ref}`,
     retryBudgetMs: context.retryBudgetMs,
     refresh:
-      fetch === undefined
+      options.fetch === undefined
         ? context.refresh
         : async () => {
-            const read = await context.refreshWith(fetch)
+            const read = await context.refreshWith(options.fetch as readonly string[])
             tips = read.tips
             return read.tip
           },
     publish: context.publish,
-    findTransaction: async (winner, base, instance, attemptSeq) =>
-      context.backend.findTransaction(context.repo, winner, base, instance, attemptSeq),
+    findTransaction: async (winner, base, instance, seq) =>
+      context.backend.findTransaction(context.repo, winner, base, instance, seq),
     attempt: async (parent, retries) => {
-      // Built inside the attempt and never captured by the receipt search: a replay reads its own parent afresh.
-      const base = await readLazyBase(context.backend, context.repo, parent)
-      const prefetch = (update as PrefetchingUpdate)[PREFETCH_PATHS]
-      if (prefetch !== undefined) await base.prefetch(prefetch)
-      const { map, changes, modeSources } = makeOverlay(base)
-      await update(map, parent, { tips })
-      const commitInput = (effective: ReadonlyMap<string, string | undefined>, commitMessage: string) => {
-        seq ??= context.nextSeq()
-        assertNextTree(base, effective)
-        return {
-          parent,
-          time: context.clock(),
-          changes: effective,
-          ...(modeSources.size === 0 ? {} : { modeSources }),
-          message: commitMessage,
-          writer: context.writer,
-          instance: context.instance,
-          seq,
-          ...(provenance === undefined ? {} : { provenance }),
-          ...(trailers === undefined ? {} : { trailers }),
-          author: author ?? context.committer,
-          committer: context.committer,
-        }
+      let current = parent
+      let position = 0
+      let lastMap: GitMap | undefined
+      let lastCommittedSeq: number | undefined
+      const value = await run({
+        base: parent,
+        tips,
+        step: async (update, message, stepOptions) => {
+          if (typeof message !== "string" || message.trim().length === 0) {
+            throw new TypeError("message must say why this transaction exists")
+          }
+          assertUtf8(message, "message")
+          if (message.includes("\0")) {
+            throw new TypeError("message cannot contain NUL because Git commit messages forbid it")
+          }
+          const candidate = stepOptions?.candidate
+          if (candidate !== undefined && typeof candidate !== "function") {
+            throw new TypeError("candidate must be a function")
+          }
+          const provenance = cloneCommitProvenance(stepOptions?.provenance)
+          const author = cloneIdent(stepOptions?.author, "author")
+          const trailers = stepOptions?.trailers
+          const index = position++
+          // The same slot keeps the same receipt even if earlier steps become
+          // noops or are refused when this attempt is replayed on a new tip.
+          const seq = (seqs[index] ??= context.nextSeq())
+          const stepBase = current
+          const base = await readLazyBase(context.backend, context.repo, stepBase)
+          const prefetch = (update as PrefetchingUpdate)[PREFETCH_PATHS]
+          if (prefetch !== undefined) await base.prefetch(prefetch)
+          const { map, changes, modeSources } = makeOverlay(base)
+          await update(map, stepBase, { tips })
+          const commitInput = (effective: ReadonlyMap<string, string | undefined>, commitMessage: string) => {
+            assertNextTree(base, effective)
+            return {
+              parent: stepBase,
+              time: context.clock(),
+              changes: effective,
+              ...(modeSources.size === 0 ? {} : { modeSources }),
+              message: commitMessage,
+              writer: context.writer,
+              instance: context.instance,
+              seq,
+              ...(provenance === undefined ? {} : { provenance }),
+              ...(trailers === undefined ? {} : { trailers }),
+              author: author ?? context.committer,
+              committer: context.committer,
+            }
+          }
+          let report: readonly string[] | undefined
+          if (candidate !== undefined) {
+            const changed = [...removeNoopChanges(base, changes).keys()].sort()
+            const verdict = await candidate({
+              base: stepBase,
+              changed,
+              map,
+              readBase: (path) => base.get(path),
+              materialize: async () =>
+                backendOid(
+                  await context.backend.writeCommit(
+                    context.repo,
+                    commitInput(removeNoopChanges(base, changes), `gitomic candidate for: ${message.trim()}`),
+                  ),
+                ),
+            })
+            if (verdict?.refuse !== undefined && verdict.refuse.length > 0) {
+              throw new CandidateRefused([...verdict.refuse], stepBase)
+            }
+            report = verdict?.report === undefined ? [] : [...verdict.report]
+          }
+          const effective = removeNoopChanges(base, changes)
+          if (effective.size === 0) {
+            lastMap = map
+            return { oid: current, committed: false, ...(report === undefined ? {} : { report }) }
+          }
+          const next = backendOid(
+            await context.backend.writeCommit(context.repo, commitInput(effective, message.trim())),
+          )
+          current = next
+          lastMap = map
+          lastCommittedSeq = seq
+          return { oid: next, committed: true, ...(report === undefined ? {} : { report }) }
+        },
+      })
+      if (current === parent) return { kind: "noop", result: { value, oid: parent, retries } }
+      if (lastMap === undefined || lastCommittedSeq === undefined) {
+        throw new Error("sequence wrote a commit without a step map and receipt")
       }
-      // The candidate runs on THIS attempt's tree, after the caller's update and before the CAS; a replay runs it again.
-      let report: readonly string[] | undefined
-      if (candidate !== undefined) {
-        const changed = [...removeNoopChanges(base, changes).keys()].sort()
-        const verdict = await candidate({
-          base: parent,
-          changed,
-          map,
-          readBase: (path) => base.get(path),
-          materialize: async () =>
-            backendOid(
-              await context.backend.writeCommit(
-                context.repo,
-                commitInput(removeNoopChanges(base, changes), `gitomic candidate for: ${message.trim()}`),
-              ),
-            ),
-        })
-        if (verdict?.refuse !== undefined && verdict.refuse.length > 0) {
-          throw new CandidateRefused([...verdict.refuse], parent)
-        }
-        report = verdict?.report === undefined ? [] : [...verdict.report]
-      }
-      const withReport = (result: Committed): Committed => (report === undefined ? result : { ...result, report })
-      const effective = removeNoopChanges(base, changes)
-      if (effective.size === 0) return { kind: "noop", result: withReport({ oid: parent, retries }) }
-      const next = backendOid(await context.backend.writeCommit(context.repo, commitInput(effective, message.trim())))
-      // After the commit, before the CAS, once per attempt: a replay calls it again with the new commit.
-      const besideRefs =
-        beside === undefined
+      const beside =
+        options.beside === undefined
           ? []
-          : shapeRefUpdates(context.ref, await beside({ next, base: parent, map, tips }), "beside")
+          : shapeRefUpdates(
+              context.ref,
+              await options.beside({ next: current, base: parent, map: lastMap, tips, value }),
+              "beside",
+            )
       return {
         kind: "write",
-        next,
+        next: current,
         base: parent,
         instance: context.instance,
-        seq: seq as number,
-        ...(besideRefs.length === 0 ? {} : { beside: besideRefs }),
-        landed: (oid, retries) => withReport({ oid: backendOid(oid), retries }),
+        seq: lastCommittedSeq,
+        ...(beside.length === 0 ? {} : { beside }),
+        landed: (oid, retries) => ({ value, oid: backendOid(oid), retries }),
       }
     },
   })
