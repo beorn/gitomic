@@ -37,6 +37,8 @@ let ran: string
 const shell = createShellBackend()
 
 beforeEach(async () => {
+  // A runner carrying GITOMIC_CACHE_DIR (hh's timers do) must not move URL rows onto its kept copy (hh 25615).
+  vi.stubEnv("GITOMIC_CACHE_DIR", "")
   work = await mkdtemp(join(tmpdir(), "gitomic-trust-"))
   fixture = await createBareRepo()
   ran = join(work, "check-ran")

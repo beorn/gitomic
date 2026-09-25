@@ -54,6 +54,9 @@ beforeEach(async () => {
   // note to stderr (ADR-0020's fallback, tested on its own in cli-candidate.test.ts). CI runners have none.
   vi.stubEnv("GIT_AUTHOR_NAME", "CLI Test")
   vi.stubEnv("GIT_AUTHOR_EMAIL", "cli@example.org")
+  // A runner that carries GITOMIC_CACHE_DIR (hh's timers do) must not move every URL row onto its kept copy:
+  // empty is unset, and the kept-copy rows pass their own directory (hh 25615, review2 76eaab55).
+  vi.stubEnv("GITOMIC_CACHE_DIR", "")
 })
 
 afterEach(async () => {

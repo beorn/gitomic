@@ -41,6 +41,8 @@ let work: string
 let fixture: { repo: string; cleanup(): Promise<void> }
 
 beforeEach(async () => {
+  // A runner carrying GITOMIC_CACHE_DIR (hh's timers do) must not move URL rows onto its kept copy (hh 25615).
+  vi.stubEnv("GITOMIC_CACHE_DIR", "")
   work = await mkdtemp(join(tmpdir(), "gitomic-exit-conformance-"))
   // A URL address's trust lives in the caller's global git config: point it at a scratch file, never the real one.
   vi.stubEnv("GIT_CONFIG_GLOBAL", join(work, "global-gitconfig"))
