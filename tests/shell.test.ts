@@ -937,7 +937,7 @@ describe.sequential("shell backend failure boundaries", () => {
     })
     try {
       await expect(createShellBackend().compareAndSwap("ignored", "refs/heads/main", next, expected)).resolves.toBe(
-        false,
+        "locked",
       )
     } finally {
       restore()

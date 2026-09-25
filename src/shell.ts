@@ -35,6 +35,7 @@ import type {
   Ident,
   Oid,
   PublishResult,
+  RefSwap,
   RefUpdate,
   TreeEntry,
   TreeListing,
@@ -951,11 +952,12 @@ async function compareAndSwap(
   next: Oid,
   expected: Oid,
   baseEnv?: NodeJS.ProcessEnv,
-): Promise<boolean> {
+): Promise<RefSwap> {
   const result = await run(selectedGit(), durableGitArgs(repo, ["update-ref", ref, next, expected]), { baseEnv })
-  if (result.code === 0) return true
+  if (result.code === 0) return "swapped"
   const detail = result.stderr.toString("utf8").trim()
-  if (isCompareAndSwapRejection(detail) || isTransientRefLockContention(detail)) return false
+  if (isCompareAndSwapRejection(detail)) return "moved"
+  if (isTransientRefLockContention(detail)) return "locked"
   throw new Error(`git update-ref failed (${result.code})${detail ? `: ${detail}` : ""}`)
 }
 
@@ -1133,7 +1135,7 @@ async function compareAndSwapRemote(
   remote: string,
   timeoutMs: number,
   baseEnv?: NodeJS.ProcessEnv,
-): Promise<boolean> {
+): Promise<{ readonly landed: false } | { readonly landed: true; readonly kept: RefSwap }> {
   let result: GitResult
   try {
     result = await run(
@@ -1146,16 +1148,16 @@ async function compareAndSwapRemote(
   }
   if (result.code !== 0) {
     const detail = `${result.stdout.toString("utf8")}\n${result.stderr.toString("utf8")}`.trim()
-    if (isRemoteCompareAndSwapRejection(detail)) return false
+    if (isRemoteCompareAndSwapRejection(detail)) return { landed: false }
     throw new Error(`git push failed (${result.code})${detail ? `: ${detail}` : ""}`)
   }
   // Keep the local cache in step. A ref created by this push may not exist
   // locally yet: an all-zero expected then means "absent here too".
   const local = await optionalRef(repo, ref, baseEnv)
   if (local === expected || (local === undefined && isZeroOid(expected))) {
-    await compareAndSwap(repo, ref, next, expected, baseEnv)
+    return { landed: true, kept: await compareAndSwap(repo, ref, next, expected, baseEnv) }
   }
-  return true
+  return { landed: true, kept: "moved" }
 }
 
 /** A lease lost between the read and the re-run, as update-ref reports it. */

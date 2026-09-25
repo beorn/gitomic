@@ -236,9 +236,9 @@ describe("CAS contract: an all-zero expected means the ref must be absent (rulin
       const next = await target.backend.writeCommit(target.repo, input)
       const zero = "0".repeat(parent.length)
       const ref = "refs/events/absent-then-created"
-      expect(await target.backend.compareAndSwap(target.repo, ref, next, zero), target.name).toBe(true)
-      expect(await target.backend.compareAndSwap(target.repo, ref, next, zero), target.name).toBe(false)
-      expect(await target.backend.compareAndSwap(target.repo, "refs/heads/main", next, zero), target.name).toBe(false)
+      expect(await target.backend.compareAndSwap(target.repo, ref, next, zero), target.name).toBe("swapped")
+      expect(await target.backend.compareAndSwap(target.repo, ref, next, zero), target.name).toBe("moved")
+      expect(await target.backend.compareAndSwap(target.repo, "refs/heads/main", next, zero), target.name).toBe("moved")
     })
   })
 })

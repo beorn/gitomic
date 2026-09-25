@@ -24,6 +24,7 @@ import type {
   GitomicBackend,
   Oid,
   PublishResult,
+  RefSwap,
   RefUpdate,
   TreeEntry,
   TreeListing,
@@ -168,14 +169,14 @@ export function createMemBackend(): GitomicBackend {
     return commit.oid
   }
 
-  const compareAndSwap = async (name: string, ref: string, next: Oid, expected: Oid): Promise<boolean> => {
+  const compareAndSwap = async (name: string, ref: string, next: Oid, expected: Oid): Promise<RefSwap> => {
     const repo = getRepo(name)
     const current = repo.refs.get(ref)
     // An all-zero expected means the ref must be absent: create-if-absent.
-    if (isZeroOid(expected) ? current !== undefined : current !== expected) return false
+    if (isZeroOid(expected) ? current !== undefined : current !== expected) return "moved"
     if (!repo.commits.has(next)) throw new Error(`unknown next commit: ${next}`)
     repo.refs.set(ref, next)
-    return true
+    return "swapped"
   }
 
   // MULTI: check every lease first, then set every ref; nothing awaits in
