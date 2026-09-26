@@ -6,6 +6,7 @@ import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 
 import { GitTimeout } from "./errors.js"
+import { journalLeaseRejection } from "./lease-journal.js"
 import {
   assertRefUpdates,
   commitIdents,
@@ -1165,7 +1166,12 @@ async function compareAndSwapRemote(
   }
   if (result.code !== 0) {
     const detail = `${result.stdout.toString("utf8")}\n${result.stderr.toString("utf8")}`.trim()
-    if (isRemoteCompareAndSwapRejection(detail)) return { landed: false }
+    if (isRemoteCompareAndSwapRejection(detail)) {
+      // Journaled before the caller sees the loss (hh 25626). This site throws no Conflict to attach a journal failure
+      // to, so that failure is said on stderr with its path and the lost lease is still answered.
+      await journalLeaseRejection(repo, "compareAndSwapRemote", remote, [{ ref, expect: expected }])
+      return { landed: false }
+    }
     throw new Error(`git push failed (${result.code})${detail ? `: ${detail}` : ""}`)
   }
   // Keep the local cache in step. A ref created by this push may not exist
@@ -1414,7 +1420,10 @@ async function publishRemote(
         )
       }
     }
-    throw leaseConflict(stale.map(({ ref, expect }) => ({ ref, expect, observed: observed(ref) })))
+    const lost = stale.map(({ ref, expect }) => ({ ref, expect, observed: observed(ref) }))
+    // Journaled before the Conflict is thrown (hh 25626); a journal failure rides on it as its cause, never instead.
+    const journalFailure = await journalLeaseRejection(repo, "publishRemote", remote, lost)
+    throw leaseConflict(lost, journalFailure === undefined ? undefined : { cause: journalFailure })
   }
   return {
     outcomes: updates.map(({ ref, oid }) => {
