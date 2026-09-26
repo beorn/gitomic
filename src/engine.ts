@@ -4,7 +4,7 @@
  * door says how to read its state and build the next commit; the loop owns
  * contention, receipts and the retry budget, so there is exactly one of each.
  */
-import { Conflict, RetriesExhausted } from "./errors.js"
+import { Conflict, PublicationUnknown, RetriesExhausted } from "./errors.js"
 import type { Oid, RefUpdate } from "./types.js"
 
 /** What one attempt decided against the tip it saw. */
@@ -54,17 +54,14 @@ export async function runCasLoop<H, R>(loop: CasLoop<H, R>): Promise<R> {
     const attempt = await loop.attempt(tip, retries)
     if (attempt.kind === "noop") return attempt.result
 
-    let publicationFailure: { cause: unknown; message: string } | undefined
+    let publicationFailure: PublicationUnknown | undefined
     try {
       if (await loop.publish(attempt.next, tip, attempt.beside ?? [])) return attempt.landed(attempt.next, retries)
     } catch (cause) {
       // A Conflict is the tool naming a definite rejection: nothing landed, so
       // there is no unknown outcome to resolve and nothing to retry.
       if (cause instanceof Conflict) throw cause
-      publicationFailure = {
-        cause,
-        message: `Transaction publication to ${loop.label} is unknown; do not blindly retry. ${cause instanceof Error ? cause.message : String(cause)}`,
-      }
+      publicationFailure = new PublicationUnknown(loop.label, cause, "no-receipt")
     }
 
     if (publicationFailure === undefined) retries += 1
@@ -80,12 +77,12 @@ export async function runCasLoop<H, R>(loop: CasLoop<H, R>): Promise<R> {
       if (landed !== undefined) return attempt.landed(landed, retries)
     } catch (verificationError) {
       if (publicationFailure !== undefined) {
-        throw new AggregateError([publicationFailure.cause, verificationError], publicationFailure.message)
+        throw new PublicationUnknown(loop.label, publicationFailure.cause, "unverified", verificationError)
       }
       throw verificationError
     }
     if (publicationFailure !== undefined) {
-      throw new Error(publicationFailure.message, { cause: publicationFailure.cause })
+      throw publicationFailure
     }
     // The ref advanced under us: a writer landed this round, so the race is
     // making progress — extend the budget rather than abandon a healthy burst.
@@ -102,8 +99,8 @@ export async function runCasLoop<H, R>(loop: CasLoop<H, R>): Promise<R> {
 function delayForRetry(retries: number): Promise<void> {
   const ceiling = Math.min(150, 4 * 2 ** Math.min(retries, 6))
   const milliseconds = Math.random() * ceiling
-  return new Promise((resolveDelay) => {
+  return new Promise((resolve) => {
     // raw-lifecycle-ok: this transaction-owned backoff is awaited and cannot outlive its caller.
-    setTimeout(resolveDelay, milliseconds)
+    setTimeout(resolve, milliseconds)
   })
 }

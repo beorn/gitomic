@@ -13,6 +13,7 @@ import {
   open,
   openReader,
   openRemoteRepository,
+  PublicationUnknown,
   refreshKeptCopy,
   RetriesExhausted,
 } from "../src/index.js"
@@ -736,6 +737,10 @@ describe("remote arbitration", () => {
         const outcome = store.transact(update, "uncertain increment")
         await expect(outcome).rejects.toThrow(/publication.*unknown/i)
         await expect(outcome).rejects.toThrow(/do not blindly retry/i)
+        await expect(outcome).rejects.toBeInstanceOf(PublicationUnknown)
+        await expect(outcome).rejects.toMatchObject({
+          verified: failure === "refresh failure" || failure === "lookup failure" ? "unverified" : "no-receipt",
+        })
         await expect(outcome).rejects.not.toBeInstanceOf(RetriesExhausted)
         if (failure === "refresh failure" || failure === "lookup failure") {
           await expect(outcome).rejects.toBeInstanceOf(AggregateError)

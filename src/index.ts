@@ -13,7 +13,14 @@ import {
   untilAborted,
   waitForPoll,
 } from "./options.js"
-import { CandidateRefused, Conflict, EditDoesNotApply, GitTimeout, RetriesExhausted } from "./errors.js"
+import {
+  CandidateRefused,
+  Conflict,
+  EditDoesNotApply,
+  GitTimeout,
+  PublicationUnknown,
+  RetriesExhausted,
+} from "./errors.js"
 import { cloneCommitProvenance, cloneIdent, GITOMIC_IDENT, validateOid } from "./git-object.js"
 import { assertTreeShape, isGitPrefixNotFoundError, normalizePath, normalizePrefix } from "./path.js"
 import { createLazyBase, readLazyBase, type LazyBase } from "./lazy-base.js"
@@ -47,7 +54,7 @@ import type {
 } from "./types.js"
 import { assertUtf8 } from "./utf8.js"
 
-export { CandidateRefused, Conflict, EditDoesNotApply, GitTimeout, RetriesExhausted }
+export { CandidateRefused, Conflict, EditDoesNotApply, GitTimeout, PublicationUnknown, RetriesExhausted }
 export type { EditKind, PreconditionType } from "./errors.js"
 export { applyEdits } from "./edits.js"
 export { editsFromCheckout } from "./checkout-edits.js"

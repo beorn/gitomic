@@ -26,6 +26,24 @@ export class RetriesExhausted extends Error {
   }
 }
 
+/** A publish threw and its transaction receipt could not prove that it landed. */
+export class PublicationUnknown extends AggregateError {
+  override readonly name = "PublicationUnknown"
+
+  constructor(
+    readonly label: string,
+    cause: unknown,
+    readonly verified: "no-receipt" | "unverified",
+    verificationError?: unknown,
+  ) {
+    super(
+      verified === "unverified" ? [cause, verificationError] : [cause],
+      `Transaction publication to ${label} is unknown; do not blindly retry. ${cause instanceof Error ? cause.message : String(cause)}`,
+      { cause },
+    )
+  }
+}
+
 /** The four edit kinds `apply` carries. */
 export type EditKind = "put" | "append" | "rm" | "mv"
 
