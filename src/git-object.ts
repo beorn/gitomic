@@ -441,11 +441,10 @@ export function assertRefUpdates(updates: readonly RefUpdate[]): readonly RefUpd
 export type LostLease = { readonly ref: string; readonly expect: Oid; readonly observed: string }
 
 /** The Conflict for lost leases, naming each ref, its expected value and its observed tip. */
-export function leaseConflict(lost: readonly LostLease[], options?: ErrorOptions): Conflict {
+export function leaseConflict(lost: readonly LostLease[]): Conflict {
   const describe = ({ ref, expect, observed }: LostLease) =>
     `${ref} is at ${observed}, not ${isZeroOid(expect) ? "absent" : expect}`
   return new Conflict(`lease lost, nothing published: ${lost.map(describe).join("; ")}`, {
-    ...options,
     refs: lost.map(({ ref }) => ref),
   })
 }

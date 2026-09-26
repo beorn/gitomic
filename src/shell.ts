@@ -5,7 +5,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 
-import { GitTimeout } from "./errors.js"
+import { Conflict, GitTimeout } from "./errors.js"
 import { journalLeaseRejection } from "./lease-journal.js"
 import {
   assertRefUpdates,
@@ -1423,7 +1423,9 @@ async function publishRemote(
     const lost = stale.map(({ ref, expect }) => ({ ref, expect, observed: observed(ref) }))
     // Journaled before the Conflict is thrown (hh 25626); a journal failure rides on it as its cause, never instead.
     const journalFailure = await journalLeaseRejection(repo, "publishRemote", remote, lost)
-    throw leaseConflict(lost, journalFailure === undefined ? undefined : { cause: journalFailure })
+    const conflict = leaseConflict(lost)
+    if (journalFailure === undefined) throw conflict
+    throw new Conflict(conflict.message, { refs: conflict.refs, cause: journalFailure })
   }
   return {
     outcomes: updates.map(({ ref, oid }) => {
