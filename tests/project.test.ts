@@ -174,6 +174,33 @@ describe("gitomic project and checkout synchronization", () => {
       // Clean tree: no reverse-delta dirt
       expect(worktreeDirtyPaths(checkout)).toEqual([])
     })
+
+    test("both projections fetch through a private ref: FETCH_HEAD is untouched and no scratch ref is left", async () => {
+      // FETCH_HEAD is shared with whatever else fetches in the checkout: a projection that wrote it clobbered another
+      // fetcher's, and one that read it back could read theirs.
+      const { checkout, landAtOrigin } = remoteFixture()
+      const fetchHead = join(git(checkout, "rev-parse", "--absolute-git-dir"), "FETCH_HEAD")
+      const sentinel = "0000000000000000000000000000000000000000\t\tbranch 'elsewhere' of another-remote\n"
+      writeFileSync(fetchHead, sentinel)
+
+      const first = landAtOrigin("tracked.md", "# landed, then projected by its receipt\n")
+      const byReceipt = await projectRemoteFirstFastForward({
+        repoRoot: checkout,
+        to: first,
+        ref: "refs/heads/main",
+        remote: "origin",
+        expectedDirtyPaths: [],
+      })
+      expect(byReceipt).toMatchObject({ ok: true, kind: "synchronized" })
+      const second = landAtOrigin("tracked.md", "# landed, then projected to the remote tip\n")
+      const toTip = await runCli(["project", checkout, "--remote", "origin", "--ref", "refs/heads/main"])
+      expect(toTip.code, toTip.stderr).toBe(0)
+      expect(toTip.stdout).toContain(`to=${second}`)
+
+      expect(git(checkout, "rev-parse", "HEAD")).toBe(second)
+      expect(readFileSync(fetchHead, "utf8")).toBe(sentinel)
+      expect(git(checkout, "for-each-ref", "refs/gitomic")).toBe("")
+    })
   })
 
   describe("Witness 2: local-only commit -> exit 4, stranded-local-commits, nothing changed", () => {
