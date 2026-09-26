@@ -171,8 +171,8 @@ import { decodeUtf8 } from "./utf8.js"
  *   Its reasons, then one machine line `code=candidate-refused base=<oid>
  *   reasons=<JSON array>`. Tree and ref unchanged. Or, for `project`, an
  *   unsynchronized or stranded checkout (stranded-local-commits,
- *   landed-but-unsynchronized, worktree-update-refused, dirt-changed,
- *   dirt-unverifiable).
+ *   landed-but-unsynchronized, worktree-update-refused, index-locked,
+ *   dirt-changed, dirt-unverifiable; PROJECT_LEAVES_UNSYNCHRONIZED places each).
  * - `5` the checkout lock is held by another writer past the wait: transient,
  *   and nothing was written — not the write, not the checkout. The refusal
  *   names the lock path and, when the lock records it, the holder's pid and
@@ -1033,15 +1033,7 @@ async function runProject(args: string[], stdout: CliWriter, stderr: CliWriter):
     return OK
   }
 
-  const UNSYNCHRONIZED_KINDS = new Set([
-    "stranded-local-commits",
-    "landed-but-unsynchronized",
-    "worktree-update-refused",
-    "dirt-changed",
-    "dirt-unverifiable",
-  ])
-
-  if (UNSYNCHRONIZED_KINDS.has(outcome.kind)) {
+  if (PROJECT_LEAVES_UNSYNCHRONIZED[outcome.kind]) {
     const localOnlyStr =
       outcome.kind === "stranded-local-commits" ? ` localOnly=${JSON.stringify(outcome.localOnly)}` : ""
     const localTipStr = outcome.localTip ?? ""
@@ -1052,6 +1044,27 @@ async function runProject(args: string[], stdout: CliWriter, stderr: CliWriter):
 
   stderr.write(`gitomic: ${outcome.error}\nkind=${outcome.kind}\n`)
   return RUNTIME_ERROR
+}
+
+/**
+ * Each refusal `gitomic project` can answer, placed: true exits CANDIDATE_REFUSED with the checkout left
+ * unsynchronized, false is a runtime failure. Keyed by the outcome's own union, so a kind added later fails to compile
+ * here until it is placed.
+ */
+const PROJECT_LEAVES_UNSYNCHRONIZED: {
+  readonly [Kind in Extract<RemoteFirstProjectionOutcome, { readonly ok: false }>["kind"]]: boolean
+} = {
+  "stranded-local-commits": true,
+  "landed-but-unsynchronized": true,
+  "worktree-update-refused": true,
+  "index-locked": true,
+  "dirt-changed": true,
+  "dirt-unverifiable": true,
+  "wrong-branch": false,
+  "authored-mismatch": false,
+  "fetch-failed": false,
+  "ancestry-unverifiable": false,
+  "ref-advance-refused": false,
 }
 
 type Attribution = { author: Ident | undefined; trailers: Trailer[] }

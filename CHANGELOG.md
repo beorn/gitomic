@@ -4,7 +4,13 @@
 
 ### Added
 
+- `CheckoutSyncOutcome` (and so `RemoteFirstProjectionOutcome`) gains `{ ok: false, kind: "index-locked", error, gitDetail, lockPath, lockAgeMs }`: a two-way merge that could not take the index lock another git process holds. It is chosen only from the failed merge's own stderr, at every `read-tree -m -u` site through one classifier; nothing was weighed or changed, and `lockAgeMs` tells a live holder's brief lock from a dead process's. Before, this read as `worktree-update-refused`, "an uncommitted local edit", listing unrelated dirt. A consumer switching exhaustively on the kind fails to compile until it places the new one; `gitomic project` exits 4 for it, as it did.
+
 - `refreshKeptCopy({ repo, ref, remote, backend? })`: the one kept-copy refresh, exported. It reads `remote`'s tip without moving a ref, advances the kept `ref` to it (a ref another process moved is left alone; a held ref lock is waited out for about 200 ms, then named), and answers the tip. A remote Store's refresh runs the same function, so a caller keeping its own copy of the remote calls it instead of carrying a second implementation.
+
+### Fixed
+
+- `projectRemoteFirstFastForward` and `projectCheckout` fetch through a private `refs/gitomic/fetch/<uuid>` ref with `--no-write-fetch-head`, released on every path, instead of writing the checkout's shared `FETCH_HEAD` and reading it back.
 
 ## 0.6.0 — 2026-09-25
 

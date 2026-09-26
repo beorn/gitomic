@@ -33,7 +33,7 @@
 
 import { spawnSync } from "node:child_process"
 import { randomUUID } from "node:crypto"
-import { copyFileSync, readFileSync, rmSync } from "node:fs"
+import { copyFileSync, readFileSync, rmSync, statSync } from "node:fs"
 import { dirname, join } from "node:path"
 
 import { objectOid } from "./git-object.js"
@@ -110,6 +110,21 @@ export type CheckoutSyncOutcome =
       readonly error: string
       readonly expectedDirtyPaths: readonly string[]
       readonly gitDetail: string
+    }
+  /**
+   * The two-way merge could not take the index lock another git process holds, so it never ran: no dirt was weighed,
+   * and the index and working tree are as they were. Chosen only from the failed merge's own stderr; a caller may take
+   * the checkout again once the holder lets go.
+   */
+  | {
+      readonly ok: false
+      readonly kind: "index-locked"
+      readonly error: string
+      readonly gitDetail: string
+      /** The lock file git named. */
+      readonly lockPath: string
+      /** The lock's age when read, or null when it was already gone or unreadable: an old one is a dead process's. */
+      readonly lockAgeMs: number | null
     }
   /** The merge ran but the resulting dirt could not be read back. */
   | { readonly ok: false; readonly kind: "dirt-unverifiable"; readonly error: string }
@@ -200,6 +215,57 @@ function gitDetail(result: GitOutcome): string {
   return result.stderr || result.stdout || `git exited ${result.status}`
 }
 
+type ReadTreeFailure = Extract<CheckoutSyncOutcome, { readonly kind: "worktree-update-refused" | "index-locked" }>
+
+/** git's own refusal to take a lock another process holds: `Unable to create '<path>/index.lock': File exists.` */
+const INDEX_LOCK_HELD = /Unable to create '([^']*index\.lock)': File exists/u
+
+/**
+ * The one reading of a failed `read-tree -m -u`, for every site that runs one. A merge that could not take the index
+ * lock never weighed any dirt, so it is `index-locked`, named from the merge's own stderr and never from a later
+ * probe; any other failure is the refusal to overwrite an uncommitted edit. Each site words both.
+ */
+function classifyReadTreeFailure(
+  merged: GitOutcome,
+  expectedDirtyPaths: readonly string[],
+  words: {
+    readonly refused: (detail: string) => string
+    readonly locked: (lock: { readonly lockPath: string; readonly lockAge: string; readonly detail: string }) => string
+  },
+): ReadTreeFailure {
+  const detail = gitDetail(merged)
+  const lockPath = INDEX_LOCK_HELD.exec(merged.stderr)?.[1]
+  if (lockPath !== undefined) {
+    const lockAgeMs = lockAgeOf(lockPath)
+    const lockAge = lockAgeMs === null ? "age unknown: gone or unreadable when read" : `${Math.round(lockAgeMs)} ms old`
+    return {
+      ok: false,
+      kind: "index-locked",
+      gitDetail: detail,
+      lockPath,
+      lockAgeMs,
+      error: words.locked({ lockPath, lockAge, detail }),
+    }
+  }
+  return {
+    ok: false,
+    kind: "worktree-update-refused",
+    expectedDirtyPaths: [...expectedDirtyPaths].sort(),
+    gitDetail: detail,
+    error: words.refused(detail),
+  }
+}
+
+function lockAgeOf(lockPath: string): number | null {
+  try {
+    return Math.max(0, Date.now() - statSync(lockPath).mtimeMs)
+  } catch {
+    // Released between git's refusal and this read, or unreadable: the age is unknown, and the outcome says so.
+    // silent-fallback-allow: null is the outcome's named "age unknown"; the error text prints it as such
+    return null
+  }
+}
+
 /**
  * Fetch `ref`'s tip from `remote` through a private scratch ref, never FETCH_HEAD: that file is shared with
  * whatever else fetches in this checkout, so writing it clobbers another reader's, and reading it back can read theirs.
@@ -218,18 +284,22 @@ async function fetchTip(
     ["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", remote, `+${source}:${scratch}`],
     timeoutMs,
   )
-  if (fetched.status !== 0) return { ok: false, detail: gitDetail(fetched) }
-  const tip = git(repoRoot, readonlyArgs(["rev-parse", "--verify", `${scratch}^{commit}`]))
-  const released = git(repoRoot, ["update-ref", "-d", scratch])
-  if (tip.status !== 0 || tip.stdout === "")
-    return { ok: false, detail: `the fetched tip is unreadable (${gitDetail(tip)})` }
-  if (released.status !== 0) {
-    return {
-      ok: false,
-      detail: `fetched ${tip.stdout}, but the scratch ref ${scratch} could not be released (${gitDetail(released)})`,
-    }
+  const tip = git(repoRoot, readonlyArgs(["rev-parse", "--verify", "--quiet", `${scratch}^{commit}`]))
+  // Released on every path: a fetch stopped at its limit after git wrote the ref would otherwise leave it behind.
+  const unreleased = tip.status === 0 ? releaseScratch(repoRoot, scratch) : undefined
+  const leak = unreleased === undefined ? "" : `; the scratch ref ${scratch} could not be released (${unreleased})`
+  if (fetched.status !== 0) return { ok: false, detail: `${gitDetail(fetched)}${leak}` }
+  if (tip.status !== 0 || tip.stdout === "") {
+    return { ok: false, detail: `the fetched tip is unreadable (${gitDetail(tip)})${leak}` }
   }
+  if (unreleased !== undefined) return { ok: false, detail: `fetched ${tip.stdout}${leak}` }
   return { ok: true, oid: tip.stdout }
+}
+
+/** Delete a scratch ref; the failure's detail, or undefined once it is gone. */
+function releaseScratch(repoRoot: string, scratch: string): string | undefined {
+  const released = git(repoRoot, ["update-ref", "-d", scratch])
+  return released.status === 0 ? undefined : gitDetail(released)
 }
 
 function nulPaths(output: string): string[] {
@@ -347,16 +417,16 @@ function carryIndexTo(
   if (merged.status !== 0) {
     return {
       ok: false,
-      outcome: {
-        ok: false,
-        kind: "worktree-update-refused",
-        expectedDirtyPaths: [...expected].sort(),
-        gitDetail: gitDetail(merged),
-        error:
+      outcome: classifyReadTreeFailure(merged, expected, {
+        refused: (detail) =>
           `${ref} in the checkout ${repoRoot} is at ${tip}, but its index still holds ${ancestor}'s tree and could ` +
-          `not be brought forward without overwriting an uncommitted local edit (${gitDetail(merged)}). The index ` +
+          `not be brought forward without overwriting an uncommitted local edit (${detail}). The index ` +
           "and working tree are unchanged.",
-      },
+        locked: ({ lockPath, lockAge, detail }) =>
+          `${ref} in the checkout ${repoRoot} is at ${tip}, but its index still holds ${ancestor}'s tree and could ` +
+          `not be brought forward: another git process holds ${lockPath} (${lockAge}; ${detail}). No dirt was ` +
+          "weighed; the index and working tree are unchanged.",
+      }),
     }
   }
   const resolved = new Set(nulPaths(delta.stdout))
@@ -617,21 +687,25 @@ export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): Check
   const merged = git(repoRoot, ["read-tree", "-m", "-u", from, to])
   if (merged.status !== 0) {
     const unstaged = unstageAuthoredPaths(repoRoot, from, request.authoredPaths ?? [])
-    return {
-      ok: false,
-      kind: "worktree-update-refused",
-      expectedDirtyPaths: expected,
-      gitDetail: gitDetail(merged),
-      error:
+    const unstageNote =
+      unstaged === undefined
+        ? ""
+        : ` The authored paths could NOT be unstaged back to ${from} (${unstaged}); the index holds them staged.`
+    return classifyReadTreeFailure(merged, expected, {
+      refused: (detail) =>
         `${ref} in the checkout ${repoRoot} advanced ${from} -> ${to}, but the checkout could not be ` +
         `brought forward without overwriting an uncommitted local edit to a path the transaction wrote ` +
-        `(${gitDetail(merged)}). Dirty at the time of the transaction: [${expected.join(", ")}]. Both the dirt ` +
+        `(${detail}). Dirty at the time of the transaction: [${expected.join(", ")}]. Both the dirt ` +
         `and the commit are intact, and the index and working tree still hold their pre-advance state; until ` +
         "the checkout is reconciled, every write here refuses, naming the whole inverse delta as dirt." +
-        (unstaged === undefined
-          ? ""
-          : ` The authored paths could NOT be unstaged back to ${from} (${unstaged}); the index holds them staged.`),
-    }
+        unstageNote,
+      locked: ({ lockPath, lockAge, detail }) =>
+        `${ref} in the checkout ${repoRoot} advanced ${from} -> ${to}, but the checkout could not be brought ` +
+        `forward: another git process holds ${lockPath} (${lockAge}; ${detail}). No dirt was weighed. The commit ` +
+        "is intact, and the index and working tree still hold their pre-advance state until the checkout is " +
+        "reconciled once the lock is released." +
+        unstageNote,
+    })
   }
 
   const remaining = readDirt(repoRoot)
@@ -907,20 +981,24 @@ export async function projectRemoteFirstFastForward(
   if (probed.status !== 0) {
     const unstaged = unstageAuthoredPaths(repoRoot, localTip, authoredPaths)
     const expected = [...expectedDirtyPaths].sort()
-    return {
-      ok: false,
-      kind: "worktree-update-refused",
-      expectedDirtyPaths: expected,
-      gitDetail: gitDetail(probed),
-      error:
+    const unstageNote =
+      unstaged === undefined
+        ? ""
+        : ` The authored paths could NOT be unstaged back to ${localTip} (${unstaged}); the index holds them staged.`
+    return classifyReadTreeFailure(probed, expected, {
+      refused: (detail) =>
         `${ref} in the checkout ${repoRoot}: the landed commit ${to} is at ${remote}, but the checkout could not ` +
         `be brought forward without overwriting an uncommitted local edit to a path the landing wrote ` +
-        `(${gitDetail(probed)}). The ref still holds ${localTip} and nothing was changed. Dirty at projection ` +
+        `(${detail}). The ref still holds ${localTip} and nothing was changed. Dirty at projection ` +
         `time: [${expected.join(", ")}]. The landing ${to} is complete and safe at ${remote}.` +
-        (unstaged === undefined
-          ? ""
-          : ` The authored paths could NOT be unstaged back to ${localTip} (${unstaged}); the index holds them staged.`),
-    }
+        unstageNote,
+      locked: ({ lockPath, lockAge, detail }) =>
+        `${ref} in the checkout ${repoRoot}: the landed commit ${to} is at ${remote}, but the checkout could not ` +
+        `be brought forward: another git process holds ${lockPath} (${lockAge}; ${detail}). No dirt was weighed; ` +
+        `the ref still holds ${localTip} and nothing was changed. The landing ${to} is complete and safe at ` +
+        `${remote}; project again once the lock is released.` +
+        unstageNote,
+    })
   }
 
   request.beforeRefAdvance?.()
