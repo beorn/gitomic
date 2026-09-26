@@ -416,6 +416,23 @@ describe("gitomic project and checkout synchronization", () => {
       expect(read.stdout).toBe("")
     })
 
+    test("the local git runner speaks git's English whatever the caller's locale, so a refusal is classified by its words", () => {
+      // The index-locked kind is read from git's own stderr; a translated git would read as the old dirt refusal.
+      const root = mkdtempSync(join(tmpdir(), "gitomic-locale-"))
+      roots.push(root)
+      git(root, "init", "-q", "--initial-branch=main", "repo")
+      const repo = join(root, "repo")
+      git(repo, "config", "alias.locale", '!printf %s "$LC_ALL"')
+      const before = process.env.LC_ALL
+      process.env.LC_ALL = "de_DE.UTF-8"
+      try {
+        expect(gitOutcomeForTest(repo, ["locale"])).toMatchObject({ status: 0, stdout: "C" })
+      } finally {
+        if (before === undefined) delete process.env.LC_ALL
+        else process.env.LC_ALL = before
+      }
+    })
+
     test("a projection with index.lock held succeeds on the healthy path and leaves the lock untouched", async () => {
       const { checkout } = remoteFixture()
       const lockFile = join(git(checkout, "rev-parse", "--absolute-git-dir"), "index.lock")

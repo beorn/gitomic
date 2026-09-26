@@ -170,6 +170,9 @@ export function gitOutcomeForTest(repoRoot: string, args: readonly string[]): Gi
 function git(repoRoot: string, args: readonly string[], maxBuffer?: number): GitOutcome {
   const result = spawnSync("git", ["-C", repoRoot, ...args], {
     encoding: "utf8",
+    // git's own words are read here (an index.lock refusal is classified from its stderr), so they must be English,
+    // as the shell backend's runner pins them.
+    env: { ...process.env, LC_ALL: "C" },
     ...(maxBuffer === undefined ? {} : { maxBuffer }),
   })
   if (result.error !== undefined || result.status === null) {
@@ -702,8 +705,8 @@ export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): Check
       locked: ({ lockPath, lockAge, detail }) =>
         `${ref} in the checkout ${repoRoot} advanced ${from} -> ${to}, but the checkout could not be brought ` +
         `forward: another git process holds ${lockPath} (${lockAge}; ${detail}). No dirt was weighed. The commit ` +
-        "is intact, and the index and working tree still hold their pre-advance state until the checkout is " +
-        "reconciled once the lock is released." +
+        "is intact, and the index and working tree still hold their pre-advance state; until the checkout is " +
+        "reconciled once the lock is released, every write here refuses, naming the whole inverse delta as dirt." +
         unstageNote,
     })
   }

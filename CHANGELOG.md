@@ -10,6 +10,7 @@
 
 ### Fixed
 
+- The projection's local git runner pins `LC_ALL=C`, as the shell backend's runner does: `index-locked` is read from git's own stderr, and a translated git would read as the old dirt refusal.
 - `projectRemoteFirstFastForward` and `projectCheckout` fetch through a private `refs/gitomic/fetch/<uuid>` ref with `--no-write-fetch-head`, released on every path, instead of writing the checkout's shared `FETCH_HEAD` and reading it back.
 
 ## 0.6.0 — 2026-09-25
