@@ -87,7 +87,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@bearly/flock": "workspace:*"
+    "@bearly/flock": "^0.1.1"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",
