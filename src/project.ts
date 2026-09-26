@@ -263,6 +263,41 @@ function lockAgeOf(lockPath: string): number | null {
     // Released between git's refusal and this read, or unreadable: the age is unknown, and the outcome says so.
     return null
   }
+
+/**
+ * Fetch `ref`'s tip from `remote` through a private scratch ref, never FETCH_HEAD: that file is shared with
+ * whatever else fetches in this checkout, so writing it clobbers another reader's, and reading it back can read theirs.
+ * The scratch ref is released before this returns; the fetched objects stay until the branch advances onto them.
+ */
+async function fetchTip(
+  repoRoot: string,
+  remote: string,
+  ref: string,
+  timeoutMs: number,
+): Promise<{ readonly ok: true; readonly oid: string } | { readonly ok: false; readonly detail: string }> {
+  const source = ref.startsWith("refs/") ? ref : `refs/heads/${ref}`
+  const scratch = `refs/gitomic/fetch/${randomUUID()}`
+  const fetched = await gitRemote(
+    repoRoot,
+    ["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", remote, `+${source}:${scratch}`],
+    timeoutMs,
+  )
+  const tip = git(repoRoot, readonlyArgs(["rev-parse", "--verify", "--quiet", `${scratch}^{commit}`]))
+  // Released on every path: a fetch stopped at its limit after git wrote the ref would otherwise leave it behind.
+  const unreleased = tip.status === 0 ? releaseScratch(repoRoot, scratch) : undefined
+  const leak = unreleased === undefined ? "" : `; the scratch ref ${scratch} could not be released (${unreleased})`
+  if (fetched.status !== 0) return { ok: false, detail: `${gitDetail(fetched)}${leak}` }
+  if (tip.status !== 0 || tip.stdout === "") {
+    return { ok: false, detail: `the fetched tip is unreadable (${gitDetail(tip)})${leak}` }
+  }
+  if (unreleased !== undefined) return { ok: false, detail: `fetched ${tip.stdout}${leak}` }
+  return { ok: true, oid: tip.stdout }
+}
+
+/** Delete a scratch ref; the failure's detail, or undefined once it is gone. */
+function releaseScratch(repoRoot: string, scratch: string): string | undefined {
+  const released = git(repoRoot, ["update-ref", "-d", scratch])
+  return released.status === 0 ? undefined : gitDetail(released)
 }
 
 function nulPaths(output: string): string[] {
@@ -533,8 +568,9 @@ function stageAuthoredPaths(
     }
     const checkoutOid = content === undefined ? null : objectOid("blob", content, algorithm)
     if (!landingPaths.has(path)) return mismatch(path, checkoutOid, landedOid, "the landing did not change that path")
-    if (checkoutOid !== landedOid)
+    if (checkoutOid !== landedOid) {
       return mismatch(path, checkoutOid, landedOid, "the checkout does not hold the landed content")
+    }
   }
 
   const staged = git(topLevel, ["update-index", "--add", "--remove", "--", ...authoredPaths])
@@ -800,18 +836,14 @@ export async function projectRemoteFirstFastForward(
   }
 
   const branchName = ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : ref
-  const fetched = await gitRemote(
-    repoRoot,
-    ["fetch", "--quiet", remote, branchName],
-    request.remoteTimeoutMs ?? DEFAULT_REMOTE_TIMEOUT_MS,
-  )
-  if (fetched.status !== 0) {
+  const fetched = await fetchTip(repoRoot, remote, ref, request.remoteTimeoutMs ?? DEFAULT_REMOTE_TIMEOUT_MS)
+  if (!fetched.ok) {
     return {
       ok: false,
       kind: "fetch-failed",
       error:
         `${ref} in the checkout ${repoRoot}: fetching ${branchName} from ${remote} failed ` +
-        `(${gitDetail(fetched)}). The landing ${to} is safe at the remote; nothing here was changed.`,
+        `(${fetched.detail}). The landing ${to} is safe at the remote; nothing here was changed.`,
     }
   }
   const landedPresent = git(repoRoot, readonlyArgs(["rev-parse", "--verify", `${to}^{commit}`]))
@@ -1039,30 +1071,17 @@ export async function projectCheckout(request: ProjectCheckoutRequest): Promise<
   }
 
   const branchName = ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : ref
-  const fetched = await gitRemote(
-    repoRoot,
-    ["fetch", "--quiet", remote, branchName],
-    request.remoteTimeoutMs ?? DEFAULT_REMOTE_TIMEOUT_MS,
-  )
-  if (fetched.status !== 0) {
+  const fetched = await fetchTip(repoRoot, remote, ref, request.remoteTimeoutMs ?? DEFAULT_REMOTE_TIMEOUT_MS)
+  if (!fetched.ok) {
     return {
       ok: false,
       kind: "fetch-failed",
       error:
         `${ref} in the checkout ${repoRoot}: fetching ${branchName} from ${remote} failed ` +
-        `(${gitDetail(fetched)}). Nothing here was changed.`,
+        `(${fetched.detail}). Nothing here was changed.`,
     }
   }
-
-  const toRead = git(repoRoot, readonlyArgs(["rev-parse", "--verify", "FETCH_HEAD"]))
-  if (toRead.status !== 0 || toRead.stdout === "") {
-    return {
-      ok: false,
-      kind: "fetch-failed",
-      error: `${ref} in the checkout ${repoRoot}: could not resolve fetched tip (${gitDetail(toRead)}).`,
-    }
-  }
-  const to = toRead.stdout
+  const to = fetched.oid
 
   const localTipRead = git(repoRoot, readonlyArgs(["rev-parse", "--verify", ref]))
   const localTip = localTipRead.status === 0 ? localTipRead.stdout : undefined
