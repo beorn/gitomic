@@ -3,6 +3,8 @@
 //          retryable rejection into a terminal error, or fails without saying where.
 // @level l1
 // @consumer tools/cas-rejections.ts (hh 25626), the census receipt's rejected compare-and-swaps row
+// @reach fs-walk <fixture-only: createRemoteRepos temp repositories>
+// @testonly none
 
 import { describe, expect, test, vi } from "vitest"
 import { basename, join } from "node:path"
