@@ -263,6 +263,7 @@ function lockAgeOf(lockPath: string): number | null {
     // Released between git's refusal and this read, or unreadable: the age is unknown, and the outcome says so.
     return null
   }
+}
 
 /**
  * Fetch `ref`'s tip from `remote` through a private scratch ref, never FETCH_HEAD: that file is shared with

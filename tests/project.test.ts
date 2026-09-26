@@ -3,7 +3,7 @@
 // @consumer gitomic project and apply --checkout callers, including state-checkout-sync and km create
 
 import { spawnSync } from "node:child_process"
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -514,6 +514,98 @@ describe("gitomic project and checkout synchronization", () => {
       expect(outcome).toMatchObject({ ok: true, kind: "synchronized", repairedIndexFrom: parent })
       expect(git(checkout, "write-tree")).toBe(git(checkout, "rev-parse", `${head}^{tree}`))
       expect(worktreeDirtyPaths(checkout)).toEqual([])
+    })
+  })
+
+  describe("index.lock held by another git: named as the lock, never as dirt", () => {
+    // Another git's brief hold on the index (a status refresh) refused two live landings as "an uncommitted local
+    // edit", listing dirty paths the landing never wrote; the kind is read from the failed merge's own stderr.
+    function lockedLanding(ageMs = 0) {
+      const { checkout, landAtOrigin } = remoteFixture()
+      const before = git(checkout, "rev-parse", "HEAD")
+      const landed = landAtOrigin("tracked.md", "# landed while another git held the index\n")
+      const gitDir = git(checkout, "rev-parse", "--absolute-git-dir")
+      const lockFile = join(gitDir, "index.lock")
+      writeFileSync(lockFile, "another git's half-written index\n")
+      if (ageMs > 0) {
+        const then = new Date(Date.now() - ageMs)
+        utimesSync(lockFile, then, then)
+      }
+      return { checkout, before, landed, gitDir, lockFile }
+    }
+
+    test("a landing projected while another git holds index.lock is index-locked, naming the lock", async () => {
+      const { checkout, before, landed, lockFile } = lockedLanding()
+      try {
+        const outcome = await projectRemoteFirstFastForward({
+          repoRoot: checkout,
+          to: landed,
+          ref: "refs/heads/main",
+          remote: "origin",
+          expectedDirtyPaths: [],
+        })
+        expect(outcome).toMatchObject({ ok: false, kind: "index-locked", lockPath: lockFile })
+        if (outcome.kind !== "index-locked") throw new Error("unreachable")
+        expect(outcome.lockAgeMs).toBeGreaterThanOrEqual(0)
+        expect(outcome.lockAgeMs).toBeLessThan(60_000)
+        expect(outcome.error).toContain(`another git process holds ${lockFile}`)
+        expect(outcome.error).not.toContain("uncommitted local edit")
+        expect(git(checkout, "rev-parse", "HEAD")).toBe(before)
+      } finally {
+        rmSync(lockFile, { force: true })
+      }
+    })
+
+    test("nothing changes under an index-locked outcome: index, working tree and lock are byte-identical", async () => {
+      const { checkout, landed, gitDir, lockFile } = lockedLanding()
+      try {
+        const indexBefore = readFileSync(join(gitDir, "index"))
+        const treeBefore = ["tracked.md", "bystander.md"].map((path) => readFileSync(join(checkout, path), "utf8"))
+        const outcome = await projectRemoteFirstFastForward({
+          repoRoot: checkout,
+          to: landed,
+          ref: "refs/heads/main",
+          remote: "origin",
+          expectedDirtyPaths: [],
+        })
+        expect(outcome.kind).toBe("index-locked")
+        expect(readFileSync(join(gitDir, "index")).equals(indexBefore)).toBe(true)
+        expect(["tracked.md", "bystander.md"].map((path) => readFileSync(join(checkout, path), "utf8"))).toEqual(
+          treeBefore,
+        )
+        expect(readFileSync(lockFile, "utf8")).toBe("another git's half-written index\n")
+      } finally {
+        rmSync(lockFile, { force: true })
+      }
+      // Released, the same landing projects: the refusal left nothing behind to trip over.
+      const retried = await projectRemoteFirstFastForward({
+        repoRoot: checkout,
+        to: landed,
+        ref: "refs/heads/main",
+        remote: "origin",
+        expectedDirtyPaths: [],
+      })
+      expect(retried).toMatchObject({ ok: true, kind: "synchronized" })
+      expect(git(checkout, "rev-parse", "HEAD")).toBe(landed)
+    })
+
+    test("a stale lock left by a dead process reads by its age", async () => {
+      const hour = 60 * 60 * 1000
+      const { checkout, landed, lockFile } = lockedLanding(hour)
+      try {
+        const outcome = await projectRemoteFirstFastForward({
+          repoRoot: checkout,
+          to: landed,
+          ref: "refs/heads/main",
+          remote: "origin",
+          expectedDirtyPaths: [],
+        })
+        if (outcome.kind !== "index-locked") throw new Error(`expected index-locked, got ${outcome.kind}`)
+        expect(outcome.lockAgeMs).toBeGreaterThanOrEqual(hour - 5_000)
+        expect(outcome.error).toMatch(/\(\d{7,} ms old;/u)
+      } finally {
+        rmSync(lockFile, { force: true })
+      }
     })
   })
 
