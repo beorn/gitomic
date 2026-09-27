@@ -129,6 +129,70 @@ describe.each(backends)("binary blobs ride through the $name backend", ({ name, 
     }
   })
 
+  test("put-bytes creates and replaces exact blobs, then mv and rm use OIDs without decoding", async () => {
+    const fixture = await createMixedRepo()
+    try {
+      const store = await open({
+        repo: fixture.repo,
+        ref: "main",
+        writer: `binary-edits-${name}`,
+        ...(backend === undefined ? {} : { backend }),
+      })
+      const path = "assets/new.png"
+      const firstOid = await gitWithInput(fixture.repo, BINARY, "hash-object", "--stdin")
+      const created = await apply(
+        store,
+        fixture.initial,
+        [{ kind: "put-bytes", path, content: BINARY, expect: null }],
+        "add image",
+      )
+      expect(await git(fixture.repo, "rev-parse", `${created.oid}:${path}`)).toBe(firstOid)
+
+      const replacement = Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0x00, 0xff, 0x81)
+      const nextOid = await gitWithInput(fixture.repo, replacement, "hash-object", "--stdin")
+      const replaced = await apply(
+        store,
+        created.oid,
+        [{ kind: "put-bytes", path, content: replacement, expect: firstOid }],
+        "replace image",
+      )
+      expect(await git(fixture.repo, "rev-parse", `${replaced.oid}:${path}`)).toBe(nextOid)
+      await expect(
+        apply(store, created.oid, [{ kind: "put-bytes", path, content: BINARY, expect: firstOid }], "stale image"),
+      ).rejects.toMatchObject({ kind: "put-bytes", expected: firstOid, actual: nextOid })
+      await expect(
+        apply(
+          store,
+          replaced.oid,
+          [{ kind: "mv", from: path, to: "assets/moved.png", expect: firstOid }],
+          "stale move",
+        ),
+      ).rejects.toMatchObject({ kind: "mv", expected: firstOid, actual: nextOid })
+
+      const moved = await apply(
+        store,
+        replaced.oid,
+        [{ kind: "mv", from: path, to: "assets/moved.png", expect: nextOid }],
+        "move image",
+      )
+      expect(await store.at(moved.oid).has(path)).toBe(false)
+      expect(await git(fixture.repo, "rev-parse", `${moved.oid}:assets/moved.png`)).toBe(nextOid)
+      await expect(
+        apply(store, moved.oid, [{ kind: "rm", path: "assets/moved.png", expect: firstOid }], "stale remove"),
+      ).rejects.toMatchObject({ kind: "rm", expected: firstOid, actual: nextOid })
+      const removed = await apply(
+        store,
+        moved.oid,
+        [{ kind: "rm", path: "assets/moved.png", expect: nextOid }],
+        "remove image",
+      )
+      expect(await store.at(removed.oid).has("assets/moved.png")).toBe(false)
+      expect(await store.at(removed.oid).oid("assets/screenshot.png")).toBe(fixture.binaryOid)
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
   test("native valid-UTF-8 BOM blobs retain every BOM byte through get, oid, and native-anchor apply", async () => {
     const fixture = await createBareRepo()
     try {

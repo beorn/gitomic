@@ -1,6 +1,15 @@
 import { randomUUID } from "node:crypto"
 
-import { applyEdits, editPaths, KEEP_MODE_OF, PREFETCH_PATHS, type Edit, type PrefetchingUpdate } from "./edits.js"
+import {
+  applyEdits,
+  editPaths,
+  GET_RAW_VALUE,
+  KEEP_MODE_OF,
+  PREFETCH_PATHS,
+  SET_BYTES,
+  type Edit,
+  type PrefetchingUpdate,
+} from "./edits.js"
 import { runCasLoop } from "./engine.js"
 import { shapeRefUpdates } from "./ref-updates.js"
 import {
@@ -27,6 +36,7 @@ import { createLazyBase, readLazyBase, type LazyBase } from "./lazy-base.js"
 import { createShellBackend } from "./shell.js"
 import type {
   Candidate,
+  BlobValue,
   Change,
   Clock,
   CommitMeta,
@@ -52,7 +62,7 @@ import type {
   Store,
   Trailer,
 } from "./types.js"
-import { assertUtf8 } from "./utf8.js"
+import { assertUtf8, decodeUtf8 } from "./utf8.js"
 
 export { CandidateRefused, Conflict, EditDoesNotApply, GitTimeout, PublicationUnknown, RetriesExhausted }
 export type { EditKind, PreconditionType } from "./errors.js"
@@ -248,8 +258,14 @@ export async function apply(
   options?: { readonly author?: Ident; readonly candidate?: Candidate; readonly trailers?: readonly Trailer[] },
 ): Promise<Committed> {
   // The edit list names every path it will read, so one attempt fetches them all in ONE read before the first edit.
-  const update: PrefetchingUpdate = (map, head) => applyEdits(map, base, head, edits)
-  Object.defineProperty(update, PREFETCH_PATHS, { value: editPaths(edits) })
+  // Copy mutable byte inputs once, before a CAS replay can run against a later tip.
+  const stableEdits = edits.map((edit) => {
+    if (edit.kind !== "put-bytes") return edit
+    if (!(edit.content instanceof Uint8Array)) throw new TypeError("put-bytes content must be Uint8Array")
+    return { ...edit, content: Uint8Array.from(edit.content) }
+  })
+  const update: PrefetchingUpdate = (map, head) => applyEdits(map, base, head, stableEdits)
+  Object.defineProperty(update, PREFETCH_PATHS, { value: editPaths(stableEdits) })
   return store.transact(
     update,
     message,
@@ -632,7 +648,7 @@ async function transactSequenceBody<R>(
             if (prefetch !== undefined) await base.prefetch(prefetch)
             const { map, changes, modeSources } = makeOverlay(base)
             await update(map, stepBase, { tips })
-            const commitInput = (effective: ReadonlyMap<string, string | undefined>, commitMessage: string) => {
+            const commitInput = (effective: ReadonlyMap<string, BlobValue | undefined>, commitMessage: string) => {
               assertNextTree(base, effective)
               return {
                 parent: stepBase,
@@ -782,7 +798,7 @@ async function* watchRef(context: ReaderContext, options: RefTipWatchOptions): A
   }
 }
 
-function assertNextTree(base: LazyBase, changes: ReadonlyMap<string, string | undefined>): void {
+function assertNextTree(base: LazyBase, changes: ReadonlyMap<string, BlobValue | undefined>): void {
   const next = new Set(base.listing.keys())
   for (const [path, content] of changes) {
     if (content === undefined) next.delete(path)
@@ -797,13 +813,19 @@ function backendOid(value: unknown): Oid {
 
 function makeOverlay(base: LazyBase): {
   map: GitMap
-  changes: Map<string, string | undefined>
+  changes: Map<string, BlobValue | undefined>
   modeSources: Map<string, string>
 } {
-  const changes = new Map<string, string | undefined>()
+  const changes = new Map<string, BlobValue | undefined>()
   const modeSources = new Map<string, string>()
-  const get = (path: string): Promise<string | undefined> =>
-    changes.has(path) ? Promise.resolve(changes.get(path)) : base.get(path)
+  const raw = (path: string): Promise<BlobValue | undefined> =>
+    changes.has(path) ? Promise.resolve(changes.get(path)) : base.raw(path)
+  const get = async (path: string): Promise<string | undefined> => {
+    if (!changes.has(path)) return base.get(path)
+    const value = changes.get(path)
+    if (value === undefined || typeof value === "string") return value
+    return decodeUtf8(value, `Git blob at ${JSON.stringify(path)}`)
+  }
   const present = (path: string): boolean => (changes.has(path) ? changes.get(path) !== undefined : base.has(path))
   const map: GitMap = {
     // oxlint-disable-next-line typescript/require-await -- Promise-typed reads reject validation errors, never throw synchronously.
@@ -839,6 +861,13 @@ function makeOverlay(base: LazyBase): {
     modeSources.set(normalizePath(to), modeSources.get(source) ?? source)
   }
   Object.defineProperty(map, KEEP_MODE_OF, { value: keepModeOf })
+  Object.defineProperty(map, GET_RAW_VALUE, { value: (path: string) => raw(normalizePath(path)) })
+  Object.defineProperty(map, SET_BYTES, {
+    value: (path: string, content: Uint8Array) => {
+      if (!(content instanceof Uint8Array)) throw new TypeError("put-bytes content must be Uint8Array")
+      changes.set(normalizePath(path), Uint8Array.from(content))
+    },
+  })
   return { map, changes, modeSources }
 }
 
@@ -857,7 +886,7 @@ function createQueue(): <T>(operation: () => Promise<T>) => Promise<T> {
 /** The changes that alter the tree, decided from the listing's oids: no base value is read for it. */
 function removeNoopChanges(
   base: LazyBase,
-  changes: ReadonlyMap<string, string | undefined>,
-): Map<string, string | undefined> {
+  changes: ReadonlyMap<string, BlobValue | undefined>,
+): Map<string, BlobValue | undefined> {
   return new Map([...changes].filter(([path, value]) => base.isChange(path, value)))
 }

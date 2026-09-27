@@ -973,6 +973,46 @@ describe("gitomic CLI — mv", () => {
 })
 
 describe("gitomic CLI — apply", () => {
+  test("put-bytes reads invalid UTF-8 from a file and commits the exact bytes", async () => {
+    const backend = createMemBackend()
+    const bytes = Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0xff, 0x00)
+    const path = join(workdir, "image.png")
+    await writeFile(path, bytes)
+    const result = await run(backend, [
+      "apply",
+      ADDRESS,
+      "-m",
+      "archive image",
+      "put-bytes",
+      "file/image.png",
+      path,
+      "--create",
+    ])
+    expect(result.code).toBe(0)
+    const store = await open({ repo: "repo", ref: "main", writer: "test", backend })
+    expect(await store.at(result.stdout.trim()).oid("file/image.png")).toBe(objectOid("blob", Buffer.from(bytes)))
+    await expect(store.at(result.stdout.trim()).get("file/image.png")).rejects.toThrow("valid UTF-8")
+  })
+
+  test("put-bytes names a missing input file and lands no edit", async () => {
+    const backend = createMemBackend()
+    const path = join(workdir, "missing-image.png")
+    const result = await run(backend, [
+      "apply",
+      ADDRESS,
+      "-m",
+      "missing image",
+      "put-bytes",
+      "file/image.png",
+      path,
+      "--create",
+    ])
+    expect(result.code).toBe(1)
+    expect(result.stderr).toContain(path)
+    const store = await open({ repo: "repo", ref: "main", writer: "test", backend })
+    expect(await store.at().has("file/image.png")).toBe(false)
+  })
+
   test("apply lands a mixed put/append/rm/mv edit list as one commit", async () => {
     const backend = createMemBackend()
     await writeOne(backend, "keep.md", "keep\n")

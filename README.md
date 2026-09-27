@@ -293,7 +293,7 @@ Paths are git tree paths — forward slashes, no leading slash:
 - Public paths and prefixes normalize to Unicode NFC, and `keys` returns full canonical paths, sorted.
 - Every path in the scope you read must be NFC, valid UTF-8, free of file/directory collisions, and a regular blob. Bad path bytes, symlink entries and gitlinks fail loudly rather than being replaced, followed, or skipped.
 - A written path keeps its mode: an executable (100755) stays executable when it is changed, appended to, or moved by `apply`. A new path is 100644. A move done by hand inside `transact` (`get` then `set` then `delete`) carries content only.
-- Values are strict UTF-8 strings in v1 — there is no binary value mode. A tree holding a blob that is _not_ valid UTF-8 still works: the entry counts for `keys` and `has`, and a transaction that never touches it carries it into the next commit as the same blob. Only reading that one value fails, and it names the path.
+- `GitMap` values remain strict UTF-8 strings. `apply` accepts opaque bytes through `put-bytes`; `rm` and `mv` can then act on that blob by oid without decoding it. A tree holding a blob that is _not_ valid UTF-8 still works: the entry counts for `keys` and `has`, and a transaction that never touches it carries it into the next commit as the same blob. Reading that one value through `get` fails and names the path.
 - Unpaired JavaScript surrogates always fail on write.
 - `at()` takes only a full lowercase 40- or 64-hex commit id and pins it when called. A well-formed but missing id throws on first read.
 - `refs/gitomic/` and the `.gitomic/` tree path are reserved. Gitomic uses only temporary remote-fetch refs under the former, writes nothing under the latter, and refuses application writes to either.
@@ -312,13 +312,14 @@ if (oldNote === undefined) throw new Error("notes/old.md is gone")
 
 const edits: Edit[] = [
   { kind: "put", path: "notes/today.md", content: "buy milk", expect: null }, // create: must be ABSENT
+  { kind: "put-bytes", path: "images/pixel.png", content: pngBytes, expect: null }, // raw bytes
   { kind: "append", path: "log.md", content: "bought milk\n" }, // no precondition
   { kind: "rm", path: "notes/old.md", expect: oldNote }, // remove exactly this blob
 ]
 const { oid } = await apply(store, base, edits, "sync notes")
 ```
 
-`apply(store, base, edits, message)` lands the whole list as ONE all-or-nothing commit. `base` is the commit the edits were read against; the natural anchor for each `expect` is `store.at(base).oid(path)` — the git blob oid there, or `undefined` when the path is absent. Each edit re-checks its own precondition against the tree the commit actually attempts, so when a concurrent writer has moved the ref `apply` replays against the new tip for free (the same contract `transact` gives a callback). The FIRST edit whose precondition fails throws `EditDoesNotApply` — naming the edit index, the path, the oid it expected and the one it found, and both commits — and lands nothing. A `put` with `expect: null` demands the path be ABSENT (a create); `append` carries no precondition and always re-applies. Edits apply in order against the same attempted tree, so a later one can depend on an earlier one — `rm dest` then `mv src dest` frees the destination inside a single commit.
+`apply(store, base, edits, message)` lands the whole list as ONE all-or-nothing commit. `base` is the commit the edits were read against; the natural anchor for each `expect` is `store.at(base).oid(path)` — the git blob oid there, or `undefined` when the path is absent. Each edit re-checks its own precondition against the tree the commit actually attempts, so when a concurrent writer has moved the ref `apply` replays against the new tip for free (the same contract `transact` gives a callback). The FIRST edit whose precondition fails throws `EditDoesNotApply` — naming the edit index, the path, the oid it expected and the one it found, and both commits — and lands nothing. A `put` or `put-bytes` with `expect: null` demands the path be ABSENT (a create); `append` carries no precondition and always re-applies. Edits apply in order against the same attempted tree, so a later one can depend on an earlier one — `rm dest` then `mv src dest` frees the destination inside a single commit.
 
 ### Ownership manifests
 
@@ -541,14 +542,14 @@ Both commands calculate their complete result before writing stdout. Use `--json
 
 **Write verbs** open the store and land ONE commit per invocation:
 
-| verb                                                                                        | edit(s)                                                               |
-| ------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
-| `write <addr> -m <msg> [--json] [--expect <path>=<oid>]… [--create <path>]… <path>=<file>…` | one `put` per `<path>=<file>` (`-` is stdin)                          |
-| `rm <addr> -m <msg> [--json] [--expect <path>=<oid>]… <path>…`                              | one `rm` per path                                                     |
-| `mv <addr> -m <msg> [--json] <from> <to>`                                                   | one `mv`                                                              |
-| `apply <addr> -m <msg> [--base <oid>] [--json] <clause>…`                                   | one edit per `put`/`append`/`rm`/`mv` clause, in order, as one commit |
+| verb                                                                                        | edit(s)                                                                           |
+| ------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| `write <addr> -m <msg> [--json] [--expect <path>=<oid>]… [--create <path>]… <path>=<file>…` | one `put` per `<path>=<file>` (`-` is stdin)                                      |
+| `rm <addr> -m <msg> [--json] [--expect <path>=<oid>]… <path>…`                              | one `rm` per path                                                                 |
+| `mv <addr> -m <msg> [--json] <from> <to>`                                                   | one `mv`                                                                          |
+| `apply <addr> -m <msg> [--base <oid>] [--json] <clause>…`                                   | one edit per `put`/`put-bytes`/`append`/`rm`/`mv` clause, in order, as one commit |
 
-Every precondition is the git BLOB oid `ls`/a prior write reports — never a raw hash of the file's bytes. Unless `--expect <path>=<oid>` names it (or `--create`, a strict create), a path's precondition is auto-read the moment the command starts — present means "replace exactly this", absent means a create — and re-checked against whatever tree the commit actually attempts, so the auto-read stays race-safe. `apply` clauses apply in order against one pinned base (`--base <oid>`, default the tip), so `rm to.md` then `mv from.md to.md` frees the destination inside one commit while the reverse order refuses. A path spelled like a clause keyword is written `./put` — git's own path form, which the CLI strips (a gitomic path never begins with `./`).
+Every precondition is the git BLOB oid `ls`/a prior write reports — never a raw hash of the file's bytes. Unless `--expect <path>=<oid>` names it (or `--create`, a strict create), a path's precondition is auto-read the moment the command starts — present means "replace exactly this", absent means a create — and re-checked against whatever tree the commit actually attempts, so the auto-read stays race-safe. `put-bytes <path> <file> [--expect <oid> | --create]` reads raw bytes from a local file; `-` stdin is not supported. `apply` clauses apply in order against one pinned base (`--base <oid>`, default the tip), so `rm to.md` then `mv from.md to.md` frees the destination inside one commit while the reverse order refuses. A path spelled like a clause keyword is written `./put` — git's own path form, which the CLI strips (a gitomic path never begins with `./`).
 
 `--writer <label>` labels the audit trail on any write verb. `--author "Name <email>"` records who acted; without it the author is the ident `git commit` would record (`git var GIT_AUTHOR_IDENT`), and gitomic stays the committer. When no ident resolves, the write still lands, authored by the committer, with a note on stderr. `--trailer Key=Value` (repeatable) adds trailers ahead of gitomic's own; a `Gitomic-*` key is refused (exit 2). `--json` replaces the bare-oid line with a one-line receipt — the output contract for a script:
 

@@ -22,6 +22,23 @@ function oid(content: string): string {
 }
 
 describe("apply — the four-edit door", () => {
+  test("put-bytes stores opaque bytes in the mem backend with their Git blob identity", async () => {
+    const backend = createMemBackend()
+    const store = await open({ repo: "put-bytes-mem", ref: "main", writer: "edits-test", backend })
+    const base = await store.head()
+    const bytes = Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0xff, 0x00)
+    const expected = objectOid("blob", Buffer.from(bytes))
+    const landed = await apply(
+      store,
+      base,
+      [{ kind: "put-bytes", path: "image.png", content: bytes, expect: null }],
+      "add image",
+    )
+    expect(await store.at(landed.oid).oid("image.png")).toBe(expected)
+    expect((await backend.readBlobs("put-bytes-mem", [expected])).get(expected)).toEqual(bytes)
+    await expect(store.at(landed.oid).get("image.png")).rejects.toThrow("valid UTF-8")
+  })
+
   test("put creates an absent path (expect null) and lands its content", async () => {
     const store = await createStore("put-create")
     const base = await store.head()

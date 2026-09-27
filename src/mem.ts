@@ -42,14 +42,14 @@ type MemCommit = {
   timestamp: number
   instance?: string
   seq?: number
-  files: ReadonlyMap<string, string>
+  files: ReadonlyMap<string, BlobValue>
 }
 
 type MemRepo = {
   refs: Map<string, Oid>
   commits: Map<Oid, MemCommit>
   /** Every blob a commit of this repo names, by oid — what `readBlobs` answers from. */
-  blobs: Map<Oid, string>
+  blobs: Map<Oid, BlobValue>
   /** The oid of each content already hashed, so a 20,000-file listing hashes each value once. */
   oidsByContent: Map<string, Oid>
 }
@@ -93,7 +93,12 @@ export function createMemBackend(): GitomicBackend {
   }
 
   /** The mem backend hashes like git: the same content is the same blob oid the shell backend reports. */
-  const blobOid = (repo: MemRepo, content: string): Oid => {
+  const blobOid = (repo: MemRepo, content: BlobValue): Oid => {
+    if (typeof content !== "string") {
+      const oid = objectOid("blob", Buffer.from(content))
+      repo.blobs.set(oid, Uint8Array.from(content))
+      return oid
+    }
     let oid = repo.oidsByContent.get(content)
     if (oid === undefined) {
       oid = objectOid("blob", Buffer.from(content, "utf8"))
@@ -122,7 +127,7 @@ export function createMemBackend(): GitomicBackend {
     for (const oid of new Set(oids)) {
       const content = repo.blobs.get(oid)
       if (content === undefined) throw new Error(`unknown blob: ${oid}`)
-      read.set(oid, content)
+      read.set(oid, typeof content === "string" ? content : Uint8Array.from(content))
     }
     return read
   }
@@ -140,7 +145,7 @@ export function createMemBackend(): GitomicBackend {
       if (content === undefined) {
         files.delete(path)
       } else {
-        files.set(path, content)
+        files.set(path, typeof content === "string" ? content : Uint8Array.from(content))
         blobOid(repo, content)
       }
     }

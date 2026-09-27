@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { spawnSync } from "node:child_process"
+import { readFile } from "node:fs/promises"
 import { isAbsolute, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 
@@ -92,6 +93,7 @@ import { decodeUtf8 } from "./utf8.js"
  *   precondition is refused aborts every clause, per R44 — never a partial
  *   apply). Each clause is introduced by its own kind keyword:
  *     - `put <path> <file> [--expect <oid> | --create]`
+ *     - `put-bytes <path> <file> [--expect <oid> | --create]`
  *     - `append <path> <file>`
  *     - `rm <path> [--expect <oid>]`
  *     - `mv <from> <to> [--expect <oid>]`
@@ -559,7 +561,7 @@ async function runMv(args: string[], stdout: CliWriter, stderr: CliWriter, sourc
 
 // --- apply verb ------------------------------------------------------------
 
-const CLAUSE_KEYWORDS = new Set(["put", "append", "rm", "mv"])
+const CLAUSE_KEYWORDS = new Set(["put", "put-bytes", "append", "rm", "mv"])
 
 async function runApply(
   args: string[],
@@ -676,11 +678,11 @@ function splitClauses(tokens: readonly string[]): string[][] {
     }
     const current = clauses.at(-1)
     if (current === undefined) {
-      throw new UsageError(`apply: expected a clause keyword (put/append/rm/mv), got: ${token}`)
+      throw new UsageError(`apply: expected a clause keyword (put/put-bytes/append/rm/mv), got: ${token}`)
     }
     current.push(token)
   }
-  if (clauses.length === 0) throw new UsageError("apply requires at least one clause (put/append/rm/mv)")
+  if (clauses.length === 0) throw new UsageError("apply requires at least one clause (put/put-bytes/append/rm/mv)")
   return clauses
 }
 
@@ -701,6 +703,8 @@ async function parseClause(
   switch (keyword) {
     case "put":
       return parsePutClause(rest, snapshot, stdin)
+    case "put-bytes":
+      return parsePutBytesClause(rest, snapshot)
     case "append":
       return parseAppendClause(rest, stdin)
     case "rm":
@@ -709,7 +713,9 @@ async function parseClause(
       return parseMvClause(rest, snapshot, address)
     default:
       // Unreachable: splitClauses only ever starts a group with one of these keywords.
-      throw new UsageError(`apply: expected a clause keyword (put/append/rm/mv), got: ${JSON.stringify(keyword)}`)
+      throw new UsageError(
+        `apply: expected a clause keyword (put/put-bytes/append/rm/mv), got: ${JSON.stringify(keyword)}`,
+      )
   }
 }
 
@@ -737,6 +743,20 @@ async function parsePutClause(tokens: readonly string[], snapshot: Snapshot, std
   const content = file === "-" ? await readStdin(stdin) : await readTextFile(file)
   const anchor = await putPrecondition(path, expectFlag, createFlag, snapshot)
   return { kind: "put", path, content, expect: anchor }
+}
+
+async function parsePutBytesClause(tokens: readonly string[], snapshot: Snapshot): Promise<Edit> {
+  const { positionals, flags } = extractFlags(tokens, { "--expect": "value", "--create": "boolean" })
+  assertNoExtraPositionals(positionals, 2, "put-bytes <path> <file>")
+  const path = clausePath(requirePositional(positionals, 0, "put-bytes <path>"))
+  const file = requirePositional(positionals, 1, "put-bytes <path> <file>")
+  if (file === "-") throw new UsageError("put-bytes requires a file path; stdin is not supported")
+  const expectFlag = optionalStringFlag(flags, "--expect")
+  const createFlag = flags.get("--create") === true
+  assertNotContradictoryPrecondition(path, expectFlag !== undefined, createFlag)
+  const content = await readFile(file)
+  const anchor = await putPrecondition(path, expectFlag, createFlag, snapshot)
+  return { kind: "put-bytes", path, content, expect: anchor }
 }
 
 async function parseAppendClause(tokens: readonly string[], stdin: CliStdin): Promise<Edit> {
