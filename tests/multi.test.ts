@@ -487,6 +487,22 @@ describe("remote: one atomic push, one fetch", () => {
         }
         const fetchRefs = backend.fetchRefs as NonNullable<GitomicBackend["fetchRefs"]>
         const there = await listRefs("refs/yrd/q/changes/", { repo: pair.origin.repo, backend: writer })
+        const bundled: (string | readonly string[])[] = []
+        const chain = await openEvents({
+          repo: pair.local.repo,
+          remote: "origin",
+          ref: "refs/yrd/q/changes/b",
+          fetch: ["refs/yrd/q/changes/a"],
+          backend: {
+            ...backend,
+            fetchRefs: async (...args: Parameters<typeof fetchRefs>) => {
+              bundled.push(args[1])
+              return fetchRefs(...args)
+            },
+          },
+        })
+        expect(await chain.head()).toBe(there.get("refs/yrd/q/changes/b"))
+        expect(bundled).toEqual([["refs/yrd/q/changes/b", "refs/yrd/q/changes/a"]])
         const tracked = there.values().next().value
         if (tracked === undefined) throw new Error("fixture wrote no remote change tip")
         await git(pair.origin.repo, "update-ref", "refs/heads/main", tracked)

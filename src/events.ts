@@ -78,6 +78,8 @@ export type EventsOptions = {
   remote?: string
   backend?: GitomicBackend
   retryBudgetMs?: number
+  /** Additional remote refs to fetch with this chain's tip; absent extras are omitted. */
+  fetch?: readonly string[]
   /** The clock this chain's events are dated by (unix seconds); the wall clock by default (25486). */
   clock?: Clock
 }
@@ -277,6 +279,17 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
   const backend = requireEvents(options.backend ?? createShellBackend())
   const retryBudgetMs = normalizeRetryBudget(options.retryBudgetMs)
   const remote = options.remote
+  if (options.fetch !== undefined && !Array.isArray(options.fetch)) {
+    throw new TypeError("events fetch needs an array of full refs/ names")
+  }
+  const extra: readonly string[] = options.fetch ?? []
+  if (extra.some((name) => typeof name !== "string" || !name.startsWith("refs/"))) {
+    throw new TypeError("events fetch needs an array of full refs/ names")
+  }
+  if (new Set([ref, ...extra]).size !== extra.length + 1) {
+    throw new TypeError(`${ref}: events fetch repeats the chain ref or another ref`)
+  }
+  if (extra.length > 0 && remote === undefined) throw new TypeError(`${ref}: events fetch needs a remote`)
   // One id per open, exactly like `open`: `(instance, seq)` names a transaction
   // without a lock or a stored high-water mark.
   const instance = randomUUID()
@@ -294,7 +307,15 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
       const listed = (await backend.listRefs(repo, ref, remote)).get(ref) ?? null
       // Bring the objects over into gitomic's private namespace: no application
       // ref moves, and no local ref is treated as a cache of the remote.
-      if (listed !== null) await fetchRefs(repo, [ref], remote)
+      if (listed !== null) {
+        const fetched = await fetchRefs(
+          repo,
+          [ref, ...extra],
+          remote,
+          extra.length === 0 ? undefined : { absent: "omit" },
+        )
+        if (fetched.get(ref) === undefined) throw new Error(`${remote} lost ${ref} while fetching its event chain`)
+      }
       return listed
     }
   }
