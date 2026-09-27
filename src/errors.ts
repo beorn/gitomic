@@ -44,8 +44,8 @@ export class PublicationUnknown extends AggregateError {
   }
 }
 
-/** The four edit kinds `apply` carries. */
-export type EditKind = "put" | "append" | "rm" | "mv"
+/** The edit kinds `apply` carries. */
+export type EditKind = "put" | "put-bytes" | "append" | "rm" | "mv"
 
 /**
  * Which precondition an edit failed. `put` and `rm` check the path's blob is

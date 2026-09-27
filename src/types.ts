@@ -4,9 +4,8 @@ export type Oid = string
  * What a backend reports for one tree entry: the decoded UTF-8 value, or the
  * raw bytes when the blob is not valid UTF-8.
  *
- * Values a caller can WRITE are still strings only. Bytes exist so that a tree
- * holding one binary file — an image beside ten thousand Markdown notes — does
- * not make every transaction on that tree impossible.
+ * GitMap values remain text. `apply`'s put-bytes edit can write opaque bytes;
+ * unrelated binary blobs survive transactions without decoding.
  */
 export type BlobValue = string | Uint8Array
 
@@ -143,7 +142,7 @@ export type CommitInput = {
    * Written by `apply`'s move edit only.
    */
   modeSources?: ReadonlyMap<string, string>
-  changes: ReadonlyMap<string, string | undefined>
+  changes: ReadonlyMap<string, BlobValue | undefined>
   message: string
   /** The caller's human-readable label. Not an identity: it may repeat. */
   writer: string

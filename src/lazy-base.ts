@@ -32,10 +32,12 @@ export type LazyBase = {
   publicPaths(): string[]
   /** The stored value at `path`, decoded and validated at this read; `undefined` when absent. */
   get(path: string): Promise<string | undefined>
+  /** Internal raw value for an OID-anchored move; no public GitMap byte read. */
+  raw(path: string): Promise<BlobValue | undefined>
   /** Fetch the values of every listed path among `paths` in one read, so later `get`s answer from memory. */
   prefetch(paths: Iterable<string>): Promise<void>
   /** Whether writing `content` at `path` (or deleting it, `undefined`) changes the tree. Decided from the listing. */
-  isChange(path: string, content: string | undefined): boolean
+  isChange(path: string, content: BlobValue | undefined): boolean
 }
 
 type Waiter = { readonly path: string; resolve(value: BlobValue): void; reject(error: unknown): void }
@@ -160,6 +162,14 @@ export function createLazyBase(backend: GitomicBackend, repo: string, parent: Oi
       }
       return decodeUtf8(value, `Git blob at ${JSON.stringify(path)}`)
     },
+    async raw(path) {
+      try {
+        return await stored(path)
+      } catch (error) {
+        const cause = error instanceof Error && error.cause !== undefined ? error.cause : error
+        throw unreadable(listing.get(path)?.oid ?? "?", path, cause)
+      }
+    },
     async prefetch(paths) {
       const reads: Promise<BlobValue>[] = []
       for (const path of paths) {
@@ -172,8 +182,8 @@ export function createLazyBase(backend: GitomicBackend, repo: string, parent: Oi
     isChange(path, content) {
       const entry = listing.get(path)
       if (content === undefined) return entry !== undefined
-      // Same bytes, same oid: a string that hashes to a stored binary blob's oid would have been valid UTF-8.
-      return entry === undefined || entry.oid !== objectOid("blob", Buffer.from(content, "utf8"), algorithm)
+      const bytes = Buffer.from(content)
+      return entry === undefined || entry.oid !== objectOid("blob", bytes, algorithm)
     },
   }
 }

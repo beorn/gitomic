@@ -145,7 +145,7 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
   const applyChange = (
     root: TreeNode,
     path: string,
-    content: string | undefined,
+    content: BlobValue | undefined,
     oid?: Oid,
     mode: "100644" | "100755" = "100644",
   ): void => {
@@ -191,7 +191,7 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
     const blobs = new Map<string, Oid>()
     for (const [path, content] of input.changes) {
       if (content === undefined) continue
-      const blob = encodeBlob(Buffer.from(content, "utf8"))
+      const blob = encodeBlob(Buffer.from(content))
       objects.set(blob.oid, blob)
       blobs.set(path, blob.oid)
     }

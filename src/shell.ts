@@ -734,7 +734,7 @@ async function writeCommit(repo: string, input: CommitInput, baseEnv?: NodeJS.Pr
     for (const [position, [, content]] of changes.entries()) {
       if (content === undefined) continue
       const blobFile = join(indexDir, `blob-${position}`)
-      await writeFile(blobFile, content, "utf8")
+      await writeFile(blobFile, typeof content === "string" ? Buffer.from(content, "utf8") : content)
       blobFiles.push(blobFile)
     }
     const blobOutput =
@@ -784,7 +784,7 @@ async function writeCommit(repo: string, input: CommitInput, baseEnv?: NodeJS.Pr
 async function parentExecutables(
   repo: string,
   indexEnv: NodeJS.ProcessEnv,
-  changes: readonly (readonly [string, string | undefined])[],
+  changes: readonly (readonly [string, string | Uint8Array | undefined])[],
   baseEnv?: NodeJS.ProcessEnv,
 ): Promise<ReadonlySet<string>> {
   const executables = new Set<string>()

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto"
 
-import type { CommitInput, CommitMeta, CommitProvenance, Ident, Oid, RefUpdate, Trailer } from "./types.js"
+import type { BlobValue, CommitInput, CommitMeta, CommitProvenance, Ident, Oid, RefUpdate, Trailer } from "./types.js"
 import { Conflict } from "./errors.js"
 import { assertUtf8, decodeUtf8 } from "./utf8.js"
 
@@ -477,7 +477,7 @@ export function encodeCommit(input: {
 }
 
 type TreeNode = {
-  files: Map<string, string>
+  files: Map<string, BlobValue>
   directories: Map<string, TreeNode>
 }
 
@@ -485,7 +485,7 @@ function createTreeNode(): TreeNode {
   return { files: new Map(), directories: new Map() }
 }
 
-function addPath(root: TreeNode, path: string, content: string): void {
+function addPath(root: TreeNode, path: string, content: BlobValue): void {
   const parts = path.split("/")
   const filename = parts.pop()
   if (filename === undefined) throw new TypeError(`invalid git tree path: ${JSON.stringify(path)}`)
@@ -504,7 +504,7 @@ function addPath(root: TreeNode, path: string, content: string): void {
 function encodeTree(node: TreeNode, objects: Map<Oid, GitObject>): GitObject {
   const entries: GitTreeObjectEntry[] = []
   for (const [name, value] of node.files) {
-    const blob = encodeBlob(Buffer.from(value, "utf8"))
+    const blob = encodeBlob(Buffer.from(value))
     objects.set(blob.oid, blob)
     entries.push({
       mode: "100644",
@@ -525,7 +525,7 @@ function encodeTree(node: TreeNode, objects: Map<Oid, GitObject>): GitObject {
   return tree
 }
 
-export function encodeFiles(files: ReadonlyMap<string, string>): {
+export function encodeFiles(files: ReadonlyMap<string, BlobValue>): {
   tree: GitObject
   objects: ReadonlyMap<Oid, GitObject>
 } {
