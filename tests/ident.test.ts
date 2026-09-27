@@ -3,6 +3,9 @@
 // without broadcasting to the whole fleet (who-acted WA-R13, 25073).
 // @level l1
 // @consumer km's rail writes, which must record the acting agent as author and km as committer
+/**
+ * @reach fs-walk <fixture-only: trace and Git history reads use temporary bare repositories>
+ */
 
 import { execFile } from "node:child_process"
 import { readFile } from "node:fs/promises"

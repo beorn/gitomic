@@ -1,6 +1,9 @@
 // @failure The CLI could read a stale value, silently corrupt binary/invalid-UTF-8 content, apply a refused write anyway, ignore a --expect naming the wrong thing, or swallow a bad invocation instead of failing loudly with a distinct exit code.
 // @level l1
 // @consumer file-level-door CLI users — any agent or script reading and writing one repo by address, with no checkout
+/**
+ * @reach fs-walk <fixture-only: CLI filesystem reads use temporary repositories>
+ */
 
 import { Buffer } from "node:buffer"
 import { createHash } from "node:crypto"

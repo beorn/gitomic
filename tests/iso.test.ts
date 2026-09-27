@@ -1,6 +1,9 @@
 // @failure The fast backend could serialize different Git objects or weaken delete semantics.
 // @level l1
 // @consumer gitomic users opting into isomorphic-git
+/**
+ * @reach fs-walk <fixture-only: Git tree reads use temporary bare repositories>
+ */
 
 import * as nodeFs from "node:fs"
 import { spawnSync } from "node:child_process"

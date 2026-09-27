@@ -1,6 +1,9 @@
 // @failure The projector could falsely report current over stale files, lose uncommitted dirt, fail to report a stranded local commit with exit 4, or tear on a concurrent ref advance.
 // @level l1
 // @consumer gitomic project and apply --checkout callers, including state-checkout-sync and km create
+/**
+ * @reach fs-walk <fixture-only: checkout directory reads use temporary repositories>
+ */
 
 import { spawnSync } from "node:child_process"
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs"

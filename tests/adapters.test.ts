@@ -1,6 +1,9 @@
 // @failure Familiar interface adapters could bypass replay, expose writable tip views, or fail real consumers.
 // @level l1
 // @consumer node:fs, KV, and unstorage callers
+/**
+ * @reach fs-walk <fixture-only: adapter directory reads use an in-memory store>
+ */
 
 import { createStorage } from "unstorage"
 import { describe, expect, test } from "vitest"

@@ -2,6 +2,9 @@
 // recorded 100644; a mv of one lands a non-executable copy; an identical put on one lands a mode-only commit.
 // @level l1
 // @consumer 24168 slice A: STATE holds 11 executables (.agents/hooks/*.sh among them) edited through gitomic apply
+/**
+ * @reach fs-walk <fixture-only: Git tree reads use temporary bare repositories>
+ */
 
 import { describe, expect, test } from "vitest"
 
