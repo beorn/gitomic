@@ -5,6 +5,8 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 
+import { fullJitter, type RandomUnit } from "@bearly/pacing"
+
 import { Conflict, GitTimeout } from "./errors.js"
 import { journalLeaseRejection } from "./lease-journal.js"
 import {
@@ -1573,11 +1575,20 @@ function lostFetchedRefRace(error: unknown, namespace: string): "moved" | "held"
   return lost.some(({ form }) => form === "held") ? "held" : "moved"
 }
 
+const HELD_LOCK_FLOOR_MS = 25
+const HELD_LOCK_SPREAD_MS = 75
+const HELD_LOCK_CAP_MS = HELD_LOCK_FLOOR_MS + HELD_LOCK_SPREAD_MS
+
+/** Full-jitter wait from @bearly/pacing (25676) over the held-lock window. Never above HELD_LOCK_CAP_MS. */
+export function waitOutHeldFetchLockMs(random: RandomUnit = Math.random): number {
+  return HELD_LOCK_FLOOR_MS + Math.floor(fullJitter(HELD_LOCK_SPREAD_MS, HELD_LOCK_SPREAD_MS, 0, random))
+}
+
 /** A short jittered wait, so a retry does not land inside the lock window of the fetch that holds it. */
 function waitOutHeldFetchLock(): Promise<void> {
   return new Promise((resolve) => {
     // raw-lifecycle-ok: the fetch retry awaits this wait, so it cannot outlive its caller.
-    setTimeout(resolve, 25 + Math.floor(Math.random() * 75))
+    setTimeout(resolve, waitOutHeldFetchLockMs())
   })
 }
 

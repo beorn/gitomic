@@ -4,6 +4,7 @@
  * door says how to read its state and build the next commit; the loop owns
  * contention, receipts and the retry budget, so there is exactly one of each.
  */
+import { fullJitter, type RandomUnit } from "@bearly/pacing"
 import { Conflict, PublicationUnknown, RetriesExhausted } from "./errors.js"
 import type { Oid, RefUpdate } from "./types.js"
 
@@ -96,9 +97,16 @@ export async function runCasLoop<H, R>(loop: CasLoop<H, R>): Promise<R> {
   }
 }
 
+const RETRY_BASE_MS = 4
+const RETRY_CAP_MS = 150
+
+/** Full-jitter retry delay from @bearly/pacing (25676). Never above RETRY_CAP_MS. */
+export function delayForRetryMs(retries: number, random: RandomUnit = Math.random): number {
+  return fullJitter(RETRY_BASE_MS, RETRY_CAP_MS, Math.min(retries, 6), random)
+}
+
 function delayForRetry(retries: number): Promise<void> {
-  const ceiling = Math.min(150, 4 * 2 ** Math.min(retries, 6))
-  const milliseconds = Math.random() * ceiling
+  const milliseconds = delayForRetryMs(retries)
   return new Promise((resolve) => {
     // raw-lifecycle-ok: this transaction-owned backoff is awaited and cannot outlive its caller.
     setTimeout(resolve, milliseconds)

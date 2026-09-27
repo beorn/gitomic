@@ -32,8 +32,8 @@ describe("package dependency boundary", () => {
   test("depends only on the checkout lock's flock and makes isomorphic-git an optional peer", async () => {
     const packageManifest = await manifest()
 
-    // @bearly/flock is the estate's one fd-held flock; it has no dependencies, so nothing it pulls in imports gitomic.
-    expect(packageManifest.dependencies).toEqual({ "@bearly/flock": "^0.1.1" })
+    // @bearly/flock is the estate's one fd-held flock; @bearly/pacing is the shared retry jitter (25676). Neither imports gitomic.
+    expect(packageManifest.dependencies).toEqual({ "@bearly/flock": "^0.1.1", "@bearly/pacing": "^0.1.0" })
     expect(packageManifest.optionalDependencies).toBeUndefined()
     expect(packageManifest.peerDependencies).toEqual({ "isomorphic-git": "^1.38.7" })
     expect(packageManifest.peerDependenciesMeta).toEqual({ "isomorphic-git": { optional: true } })
