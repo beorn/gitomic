@@ -679,7 +679,7 @@ describe("reads that must reach a boundary refuse loudly when they do not (CTO v
     })
   })
 
-  test("transact on a chain longer than 1024 events throws naming the ref and the bound; 1024 still works", async () => {
+  test("transact decides from the complete chain after event 1024", async () => {
     const backend = createMemBackend()
     const full = await openEvents({ repo: "events-bound-full", ref: CHAIN, backend })
     await full.append(many(1_024), { expect: null })
@@ -691,16 +691,104 @@ describe("reads that must reach a boundary refuse loudly when they do not (CTO v
     expect(seen).toEqual([1_024])
 
     const over = await openEvents({ repo: "events-bound-over", ref: CHAIN, backend })
-    await over.append(many(1_025), { expect: null })
+    const seeded = await over.append(many(1_025), { expect: null })
+    const first = seeded.events[0]?.id
+    if (first === undefined) throw new Error("long event chain has no first event")
+    await expect(over.events({ limit: 1_025 })).rejects.toThrow("1024")
+    const complete: string[][] = []
+    const written = await over.transact((events) => {
+      complete.push([events[0]?.type ?? "missing", events.at(-1)?.type ?? "missing"])
+      expect(events).toHaveLength(1_025)
+      return [{ type: "after" }]
+    }, "decide on a complete chain")
+    expect(complete).toEqual([["e0", "e1024"]])
+    expect(written.events.map((event) => event.type)).toEqual(["after"])
+    expect((await over.events({ limit: 1, order: "newest-first" }))[0]?.type).toBe("after")
+
+    const afterFirst: string[][] = []
+    await over.transact(
+      (events) => {
+        afterFirst.push([String(events.length), events[0]?.type ?? "missing", events.at(-1)?.type ?? "missing"])
+        return []
+      },
+      "read past the first page to a named bound",
+      { from: first },
+    )
+    expect(afterFirst).toEqual([["1025", "e1", "after"]])
+
+    const tip = await over.head()
+    if (tip === null) throw new Error("long event chain has no tip")
+    const empty: number[] = []
+    await over.transact(
+      (events) => {
+        empty.push(events.length)
+        return []
+      },
+      "read an empty tail",
+      { from: tip },
+    )
+    expect(empty).toEqual([0])
+
     let decided = false
-    const refused = over.transact(() => {
-      decided = true
-      return [{ type: "never" }]
-    }, "decide on a truncated chain")
-    await expect(refused).rejects.toThrow(CHAIN)
-    await expect(refused).rejects.toThrow("1024")
+    await expect(
+      over.transact(
+        () => {
+          decided = true
+          return []
+        },
+        "refuse an unreachable bound",
+        { from: "f".repeat(40) },
+      ),
+    ).rejects.toThrow("refusing a partial read")
     expect(decided).toBe(false)
-    expect((await over.events({ limit: 1, order: "newest-first" }))[0]?.type).toBe("e1024")
+  })
+
+  /** @failure A lost lease retries from a truncated page after the chain crosses 1024.
+   * @level l1 @consumer Yrd queue and branch event writes
+   */
+  test("a long transaction re-decides from the complete winner history", async () => {
+    const backend = createMemBackend()
+    const first = await openEvents({ repo: "events-long-race", ref: CHAIN, backend })
+    const second = await openEvents({ repo: "events-long-race", ref: CHAIN, backend })
+    const seed = await first.append(many(1_025), { expect: null })
+    if (seed.head === null) throw new Error("long event chain has no tip")
+    let entered: () => void = () => {}
+    let release: () => void = () => {}
+    const inside = new Promise<void>((resolve) => {
+      entered = resolve
+    })
+    const mayLand = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const seen: [number, string | undefined][] = []
+    const pending = second.transact(async (events) => {
+      seen.push([events.length, events.at(-1)?.type])
+      if (seen.length === 1) {
+        entered()
+        await mayLand
+      }
+      return [{ type: "after-race" }]
+    }, "decide after a long-chain race")
+    await Promise.race([
+      inside,
+      pending.then(
+        () => {
+          throw new Error("long transaction finished before its decision was observed")
+        },
+        (error: unknown) => {
+          throw error
+        },
+      ),
+    ])
+    await first.append([{ type: "winner" }], { expect: seed.head })
+    release()
+    const result = await pending
+    expect(result.retries).toBeGreaterThanOrEqual(1)
+    expect(seen).toEqual([
+      [1_025, "e1024"],
+      [1_026, "winner"],
+    ])
+    expect((await second.events({ limit: 1, order: "newest-first" }))[0]?.type).toBe("after-race")
   })
 
   test("watch refuses a tip that moved more than 1024 events past the last one it saw", async () => {

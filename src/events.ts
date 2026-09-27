@@ -121,8 +121,9 @@ export type Events = {
   events(options?: EventsRead): Promise<Event[]>
   /**
    * Read every event after `from` (or from genesis), decide, append, and replay
-   * on a lost race. `message` names the transaction in errors. A span over
-   * 1024 events after `from` is refused, not truncated.
+   * on a lost race. `message` names the transaction in errors. Long histories
+   * are paged at one selected tip before `decide` runs; a missing boundary is
+   * refused, never passed to `decide` as a partial chain.
    */
   transact(
     decide: Decide,
@@ -332,12 +333,7 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
     return { ...read, events: read.events.slice(0, options.limit) }
   }
 
-  /**
-   * Read EVERY event from `at` back to a boundary: `from` when given, else the
-   * genesis. transact's decide and watch's batches must see the whole span, so a
-   * span longer than the bound is refused rather than handed over truncated as if
-   * it were whole. Paging through a long chain is `events({ from, limit })`.
-   */
+  /** Watch keeps its bounded jump refusal; a partial batch is never yielded. */
   const readWhole = async (at: Oid, from?: Oid) => {
     const history = await backend.readHistory(repo, [at], {
       ...(from === undefined ? {} : { exclude: [from] }),
@@ -357,6 +353,37 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
       )
     }
     return toEvents(history, ref)
+  }
+
+  /** Assemble one attempt's complete history before a transaction decides. */
+  const readComplete = async (at: Oid, from?: Oid): Promise<Event[]> => {
+    const pages: Event[][] = []
+    const seen = new Set<Oid>()
+    let cursor = at
+    for (;;) {
+      if (seen.has(cursor)) throw new Error(`${ref} at ${at}: event paging did not advance at ${cursor}`)
+      seen.add(cursor)
+      const { events } = await readChain(cursor, { ...(from === undefined ? {} : { from }), limit: MAX_LIMIT })
+      if (events.length === 0) {
+        if (cursor === from) return pages.flat().reverse()
+        throw new Error(`${ref} at ${at} does not reach event ${from ?? "its genesis"}; refusing a partial read`)
+      }
+      if (events[0]?.id !== cursor) {
+        throw new Error(`${ref} at ${at}: event paging expected ${cursor}, read ${events[0]?.id ?? "nothing"}`)
+      }
+      for (let index = 0; index + 1 < events.length; index++) {
+        if (events[index]?.parent !== events[index + 1]?.id) {
+          throw new Error(`${ref} at ${at}: event paging lost the first-parent chain at ${events[index]?.id}`)
+        }
+      }
+      pages.push(events)
+      const parent = events.at(-1)?.parent
+      if (from === undefined ? parent === null : parent === from) return pages.flat().reverse()
+      if (parent === null || parent === undefined) {
+        throw new Error(`${ref} at ${at} does not reach event ${from}; refusing a partial read`)
+      }
+      cursor = parent
+    }
   }
 
   /**
@@ -451,7 +478,7 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
           if (at === null && from !== undefined) {
             throw new Error(`${ref} has no chain tip to reach event ${from}; refusing a partial read.`)
           }
-          const current = at === null ? [] : (await readWhole(at, from)).events.reverse()
+          const current = at === null ? [] : await readComplete(at, from)
           const inputs = await decide(current)
           if (inputs.length === 0) return { kind: "noop", result: { head: at, events: [], retries } }
           const base = at ?? (await genesisOf())
