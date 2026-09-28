@@ -16,6 +16,7 @@ import { describe, expect, test } from "vitest"
 
 import { apply, identProblem, open, resolveGitAuthor } from "../src/index.js"
 import type { CommitInput, GitomicBackend, Ident } from "../src/index.js"
+import { parseCommit } from "../src/git-object.js"
 import { openEvents } from "../src/events.js"
 import { createIsoBackend } from "../src/iso.js"
 import { createMemBackend } from "../src/mem.js"
@@ -105,6 +106,37 @@ describe("the caller's Git author resolves from the selected repository and envi
     } finally {
       await fixture.cleanup()
     }
+  })
+})
+
+// @failure Retiring Writer trailers must preserve generated program roles; otherwise Yrd cannot fold its persisted queue fence.
+// @level l0
+// @consumer Yrd queue folds and every CommitMeta.writer reader
+// Exact subject/trailers from queue fence 2dd9f2acc7961f18fc8a6e7e7388d374cc7980d8 (25073).
+describe("program roles survive Writer trailer retirement", () => {
+  const fenceMessage = `yrd-run: merge-fenced
+
+Queue: 9e92147f0723eb086b4048cb001143a522979639
+Time: 2026-09-28T04:37:23.423Z
+For: 55c02e4bc929ac5de51f1921b97f4954d6d629ef
+Branch: task/dev3-26202-ag-boundaries
+Commit: 23e391fcdd1063e4faed700260ce27f4f29e3395
+Ops: {"version":1,"pause":null,"overrides":[]}
+Event: merge-fenced
+Gitomic-Instance: 9b1770d9-d934-42fa-84c3-0b4774138a8b
+Gitomic-Seq: 0
+`
+  test.each([
+    ["persisted trailer-less fence", fenceMessage, "yrd-run"],
+    ["legacy trailer takes precedence", `${fenceMessage}Gitomic-Writer: legacy-run\n`, "legacy-run"],
+    ["ordinary subject is not a program role", "yrd-run: ordinary\n", null],
+    ["Instance alone is not generated", "yrd-run: ordinary\n\nGitomic-Instance: instance\n", null],
+    ["Seq alone is not generated", "yrd-run: ordinary\n\nGitomic-Seq: 0\n", null],
+  ])("%s", (_label, message, expectedWriter) => {
+    const raw = `tree ${EMPTY_TREE}\nauthor gitomic <gitomic@localhost> 1790570247 +0000\ncommitter gitomic <gitomic@localhost> 1790570247 +0000\n\n${message}`
+    expect(parseCommit("2dd9f2acc7961f18fc8a6e7e7388d374cc7980d8", new TextEncoder().encode(raw)).writer).toBe(
+      expectedWriter,
+    )
   })
 })
 

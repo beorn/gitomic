@@ -200,7 +200,7 @@ describe("acceptance: a transacted event reads back with its trailers and its ke
         title: "task/demo@abc opened",
         content: "a body paragraph\n\nand a second one",
         props: input.props,
-        writer: null,
+        writer: "queue",
       })
       expect(event?.instance, target.name).toMatch(/^[0-9a-f-]{36}$/)
       expect(event?.seq, target.name).toBe(0)
@@ -317,7 +317,7 @@ describe("per-call event trailers", () => {
         type: "appended",
         title: "appended",
         props: [["Reason", "kept"]],
-        writer: null,
+        writer: "queue",
       })
 
       const transactTrailers: [string, string][] = [["Actor-Session", "transact-session"]]
@@ -973,6 +973,42 @@ describe("reads that must reach a boundary refuse loudly when they do not (CTO v
   })
 })
 
+// @failure New generated writer recovery must keep commit attribution out of Event.props; legacy props remain intact.
+// @level l1
+// @consumer Yrd folds and callers of gitomic/events
+describe("writer retirement preserves event property boundaries", () => {
+  test.each([false, true])("legacy Writer trailer present: %s", async (legacy) => {
+    const fixture = await createBareRepo()
+    try {
+      const message = `yrd-run: merge-fenced\n\nQueue: prior\nEvent: merge-fenced\nActor-Session: caller\nActor-Generation: 7\n${legacy ? "Gitomic-Writer: yrd-run\n" : ""}Gitomic-Instance: generated\nGitomic-Seq: 0\n`
+      const oid = await git(
+        fixture.repo,
+        "commit-tree",
+        "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+        "-p",
+        fixture.initial,
+        "-m",
+        message,
+      )
+      await git(fixture.repo, "update-ref", CHAIN, oid)
+      const [event] = await (await openEvents({ repo: fixture.repo, ref: CHAIN })).events()
+      expect(event).toMatchObject({
+        writer: "yrd-run",
+        title: "merge-fenced",
+        props: legacy
+          ? [
+              ["Queue", "prior"],
+              ["Actor-Session", "caller"],
+              ["Actor-Generation", "7"],
+            ]
+          : [["Queue", "prior"]],
+      })
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+})
+
 describe("an event's subject defaults to its type (CTO verdict number 2)", () => {
   test("append and transact write '<writer>: <type>' when no title is given", async () => {
     const backend = createMemBackend()
@@ -1009,8 +1045,8 @@ describe("the genesis commit is one object on every backend (CTO verdict number 
       await byIso.append([{ type: "paid", content: "by iso" }], { expect: first.head })
       const readByShell = await byShell.events()
       expect(readByShell.map((event) => [event.type, event.writer])).toEqual([
-        ["opened", null],
-        ["paid", null],
+        ["opened", "shell"],
+        ["paid", "iso"],
       ])
       expect(readByShell[0]?.parent).toBeNull()
       expect(await byIso.events()).toEqual(readByShell)

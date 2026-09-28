@@ -68,7 +68,7 @@ export function validateOid(value: unknown, label = "invalid Git object id"): Oi
   return value
 }
 
-/** Decode the same stored commit bytes in every backend; metadata is not inferred from its subject. */
+/** Decode the same stored commit bytes in every backend; program roles follow the generated message format. */
 export function parseCommit(oid: Oid, content: Uint8Array): CommitMeta {
   validateOid(oid)
   const raw = decodeUtf8(content, `Git commit ${oid}`)
@@ -136,20 +136,36 @@ export function commitMeta(
     throw new Error(`invalid Git commit ${oid}: malformed Gitomic-Seq trailer`)
   }
   const provenance = parseCommitProvenance(oid, trailers)
+  const instance = trailers.get("Gitomic-Instance") ?? null
+  const subject = message.split("\n", 1)[0] ?? ""
+  const separator = subject.indexOf(": ")
+  const writer =
+    trailers.get("Gitomic-Writer") ??
+    (isCurrentGeneratedCommit(message, instance, seq) && separator > 0 ? subject.slice(0, separator) : null)
   return {
     oid,
     parent: parents[0] ?? null,
     parents,
     trailers: callerTrailers(message),
     message,
-    writer: trailers.get("Gitomic-Writer") ?? null,
-    instance: trailers.get("Gitomic-Instance") ?? null,
+    writer,
+    instance,
     seq,
     provenance,
     author: idents.author,
     committer: idents.committer,
     timestamp,
   }
+}
+
+/** Internal shared discriminator: current generated messages have no legacy Writer trailer. */
+export function isCurrentGeneratedCommit(message: string, instance: string | null, seq: number | null): boolean {
+  const lastParagraph =
+    message
+      .trimEnd()
+      .split(/\n[ \t]*\n/)
+      .at(-1) ?? ""
+  return instance !== null && seq !== null && !/^Gitomic-Writer:/m.test(lastParagraph)
 }
 
 /**

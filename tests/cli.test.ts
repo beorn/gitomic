@@ -481,7 +481,7 @@ describe("gitomic CLI — history reads", () => {
       parent: initial,
       parents: [initial],
       trailers: [],
-      writer: null,
+      writer: "history",
       instance: expect.any(String),
       seq: 0,
       provenance: null,
@@ -838,12 +838,12 @@ describe("gitomic CLI — write", () => {
     expect((await run(backend, ["read", ADDRESS, "a.md"])).stdout).toBe("two\n")
   })
 
-  test("--writer labels the subject while typed writer metadata stays historical", async () => {
+  test("--writer labels the subject and remains readable without a Writer trailer", async () => {
     const backend = createMemBackend()
     const result = await writeOne(backend, "a.md", "one\n", ["--writer", "cli-test"])
     expect(result.code).toBe(0)
     const commit = await backend.readCommit("repo", result.stdout.trim())
-    expect(commit.writer).toBeNull()
+    expect(commit.writer).toBe("cli-test")
     expect(commit.message).toMatch(/^cli-test: write a\.md\n/u)
   })
 

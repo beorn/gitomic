@@ -109,7 +109,7 @@ describe("iso backend", () => {
           parents: [first[0]],
           trailers: [],
           message: `same-writer: second\n\nGitomic-Instance: ${identity.instance}\nGitomic-Seq: 1\n`,
-          writer: null,
+          writer: "same-writer",
           instance: identity.instance,
           seq: 1,
           provenance: null,

@@ -13,7 +13,15 @@ import { randomUUID } from "node:crypto"
 
 import { runCasLoop } from "./engine.js"
 import { Conflict } from "./errors.js"
-import { assertTrailers, cloneIdent, GENESIS_MESSAGE, GITOMIC_IDENT, validateOid, zeroOid } from "./git-object.js"
+import {
+  assertTrailers,
+  cloneIdent,
+  GENESIS_MESSAGE,
+  GITOMIC_IDENT,
+  isCurrentGeneratedCommit,
+  validateOid,
+  zeroOid,
+} from "./git-object.js"
 import { shapeRefUpdates, type AlsoRef } from "./ref-updates.js"
 import {
   assertWriter,
@@ -300,7 +308,7 @@ function toEvent(meta: CommitMeta, ref: string): Event {
   const newline = text.indexOf("\n")
   const subject = newline < 0 ? text : text.slice(0, newline)
   const generatedSeparator = subject.indexOf(": ")
-  const currentGeneratedMessage = meta.writer === null && meta.instance !== null && meta.seq !== null
+  const currentGeneratedMessage = isCurrentGeneratedCommit(meta.message, meta.instance, meta.seq)
   const prefix =
     meta.writer !== null
       ? `${meta.writer}: `
