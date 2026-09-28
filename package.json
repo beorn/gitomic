@@ -91,10 +91,10 @@
     "@bearly/pacing": "^0.1.0"
   },
   "devDependencies": {
-    "@types/node": "^26.1.1",
-    "isomorphic-git": "^1.38.7",
+    "@types/node": "26.6.3",
+    "isomorphic-git": "1.42.3",
     "oxfmt": "^0.59.0",
-    "oxlint": "^1.74.0",
+    "oxlint": "1.85.0",
     "typescript": "^7.0.2",
     "unstorage": "^1.17.5",
     "vitest": "^4.1.10"
