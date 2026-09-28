@@ -98,6 +98,7 @@ export {
   danglingRefs,
   DEFAULT_REMOTE_TIMEOUT_MS,
   isMissingObjectFetchError,
+  resolveGitAuthor,
   runGit,
   type DanglingRef,
   type DanglingRefsOptions,
