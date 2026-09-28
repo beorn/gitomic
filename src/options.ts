@@ -34,10 +34,10 @@ export function untilAborted<T>(pending: Promise<T>, signal: AbortSignal): Promi
       resolve(undefined)
     }
     signal.addEventListener("abort", onAbort, { once: true })
-    pending.then(
+    void pending.then(
       (value) => {
         cleanup()
-        resolve(value)
+        return resolve(value)
       },
       (error: unknown) => {
         cleanup()
@@ -57,14 +57,14 @@ export function normalizePollInterval(value: number | undefined): number {
 
 export function waitForPoll(milliseconds: number, signal: AbortSignal): Promise<boolean> {
   if (signal.aborted) return Promise.resolve(false)
-  return new Promise((resolveWait) => {
+  return new Promise((resolve) => {
     let settled = false
     const settle = (elapsed: boolean): void => {
       if (settled) return
       settled = true
       clearTimeout(timer)
       signal.removeEventListener("abort", onAbort)
-      resolveWait(elapsed)
+      resolve(elapsed)
     }
     const onAbort = (): void => settle(false)
     // raw-lifecycle-ok: the awaited reader poll owns and clears this timer and abort listener.
