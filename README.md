@@ -102,6 +102,8 @@ store.at(commit?: string): Snapshot      // read-only view there — lazy
 store.transact(fn: Update, message: string, options?: { readonly author?: Ident; readonly trailers?: readonly Trailer[]; readonly beside?: (attempt: BesideAttempt) => BesideRef[] | Promise<BesideRef[]> }): Promise<Committed>
 ```
 
+`writer` defaults to `gitomic`. A supplied label must be non-empty and single-line, with no control characters or `": "`: that separator delimits the writer in the stored commit subject. Invalid labels fail before the store opens. The same rule applies to `openEvents` and CLI `--writer`.
+
 `transact` runs your update function and lands its writes as one commit, re-running it if another writer got there first. `message` is required — it becomes the commit message; say why, not what. The update function's second argument, `base`, is the commit oid it is running against on this attempt — a fresh tip on every re-run — so a precondition check can name the exact commit it refused on.
 
 `transactSequence` keeps several ordered commits in one attempt and moves the ref only once:

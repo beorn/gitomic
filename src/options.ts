@@ -73,7 +73,7 @@ export function waitForPoll(milliseconds: number, signal: AbortSignal): Promise<
   })
 }
 
-/** The writer label leads the commit subject, so it stays single-line. */
+/** The writer label leads the commit subject and must round-trip through its separator. */
 export function assertWriter(writer: string): void {
   assertUtf8(writer, "writer")
   const hasControlCharacter = [...writer].some((character) => {
@@ -82,6 +82,9 @@ export function assertWriter(writer: string): void {
   })
   if (writer.trim().length === 0 || hasControlCharacter) {
     throw new TypeError("writer must be a non-empty, single-line identifier")
+  }
+  if (writer.includes(": ")) {
+    throw new TypeError('writer cannot contain ": "; it separates the writer from the commit message')
   }
 }
 

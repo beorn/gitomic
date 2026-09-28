@@ -39,6 +39,41 @@ describe("public contract guards", () => {
     )
   })
 
+  test("rejects the subject separator in a writer before opening a store", async () => {
+    await expect(
+      open({ repo: "ambiguous-writer", ref: "main", writer: "worker: role", backend: createMemBackend() }),
+    ).rejects.toThrow('writer cannot contain ": "; it separates the writer from the commit message')
+  })
+
+  // @failure An accepted writer can be changed by commit serialization or subject recovery.
+  // @level l1
+  // @consumer Every public write API caller and CommitMeta.writer reader
+  test.each([
+    "gitomic",
+    "yrd",
+    "yrd-run",
+    "tent",
+    "k0-replay",
+    "km",
+    "@dev/1",
+    "km-cli#123",
+    "@hab#work-authorization-123",
+    "worker:role",
+    "worker:",
+    ":worker",
+    "worker role",
+    " worker ",
+    "日本語🙂",
+    "cafe\u0301",
+  ])("round-trips accepted writer %j through a stored commit", async (writer) => {
+    const backend = createMemBackend()
+    const repo = "writer-roundtrip"
+    const store = await open({ repo, ref: "main", writer, backend })
+    await store.transact(async (map) => map.set("value", "one"), "message: detail")
+
+    expect((await backend.readCommit(repo, await store.head())).writer).toBe(writer)
+  })
+
   test("opens without a writer label and still names itself in the audit trail", async () => {
     const mem = createMemBackend()
     let written: CommitInput | undefined
