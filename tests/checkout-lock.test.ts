@@ -10,11 +10,12 @@ import { join } from "node:path"
 import { afterAll, afterEach, describe, expect, test } from "vitest"
 
 import { main } from "../src/bin.js"
+import { fileURLToPath } from "node:url"
 
 const roots: string[] = []
 const holders: ChildProcessWithoutNullStreams[] = []
-const holderScript = new URL("./fixtures/checkout-lock-holder.ts", import.meta.url).pathname
-const binPath = new URL("../src/bin.ts", import.meta.url).pathname
+const holderScript = fileURLToPath(new URL("./fixtures/checkout-lock-holder.ts", import.meta.url))
+const binPath = fileURLToPath(new URL("../src/bin.ts", import.meta.url))
 const env = {
   ...process.env,
   GIT_AUTHOR_NAME: "Lock Test",

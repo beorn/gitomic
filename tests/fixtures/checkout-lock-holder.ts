@@ -10,6 +10,7 @@ import { spawnSync } from "node:child_process"
 import { tryAcquireFlock } from "@bearly/flock"
 
 import { CHECKOUT_LOCK_FD_ENV, checkoutLockPath, holdCheckoutLock } from "../../src/checkout-lock.js"
+import { fileURLToPath } from "node:url"
 
 const [repo, mode, ...rest] = process.argv.slice(2)
 if (repo === undefined || mode === undefined) throw new Error("usage: checkout-lock-holder.ts <repo> <mode> ...")
@@ -19,7 +20,7 @@ if (mode === "borrow") {
   if (separator !== "--") throw new Error("borrow: expected -- before the gitomic arguments")
   const held = holdCheckoutLock(repo, { timeoutMs: 0 })
   if (!held.ok) throw new Error(held.error)
-  const bin = new URL("../../src/bin.ts", import.meta.url).pathname
+  const bin = fileURLToPath(new URL("../../src/bin.ts", import.meta.url))
   const child = spawnSync("bun", [bin, ...gitomicArgs], {
     encoding: "utf8",
     stdio: pass === "pass" ? ["ignore", "pipe", "pipe", held.lock.fd] : ["ignore", "pipe", "pipe"],

@@ -14,6 +14,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, test, vi } from "vit
 
 import { projectRemoteFirstFastForward, synchronizeCheckoutToCommit, worktreeDirtyPaths } from "../src/index.js"
 import { gitOutcomeForTest } from "../src/project.js"
+import { fileURLToPath } from "node:url"
 
 const roots: string[] = []
 
@@ -58,7 +59,7 @@ async function runCli(args: string[]): Promise<{ code: number; stdout: string; s
 }
 
 function runCliSubprocess(args: string[]): { code: number; stdout: string; stderr: string } {
-  const binPath = new URL("../src/bin.ts", import.meta.url).pathname
+  const binPath = fileURLToPath(new URL("../src/bin.ts", import.meta.url))
   const result = spawnSync("bun", [binPath, ...args], {
     encoding: "utf8",
     env: {
