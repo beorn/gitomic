@@ -412,7 +412,7 @@ export function isZeroOid(oid: Oid): boolean {
 export function assertRefUpdates(updates: readonly RefUpdate[]): readonly RefUpdate[] {
   if (!Array.isArray(updates) || updates.length === 0) throw new TypeError("publish needs at least one ref update")
   const seen = new Set<string>()
-  return updates.map((update) => {
+  return updates.map((update: RefUpdate) => {
     const ref = update.ref
     if (typeof ref !== "string" || !ref.startsWith("refs/") || /[\s~^:?*[\\]|\.\.|@\{/.test(ref)) {
       throw new TypeError(`publish ref must be a full refs/ name: ${JSON.stringify(ref)}`)
