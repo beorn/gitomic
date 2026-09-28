@@ -8,16 +8,9 @@
     "exactOptionalPropertyTypes": true,
     "verbatimModuleSyntax": true,
     "skipLibCheck": true,
-    "types": [
-      "node",
-      "vitest/globals"
-    ],
-    "allowImportingTsExtensions": true
+    "types": ["node", "vitest/globals"],
+    "allowImportingTsExtensions": true,
+    "noEmit": true
   },
-  "include": [
-    "src/**/*.ts",
-    "tests/**/*.ts",
-    "vitest.config.ts",
-    "vitest.stress.config.ts"
-  ]
+  "include": ["src/**/*.ts", "tests/**/*.ts", "vitest.config.ts", "vitest.stress.config.ts"]
 }
