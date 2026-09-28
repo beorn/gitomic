@@ -1,3 +1,4 @@
+import { TreePathCollision } from "./errors.js"
 import { assertUtf8 } from "./utf8.js"
 
 /**
@@ -96,9 +97,7 @@ export function assertTreeShape(paths: Iterable<string>): void {
     while (separator >= 0) {
       const ancestor = path.slice(0, separator)
       if (stored.has(ancestor)) {
-        throw new Error(
-          `Git tree path collision: ${JSON.stringify(ancestor)} is both a file and a directory prefix for ${JSON.stringify(path)}; delete one side in the same transaction`,
-        )
+        throw new TreePathCollision(ancestor, path)
       }
       separator = path.indexOf("/", separator + 1)
     }

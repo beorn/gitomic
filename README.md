@@ -321,6 +321,8 @@ const { oid } = await apply(store, base, edits, "sync notes")
 
 `apply(store, base, edits, message)` lands the whole list as ONE all-or-nothing commit. `base` is the commit the edits were read against; the natural anchor for each `expect` is `store.at(base).oid(path)` — the git blob oid there, or `undefined` when the path is absent. Each edit re-checks its own precondition against the tree the commit actually attempts, so when a concurrent writer has moved the ref `apply` replays against the new tip for free (the same contract `transact` gives a callback). The FIRST edit whose precondition fails throws `EditDoesNotApply` — naming the edit index, the path, the oid it expected and the one it found, and both commits — and lands nothing. A `put` or `put-bytes` with `expect: null` demands the path be ABSENT (a create); `append` carries no precondition and always re-applies. Edits apply in order against the same attempted tree, so a later one can depend on an earlier one — `rm dest` then `mv src dest` frees the destination inside a single commit.
 
+A file and its descendant cannot coexist in a Git tree. Before writing the candidate commit or publishing any ref, gitomic rejects that shape with `TreePathCollision` (`code: "tree-path-collision"`), naming the `file` and `descendant`. This shared check behaves identically across shell, iso and mem backends; remove one side in the same transaction.
+
 ### Ownership manifests
 
 `parseOwnershipManifest(raw, { label?, acceptPath })` parses a version-1 path/source declaration into sorted paths and an exact source-object mapping. It rejects malformed git paths, duplicates, schema drift, and any path your policy declines. gitomic owns this mechanism; it does not choose your state partition.
@@ -470,7 +472,7 @@ await store.transact(async (map) => {
 }, "take deploy lock")
 ```
 
-Two writers race this; exactly one wins. The loser's re-run _sees_ the winner's lock and gives up — `Conflict` reaches your caller. (`RetriesExhausted` — a transaction that made no progress within its time budget — is the only other error `transact` itself adds; the `apply` door above adds `EditDoesNotApply`.)
+Two writers race this; exactly one wins. The loser's re-run _sees_ the winner's lock and gives up — `Conflict` reaches your caller. (`transact` also reports `RetriesExhausted` when its time budget expires, `TreePathCollision` for an impossible tree shape, `CandidateRefused` when a candidate check refuses, and `PublicationUnknown` when publication cannot be established. The `apply` door above adds `EditDoesNotApply`.)
 
 Same store, other faces. The rule: `asX(store)` re-views the store as interface X, read-only where a write would dodge the transaction; `withX(fn)` wraps your update function so X-shaped calls stay transactional:
 

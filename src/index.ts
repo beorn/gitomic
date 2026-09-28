@@ -29,6 +29,7 @@ import {
   GitTimeout,
   PublicationUnknown,
   RetriesExhausted,
+  TreePathCollision,
 } from "./errors.js"
 import { cloneCommitProvenance, cloneIdent, GITOMIC_IDENT, validateOid } from "./git-object.js"
 import { assertTreeShape, isGitPrefixNotFoundError, normalizePath, normalizePrefix } from "./path.js"
@@ -64,7 +65,15 @@ import type {
 } from "./types.js"
 import { assertUtf8, decodeUtf8 } from "./utf8.js"
 
-export { CandidateRefused, Conflict, EditDoesNotApply, GitTimeout, PublicationUnknown, RetriesExhausted }
+export {
+  CandidateRefused,
+  Conflict,
+  EditDoesNotApply,
+  GitTimeout,
+  PublicationUnknown,
+  RetriesExhausted,
+  TreePathCollision,
+}
 export type { EditKind, PreconditionType } from "./errors.js"
 export { applyEdits } from "./edits.js"
 export { editsFromCheckout } from "./checkout-edits.js"

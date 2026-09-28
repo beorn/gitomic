@@ -1,3 +1,20 @@
+/** The proposed Git tree contains a file and one of that file's descendants. */
+export class TreePathCollision extends Error {
+  override readonly name = "TreePathCollision"
+  readonly code = "tree-path-collision" as const
+
+  constructor(
+    readonly file: string,
+    readonly descendant: string,
+    options?: ErrorOptions,
+  ) {
+    super(
+      `Git tree path collision: ${JSON.stringify(file)} is both a file and a directory prefix for ${JSON.stringify(descendant)}; delete one side in the same transaction`,
+      options,
+    )
+  }
+}
+
 export class Conflict extends Error {
   override readonly name = "Conflict"
   /** The refs whose lease a MULTI publish lost, as the tool named them; empty otherwise. */

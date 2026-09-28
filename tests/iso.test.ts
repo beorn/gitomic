@@ -11,7 +11,7 @@ import { spawnSync } from "node:child_process"
 import type { FsClient } from "isomorphic-git"
 import { describe, expect, test } from "vitest"
 
-import { createShellBackend, open, openReader } from "../src/index.js"
+import { createShellBackend, open, openReader, TreePathCollision } from "../src/index.js"
 import type { CommitInput, GitMap, GitomicBackend, Oid } from "../src/index.js"
 import { createIsoBackend } from "../src/iso.js"
 import { createMemBackend } from "../src/mem.js"
@@ -177,12 +177,26 @@ describe("iso backend", () => {
       ]
 
       for (const store of stores) {
-        await expect(
-          store.transact(async (map) => {
+        const collision = await store
+          .transact(async (map) => {
             map.set("a", "file")
             map.set("a/b", "nested")
-          }, "create impossible tree"),
-        ).rejects.toThrow('Git tree path collision: "a" is both a file and a directory')
+          }, "create impossible tree")
+          .then(
+            () => {
+              throw new Error("Expected tree collision")
+            },
+            (error: unknown) => error,
+          )
+        expect(collision).toBeInstanceOf(TreePathCollision)
+        expect(collision).toMatchObject({
+          name: "TreePathCollision",
+          code: "tree-path-collision",
+          file: "a",
+          descendant: "a/b",
+          message:
+            'Git tree path collision: "a" is both a file and a directory prefix for "a/b"; delete one side in the same transaction',
+        })
         expect(await store.at().keys()).toEqual([])
       }
     } finally {
