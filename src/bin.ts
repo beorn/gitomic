@@ -21,6 +21,7 @@ import {
   readPublishDeclaration,
   readRepositoryDeclaration,
   repositoryCandidate,
+  resolveGitAuthor,
   trustDeclaration,
   runGit,
   synchronizeCheckoutToCommit,
@@ -1136,23 +1137,10 @@ async function writeOptions(
  * (ADR-0020): the commit is authored by gitomic's committer, and stderr says why.
  */
 async function claimedAuthor(stderr: CliWriter): Promise<Ident | undefined> {
-  const result = await runGit(["var", "GIT_AUTHOR_IDENT"])
-  const line = result.stdout.toString("utf8").trim()
-  const match = /^(.+?) <([^<>]*)> \d+ [+-]\d{4}$/u.exec(line)
-  if (result.code !== 0 || match === null) {
-    const detail = result.stderr.toString("utf8").trim().split("\n").at(-1) ?? ""
-    stderr.write(
-      `gitomic: no author identity (git var GIT_AUTHOR_IDENT exit ${result.code}${detail ? `: ${detail}` : ""}); authoring as the committer\n`,
-    )
-    return undefined
-  }
-  const ident = { name: match[1] ?? "", email: match[2] ?? "" }
-  const problem = identProblem(ident)
-  if (problem !== undefined) {
-    stderr.write(`gitomic: git var GIT_AUTHOR_IDENT ${problem}; authoring as the committer\n`)
-    return undefined
-  }
-  return ident
+  const result = await resolveGitAuthor()
+  if ("author" in result) return result.author
+  stderr.write(`gitomic: ${result.problem}; authoring as the committer\n`)
+  return undefined
 }
 
 // --- argument parsing ------------------------------------------------------

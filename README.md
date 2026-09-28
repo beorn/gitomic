@@ -161,7 +161,7 @@ await store.transact(update, "close 42", { author: { name: "ada", email: "ada@ex
 - The **author** is who the commit acts for: one per call, on `transact`, `apply`, and the events `transact` and `append`. A call that names none has the committer as its author, which is git's own rule.
 - Name neither and every byte is as before: author and committer `gitomic <gitomic@localhost>`.
 - An event chain's genesis always keeps gitomic's identity, so every store computes the same empty root.
-- gitomic never reads the environment, git config, or a process to find an ident. The caller works it out and passes it; gitomic records it and never verifies it.
+- Transactions never read the environment, git config, or a process to find an ident. The caller works it out and passes it; gitomic records it and never verifies it.
 - The ident is copied when the call is submitted and stays fixed through every retry.
 - `CommitMeta` and `Event` carry `author` and `committer`, read from the commit header. History written before idents were data reads back as `gitomic <gitomic@localhost>`.
 
@@ -172,6 +172,8 @@ await store.transact(update, "close 42", { author: { name: "ada", email: "ada@ex
 - begins or ends with a space or any of `. , : ; < > " \ '`. git 2.42 and later keep a trailing `.`, but 2.36 to 2.41 strip it, so it is refused while those stay supported.
 
 `identProblem(ident)` returns the same reason as a string, or `undefined` when the ident is fine. Check an ident you did not choose (a user's git config) with it first, and fall back to your program's own ident instead of failing the write.
+
+`resolveGitAuthor({ cwd?, env? })` resolves the author `git commit` would record, using native `git var GIT_AUTHOR_IDENT`. It returns a promise of `{ author: Ident }` or `{ problem: string }` for a missing or unusable identity. `cwd` selects the caller's repository (defaults to the current directory); `env` overrides the inherited environment as with `runGit`. Process failures reject. The helper writes no output and changes no repository state. Capture its result before submitting a transaction; on a problem, report it and use your program's own ident. The CLI uses this same resolver.
 
 ### Who wrote it
 

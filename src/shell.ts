@@ -19,6 +19,7 @@ import {
   GENESIS_MESSAGE,
   GITOMIC_IDENT,
   INITIAL_TIMESTAMP,
+  identProblem,
   isZeroOid,
   leaseConflict,
   objectOid,
@@ -263,6 +264,31 @@ async function optionalRef(repo: string, ref: string, baseEnv?: NodeJS.ProcessEn
  */
 export async function runGit(args: readonly string[], options: RunGitOptions = {}): Promise<GitResult> {
   return run("git", args, options)
+}
+
+/**
+ * Resolve the author `git commit` would record in the caller's repository and environment.
+ * Missing or unusable identities return a diagnostic; process failures reject.
+ * `env` overrides the inherited environment, as with {@link runGit}.
+ */
+export async function resolveGitAuthor(
+  options: { cwd?: string; env?: NodeJS.ProcessEnv } = {},
+): Promise<{ author: Ident } | { problem: string }> {
+  const result = await runGit(
+    [...(options.cwd === undefined ? [] : ["-C", options.cwd]), "var", "GIT_AUTHOR_IDENT"],
+    options.env === undefined ? {} : { env: options.env },
+  )
+  const line = result.stdout.toString("utf8").trim()
+  const match = /^(.+?) <([^<>]*)> \d+ [+-]\d{4}$/u.exec(line)
+  if (result.code !== 0 || match === null) {
+    const detail = result.stderr.toString("utf8").trim().split("\n").at(-1) ?? ""
+    return {
+      problem: `no author identity (git var GIT_AUTHOR_IDENT exit ${result.code}${detail ? `: ${detail}` : ""})`,
+    }
+  }
+  const author = { name: match[1] ?? "", email: match[2] ?? "" }
+  const problem = identProblem(author)
+  return problem === undefined ? { author } : { problem: `git var GIT_AUTHOR_IDENT ${problem}` }
 }
 
 /**

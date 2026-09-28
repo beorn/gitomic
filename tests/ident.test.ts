@@ -14,7 +14,7 @@ import { promisify } from "node:util"
 
 import { describe, expect, test } from "vitest"
 
-import { apply, identProblem, open } from "../src/index.js"
+import { apply, identProblem, open, resolveGitAuthor } from "../src/index.js"
 import type { CommitInput, GitomicBackend, Ident } from "../src/index.js"
 import { openEvents } from "../src/events.js"
 import { createIsoBackend } from "../src/iso.js"
@@ -57,6 +57,56 @@ async function legs(): Promise<Leg[]> {
     { name: "shell", backend: createShellBackend(), repo: shell.repo, cleanup: shell.cleanup },
   ]
 }
+
+// @failure A library caller resolves the daemon's repository or ignores the caller's environment,
+// or receives an unusable author without a diagnostic (25073's shared resolver contract).
+// @level l1
+// @consumer gitomic CLI and km's caller-side attribution capture
+describe("the caller's Git author resolves from the selected repository and environment", () => {
+  test.each([
+    ["repository configuration", {}, { author: { name: "Configured Seat", email: "configured@example.org" } }],
+    [
+      "author environment overrides repository configuration",
+      { GIT_AUTHOR_NAME: "Claimed Seat", GIT_AUTHOR_EMAIL: "claimed@example.org" },
+      { author: { name: "Claimed Seat", email: "claimed@example.org" } },
+    ],
+    ["missing identity", { GIT_AUTHOR_NAME: "", GIT_AUTHOR_EMAIL: "" }, { problem: /no author identity.*exit 128/u }],
+    [
+      "an identity Gitomic cannot serialize unchanged",
+      { GIT_AUTHOR_NAME: "Trailing Dot." },
+      { problem: /git var GIT_AUTHOR_IDENT.*name/u },
+    ],
+  ] as const)("%s", async (_label, overrides, expected) => {
+    const fixture = await createBareRepo()
+    try {
+      await git(fixture.repo, "config", "user.name", "Configured Seat")
+      await git(fixture.repo, "config", "user.email", "configured@example.org")
+      await git(fixture.repo, "config", "user.useConfigOnly", "true")
+      const result = await resolveGitAuthor({
+        cwd: fixture.repo,
+        env: {
+          GIT_DIR: undefined,
+          GIT_WORK_TREE: undefined,
+          GIT_AUTHOR_NAME: undefined,
+          GIT_AUTHOR_EMAIL: undefined,
+          GIT_COMMITTER_NAME: undefined,
+          GIT_COMMITTER_EMAIL: undefined,
+          EMAIL: undefined,
+          GIT_CONFIG_GLOBAL: process.platform === "win32" ? "NUL" : "/dev/null",
+          GIT_CONFIG_NOSYSTEM: "1",
+          GIT_CONFIG_COUNT: "0",
+          ...overrides,
+        },
+      })
+      if ("author" in expected) expect(result).toEqual(expected)
+      else {
+        expect(result).toEqual({ problem: expect.stringMatching(expected.problem) })
+      }
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+})
 
 describe("author and committer are data, identical on every backend", () => {
   test("the shell uses its selected environment and explicit identities for both commit paths", async () => {
