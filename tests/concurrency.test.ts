@@ -155,7 +155,7 @@ describe("semantic CAS replay", () => {
     },
   )
 
-  test("preserves per-call provenance captured before a CAS replay", async () => {
+  test("replays one semantic result without serializing legacy actor trailers", async () => {
     const fixture = await createBareRepo()
     try {
       const shell = createShellBackend()
@@ -188,19 +188,14 @@ describe("semantic CAS replay", () => {
           }
           map.set("captured", "once")
         },
-        "capture attribution before replay",
+        "capture metadata before replay",
         { provenance },
       )
 
       expect(result.retries).toBe(1)
       expect(attempts).toBe(2)
       await expect(shell.readCommit(fixture.repo, result.oid)).resolves.toMatchObject({
-        provenance: {
-          actor: "original-actor",
-          session: "0198b5e8-cdd2-7a63-8a81-2fdc8144e6a4",
-          generation: 7,
-          run: "run-0198b5e8",
-        },
+        provenance: null,
       })
     } finally {
       await fixture.cleanup()

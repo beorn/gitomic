@@ -299,9 +299,8 @@ function assertProvenanceString(value: unknown, field: "actor" | "session" | "ru
 /**
  * Build the commit message for one transaction.
  *
- * `writer` is the caller's human-readable label: it leads the subject so
- * `git log --oneline` reads as an audit trail, and it repeats as a trailer so
- * `git log --format=%(trailers:key=Gitomic-Writer,valueonly)` can group by it.
+ * `writer` is the applying program's human-readable label: it leads the subject
+ * so `git log --oneline` identifies the program that made the commit.
  * `instance` is the library-minted id of the one live store that produced this
  * commit. The label is a name and may repeat across processes; the instance is
  * an identity and cannot, which is why `transactionMatches` keys on it.
@@ -311,21 +310,16 @@ export function formatCommitMessage(
   instance: string,
   message: string,
   seq: number,
-  provenance?: CommitProvenance,
+  _provenance?: CommitProvenance,
   trailers: readonly Trailer[] = [],
 ): string {
-  const captured = cloneCommitProvenance(provenance)
-  const provenanceTrailers =
-    captured === undefined
-      ? ""
-      : `Gitomic-Actor: ${captured.actor}\nGitomic-Actor-Session: ${captured.session}\nGitomic-Actor-Generation: ${captured.generation}\n${captured.run === undefined ? "" : `Gitomic-Actor-Run: ${captured.run}\n`}`
   // Caller trailers go INSIDE the final block, ahead of gitomic's own: git and
   // parseCommit read trailers from the last paragraph only, and
   // `transactionMatches` needs Instance/Seq to end the message.
   const callerBlock = assertTrailers(trailers)
     .map(([key, value]) => `${key}: ${value}\n`)
     .join("")
-  return `${writer}: ${message}\n\n${callerBlock}Gitomic-Writer: ${writer}\n${provenanceTrailers}Gitomic-Instance: ${instance}\nGitomic-Seq: ${seq}\n`
+  return `${writer}: ${message}\n\n${callerBlock}Gitomic-Instance: ${instance}\nGitomic-Seq: ${seq}\n`
 }
 
 /**

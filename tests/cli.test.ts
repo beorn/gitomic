@@ -481,14 +481,14 @@ describe("gitomic CLI — history reads", () => {
       parent: initial,
       parents: [initial],
       trailers: [],
-      writer: "history",
+      writer: null,
       instance: expect.any(String),
       seq: 0,
       provenance: null,
       author: { name: "gitomic", email: "gitomic@localhost" },
       committer: { name: "gitomic", email: "gitomic@localhost" },
       timestamp: 946_684_801,
-      message: expect.stringMatching(/^history: first\n\nfull body\n\nGitomic-Writer: history\n/),
+      message: expect.stringMatching(/^history: first\n\nfull body\n\nGitomic-Instance: [^\n]+\nGitomic-Seq: 0\n$/),
     })
     expect(records[2]).toEqual({
       oid: initial,
@@ -838,11 +838,13 @@ describe("gitomic CLI — write", () => {
     expect((await run(backend, ["read", ADDRESS, "a.md"])).stdout).toBe("two\n")
   })
 
-  test("--writer passes an interim identity label through to open()", async () => {
+  test("--writer labels the subject while typed writer metadata stays historical", async () => {
     const backend = createMemBackend()
     const result = await writeOne(backend, "a.md", "one\n", ["--writer", "cli-test"])
     expect(result.code).toBe(0)
-    expect((await backend.readCommit("repo", result.stdout.trim())).writer).toBe("cli-test")
+    const commit = await backend.readCommit("repo", result.stdout.trim())
+    expect(commit.writer).toBeNull()
+    expect(commit.message).toMatch(/^cli-test: write a\.md\n/u)
   })
 
   test("--expect naming a path not being written is a usage error", async () => {

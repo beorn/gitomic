@@ -13,7 +13,7 @@ import type { GitomicBackend } from "../src/types.js"
 import { createBareRepo } from "./helpers/git.js"
 
 describe("Store.transactSequence", () => {
-  test("shell, iso and mem keep three attributed steps in one publication", async () => {
+  test("shell, iso and mem keep native authors and sequence in one publication without legacy actor trailers", async () => {
     const shell = await createBareRepo()
     const iso = await createBareRepo()
     const targets: { repo: string; backend: GitomicBackend }[] = [
@@ -47,7 +47,7 @@ describe("Store.transactSequence", () => {
           const meta = await backend.readCommit(repo, step.oid)
           expect(meta.parent).toBe(previous)
           expect(meta.author.name).toBe(`Actor ${index + 1}`)
-          expect(meta.provenance?.actor).toBe(`actor-${index + 1}`)
+          expect(meta.provenance).toBeNull()
           previous = step.oid
         }
         expect(landed.oid).toBe(previous)

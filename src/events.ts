@@ -42,6 +42,10 @@ export type EventInput = {
   readonly props?: readonly Prop[]
   /** Commits this event keeps: written as extra parents after the chain parent. */
   readonly keeps?: readonly Oid[]
+  /** Git author for this event; when present, overrides the transaction's author. */
+  readonly author?: Ident
+  /** Commit trailers for this event, never event properties; when present, overrides transaction trailers. */
+  readonly trailers?: readonly Trailer[]
 }
 
 /** One event as read back. */
@@ -117,6 +121,8 @@ export type StagedEvents = {
   publish(options?: { also?: readonly AlsoRef[] }): Promise<Appended>
 }
 
+type EventWriteOptions = { readonly trailers?: readonly Trailer[] }
+
 export type Events = {
   /** The chain tip, or null when the ref does not exist yet. */
   head(): Promise<Oid | null>
@@ -130,15 +136,18 @@ export type Events = {
   transact(
     decide: Decide,
     message: string,
-    options?: { also?: readonly AlsoRef[]; author?: Ident; from?: Oid },
+    options?: { also?: readonly AlsoRef[]; author?: Ident; from?: Oid } & EventWriteOptions,
   ): Promise<Appended>
   /** Append at exactly `expect` (null = the chain must not exist); throws Conflict on a moved tip. */
   append(
     inputs: readonly EventInput[],
-    options: { expect: Oid | null; also?: readonly AlsoRef[]; author?: Ident },
+    options: { expect: Oid | null; also?: readonly AlsoRef[]; author?: Ident } & EventWriteOptions,
   ): Promise<Appended>
   /** Write commits locally without moving refs; publish the run once at the named tip. */
-  stage(inputs: readonly EventInput[], options: { expect: Oid | null; author?: Ident }): Promise<StagedEvents>
+  stage(
+    inputs: readonly EventInput[],
+    options: { expect: Oid | null; author?: Ident } & EventWriteOptions,
+  ): Promise<StagedEvents>
   watch(options: { signal: AbortSignal; pollIntervalMs?: number }): AsyncIterable<Event[]>
 }
 
@@ -214,6 +223,45 @@ function shapeInput(input: EventInput) {
   return { type, title, content: content.trim(), props, keeps, body }
 }
 
+/** Validate and snapshot per-call commit trailers before an event path awaits. */
+function captureEventTrailers(trailers: readonly Trailer[] | undefined): readonly Trailer[] {
+  if (trailers === undefined) return []
+  return assertTrailers(trailers).map(([key, value]) => {
+    if (key.toLowerCase() === EVENT_KEY.toLowerCase()) {
+      throw new TypeError(`trailer key ${JSON.stringify(key)} is reserved: gitomic/events writes the event type there`)
+    }
+    return [key, value] as const
+  })
+}
+
+type EventAttribution = { readonly author: Ident; readonly trailers: readonly Trailer[] }
+type ShapedEventInput = ReturnType<typeof shapeInput> & EventAttribution
+
+function eventAttribution(
+  input: EventInput,
+  defaultAuthor: Ident,
+  fallbackAuthor: Ident,
+  defaultTrailers: readonly Trailer[],
+): EventAttribution {
+  const author = Object.hasOwn(input, "author") ? (cloneIdent(input.author, "author") ?? fallbackAuthor) : defaultAuthor
+  const trailers = Object.hasOwn(input, "trailers") ? captureEventTrailers(input.trailers) : defaultTrailers
+  return { author, trailers }
+}
+
+function shapeEventInputs(
+  inputs: readonly EventInput[],
+  defaultAuthor: Ident,
+  fallbackAuthor: Ident,
+  defaultTrailers: readonly Trailer[],
+  captured: (EventAttribution | undefined)[] = [],
+): ShapedEventInput[] {
+  return inputs.map((input, index) => {
+    const attribution = captured[index] ?? eventAttribution(input, defaultAuthor, fallbackAuthor, defaultTrailers)
+    captured[index] = attribution
+    return { ...shapeInput(input), ...attribution }
+  })
+}
+
 /**
  * Turn one walk into events. The walk is newest-first; the chain's root is the
  * genesis, which is not an event and is dropped. A root that is not the genesis
@@ -249,9 +297,17 @@ function toEvent(meta: CommitMeta, ref: string): Event {
   const text = paragraphs.slice(0, -1).join("\n\n")
   const newline = text.indexOf("\n")
   const subject = newline < 0 ? text : text.slice(0, newline)
-  const prefix = meta.writer === null ? "" : `${meta.writer}: `
+  const generatedSeparator = subject.indexOf(": ")
+  const currentGeneratedMessage = meta.writer === null && meta.instance !== null && meta.seq !== null
+  const prefix =
+    meta.writer !== null
+      ? `${meta.writer}: `
+      : meta.instance !== null && meta.seq !== null && generatedSeparator >= 0
+        ? subject.slice(0, generatedSeparator + 2)
+        : ""
   const title = subject.startsWith(prefix) ? subject.slice(prefix.length) : subject
   const content = newline < 0 ? "" : text.slice(newline + 1).replace(/^\n+/, "")
+  const eventTrailerIndex = meta.trailers.findIndex(([key]) => key === EVENT_KEY)
   return {
     id: meta.oid,
     parent: meta.parents[0] ?? null,
@@ -259,7 +315,9 @@ function toEvent(meta: CommitMeta, ref: string): Event {
     type: (typed[0] as Trailer)[1],
     title,
     content,
-    props: meta.trailers.filter(([key]) => key !== EVENT_KEY),
+    props: currentGeneratedMessage
+      ? meta.trailers.slice(0, eventTrailerIndex)
+      : meta.trailers.filter(([key]) => key !== EVENT_KEY),
     writer: meta.writer,
     instance: meta.instance,
     seq: meta.seq,
@@ -416,14 +474,12 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
     base: Oid,
     /** True when `base` is the genesis: the chain did not exist, so event 1 has no parent. */
     newChain: boolean,
-    inputs: readonly EventInput[],
+    inputs: readonly ShapedEventInput[],
     reserved: number[],
-    author: Ident,
   ): Promise<{ next: Oid; written: Event[]; lastSeq: number }> => {
-    const shaped = inputs.map(shapeInput)
     let previous = base
     const written: Event[] = []
-    for (const [position, input] of shaped.entries()) {
+    for (const [position, input] of inputs.entries()) {
       reserved[position] ??= seq++
       const eventSeq = reserved[position] as number
       const oid = await backend.writeCommit(repo, {
@@ -432,12 +488,12 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
         parents: [previous, ...input.keeps],
         changes: new Map(),
         allowEmpty: true,
-        trailers: [...input.props, [EVENT_KEY, input.type]],
+        trailers: [...input.props, [EVENT_KEY, input.type], ...input.trailers],
         message: input.body,
         writer,
         instance,
         seq: eventSeq,
-        author,
+        author: input.author,
         committer,
       })
       written.push({
@@ -451,12 +507,12 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
         writer,
         instance,
         seq: eventSeq,
-        author,
+        author: input.author,
         committer,
       })
       previous = oid
     }
-    return { next: previous, written, lastSeq: reserved[shaped.length - 1] as number }
+    return { next: previous, written, lastSeq: reserved[inputs.length - 1] as number }
   }
 
   let genesis: Oid | undefined
@@ -480,6 +536,7 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
     },
     async transact(decide, message, transactOptions = {}) {
       const why = assertLine(typeof message === "string" ? message.trim() : message, "message")
+      const callerTrailers = captureEventTrailers(transactOptions.trailers)
       const author = cloneIdent(transactOptions.author, "author") ?? committer
       const publish = publishWith(shapeAlso(transactOptions.also))
       const from =
@@ -487,6 +544,7 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
           ? undefined
           : validateOid(transactOptions.from, "transact from must be an event id")
       const reserved: number[] = []
+      const capturedAttributions: (EventAttribution | undefined)[] = []
       return runCasLoop<Oid | null, Appended>({
         // `message` names the transaction in the loop's errors; each event's own
         // subject comes from its type or title.
@@ -502,8 +560,9 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
           const current = at === null ? [] : await readComplete(at, from)
           const inputs = await decide(current)
           if (inputs.length === 0) return { kind: "noop", result: { head: at, events: [], retries } }
+          const shaped = shapeEventInputs(inputs, author, committer, callerTrailers, capturedAttributions)
           const base = at ?? (await genesisOf())
-          const { next, written, lastSeq } = await writeRun(base, at === null, inputs, reserved, author)
+          const { next, written, lastSeq } = await writeRun(base, at === null, shaped, reserved)
           return {
             kind: "write",
             next,
@@ -515,9 +574,11 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
         },
       })
     },
-    async append(inputs, { expect, also, author: named }) {
+    async append(inputs, { expect, also, author: named, trailers: namedTrailers }) {
       if (inputs.length === 0) throw new TypeError("append needs at least one event")
+      const callerTrailers = captureEventTrailers(namedTrailers)
       const author = cloneIdent(named, "author") ?? committer
+      const shaped = shapeEventInputs(inputs, author, committer, callerTrailers)
       const expected = expect === null ? null : validateOid(expect, "append expect must be an event id or null")
       const publish = publishWith(shapeAlso(also))
       const reserved: number[] = []
@@ -545,7 +606,7 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
             throw new Conflict(`${label} is at ${at ?? "nothing"}, not the expected ${expected ?? "nothing"}`)
           }
           const base = at ?? (await genesisOf())
-          const { next, written, lastSeq } = await writeRun(base, at === null, inputs, reserved, author)
+          const { next, written, lastSeq } = await writeRun(base, at === null, shaped, reserved)
           return {
             kind: "write",
             next,
@@ -557,12 +618,14 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
         },
       })
     },
-    async stage(inputs, { expect, author: named }) {
+    async stage(inputs, { expect, author: named, trailers: namedTrailers }) {
       if (inputs.length === 0) throw new TypeError("stage needs at least one event")
+      const callerTrailers = captureEventTrailers(namedTrailers)
       const author = cloneIdent(named, "author") ?? committer
+      const shaped = shapeEventInputs(inputs, author, committer, callerTrailers)
       const expected = expect === null ? null : validateOid(expect, "stage expect must be an event id or null")
       const base = expected ?? (await genesisOf())
-      const { next, written } = await writeRun(base, expected === null, inputs, [], author)
+      const { next, written } = await writeRun(base, expected === null, shaped, [])
       let attempted = false
       return {
         ref,

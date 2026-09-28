@@ -38,7 +38,8 @@ describe("gitomic public transaction contract", () => {
       expect(parents).toBe(fixture.initial)
       const body = await git(fixture.repo, "show", "-s", "--format=%B", committed.oid)
       expect(body).toContain("worker-a: add note")
-      expect(body).toContain("Gitomic-Writer: worker-a")
+      expect(body).not.toContain("Gitomic-Writer:")
+      expect(body).not.toContain("Gitomic-Actor")
       expect(body).toMatch(/Gitomic-Instance: [0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\n/)
       expect(body).toContain("Gitomic-Seq: 0")
     } finally {
@@ -61,7 +62,7 @@ describe("gitomic public transaction contract", () => {
     }
   })
 
-  test("records each explicit per-call provenance on one reused store", async () => {
+  test("does not serialize legacy per-call actor provenance on a reused store", async () => {
     const fixture = await createBareRepo()
     try {
       const store = await open({ repo: fixture.repo, ref: "main", writer: "executor" })
@@ -88,25 +89,16 @@ describe("gitomic public transaction contract", () => {
       expect(await git(fixture.repo, "rev-list", "--count", "main")).toBe("3")
 
       await expect(backend.readCommit(fixture.repo, first.oid)).resolves.toMatchObject({
-        writer: "executor",
-        provenance: {
-          actor: "actor-a",
-          session: "0198b5e8-cdd2-7a63-8a81-2fdc8144e6a4",
-          generation: 7,
-          run: "run-a",
-        },
+        writer: null,
+        provenance: null,
       })
       await expect(backend.readCommit(fixture.repo, second.oid)).resolves.toMatchObject({
-        writer: "executor",
-        provenance: {
-          actor: "actor-b",
-          session: "0198b5e8-cdd2-7a63-8a81-2fdc8144e6a5",
-          generation: 8,
-        },
+        writer: null,
+        provenance: null,
       })
       const unmanaged = await store.transact(async (map) => map.set("third", "3"), "unmanaged call on the same store")
       await expect(backend.readCommit(fixture.repo, unmanaged.oid)).resolves.toMatchObject({
-        writer: "executor",
+        writer: null,
         provenance: null,
       })
     } finally {
@@ -114,7 +106,7 @@ describe("gitomic public transaction contract", () => {
     }
   })
 
-  test("captures queued-call provenance when the public transaction is submitted", async () => {
+  test("does not serialize queued legacy actor provenance after public submission", async () => {
     const fixture = await createBareRepo()
     try {
       const store = await open({ repo: fixture.repo, ref: "main", writer: "executor" })
@@ -138,7 +130,6 @@ describe("gitomic public transaction contract", () => {
         generation: 7,
         run: "run-a",
       }
-      const captured = { ...provenance }
       const options = { provenance }
       const second = store.transact(async (map) => map.set("second", "1"), "capture at public entry", options)
       provenance.actor = "actor-b"
@@ -151,7 +142,7 @@ describe("gitomic public transaction contract", () => {
 
       const [, committed] = await Promise.all([first, second])
       await expect(createShellBackend().readCommit(fixture.repo, committed.oid)).resolves.toMatchObject({
-        provenance: captured,
+        provenance: null,
       })
     } finally {
       await fixture.cleanup()

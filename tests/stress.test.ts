@@ -50,14 +50,22 @@ async function expectLinearContention(writerCount: number, operationsPerWriter: 
     const messages = await git(fixture.repo, "log", "--format=%B%x00", "main")
     const receipts = messages
       .split("\0")
-      .map((message) => message.match(/Gitomic-Writer: ([^\n]+)\nGitomic-Instance: ([^\n]+)\nGitomic-Seq: (\d+)\s*$/))
-      .filter((match): match is RegExpMatchArray => match !== null)
+      .map((message) => {
+        const normalized = message.trim()
+        const subject = normalized.split("\n", 1)[0] ?? ""
+        const identity = /^Gitomic-Instance: ([^\n]+)\nGitomic-Seq: (\d+)$/mu.exec(normalized)
+        const separator = subject.indexOf(":")
+        return identity === null || separator < 1
+          ? null
+          : { writer: subject.slice(0, separator), instance: identity[1] as string, seq: identity[2] as string }
+      })
+      .filter((receipt): receipt is NonNullable<typeof receipt> => receipt !== null)
     expect(receipts).toHaveLength(expected)
     // Every transaction carries a receipt no other process could mint.
-    expect(new Set(receipts.map((match) => `${match[2]}:${match[3]}`))).toHaveLength(expected)
-    expect(new Set(receipts.map((match) => match[2]))).toHaveLength(writerCount)
+    expect(new Set(receipts.map((receipt) => `${receipt.instance}:${receipt.seq}`))).toHaveLength(expected)
+    expect(new Set(receipts.map((receipt) => receipt.instance))).toHaveLength(writerCount)
     for (const writer of writerNames) {
-      expect(receipts.filter((match) => match[1] === writer)).toHaveLength(operationsPerWriter)
+      expect(receipts.filter((receipt) => receipt.writer === writer)).toHaveLength(operationsPerWriter)
     }
   } finally {
     controller.abort()

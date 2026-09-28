@@ -189,12 +189,12 @@ describe("author and committer are data, identical on every backend", () => {
     }
   })
 
-  test("with neither named, the commit is byte-identical to today's (pinned oid)", async () => {
+  test("with neither named, the commit has the pinned current serializer oid", async () => {
     const all = await legs()
     try {
       for (const { backend, repo } of all) {
         const oid = await backend.writeCommit(repo, input({ message: "pin", writer: "pin-test" }))
-        expect(oid).toBe("1bf181663ff340b7e91dc2c15e31589d5fa29b81")
+        expect(oid).toBe("35c816831de4ad502cde6bef2a253c344c80ac73")
         const meta = await backend.readCommit(repo, oid)
         expect(meta.author).toEqual(GITOMIC)
         expect(meta.committer).toEqual(GITOMIC)

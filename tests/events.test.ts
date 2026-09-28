@@ -190,7 +190,7 @@ describe("acceptance: a transacted event reads back with its trailers and its ke
         title: "task/demo@abc opened",
         content: "a body paragraph\n\nand a second one",
         props: input.props,
-        writer: "queue",
+        writer: null,
       })
       expect(event?.instance, target.name).toMatch(/^[0-9a-f-]{36}$/)
       expect(event?.seq, target.name).toBe(0)
@@ -256,6 +256,126 @@ describe("reserved trailer keys are refused loudly at append (ruling A)", () => 
       expect(await events.head(), target.name).toBeNull()
     })
   })
+
+  test("per-call trailers reject event and Gitomic-owned keys and malformed values", async () => {
+    await withTargets(async (target) => {
+      const events = await openEvents({ repo: target.repo, ref: CHAIN, backend: target.backend })
+      for (const trailer of [
+        ["Event", "forged"],
+        ["Gitomic-Instance", "forged"],
+        ["Gitomic-Seq", "1"],
+        ["Actor Session", "bad-key"],
+        ["Actor-Session", " surrounding-space "],
+      ] as const) {
+        await expect(
+          events.append([{ type: "x" }], { expect: null, trailers: [trailer] }),
+          `${target.name} ${trailer[0]}`,
+        ).rejects.toThrow()
+      }
+      expect(await events.head(), target.name).toBeNull()
+    })
+  })
+})
+
+describe("per-call event trailers", () => {
+  test("append, transact and stage snapshot caller trailers without adding them to event props", async () => {
+    await withTargets(async (target) => {
+      const events = await openEvents({ repo: target.repo, ref: CHAIN, writer: "queue", backend: target.backend })
+      const verify = async (oid: Oid, expected: readonly (readonly [string, string])[]): Promise<void> => {
+        const meta = await target.backend.readCommit(target.repo, oid)
+        expect(meta.trailers, target.name).toEqual(expected)
+      }
+
+      const appendTrailers: [string, string][] = [
+        ["Actor-Session", "append-session"],
+        ["Actor-Generation", "1"],
+      ]
+      const appendedPromise = events.append([{ type: "appended", props: [["Reason", "kept"]] }], {
+        expect: null,
+        trailers: appendTrailers,
+      })
+      appendTrailers[0]![1] = "mutated-after-call"
+      const appended = await appendedPromise
+      const firstId = appended.events[0]?.id as Oid
+      await verify(firstId, [
+        ["Reason", "kept"],
+        ["Event", "appended"],
+        ["Actor-Session", "append-session"],
+        ["Actor-Generation", "1"],
+      ])
+      expect((await events.events())[0]).toMatchObject({
+        type: "appended",
+        title: "appended",
+        props: [["Reason", "kept"]],
+        writer: null,
+      })
+
+      const transactTrailers: [string, string][] = [["Actor-Session", "transact-session"]]
+      const transactedPromise = events.transact(() => [{ type: "transacted" }], "append from a decision", {
+        trailers: transactTrailers,
+      })
+      transactTrailers[0]![1] = "mutated-after-call"
+      const transacted = await transactedPromise
+      await verify(transacted.events[0]?.id as Oid, [
+        ["Event", "transacted"],
+        ["Actor-Session", "transact-session"],
+      ])
+
+      const stageTrailers: [string, string][] = [["Actor-Session", "stage-session"]]
+      const stagedPromise = events.stage([{ type: "staged" }], { expect: transacted.head, trailers: stageTrailers })
+      stageTrailers[0]![1] = "mutated-after-call"
+      const staged = await stagedPromise
+      await verify(staged.events[0]?.id as Oid, [
+        ["Event", "staged"],
+        ["Actor-Session", "stage-session"],
+      ])
+      await staged.publish()
+      expect((await events.events()).map((event) => event.type)).toEqual(["appended", "transacted", "staged"])
+    })
+  })
+
+  test("per-event author/trailers override call defaults; absent values inherit and stay out of props", async () => {
+    await withTargets(async (target) => {
+      const events = await openEvents({ repo: target.repo, ref: CHAIN, backend: target.backend })
+      const defaultAuthor = { name: "Batch default", email: "batch@example.test" }
+      const ownAuthor = { name: "One event", email: "one@example.test" }
+      const callTrailers: [string, string][] = [["Actor-Session", "call-session"]]
+      const ownTrailers: [string, string][] = [["Actor-Session", "own-session"]]
+      const inputs: EventInput[] = [
+        { type: "one", props: [["Reason", "first"]], author: ownAuthor, trailers: ownTrailers },
+        { type: "two", props: [["Reason", "second"]] },
+      ]
+      const pending = events.append(inputs, { expect: null, author: defaultAuthor, trailers: callTrailers })
+      ownAuthor.name = "mutated"
+      ownTrailers[0]![1] = "mutated"
+      callTrailers[0]![1] = "mutated"
+      const result = await pending
+      const metas = await Promise.all(result.events.map(({ id }) => target.backend.readCommit(target.repo, id)))
+      expect(
+        metas.map(({ author }) => author.name),
+        target.name,
+      ).toEqual(["One event", "Batch default"])
+      expect(
+        metas.map(({ trailers }) => trailers),
+        target.name,
+      ).toEqual([
+        [
+          ["Reason", "first"],
+          ["Event", "one"],
+          ["Actor-Session", "own-session"],
+        ],
+        [
+          ["Reason", "second"],
+          ["Event", "two"],
+          ["Actor-Session", "call-session"],
+        ],
+      ])
+      expect(
+        (await events.events()).map(({ props }) => props),
+        target.name,
+      ).toEqual([[["Reason", "first"]], [["Reason", "second"]]])
+    })
+  })
 })
 
 describe("the equivalence suite: parents and trailers serialize byte-identically on shell, iso and mem", () => {
@@ -318,21 +438,29 @@ describe("acceptance: a race re-runs decide on the winner's events and writes th
     if (base.publish === undefined) throw new Error("memory backend cannot publish")
     const repo = "events-single-ref-retry"
     let attempts = 0
+    const inputAuthor = { name: "Retry author", email: "retry@example.test" }
+    const inputTrailers: [string, string][] = [["Actor-Session", "retry-session"]]
+    const input: EventInput = { type: "opened", author: inputAuthor, trailers: inputTrailers }
     const backend: GitomicBackend = {
       ...base,
       publish: async (...args) => {
         attempts++
         if (attempts === 1) {
+          inputAuthor.name = "mutated after first shape"
+          inputTrailers[0]![1] = "mutated after first shape"
           throw new Conflict(`lease lost, nothing published: ${CHAIN} is at locked, not absent`, { refs: [CHAIN] })
         }
         return base.publish!(...args)
       },
     }
     const chain = await openEvents({ repo, ref: CHAIN, backend })
-    const result = await chain.transact(() => [{ type: "opened" }], "single chain retry")
+    const result = await chain.transact(() => [input], "single chain retry")
     expect(attempts).toBe(2)
     expect(result.retries).toBe(1)
     expect((await chain.events()).map((event) => event.type)).toEqual(["opened"])
+    const meta = await base.readCommit(repo, result.events[0]!.id)
+    expect(meta.author.name).toBe("Retry author")
+    expect(meta.trailers).toContainEqual(["Actor-Session", "retry-session"])
   })
 
   /**
@@ -597,6 +725,37 @@ describe("readHistory returns exactly what readCommit returns (ruling C: Reader.
       expect((history ?? []).filter((meta) => meta.parents.length === 0).length, target.name).toBeGreaterThanOrEqual(1)
     })
   })
+
+  test("a human event subject containing a colon stays intact without Gitomic receipt trailers", async () => {
+    const fixture = await createBareRepo()
+    try {
+      const tree = await git(fixture.repo, "show", "-s", "--format=%T", fixture.initial)
+      const event = await git(
+        fixture.repo,
+        "commit-tree",
+        tree,
+        "-p",
+        fixture.initial,
+        "-m",
+        "human: event title",
+        "-m",
+        "Event: opened",
+      )
+      await git(fixture.repo, "update-ref", CHAIN, event)
+      const [read] = await (
+        await openEvents({ repo: fixture.repo, ref: CHAIN, backend: createShellBackend() })
+      ).events()
+      expect(read).toMatchObject({
+        type: "opened",
+        title: "human: event title",
+        writer: null,
+        instance: null,
+        seq: null,
+      })
+    } finally {
+      await fixture.cleanup()
+    }
+  })
 })
 
 describe("reads that must reach a boundary refuse loudly when they do not (CTO verdict number 1)", () => {
@@ -840,8 +999,8 @@ describe("the genesis commit is one object on every backend (CTO verdict number 
       await byIso.append([{ type: "paid", content: "by iso" }], { expect: first.head })
       const readByShell = await byShell.events()
       expect(readByShell.map((event) => [event.type, event.writer])).toEqual([
-        ["opened", "shell"],
-        ["paid", "iso"],
+        ["opened", null],
+        ["paid", null],
       ])
       expect(readByShell[0]?.parent).toBeNull()
       expect(await byIso.events()).toEqual(readByShell)
