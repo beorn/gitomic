@@ -1577,9 +1577,8 @@ function lostFetchedRefRace(error: unknown, namespace: string): "moved" | "held"
 
 const HELD_LOCK_FLOOR_MS = 25
 const HELD_LOCK_SPREAD_MS = 75
-const HELD_LOCK_CAP_MS = HELD_LOCK_FLOOR_MS + HELD_LOCK_SPREAD_MS
 
-/** Full-jitter wait from @bearly/pacing (25676) over the held-lock window. Never above HELD_LOCK_CAP_MS. */
+/** Full-jitter wait from @bearly/pacing (25676) over the held-lock window: never above HELD_LOCK_FLOOR_MS + HELD_LOCK_SPREAD_MS. */
 export function waitOutHeldFetchLockMs(random: RandomUnit = Math.random): number {
   return HELD_LOCK_FLOOR_MS + Math.floor(fullJitter(HELD_LOCK_SPREAD_MS, HELD_LOCK_SPREAD_MS, 0, random))
 }
