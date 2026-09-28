@@ -33,7 +33,6 @@ describe("Store.transactSequence", () => {
               steps.push(
                 await attempt.step(async (map) => map.set(`step-${index}.md`, String(index)), `step ${index}`, {
                   author: { name: `Actor ${index}`, email: `actor${index}@example.test` },
-                  provenance: { actor: `actor-${index}`, session: "sequence-test", generation: index },
                 }),
               )
             }

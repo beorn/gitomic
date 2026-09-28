@@ -99,7 +99,7 @@ type CommitProvenance = { readonly actor: string; readonly session: string; read
 
 store.head(): Promise<string>            // newest commit id
 store.at(commit?: string): Snapshot      // read-only view there — lazy
-store.transact(fn: Update, message: string, options?: { readonly provenance?: CommitProvenance; readonly author?: Ident; readonly beside?: (attempt: BesideAttempt) => BesideRef[] | Promise<BesideRef[]> }): Promise<Committed>
+store.transact(fn: Update, message: string, options?: { readonly author?: Ident; readonly trailers?: readonly Trailer[]; readonly beside?: (attempt: BesideAttempt) => BesideRef[] | Promise<BesideRef[]> }): Promise<Committed>
 ```
 
 `transact` runs your update function and lands its writes as one commit, re-running it if another writer got there first. `message` is required — it becomes the commit message; say why, not what. The update function's second argument, `base`, is the commit oid it is running against on this attempt — a fresh tip on every re-run — so a precondition check can name the exact commit it refused on.
@@ -114,9 +114,9 @@ const result = await store.transactSequence(async ({ step }) => {
 })
 ```
 
-Each awaited `step` sees the prior successful step's tree and takes its own `author`, `provenance`, trailers and candidate gate. A thrown step leaves that step's overlay out; the caller may catch it and continue. A step that changes nothing makes no commit. The returned `value` is the callback's result, `oid` is the final published tip, and `retries` counts lost-lease replays. If another writer moves the ref, gitomic reruns the whole callback against fresh tips; derive each step from the attempt rather than retaining a stale map. `options.fetch` reads named refs with the attempt, and `options.beside` stages side refs once after the steps for the same atomic publish. The sequence requires a backend with multi-ref `publish` when it has side refs.
+Each awaited `step` sees the prior successful step's tree and takes its own `author`, caller trailers and candidate gate. A thrown step leaves that step's overlay out; the caller may catch it and continue. A step that changes nothing makes no commit. The returned `value` is the callback's result, `oid` is the final published tip, and `retries` counts lost-lease replays. If another writer moves the ref, gitomic reruns the whole callback against fresh tips; derive each step from the attempt rather than retaining a stale map. `options.fetch` reads named refs with the attempt, and `options.beside` stages side refs once after the steps for the same atomic publish. The sequence requires a backend with multi-ref `publish` when it has side refs.
 
-Callers with independently verified original attribution may provide it as per-call `provenance`. Gitomic copies and validates its scalar fields before queueing the call, then records them in commit trailers, fixed through every retry; it never infers them from a writer label, process, environment, or store. Omitting provenance leaves that call unattributed even on a reused store. An unchanged transaction returns the existing commit without recording new attribution. This metadata is an audit record, never authority to write.
+Write options no longer accept `provenance`; supplying that legacy field from JavaScript or JSON fails loudly with guidance to use Git's native author and caller-supplied `Actor-Session` / `Actor-Generation` trailers. `CommitMeta.provenance` remains a read-only historical field for older commits.
 
 ### Refs beside the commit
 
@@ -158,7 +158,7 @@ await store.transact(update, "close 42", { author: { name: "ada", email: "ada@ex
 ```
 
 - The **committer** is who applied the commit: one per store, set at `open` (or `openEvents`).
-- The **author** is who the commit acts for: one per call, on `transact`, `apply`, and the events `transact` and `append`. A call that names none has the committer as its author, which is git's own rule.
+- The **author** is who the commit acts for: one per call, on `transact`, `apply`, and the events `transact` and `append`. A call that names none has the committer as its author, which is git's own rule. Opaque caller trailers can record application metadata such as `Actor-Session` and `Actor-Generation`.
 - Name neither and every byte is as before: author and committer `gitomic <gitomic@localhost>`.
 - An event chain's genesis always keeps gitomic's identity, so every store computes the same empty root.
 - Transactions never read the environment, git config, or a process to find an ident. The caller works it out and passes it; gitomic records it and never verifies it.
@@ -179,7 +179,7 @@ await store.transact(update, "close 42", { author: { name: "ada", email: "ada@ex
 
 `writer` is a **label, not a lock**:
 
-- It names a role for people. It leads the commit subject and repeats as a `Gitomic-Writer` trailer.
+- It names the applying program. It leads the commit subject; it is not an identity and is not repeated in a trailer.
 - It may repeat freely — across processes, restarts, and machines. Reuse `"indexer"` in fifty processes if that is what the audit trail should say.
 - It defaults to `"gitomic"` when left out.
 - gitomic never reads your environment or any agent naming convention to guess it.
@@ -189,7 +189,6 @@ Identity is minted, not declared. Every `open` mints a UUID for that one live st
 ```
 worker-3: add note
 
-Gitomic-Writer: worker-3
 Gitomic-Instance: 3f9d1c02-5b7a-4e18-9c44-0a2b6d8e1f30
 Gitomic-Seq: 0
 ```
@@ -370,6 +369,10 @@ never interprets your values: it has no fold, no status and no kinds.
 `Event` and `Gitomic-*` are reserved: a prop spelled either way is refused,
 never silently overwritten.
 
+`props` are event metadata exposed on `Event`; commit `trailers` are separate
+Git metadata. For attribution, pass the native `author` and caller trailers
+(`Actor-Session`, `Actor-Generation`) on event inputs or the write options.
+
 | Call                                                                    | Does                                                                                                                                                                                                                                                                        |
 | ----------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `openEvents({ repo, ref, writer?, remote?, backend?, retryBudgetMs? })` | Open one chain.                                                                                                                                                                                                                                                             |
@@ -506,7 +509,7 @@ const test = await open({ repo: "my-test", ref: "main", writer: "test", backend:
 
 `iso` reads objects through `isomorphic-git`, then builds and durably writes canonical objects in-process, keeping ref CAS native. `mem` builds canonical git objects entirely in memory and needs neither a repository nor the `git` program.
 
-A custom backend implements `GitomicBackend`: `head`, `readTree`, `readBlobs`, `readCommit`, `writeCommit`, `compareAndSwap`, `findTransaction`, plus the optional remote pair. `compareAndSwap` answers `"swapped"`, `"moved"` (the ref was not at `expected`) or `"locked"` (its ref lock was held); `compareAndSwapRemote` answers `{ landed: false }` for a refused lease, or `{ landed: true, kept }` with what the local ref did. `readTree` lists every regular blob (path, mode, oid) of a commit or of one prefix, reading no value; `readBlobs` returns the named blobs by oid in one read. `readCommit` supplies the `CommitMeta` record described above. `writeCommit` receives your `writer` label and the store's `instance` and `seq`, and must record all three so `findTransaction` can recognize `(instance, seq)` later. It also receives optional per-call `provenance`, which must be preserved in native commit metadata. `fetchRemote` must return the remote OID without moving the selected application ref; downloads and private temporary fetch refs are permitted. Store refresh updates the cache separately. Custom implementations must honor this behavior even though the method signature is unchanged.
+A custom backend implements `GitomicBackend`: `head`, `readTree`, `readBlobs`, `readCommit`, `writeCommit`, `compareAndSwap`, `findTransaction`, plus the optional remote pair. `compareAndSwap` answers `"swapped"`, `"moved"` (the ref was not at `expected`) or `"locked"` (its ref lock was held); `compareAndSwapRemote` answers `{ landed: false }` for a refused lease, or `{ landed: true, kept }` with what the local ref did. `readTree` lists every regular blob (path, mode, oid) of a commit or of one prefix, reading no value; `readBlobs` returns the named blobs by oid in one read. `readCommit` supplies the `CommitMeta` record described above. `writeCommit` receives your `writer` label and the store's `instance` and `seq`, and must record all three so `findTransaction` can recognize `(instance, seq)` later. It receives caller trailers and native author/committer identities as commit metadata. Historical `CommitMeta.provenance` is read-only. `fetchRemote` must return the remote OID without moving the selected application ref; downloads and private temporary fetch refs are permitted. Store refresh updates the cache separately. Custom implementations must honor this behavior even though the method signature is unchanged.
 
 ## Command line
 

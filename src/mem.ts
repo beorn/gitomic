@@ -32,6 +32,7 @@ import type {
   TreeEntry,
   TreeListing,
 } from "./types.js"
+import { rejectLegacyProvenance } from "./options.js"
 import { assertGitPrefixMatched, normalizePrefix } from "./path.js"
 
 type MemCommit = {
@@ -133,6 +134,7 @@ export function createMemBackend(): GitomicBackend {
   }
 
   const writeCommit = async (name: string, input: CommitInput): Promise<Oid> => {
+    rejectLegacyProvenance(input)
     const repo = getRepo(name)
     const parents = commitParents(input)
     const parent = repo.commits.get(input.parent)
@@ -156,14 +158,7 @@ export function createMemBackend(): GitomicBackend {
       parents,
       timestamp,
       ...commitIdents(input),
-      message: formatCommitMessage(
-        input.writer,
-        input.instance,
-        input.message,
-        input.seq,
-        input.provenance,
-        input.trailers,
-      ),
+      message: formatCommitMessage(input.writer, input.instance, input.message, input.seq, input.trailers),
     })
     repo.commits.set(commit.oid, {
       oid: commit.oid,

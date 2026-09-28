@@ -22,6 +22,7 @@ import {
   normalizePollInterval,
   normalizeRef,
   normalizeRetryBudget,
+  rejectLegacyProvenance,
   untilAborted,
   waitForPoll,
 } from "./options.js"
@@ -205,6 +206,7 @@ function assertLine(value: string, field: string): string {
 
 /** Validate one input and shape its commit: body text, trailers and parents. */
 function shapeInput(input: EventInput) {
+  rejectLegacyProvenance(input)
   const type = assertLine(input.type, "event type")
   // A reader of `git log --oneline` sees `writer: <type>`, never a generic word.
   const title = assertLine(input.title ?? type, "event title")
@@ -535,6 +537,7 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
       return read.order === "newest-first" ? events : events.reverse()
     },
     async transact(decide, message, transactOptions = {}) {
+      rejectLegacyProvenance(transactOptions)
       const why = assertLine(typeof message === "string" ? message.trim() : message, "message")
       const callerTrailers = captureEventTrailers(transactOptions.trailers)
       const author = cloneIdent(transactOptions.author, "author") ?? committer
@@ -574,7 +577,9 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
         },
       })
     },
-    async append(inputs, { expect, also, author: named, trailers: namedTrailers }) {
+    async append(inputs, appendOptions) {
+      rejectLegacyProvenance(appendOptions)
+      const { expect, also, author: named, trailers: namedTrailers } = appendOptions
       if (inputs.length === 0) throw new TypeError("append needs at least one event")
       const callerTrailers = captureEventTrailers(namedTrailers)
       const author = cloneIdent(named, "author") ?? committer
@@ -618,7 +623,9 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
         },
       })
     },
-    async stage(inputs, { expect, author: named, trailers: namedTrailers }) {
+    async stage(inputs, stageOptions) {
+      rejectLegacyProvenance(stageOptions)
+      const { expect, author: named, trailers: namedTrailers } = stageOptions
       if (inputs.length === 0) throw new TypeError("stage needs at least one event")
       const callerTrailers = captureEventTrailers(namedTrailers)
       const author = cloneIdent(named, "author") ?? committer

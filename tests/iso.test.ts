@@ -56,12 +56,6 @@ describe("iso backend", () => {
         { repo: "three-backend-equivalence", backend: createMemBackend() },
       ]
       const identity = { writer: "same-writer", instance: "3f9d1c02-5b7a-4e18-9c44-0a2b6d8e1f30" }
-      const provenance = {
-        actor: "original-actor",
-        session: "0198b5e8-cdd2-7a63-8a81-2fdc8144e6a4",
-        generation: 7,
-        run: "run-0198b5e8",
-      }
       expect(
         new Set(
           await Promise.all(targets.map(async ({ repo, backend }) => await backend.head(repo, "refs/heads/main"))),
@@ -70,7 +64,6 @@ describe("iso backend", () => {
 
       const first = await publishEverywhere(targets, {
         ...identity,
-        provenance,
         seq: 0,
         time: 946_684_800, // the genesis time: parent + 1 wins, so the pinned numbers hold
         message: "first",
@@ -84,7 +77,6 @@ describe("iso backend", () => {
 
       const second = await publishEverywhere(targets, {
         ...identity,
-        provenance,
         seq: 1,
         time: 946_684_800, // the genesis time: parent + 1 wins, so the pinned numbers hold
         message: "second",

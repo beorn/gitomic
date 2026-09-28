@@ -21,6 +21,7 @@ import {
 } from "./git-object.js"
 import type { GitObject, GitTreeObjectEntry } from "./git-object.js"
 import { createDurableObjectWriter } from "./iso-durable.js"
+import { rejectLegacyProvenance } from "./options.js"
 import { assertGitPrefixMatched, assertRegularBlob, normalizePrefix } from "./path.js"
 import { createShellRuntime } from "./shell.js"
 import type { BlobValue, CommitInput, GitomicBackend, Oid, TreeEntry, TreeListing } from "./types.js"
@@ -180,6 +181,7 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
   }
 
   const writeCommit = async (repo: string, input: CommitInput): Promise<Oid> => {
+    rejectLegacyProvenance(input)
     const gitdir = await resolveGitDir(repo)
     const parents = commitParents(input)
     const parentResult = await readCommit({ fs, gitdir, oid: input.parent, cache })
@@ -209,14 +211,7 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
       parents,
       timestamp,
       ...commitIdents(input),
-      message: formatCommitMessage(
-        input.writer,
-        input.instance,
-        input.message,
-        input.seq,
-        input.provenance,
-        input.trailers,
-      ),
+      message: formatCommitMessage(input.writer, input.instance, input.message, input.seq, input.trailers),
     })
     objects.set(commit.oid, commit)
     // Durably written but unreferenced until the publish adopts it. No pin ref

@@ -19,6 +19,7 @@ import {
   normalizePollInterval,
   normalizeRef,
   normalizeRetryBudget,
+  rejectLegacyProvenance,
   untilAborted,
   waitForPoll,
 } from "./options.js"
@@ -31,7 +32,7 @@ import {
   RetriesExhausted,
   TreePathCollision,
 } from "./errors.js"
-import { cloneCommitProvenance, cloneIdent, GITOMIC_IDENT, validateOid } from "./git-object.js"
+import { cloneIdent, GITOMIC_IDENT, validateOid } from "./git-object.js"
 import { assertTreeShape, isGitPrefixNotFoundError, normalizePath, normalizePrefix } from "./path.js"
 import { createLazyBase, readLazyBase, type LazyBase } from "./lazy-base.js"
 import { createShellBackend } from "./shell.js"
@@ -41,7 +42,6 @@ import type {
   Change,
   Clock,
   CommitMeta,
-  CommitProvenance,
   RefUpdate,
   Committed,
   GitMap,
@@ -175,7 +175,6 @@ export async function open(options: OpenOptions): Promise<Store> {
     transact: (update, message, options) => {
       // Capture the per-call scalar before enqueueing: a later transaction can
       // otherwise observe an options object the caller mutated after submit.
-      let provenance: CommitProvenance | undefined
       let author: Ident | undefined
       const candidate = options?.candidate
       const beside = options?.beside
@@ -183,7 +182,7 @@ export async function open(options: OpenOptions): Promise<Store> {
       const trailers =
         options?.trailers === undefined ? undefined : options.trailers.map(([key, value]) => [key, value] as const)
       try {
-        provenance = cloneCommitProvenance(options?.provenance)
+        rejectLegacyProvenance(options)
         author = cloneIdent(options?.author, "author")
         if (candidate !== undefined && typeof candidate !== "function") {
           throw new TypeError("candidate must be a function")
@@ -205,7 +204,6 @@ export async function open(options: OpenOptions): Promise<Store> {
           context,
           async (attempt) =>
             attempt.step(update, message, {
-              ...(provenance === undefined ? {} : { provenance }),
               ...(author === undefined ? {} : { author }),
               ...(candidate === undefined ? {} : { candidate }),
               ...(trailers === undefined ? {} : { trailers }),
@@ -645,7 +643,7 @@ async function transactSequenceBody<R>(
             if (candidate !== undefined && typeof candidate !== "function") {
               throw new TypeError("candidate must be a function")
             }
-            const provenance = cloneCommitProvenance(stepOptions?.provenance)
+            rejectLegacyProvenance(stepOptions)
             const author = cloneIdent(stepOptions?.author, "author")
             const trailers = stepOptions?.trailers
             const index = position++
@@ -669,7 +667,6 @@ async function transactSequenceBody<R>(
                 writer: context.writer,
                 instance: context.instance,
                 seq,
-                ...(provenance === undefined ? {} : { provenance }),
                 ...(trailers === undefined ? {} : { trailers }),
                 author: author ?? context.committer,
                 committer: context.committer,

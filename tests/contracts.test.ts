@@ -69,31 +69,23 @@ describe("public contract guards", () => {
     )
   })
 
-  test("rejects malformed per-call provenance before the update can run", async () => {
+  test("refuses legacy provenance before the update can run", async () => {
     const backend = createMemBackend()
-    const store = await open({ repo: "malformed-provenance", ref: "main", writer: "worker", backend })
-    for (const provenance of [
-      { actor: "", session: "session", generation: 0 },
-      { actor: "actor", session: "session\nforged", generation: 0 },
-      { actor: " actor", session: "session", generation: 0 },
-      { actor: "actor", session: "session ", generation: 0 },
-      { actor: "actor", session: "session", generation: 0, run: " run" },
-      { actor: "actor", session: "session", generation: -1 },
-      { actor: "actor", session: "session", generation: Number.MAX_SAFE_INTEGER + 1 },
-    ]) {
-      let called = false
-      await expect(
-        store.transact(
-          async (map) => {
-            called = true
-            map.set("value", "must not write")
-          },
-          "reject malformed provenance",
-          { provenance },
-        ),
-      ).rejects.toThrow("provenance")
-      expect(called).toBe(false)
-    }
+    const store = await open({ repo: "retired-provenance", ref: "main", writer: "worker", backend })
+    let called = false
+    await expect(
+      store.transact(
+        async (map) => {
+          called = true
+          map.set("value", "must not write")
+        },
+        "retired field",
+        {
+          provenance: null,
+        } as never,
+      ),
+    ).rejects.toThrow("native Git author")
+    expect(called).toBe(false)
   })
 
   test("gives up a never-landing transaction after its time budget, not a fixed attempt count", async () => {

@@ -90,8 +90,9 @@ export type CandidateVerdict = {
 export type Candidate = (context: CandidateContext) => Promise<CandidateVerdict | undefined>
 
 /**
- * Caller-supplied original attribution recorded beside Gitomic's executor and
- * receipt metadata. It is serialization data, never a capability or grant.
+ * Historical attribution parsed from older Gitomic-Actor trailers. Write
+ * options no longer accept this field; new attribution uses native Git
+ * author/committer identities and opaque caller trailers.
  */
 export type CommitProvenance = {
   readonly actor: string
@@ -149,8 +150,6 @@ export type CommitInput = {
   /** The one live store that produced this commit. Unique by construction. */
   instance: string
   seq: number
-  /** Optional original attribution for this transaction only. */
-  provenance?: CommitProvenance
   /** Git's author: who this commit acts for. Omitted, it is the committer. */
   author?: Ident
   /** Git's committer: who applied it. Omitted, it is gitomic <gitomic@localhost>. */
@@ -418,7 +417,6 @@ export type BesideRef = {
   readonly oid: Oid | null
 }
 export type TransactOptions = {
-  readonly provenance?: CommitProvenance
   /**
    * Refs that land in the SAME atomic publish as this transaction's commit
    * (25312 E2a). Called once per attempt, after the commit is written and

@@ -16,10 +16,12 @@ export const TRANSACTION_SEARCH_LIMIT = 1_024
  * could not read, or a clock that is not an integer of unix seconds, is a fault raised by name, never a default.
  */
 export function commitTimestamp(parentTime: number, time: number): number {
-  if (!Number.isFinite(parentTime))
+  if (!Number.isFinite(parentTime)) {
     throw new TypeError(`gitomic: the parent commit's time is not a number (${String(parentTime)})`)
-  if (!Number.isInteger(time))
+  }
+  if (!Number.isInteger(time)) {
     throw new TypeError(`gitomic: the clock returned ${String(time)}; an integer of unix seconds is required`)
+  }
   return Math.max(time, parentTime + 1)
 }
 
@@ -261,41 +263,6 @@ export function commitIdents(input: Pick<CommitInput, "author" | "committer">): 
   return { author: cloneIdent(input.author, "author") ?? committer, committer }
 }
 
-/** Clone and validate untrusted per-call metadata before it can cross a replay boundary. */
-export function cloneCommitProvenance(value: CommitProvenance | undefined): CommitProvenance | undefined {
-  if (value === undefined) return undefined
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    throw new TypeError("provenance must be an object with actor, session, generation, and optional run")
-  }
-  const source = value as Record<string, unknown>
-  for (const key of Object.keys(source)) {
-    if (!["actor", "session", "generation", "run"].includes(key)) {
-      throw new TypeError(`provenance contains an unknown field: ${JSON.stringify(key)}`)
-    }
-  }
-  const actor = assertProvenanceString(source.actor, "actor")
-  const session = assertProvenanceString(source.session, "session")
-  const generation = source.generation
-  if (typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 0) {
-    throw new TypeError("provenance.generation must be a non-negative safe integer")
-  }
-  const run = source.run === undefined ? undefined : assertProvenanceString(source.run, "run")
-  return run === undefined ? { actor, session, generation } : { actor, session, generation, run }
-}
-
-function assertProvenanceString(value: unknown, field: "actor" | "session" | "run"): string {
-  if (typeof value !== "string") throw new TypeError(`provenance.${field} must be a string`)
-  assertUtf8(value, `provenance.${field}`)
-  const hasControlCharacter = [...value].some((character) => {
-    const codePoint = character.codePointAt(0) ?? 0
-    return codePoint <= 0x1f || codePoint === 0x7f
-  })
-  if (value.length === 0 || value !== value.trim() || hasControlCharacter) {
-    throw new TypeError(`provenance.${field} must be a non-empty, single-line identifier`)
-  }
-  return value
-}
-
 /**
  * Build the commit message for one transaction.
  *
@@ -310,7 +277,6 @@ export function formatCommitMessage(
   instance: string,
   message: string,
   seq: number,
-  _provenance?: CommitProvenance,
   trailers: readonly Trailer[] = [],
 ): string {
   // Caller trailers go INSIDE the final block, ahead of gitomic's own: git and

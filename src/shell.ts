@@ -9,6 +9,7 @@ import { fullJitter, type RandomUnit } from "@bearly/pacing"
 
 import { Conflict, GitTimeout } from "./errors.js"
 import { journalLeaseRejection } from "./lease-journal.js"
+import { rejectLegacyProvenance } from "./options.js"
 import {
   assertRefUpdates,
   commitIdents,
@@ -721,16 +722,10 @@ function parseBatch(oids: readonly Oid[], output: Buffer): ReadonlyMap<Oid, Blob
 }
 
 async function writeCommit(repo: string, input: CommitInput, baseEnv?: NodeJS.ProcessEnv): Promise<Oid> {
+  rejectLegacyProvenance(input)
   const parents = commitParents(input)
   const idents = commitIdents(input)
-  const message = formatCommitMessage(
-    input.writer,
-    input.instance,
-    input.message,
-    input.seq,
-    input.provenance,
-    input.trailers,
-  )
+  const message = formatCommitMessage(input.writer, input.instance, input.message, input.seq, input.trailers)
   // An unchanged tree needs no index: reuse the first parent's tree. This is
   // the event path (two processes: read the parent, write the commit), and it
   // lands the same object the index path would have built.

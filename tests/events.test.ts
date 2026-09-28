@@ -61,6 +61,16 @@ afterEach(() => {
 })
 
 describe("an absent chain", () => {
+  test("refuses legacy provenance at event write doors", async () => {
+    const events = await openEvents({ repo: "retired-event-provenance", ref: CHAIN, backend: createMemBackend() })
+    await expect(events.append([{ type: "opened" }], { expect: null, provenance: null } as never)).rejects.toThrow(
+      "ADR-0020",
+    )
+    await expect(events.append([{ type: "opened", provenance: null } as never], { expect: null })).rejects.toThrow(
+      "native Git author",
+    )
+  })
+
   test("reads as no head and no events on every backend", async () => {
     await withTargets(async (target) => {
       const events = await openEvents({ repo: target.repo, ref: CHAIN, backend: target.backend })

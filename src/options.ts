@@ -8,6 +8,15 @@ export const DEFAULT_RETRY_BUDGET_MS = 30_000
 export const DEFAULT_READER_POLL_INTERVAL_MS = 1_000
 export const DEFAULT_WRITER_LABEL = "gitomic"
 
+/** Refuse the retired write-side attribution field at each public write door. */
+export function rejectLegacyProvenance(value: unknown): void {
+  if (value !== null && typeof value === "object" && Object.hasOwn(value, "provenance")) {
+    throw new TypeError(
+      "provenance is retired by ADR-0020; use the native Git author and Actor-Session/Actor-Generation trailers",
+    )
+  }
+}
+
 export function normalizeRetryBudget(value: number | undefined): number {
   const budget = value ?? DEFAULT_RETRY_BUDGET_MS
   if (!Number.isFinite(budget) || budget <= 0) {
@@ -64,7 +73,7 @@ export function waitForPoll(milliseconds: number, signal: AbortSignal): Promise<
   })
 }
 
-/** The label leads the subject and is echoed as a trailer, so it stays single-line. */
+/** The writer label leads the commit subject, so it stays single-line. */
 export function assertWriter(writer: string): void {
   assertUtf8(writer, "writer")
   const hasControlCharacter = [...writer].some((character) => {

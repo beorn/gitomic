@@ -21,11 +21,21 @@ describe("gitomic public transaction contract", () => {
       })
 
       expect(await store.head()).toBe(fixture.initial)
-      const committed = await store.transact(async (map) => {
-        map.set("notes/milk.md", "buy milk")
-        map.set("index.md", ((await map.get("index.md")) ?? "") + "milk\n")
-        expect(await map.has("notes/milk.md")).toBe(true)
-      }, "add note")
+      const committed = await store.transact(
+        async (map) => {
+          map.set("notes/milk.md", "buy milk")
+          map.set("index.md", ((await map.get("index.md")) ?? "") + "milk\n")
+          expect(await map.has("notes/milk.md")).toBe(true)
+        },
+        "add note",
+        {
+          author: { name: "@dev/1", email: "dev1@localhost" },
+          trailers: [
+            ["Actor-Session", "session-a"],
+            ["Actor-Generation", "7"],
+          ],
+        },
+      )
 
       expect(committed).toEqual({ oid: await store.head(), retries: 0 })
       const snapshot = store.at(committed.oid)
@@ -40,8 +50,17 @@ describe("gitomic public transaction contract", () => {
       expect(body).toContain("worker-a: add note")
       expect(body).not.toContain("Gitomic-Writer:")
       expect(body).not.toContain("Gitomic-Actor")
+      expect(body).toContain("Actor-Session: session-a\nActor-Generation: 7\n")
       expect(body).toMatch(/Gitomic-Instance: [0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\n/)
       expect(body).toContain("Gitomic-Seq: 0")
+      await expect(createShellBackend().readCommit(fixture.repo, committed.oid)).resolves.toMatchObject({
+        author: { name: "@dev/1", email: "dev1@localhost" },
+        trailers: [
+          ["Actor-Session", "session-a"],
+          ["Actor-Generation", "7"],
+        ],
+        provenance: null,
+      })
     } finally {
       await fixture.cleanup()
     }
@@ -62,88 +81,25 @@ describe("gitomic public transaction contract", () => {
     }
   })
 
-  test("does not serialize legacy per-call actor provenance on a reused store", async () => {
+  test("refuses legacy provenance at the public write boundary", async () => {
     const fixture = await createBareRepo()
     try {
       const store = await open({ repo: fixture.repo, ref: "main", writer: "executor" })
-      const first = await store.transact(async (map) => map.set("first", "1"), "first original actor", {
-        provenance: {
-          actor: "actor-a",
-          session: "0198b5e8-cdd2-7a63-8a81-2fdc8144e6a4",
-          generation: 7,
-          run: "run-a",
-        },
-      })
-      const second = await store.transact(async (map) => map.set("second", "2"), "second original actor", {
-        provenance: {
-          actor: "actor-b",
-          session: "0198b5e8-cdd2-7a63-8a81-2fdc8144e6a5",
-          generation: 8,
-        },
-      })
-      const backend = createShellBackend()
-      const unchanged = await store.transact(async () => {}, "inspect without changing attribution", {
-        provenance: { actor: "inspector", session: "inspection-session", generation: 9 },
-      })
-      expect(unchanged).toEqual({ oid: second.oid, retries: 0 })
-      expect(await git(fixture.repo, "rev-list", "--count", "main")).toBe("3")
-
-      await expect(backend.readCommit(fixture.repo, first.oid)).resolves.toMatchObject({
-        writer: null,
-        provenance: null,
-      })
-      await expect(backend.readCommit(fixture.repo, second.oid)).resolves.toMatchObject({
-        writer: null,
-        provenance: null,
-      })
-      const unmanaged = await store.transact(async (map) => map.set("third", "3"), "unmanaged call on the same store")
-      await expect(backend.readCommit(fixture.repo, unmanaged.oid)).resolves.toMatchObject({
-        writer: null,
-        provenance: null,
-      })
-    } finally {
-      await fixture.cleanup()
-    }
-  })
-
-  test("does not serialize queued legacy actor provenance after public submission", async () => {
-    const fixture = await createBareRepo()
-    try {
-      const store = await open({ repo: fixture.repo, ref: "main", writer: "executor" })
-      let releaseFirst: (() => void) | undefined
-      let enteredFirst: (() => void) | undefined
-      const firstEntered = new Promise<void>((resolve) => {
-        enteredFirst = resolve
-      })
-      const first = store.transact(async (map) => {
-        await new Promise<void>((resolve) => {
-          releaseFirst = resolve
-          enteredFirst?.()
-        })
-        map.set("first", "1")
-      }, "hold the queue")
-      await firstEntered
-
-      const provenance = {
-        actor: "actor-a",
-        session: "0198b5e8-cdd2-7a63-8a81-2fdc8144e6a4",
-        generation: 7,
-        run: "run-a",
-      }
-      const options = { provenance }
-      const second = store.transact(async (map) => map.set("second", "1"), "capture at public entry", options)
-      provenance.actor = "actor-b"
-      provenance.session = "session-b"
-      provenance.generation = 8
-      provenance.run = "run-b"
-      options.provenance = { actor: "actor-c", session: "session-c", generation: 9, run: "run-c" }
-      if (releaseFirst === undefined) throw new Error("first transaction did not reach its queue barrier")
-      releaseFirst()
-
-      const [, committed] = await Promise.all([first, second])
-      await expect(createShellBackend().readCommit(fixture.repo, committed.oid)).resolves.toMatchObject({
-        provenance: null,
-      })
+      let called = false
+      await expect(
+        store.transact(
+          async (map) => {
+            called = true
+            map.set("must-not-write", "1")
+          },
+          "legacy attribution",
+          {
+            provenance: { actor: "actor", session: "session", generation: 1 },
+          } as never,
+        ),
+      ).rejects.toThrow("ADR-0020")
+      expect(called).toBe(false)
+      expect(await store.head()).toBe(fixture.initial)
     } finally {
       await fixture.cleanup()
     }
