@@ -139,6 +139,8 @@ export function commitMeta(
   const instance = trailers.get("Gitomic-Instance") ?? null
   const subject = message.split("\n", 1)[0] ?? ""
   const separator = subject.indexOf(": ")
+  // A current-format writer containing ': ' is read as its first segment;
+  // the retired trailer was the only unambiguous carrier.
   const writer =
     trailers.get("Gitomic-Writer") ??
     (isCurrentGeneratedCommit(message, instance, seq) && separator > 0 ? subject.slice(0, separator) : null)

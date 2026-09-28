@@ -128,6 +128,11 @@ Gitomic-Seq: 0
 `
   test.each([
     ["persisted trailer-less fence", fenceMessage, "yrd-run"],
+    [
+      "ambiguous current label keeps first-prefix semantics",
+      fenceMessage.replace("yrd-run:", "program: worker:"),
+      "program",
+    ],
     ["legacy trailer takes precedence", `${fenceMessage}Gitomic-Writer: legacy-run\n`, "legacy-run"],
     ["ordinary subject is not a program role", "yrd-run: ordinary\n", null],
     ["Instance alone is not generated", "yrd-run: ordinary\n\nGitomic-Instance: instance\n", null],
