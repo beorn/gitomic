@@ -511,12 +511,17 @@ function matchingLandingDirt(
   to: string,
   dirtyPaths: readonly string[],
 ): { readonly ok: true; readonly paths: string[] } | { readonly ok: false; readonly detail: string } {
-  const changed = git(repoRoot, readonlyArgs(["diff", "--name-only", "-z", "--no-renames", from, to, "--"]))
+  const top = git(repoRoot, readonlyArgs(["rev-parse", "--show-toplevel"]))
+  if (top.status !== 0 || top.stdout === "") {
+    return { ok: false, detail: `reading the checkout's top level: ${gitDetail(top)}` }
+  }
+  const topLevel = top.stdout
+  const changed = git(topLevel, readonlyArgs(["diff", "--name-only", "-z", "--no-renames", from, to, "--"]))
   if (changed.status !== 0) return { ok: false, detail: `reading the landing's changed paths: ${gitDetail(changed)}` }
   const landingPaths = new Set(nulPaths(changed.stdout))
   const candidates = dirtyPaths.filter((path) => landingPaths.has(path))
   if (candidates.length === 0) return { ok: true, paths: [] }
-  const listed = git(repoRoot, readonlyArgs(["ls-tree", "--full-tree", "-z", to, "--", ...candidates]))
+  const listed = git(topLevel, readonlyArgs(["ls-tree", "--full-tree", "-z", to, "--", ...candidates]))
   if (listed.status !== 0) return { ok: false, detail: `reading the landing's tree: ${gitDetail(listed)}` }
   const landed = new Map<string, { mode: string; oid: string }>()
   for (const entry of nulPaths(listed.stdout)) {
@@ -529,7 +534,7 @@ function matchingLandingDirt(
   for (const path of candidates) {
     let stat: ReturnType<typeof lstatSync> | undefined
     try {
-      stat = lstatSync(join(repoRoot, path))
+      stat = lstatSync(join(topLevel, path))
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
         return { ok: false, detail: `reading ${path}: ${error instanceof Error ? error.message : String(error)}` }
@@ -538,9 +543,13 @@ function matchingLandingDirt(
     const target = landed.get(path)
     if (stat === undefined) {
       if (target === undefined) paths.push(path)
-    } else if (stat.isFile() && (target?.mode === "100644" || target?.mode === "100755")) {
+    } else if (
+      stat.isFile() &&
+      (target?.mode === "100644" || target?.mode === "100755") &&
+      (Number(stat.mode) & 0o111 ? "100755" : "100644") === target.mode
+    ) {
       try {
-        if (objectOid("blob", readFileSync(join(repoRoot, path)), algorithm) === target.oid) paths.push(path)
+        if (objectOid("blob", readFileSync(join(topLevel, path)), algorithm) === target.oid) paths.push(path)
       } catch (error) {
         return { ok: false, detail: `reading ${path}: ${error instanceof Error ? error.message : String(error)}` }
       }

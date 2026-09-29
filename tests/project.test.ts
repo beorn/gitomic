@@ -279,6 +279,27 @@ describe("gitomic project and checkout synchronization", () => {
     expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe(content)
   })
 
+  test("project from a repository subdirectory reconciles matching landed bytes", async () => {
+    const { checkout, landAtOrigin } = remoteFixture()
+    const subdirectory = join(checkout, "pm")
+    mkdirSync(subdirectory)
+    const path = join(subdirectory, "lane.md")
+    writeFileSync(path, "# old lane\n")
+    git(checkout, "add", "pm/lane.md")
+    git(checkout, "commit", "-qm", "add lane")
+    git(checkout, "push", "-q", "origin", "main")
+    const content = "# assigned lane\n"
+    writeFileSync(path, content)
+    const landed = landAtOrigin("pm/lane.md", content)
+
+    const result = await runCli(["project", subdirectory])
+
+    expect(result.code, result.stderr).toBe(0)
+    expect(git(checkout, "rev-parse", "HEAD")).toBe(landed)
+    expect(worktreeDirtyPaths(checkout)).toEqual([])
+    expect(readFileSync(path, "utf8")).toBe(content)
+  })
+
   /**
    * 25393: a commit hook advanced the ref, then its checkout update was refused (another git held index.lock), so
    * the index and tree stayed at the parent: `git status` shows the commit's whole inverse delta. Once the commit
