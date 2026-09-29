@@ -5,7 +5,7 @@
  * contention, receipts and the retry budget, so there is exactly one of each.
  */
 import { fullJitter, type RandomUnit } from "@bearly/pacing"
-import { Conflict, PublicationUnknown, RetriesExhausted } from "./errors.js"
+import { Conflict, PublicationRejected, PublicationUnknown, RetriesExhausted } from "./errors.js"
 import type { Oid, RefUpdate } from "./types.js"
 
 /** What one attempt decided against the tip it saw. */
@@ -25,7 +25,7 @@ export type Attempt<R> =
       landed(oid: Oid, retries: number): R
     }
 
-export type CasLoop<H, R> = {
+export type CasLoop<H extends Oid | null, R> = {
   /** Names the target in errors, e.g. `<repo> <ref>`. */
   readonly label: string
   readonly retryBudgetMs: number
@@ -39,7 +39,7 @@ export type CasLoop<H, R> = {
   attempt(tip: H, retries: number): Promise<Attempt<R>>
 }
 
-export async function runCasLoop<H, R>(loop: CasLoop<H, R>): Promise<R> {
+export async function runCasLoop<H extends Oid | null, R>(loop: CasLoop<H, R>): Promise<R> {
   let retries = 0
   // Contention policy lives HERE, not in callers: the budget is TIME, not a
   // fixed attempt count. Under CAS one publish wins per round, so the unluckiest
@@ -55,14 +55,14 @@ export async function runCasLoop<H, R>(loop: CasLoop<H, R>): Promise<R> {
     const attempt = await loop.attempt(tip, retries)
     if (attempt.kind === "noop") return attempt.result
 
-    let publicationFailure: PublicationUnknown | undefined
+    let publicationFailure: { cause: unknown } | undefined
     try {
       if (await loop.publish(attempt.next, tip, attempt.beside ?? [])) return attempt.landed(attempt.next, retries)
     } catch (cause) {
       // A Conflict is the tool naming a definite rejection: nothing landed, so
       // there is no unknown outcome to resolve and nothing to retry.
-      if (cause instanceof Conflict) throw cause
-      publicationFailure = new PublicationUnknown(loop.label, cause, "no-receipt")
+      if (cause instanceof Conflict || cause instanceof PublicationRejected) throw cause
+      publicationFailure = { cause }
     }
 
     if (publicationFailure === undefined) retries += 1
@@ -72,18 +72,27 @@ export async function runCasLoop<H, R>(loop: CasLoop<H, R>): Promise<R> {
     // stops at `base`, so it reads only the commits that arrived during this
     // attempt.
     let winner: H
+    let observation: { observed: H } | undefined
+    const identity = { candidate: attempt.next, base: attempt.base, expected: tip }
     try {
       winner = await loop.refresh(publicationFailure === undefined ? "after-rejection" : "after-unknown")
+      observation = { observed: winner }
       const landed = await loop.findTransaction(winner, attempt.base, attempt.instance, attempt.seq)
       if (landed !== undefined) return attempt.landed(landed, retries)
     } catch (verificationError) {
       if (publicationFailure !== undefined) {
-        throw new PublicationUnknown(loop.label, publicationFailure.cause, "unverified", verificationError)
+        throw new PublicationUnknown(loop.label, publicationFailure.cause, "unverified", verificationError, {
+          ...identity,
+          ...observation,
+        })
       }
       throw verificationError
     }
     if (publicationFailure !== undefined) {
-      throw publicationFailure
+      throw new PublicationUnknown(loop.label, publicationFailure.cause, "no-receipt", undefined, {
+        ...identity,
+        ...observation,
+      })
     }
     // The ref advanced under us: a writer landed this round, so the race is
     // making progress — extend the budget rather than abandon a healthy burst.

@@ -7,7 +7,7 @@ import { join, resolve } from "node:path"
 
 import { fullJitter, type RandomUnit } from "@bearly/pacing"
 
-import { Conflict, GitTimeout } from "./errors.js"
+import { Conflict, GitTimeout, PublicationRejected } from "./errors.js"
 import { journalLeaseRejection } from "./lease-journal.js"
 import { rejectLegacyProvenance } from "./options.js"
 import {
@@ -1196,6 +1196,12 @@ async function compareAndSwapRemote(
       await journalLeaseRejection(repo, "compareAndSwapRemote", remote, [{ ref, expect: expected }])
       return { landed: false }
     }
+    const rejected = rejectedPush(
+      parsePushReport(result.stdout.toString("utf8")),
+      [{ ref, expect: expected, oid: next }],
+      detail,
+    )
+    if (rejected !== undefined) throw rejected
     throw new Error(`git push failed (${result.code})${detail ? `: ${detail}` : ""}`)
   }
   // Keep the local cache in step. A ref created by this push may not exist
@@ -1363,15 +1369,58 @@ function remoteLostLeases(stderr: string): ReadonlySet<string> {
 }
 
 /**
- * MULTI, remotely: ONE `push --atomic`, a lease per ref, exactly as git does it:
- * no pre-read, and no local ref touched (in remote mode reads go through
- * {@link fetchRefs}, so no local ref is a cache of the remote). Porcelain names
- * each ref's fate: "=" unchanged; "*", " " and "+" updated; "-" deleted;
- * "[rejected] (stale info)" a lost lease, a missing ref's delete included. git
- * does not report the tip it saw, so a lost lease costs ONE `ls-remote` of the
- * lost refs to name it; that read comes after git's decision, never instead of
- * it. Anything that is not a per-ref rejection (network, auth, a missing
- * remote) is an Error with git's text.
+ * A porcelain report also retains rows that cannot prove refusal, so existing
+ * lease and success readings keep their own semantics.
+ */
+type PushReport = {
+  complete: boolean
+  fates: Map<string, { flag: string; spec: string; summary: string }>
+}
+
+/** One reading of porcelain for single-ref and atomic pushes; incomplete rows cannot prove refusal. */
+function parsePushReport(stdout: string): PushReport {
+  const report: PushReport = { complete: true, fates: new Map() }
+  for (const line of stdout.split("\n")) {
+    if (line === "" || line === "Done" || line.startsWith("To ")) continue
+    const fields = line.split("\t")
+    const [flag, spec, summary] = fields
+    if (flag === undefined || flag.length !== 1 || spec === undefined) {
+      report.complete = false
+      continue
+    }
+    if (fields.length !== 3 || summary === undefined || !spec.includes(":")) report.complete = false
+    const ref = spec.slice(spec.indexOf(":") + 1)
+    if (report.fates.has(ref)) report.complete = false
+    report.fates.set(ref, { flag, spec, summary: summary ?? "" })
+  }
+  return report
+}
+
+/** Only an exact, complete remote refusal proves this invocation did not land; absence proves nothing. */
+function rejectedPush(
+  report: PushReport,
+  updates: readonly RefUpdate[],
+  detail: string,
+): PublicationRejected | undefined {
+  if (updates.length === 0 || !report.complete || report.fates.size !== updates.length) return undefined
+  const reasons: string[] = []
+  for (const { ref, oid } of updates) {
+    const fate = report.fates.get(ref)
+    if (
+      fate?.flag !== "!" ||
+      fate.spec !== `${oid ?? ""}:${ref}` ||
+      !/^\[remote rejected\](?: \([^\r\n]*\))?$/.test(fate.summary)
+    )
+      return undefined
+    reasons.push(fate.summary)
+  }
+  return new PublicationRejected(updates, reasons, detail)
+}
+
+/**
+ * MULTI, remotely: ONE atomic push with a lease per ref. Lease rejection keeps
+ * its existing observation/journal contract; a complete explicit refusal is
+ * PublicationRejected, while every ambiguous failure retains Git's detail.
  */
 async function publishRemote(
   repo: string,
@@ -1395,12 +1444,8 @@ async function publishRemote(
     throw remoteWriteOutcomeUnknown(updates, error)
   }
   const detail = `${result.stdout.toString("utf8")}\n${result.stderr.toString("utf8")}`.trim()
-  const fates = new Map<string, { flag: string; summary: string }>()
-  for (const line of result.stdout.toString("utf8").split("\n")) {
-    const [flag, spec, summary] = line.split("\t")
-    if (flag === undefined || spec === undefined || flag.length !== 1) continue
-    fates.set(spec.slice(spec.indexOf(":") + 1), { flag, summary: summary ?? "" })
-  }
+  const report = parsePushReport(result.stdout.toString("utf8"))
+  const { fates } = report
   if (result.code !== 0) {
     const lostInReceivePack = remoteLostLeases(result.stderr.toString("utf8"))
     const porcelainLost = new Map(
@@ -1428,7 +1473,11 @@ async function publishRemote(
         (isStaleLease(fate.summary) || porcelainLost.has(ref) || (atomicLeaseLoss && lostInReceivePack.has(ref)))
       )
     })
-    if (stale.length === 0) throw new Error(`git push failed (${result.code})${detail ? `: ${detail}` : ""}`)
+    if (stale.length === 0) {
+      const rejected = rejectedPush(report, updates, detail)
+      if (rejected !== undefined) throw rejected
+      throw new Error(`git push failed (${result.code})${detail ? `: ${detail}` : ""}`)
+    }
     const observed = await observeRemote(
       repo,
       remote,

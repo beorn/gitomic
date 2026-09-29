@@ -252,6 +252,10 @@ const changes = await reader.diff(olderRevision, revision)
 
 If publishing throws and no receipt is found, the outcome remains unknown: the update is not replayed, and the error preserves the publication cause with explicit guidance not to blindly retry. If receipt refresh or lookup also fails, an `AggregateError` preserves both causes. These errors are not `RetriesExhausted`. A separate `transact` call has a new receipt and can apply the write twice; establish the prior outcome before issuing it again.
 
+An exact, complete native Git report of `[remote rejected]` for every requested ref is different: the remote explicitly refused this push. `PublicationRejected` carries the rejected `updates`, their `reasons` in the same order, and native `detail`. The attempt did not land and nothing was retried. This report is the authoritative negative check; no follow-up fetch is required. After resolving the refusal, the caller can deliberately submit a fresh transaction. Lease rejection keeps its existing contention behavior. A partial, mixed, malformed or `[remote failure]` report, timeout, or EOF text alone stays uncertain and follows receipt verification.
+
+A negative receipt scan proves only absence in the history it inspected; it remains `PublicationUnknown` and never proves a retry safe. `PublicationUnknown.attempt`, when supplied by the transaction loop, names the `candidate`, its `base`, and the pre-push `expected` tip, plus `observed` after a successful refresh. An omitted `observed` means it was never read; `null` means the read found an absent event ref. The existing message, causes and `verified` values are unchanged. Both errors retain CLI exit 1; the diagnostic says whether the push was rejected or its publication remains unknown.
+
 **Opening from a URL.** `await openRemoteRepository(source, options?)` opens a bare repository that native Git builds by cloning `source`. A filesystem source is also cloned; calling this function explicitly requests remote isolation.
 
 ```ts

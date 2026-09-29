@@ -4,7 +4,8 @@
 
 import { describe, expect, test, vi } from "vitest"
 import fs from "node:fs"
-import { chmod, readFile, unlink, writeFile } from "node:fs/promises"
+import { chmod, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { pathToFileURL } from "node:url"
 
@@ -715,9 +716,11 @@ describe("remote arbitration", () => {
         const publicationError = failure === "undefined cause" ? undefined : new Error("publication connection lost")
         const verificationError = new Error("receipt verification unavailable")
         let published = false
+        let candidate = ""
         const backend: GitomicBackend = {
           ...shell,
-          async compareAndSwapRemote() {
+          async compareAndSwapRemote(_repo, _ref, next) {
+            candidate = next
             published = true
             throw publicationError
           },
@@ -740,7 +743,16 @@ describe("remote arbitration", () => {
         await expect(outcome).rejects.toBeInstanceOf(PublicationUnknown)
         await expect(outcome).rejects.toMatchObject({
           verified: failure === "refresh failure" || failure === "lookup failure" ? "unverified" : "no-receipt",
+          attempt: {
+            candidate,
+            base: fixture.initial,
+            expected: fixture.initial,
+            ...(failure === "refresh failure" ? {} : { observed: fixture.initial }),
+          },
         })
+        const error = await outcome.catch((error) => error as PublicationUnknown)
+        if (!(error instanceof PublicationUnknown)) throw new Error("expected an unknown publication")
+        expect(Object.hasOwn(error.attempt!, "observed")).toBe(failure !== "refresh failure")
         await expect(outcome).rejects.not.toBeInstanceOf(RetriesExhausted)
         if (failure === "refresh failure" || failure === "lookup failure") {
           await expect(outcome).rejects.toBeInstanceOf(AggregateError)
@@ -754,6 +766,120 @@ describe("remote arbitration", () => {
         await fixture.cleanup()
       }
     },
+  )
+
+  /**
+   * @failure A complete native remote refusal was reported unknown on hh's early-EOF/index-pack rejection.
+   * @level l1
+   * @consumer remote Store writers deciding whether a fresh transaction is safe
+   * @testonly none: existing native executable injection exercises the public Store boundary.
+   */
+  test.each([
+    { report: "rejected", competing: false },
+    { report: "rejected", competing: true },
+    { report: "failure", competing: false },
+    { report: "missing", competing: false },
+    { report: "duplicate", competing: false },
+    { report: "wrong-ref", competing: false },
+    { report: "wrong-source", competing: false },
+    { report: "extra", competing: false },
+    { report: "mixed", competing: false },
+    { report: "multi-rejected", competing: false },
+  ])(
+    "classifies captured push report $report with competing=$competing",
+    async ({ report, competing }) => {
+      const fixture = await createRemoteRepos()
+      const directory = await mkdtemp(join(tmpdir(), "gitomic-rejected-push-"))
+      const executable = join(directory, "git.cjs")
+      const trace = join(directory, "push.json")
+      const realGit = process.env.PATH?.split(process.platform === "win32" ? ";" : ":")
+        .map((path) => join(path, process.platform === "win32" ? "git.exe" : "git"))
+        .find((path) => fs.existsSync(path))
+      if (realGit === undefined) throw new Error("native Git executable unavailable for refusal regression")
+      try {
+        await writeFile(
+          executable,
+          `#!/usr/bin/env node
+const { spawnSync } = require("node:child_process");
+const { writeFileSync } = require("node:fs");
+const args = process.argv.slice(2);
+if (args.includes("push")) {
+  const specs = args.filter(arg => /^[0-9a-f]{40}:refs\\//.test(arg));
+  const spec = specs.find(arg => arg.endsWith(":refs/heads/main"));
+  writeFileSync(${JSON.stringify(trace)}, JSON.stringify({ spec }));
+  const report = ${JSON.stringify(report)};
+  const row = "!\\t" + spec + "\\t[remote rejected] (failed)\\n";
+  const output = report === "missing" ? "" : report === "duplicate" ? row + row : report === "wrong-ref" ? row.replace("refs/heads/main", "refs/heads/other") : report === "wrong-source" ? row.replace(spec.split(":")[0], "0".repeat(40)) : report === "extra" ? row + row.replace("refs/heads/main", "refs/heads/extra") : report === "mixed" ? row + "*\\t" + specs.find(arg => arg.endsWith(":refs/heads/companion")) + "\\t[new branch]\\n" : report === "multi-rejected" ? specs.map(spec => "!\\t" + spec + "\\t[remote rejected] (failed)\\n").join("") : report === "failure" ? row.replace("remote rejected", "remote failure") : row;
+  process.stdout.write("To origin\\n" + output);
+  process.stderr.write("remote: fatal: early EOF\\nerror: remote unpack failed: index-pack failed\\n");
+  process.exit(1);
+}
+const result = spawnSync(${JSON.stringify(realGit)}, args, { stdio: "inherit" });
+process.exit(result.status ?? 1);
+`,
+        )
+        await chmod(executable, 0o755)
+        if (competing) {
+          const other = await open({ repo: fixture.right, ref: "main", remote: "origin" })
+          await other.transact(async (map) => map.set("other", "winner"), "competing writer")
+        }
+        const before = await git(fixture.remote, "rev-parse", "main")
+        const shell = createShellBackend({ gitExecutable: executable })
+        const fetchRemote = vi.fn(shell.fetchRemote!)
+        const findTransaction = vi.fn(shell.findTransaction)
+        const store = await open({
+          repo: fixture.left,
+          ref: "main",
+          remote: "origin",
+          refresh: "on-rejection",
+          backend: { ...shell, fetchRemote, findTransaction },
+        })
+        const update = vi.fn(async (map: GitMap) => map.set("mine", "once"))
+        const failure = await store
+          .transact(
+            update,
+            "captured refusal",
+            report === "mixed" || report === "multi-rejected"
+              ? { beside: ({ next }) => [{ ref: "refs/heads/companion", expect: null, oid: next }] }
+              : {},
+          )
+          .then(
+            () => undefined,
+            (error) => error,
+          )
+        const { spec } = JSON.parse(await readFile(trace, "utf8")) as { spec: string }
+        const candidate = spec.split(":")[0]
+        expect(failure).toBeInstanceOf(Error)
+        if (!(failure instanceof Error)) throw new Error("expected a publication failure")
+        if (report === "rejected" || report === "multi-rejected") {
+          expect(failure).toMatchObject({
+            name: "PublicationRejected",
+            updates: [
+              { ref: "refs/heads/main", expect: fixture.initial, oid: candidate },
+              ...(report === "multi-rejected"
+                ? [{ ref: "refs/heads/companion", expect: "0".repeat(40), oid: candidate }]
+                : []),
+            ],
+            reasons: Array(report === "multi-rejected" ? 2 : 1).fill("[remote rejected] (failed)"),
+          })
+          expect(failure.message).toMatch(/did not land.*nothing was retried/)
+          expect(fetchRemote).not.toHaveBeenCalled()
+          expect(findTransaction).not.toHaveBeenCalled()
+        } else {
+          expect(failure).toBeInstanceOf(PublicationUnknown)
+          expect(failure).toMatchObject({
+            attempt: { candidate, base: fixture.initial, expected: fixture.initial, observed: before },
+          })
+          expect(fetchRemote).toHaveBeenCalledTimes(1)
+        }
+        expect(update).toHaveBeenCalledTimes(1)
+        expect(await git(fixture.remote, "rev-parse", "main")).toBe(before)
+      } finally {
+        await rm(directory, { recursive: true, force: true })
+        await fixture.cleanup()
+      }
+    },
+    30_000,
   )
 
   test("fetches through a transaction-private ref instead of shared FETCH_HEAD", async () => {

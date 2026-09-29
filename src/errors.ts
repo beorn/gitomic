@@ -1,3 +1,5 @@
+import type { Oid, RefUpdate } from "./types.js"
+
 /** The proposed Git tree contains a file and one of that file's descendants. */
 export class TreePathCollision extends Error {
   override readonly name = "TreePathCollision"
@@ -52,11 +54,34 @@ export class PublicationUnknown extends AggregateError {
     cause: unknown,
     readonly verified: "no-receipt" | "unverified",
     verificationError?: unknown,
+    readonly attempt?: {
+      readonly candidate: Oid
+      readonly base: Oid
+      readonly expected: Oid | null
+      readonly observed?: Oid | null
+    },
   ) {
     super(
       verified === "unverified" ? [cause, verificationError] : [cause],
       `Transaction publication to ${label} is unknown; do not blindly retry. ${cause instanceof Error ? cause.message : String(cause)}`,
       { cause },
+    )
+  }
+}
+
+/** The remote explicitly refused every requested update in this push. Nothing was retried. */
+export class PublicationRejected extends Error {
+  override readonly name = "PublicationRejected"
+
+  constructor(
+    readonly updates: readonly RefUpdate[],
+    /** The remote's per-ref reasons, in the same order as updates. */
+    readonly reasons: readonly string[],
+    readonly detail: string,
+  ) {
+    super(
+      `Publication to ${updates.map(({ ref, expect, oid }) => `${ref} (candidate ${oid ?? "delete"}, expected ${expect ?? "absent"})`).join(", ")} was rejected: the attempt did not land; nothing was retried. ` +
+        `A fresh transaction can be submitted after resolving the rejection. ${detail}`,
     )
   }
 }

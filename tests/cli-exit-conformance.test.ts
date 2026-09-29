@@ -17,6 +17,7 @@ import {
   CANDIDATE_CONFIG,
   createShellBackend,
   open,
+  PublicationRejected,
   readRepositoryDeclaration,
   trustDeclaration,
   type GitomicBackend,
@@ -144,4 +145,45 @@ describe.each(targets)("the CLI exit contract on $name", (target) => {
     expect(refused.stderr).toContain(`code=candidate-refused base=${before.ref} reasons=["a.md: refused by the gate"]`)
     expect(await tip()).toEqual(before)
   })
+})
+
+/**
+ * @failure Publication failures must not print a landing receipt or become a contention exit code.
+ * @level l2
+ * @consumer CLI apply callers handling a known rejection versus an unknown publication
+ * @testonly none: existing CLI backend injection, real repository fixture and public apply entry.
+ */
+test.each(["rejected", "unknown"])("apply exits 1 and reports a %s publication without a receipt", async (kind) => {
+  const shell = createShellBackend()
+  const target: Target = {
+    name: "publication failure",
+    address: (repo) => `${repo}#main`,
+    backend: {
+      ...shell,
+      async compareAndSwap(_repo, ref, next, expected) {
+        if (kind === "rejected")
+          throw new PublicationRejected(
+            [{ ref, oid: next, expect: expected }],
+            ["[remote rejected] (failed)"],
+            "remote unpack failed: index-pack failed",
+          )
+        throw new Error("publication connection lost")
+      },
+    },
+  }
+  const before = await tip()
+  const result = await cli(target, [
+    "apply",
+    target.address(fixture.repo),
+    "-m",
+    "refused",
+    "put",
+    "a.md",
+    await file("a.md", "a\n"),
+  ])
+  expect(result.code).toBe(1)
+  expect(result.stdout).toBe("")
+  expect(result.stderr).toMatch(kind === "rejected" ? /did not land.*nothing was retried/ : /publication.*unknown/i)
+  expect(result.stderr).not.toMatch(/\n\s+at /)
+  expect(await tip()).toEqual(before)
 })
