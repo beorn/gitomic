@@ -84,11 +84,13 @@ export {
   DEFAULT_CANDIDATE_TIMEOUT_MS,
   TRUST_CONFIG,
   readPublishDeclaration,
+  readStateCheckoutDeclaration,
   readRepositoryDeclaration,
   repositoryCandidate,
   trustDeclaration,
   type RepositoryCandidateOptions,
   type RepositoryDeclaration,
+  type StateCheckoutDeclaration,
   type TrustScope,
 } from "./candidate.js"
 export { identProblem, objectOid } from "./git-object.js"
@@ -117,6 +119,7 @@ export {
   checkedOutRef,
   isBareRepository,
   projectCheckout,
+  projectCheckoutWithSetAside,
   projectRemoteFirstFastForward,
   synchronizeCheckoutToCommit,
   worktreeDirtyPaths,
@@ -124,6 +127,8 @@ export {
   type CheckoutSyncRequest,
   type ProjectCheckoutOutcome,
   type ProjectCheckoutRequest,
+  type StateCheckoutRepairOutcome,
+  type StateCheckoutRepairRequest,
   type RemoteFirstProjectionOutcome,
   type RemoteFirstProjectionRequest,
 } from "./project.js"

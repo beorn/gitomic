@@ -33,9 +33,24 @@
 
 import { spawnSync } from "node:child_process"
 import { randomUUID } from "node:crypto"
-import { copyFileSync, lstatSync, readFileSync, rmSync, statSync } from "node:fs"
+import {
+  chmodSync,
+  copyFileSync,
+  linkSync,
+  lstatSync,
+  mkdtempSync,
+  readFileSync,
+  readlinkSync,
+  renameSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs"
 import { dirname, join } from "node:path"
 
+import { readStateCheckoutDeclaration } from "./candidate.js"
 import { objectOid } from "./git-object.js"
 import { DEFAULT_REMOTE_TIMEOUT_MS, runGit } from "./shell.js"
 
@@ -504,13 +519,15 @@ type AuthoredStage =
   | { readonly ok: true; readonly expectedDirtyPaths: string[] }
   | { readonly ok: false; readonly outcome: Extract<CheckoutSyncOutcome, { readonly ok: false }> }
 
-/** A dirty regular file (or removal) already at the landing's exact content is safe to stage for projection. */
+/** Prove exact matches and name every dirty landing path that Git's two-way merge must not overwrite. */
 function matchingLandingDirt(
   repoRoot: string,
   from: string,
   to: string,
   dirtyPaths: readonly string[],
-): { readonly ok: true; readonly paths: string[] } | { readonly ok: false; readonly detail: string } {
+):
+  | { readonly ok: true; readonly paths: string[]; readonly blockers: string[] }
+  | { readonly ok: false; readonly detail: string } {
   const top = git(repoRoot, readonlyArgs(["rev-parse", "--show-toplevel"]))
   if (top.status !== 0 || top.stdout === "") {
     return { ok: false, detail: `reading the checkout's top level: ${gitDetail(top)}` }
@@ -520,7 +537,7 @@ function matchingLandingDirt(
   if (changed.status !== 0) return { ok: false, detail: `reading the landing's changed paths: ${gitDetail(changed)}` }
   const landingPaths = new Set(nulPaths(changed.stdout))
   const candidates = dirtyPaths.filter((path) => landingPaths.has(path))
-  if (candidates.length === 0) return { ok: true, paths: [] }
+  if (candidates.length === 0) return { ok: true, paths: [], blockers: [] }
   const listed = git(topLevel, readonlyArgs(["ls-tree", "--full-tree", "-z", to, "--", ...candidates]))
   if (listed.status !== 0) return { ok: false, detail: `reading the landing's tree: ${gitDetail(listed)}` }
   const landed = new Map<string, { mode: string; oid: string }>()
@@ -555,7 +572,8 @@ function matchingLandingDirt(
       }
     }
   }
-  return { ok: true, paths }
+  const matching = new Set(paths)
+  return { ok: true, paths, blockers: candidates.filter((path) => !matching.has(path)) }
 }
 
 /**
@@ -701,7 +719,9 @@ export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): Check
   if (!carried.ok) return carried.outcome
   const repaired = carried.repairedIndexFrom === undefined ? {} : { repairedIndexFrom: carried.repairedIndexFrom }
   const matching =
-    from === to ? { ok: true as const, paths: [] } : matchingLandingDirt(repoRoot, from, to, carried.expectedDirtyPaths)
+    from === to
+      ? { ok: true as const, paths: [], blockers: [] }
+      : matchingLandingDirt(repoRoot, from, to, carried.expectedDirtyPaths)
   if (!matching.ok) {
     return {
       ok: false,
@@ -712,6 +732,19 @@ export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): Check
   const stagedPaths = [...new Set([...(request.authoredPaths ?? []), ...matching.paths])]
   const authored = stageAuthoredPaths(repoRoot, ref, from, to, stagedPaths, carried.expectedDirtyPaths)
   if (!authored.ok) return authored.outcome
+  if (matching.blockers.length > 0) {
+    const unstage = unstageAuthoredPaths(repoRoot, from, stagedPaths)
+    return {
+      ok: false,
+      kind: "worktree-update-refused",
+      expectedDirtyPaths: [...carried.expectedDirtyPaths].sort(),
+      gitDetail: `preflight overlap [${matching.blockers.join(", ")}]`,
+      error:
+        `${ref} in ${repoRoot}: ${from} -> ${to} would overwrite locally edited or removed paths ` +
+        `[${matching.blockers.join(", ")}]. The checkout was not changed.` +
+        (unstage === undefined ? "" : ` Could not unstage matching paths: ${unstage}.`),
+    }
+  }
   const expected = [...authored.expectedDirtyPaths].sort()
   if (from === to) {
     const current = readDirt(repoRoot)
@@ -1062,6 +1095,20 @@ export async function projectRemoteFirstFastForward(
   const stagedPaths = [...new Set([...authoredPaths, ...matching.paths])]
   const authored = stageAuthoredPaths(repoRoot, ref, localTip, to, stagedPaths, expectedDirtyPaths)
   if (!authored.ok) return authored.outcome
+  if (matching.blockers.length > 0) {
+    const unstage = unstageAuthoredPaths(repoRoot, localTip, stagedPaths)
+    return {
+      ok: false,
+      kind: "worktree-update-refused",
+      expectedDirtyPaths: [...expectedDirtyPaths].sort(),
+      gitDetail: `preflight overlap [${matching.blockers.join(", ")}]`,
+      error:
+        `${ref} in ${repoRoot}: origin ${to} would overwrite locally edited or removed paths ` +
+        `[${matching.blockers.join(", ")}]. The branch still holds ${localTip}; the remote commit is safe and ` +
+        "the working tree was not changed." +
+        (unstage === undefined ? "" : ` Could not unstage matching paths: ${unstage}.`),
+    }
+  }
   const probed = git(repoRoot, ["read-tree", "-m", "-u", localTip, to])
   if (probed.status !== 0) {
     const unstaged = unstageAuthoredPaths(repoRoot, localTip, stagedPaths)
@@ -1189,4 +1236,500 @@ export async function projectCheckout(request: ProjectCheckoutRequest): Promise<
     to,
     ...(localTip !== undefined ? { localTip } : {}),
   }
+}
+
+/** A verified preservation ref lets a checkout shed local commits without publishing them. */
+export type StateCheckoutRepairOutcome =
+  | ProjectCheckoutOutcome
+  | {
+      readonly ok: true
+      readonly kind: "set-aside"
+      readonly preserveRef: string
+      readonly localTip: string
+      readonly to: string
+      readonly localOnly: readonly string[]
+    }
+  | {
+      readonly ok: false
+      readonly kind: "set-aside-refused"
+      readonly error: string
+      readonly localTip?: string
+      readonly to?: string
+      readonly preserveRef?: string
+    }
+
+export interface StateCheckoutRepairRequest extends ProjectCheckoutRequest {
+  /** Paths a synchronous writer already authored; its own repair may never touch them. */
+  readonly reservedPaths?: readonly string[] | undefined
+  /** Crash seams for the three durable boundaries; production callers leave these unset. */
+  readonly afterPreserveRef?: (() => void) | undefined
+  readonly afterWorktreeClear?: (() => void) | undefined
+  readonly afterLocalRefMove?: (() => void) | undefined
+}
+
+type CapturedPath =
+  | { readonly path: string; readonly kind: "absent" }
+  | {
+      readonly path: string
+      readonly kind: "regular" | "symlink"
+      readonly mode: "100644" | "100755" | "120000"
+      readonly bytes: Buffer
+    }
+
+function readCapturedPath(repoRoot: string, path: string): CapturedPath {
+  if (path.startsWith("/") || path.split("/").some((part) => part === ".." || part === "." || part === ".git")) {
+    throw new Error(`unsafe repository path ${JSON.stringify(path)}`)
+  }
+  const absolute = join(repoRoot, path)
+  let stat: ReturnType<typeof lstatSync>
+  try {
+    stat = lstatSync(absolute)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { path, kind: "absent" }
+    throw error
+  }
+  if (stat.isSymbolicLink()) {
+    return { path, kind: "symlink", mode: "120000", bytes: readlinkSync(absolute, { encoding: "buffer" }) }
+  }
+  if (stat.isFile()) {
+    return { path, kind: "regular", mode: stat.mode & 0o111 ? "100755" : "100644", bytes: readFileSync(absolute) }
+  }
+  throw new Error(`${path} has unsupported working-tree mode ${stat.mode.toString(8)}`)
+}
+
+function capturesEqual(a: CapturedPath, b: CapturedPath): boolean {
+  if (a.kind !== b.kind) return false
+  if (a.kind === "absent" || b.kind === "absent") return true
+  return a.mode === b.mode && a.bytes.equals(b.bytes)
+}
+
+function gitWithInput(repoRoot: string, args: readonly string[], input: Buffer, env?: NodeJS.ProcessEnv): GitOutcome {
+  const result = spawnSync("git", ["-C", repoRoot, ...args], {
+    input,
+    encoding: "utf8",
+    env: { ...process.env, LC_ALL: "C", ...env },
+  })
+  if (result.error !== undefined || result.status === null) {
+    return {
+      status: result.status ?? 1,
+      stdout: "",
+      stderr: `git ${args[0] ?? "command"} failed: ${String(result.error ?? result.signal)}`,
+    }
+  }
+  return { status: result.status, stdout: (result.stdout ?? "").trim(), stderr: (result.stderr ?? "").trim() }
+}
+
+function gitWithIndex(repoRoot: string, index: string, args: readonly string[]): GitOutcome {
+  return gitWithInput(repoRoot, args, Buffer.alloc(0), { GIT_INDEX_FILE: index })
+}
+
+function readGitBlob(repoRoot: string, oid: string): Buffer {
+  const result = spawnSync("git", ["-C", repoRoot, "cat-file", "blob", oid], {
+    encoding: null,
+    maxBuffer: 64 * 1024 * 1024,
+    env: { ...process.env, LC_ALL: "C" },
+  })
+  if (result.status !== 0 || result.error !== undefined) {
+    throw new Error(`cannot read baseline blob ${oid}: ${result.stderr?.toString("utf8") ?? String(result.error)}`)
+  }
+  return result.stdout
+}
+
+function baselinePath(repoRoot: string, tip: string, path: string): CapturedPath {
+  const listed = git(repoRoot, readonlyArgs(["ls-tree", "-z", tip, "--", path]))
+  if (listed.status !== 0) throw new Error(`cannot read ${path} at ${tip}: ${gitDetail(listed)}`)
+  if (listed.stdout === "") return { path, kind: "absent" }
+  const tab = listed.stdout.indexOf("\t")
+  const header = listed.stdout.slice(0, tab).split(" ")
+  const mode = header[0]
+  const oid = header[2]
+  if (tab < 0 || oid === undefined || listed.stdout.slice(tab + 1).replace(/\0$/u, "") !== path) {
+    throw new Error(`cannot parse exact baseline entry for ${path} at ${tip}`)
+  }
+  if (mode === "120000") return { path, kind: "symlink", mode, bytes: readGitBlob(repoRoot, oid) }
+  if (mode === "100644" || mode === "100755") return { path, kind: "regular", mode, bytes: readGitBlob(repoRoot, oid) }
+  throw new Error(`${path} at ${tip} has unsupported baseline mode ${mode}`)
+}
+
+function preserveDirtyTree(
+  repoRoot: string,
+  localTip: string,
+  captures: readonly CapturedPath[],
+): { preserveRef: string; commit: string } {
+  const gitDir = git(repoRoot, readonlyArgs(["rev-parse", "--absolute-git-dir"]))
+  if (gitDir.status !== 0 || gitDir.stdout === "") throw new Error(`cannot locate git directory: ${gitDetail(gitDir)}`)
+  const scratch = mkdtempSync(join(gitDir.stdout, "gitomic-preserve-index-"))
+  const index = join(scratch, "index")
+  try {
+    const base = gitWithIndex(repoRoot, index, ["read-tree", localTip])
+    if (base.status !== 0) throw new Error(`cannot seed separate index: ${gitDetail(base)}`)
+    for (const capture of captures) {
+      if (capture.kind === "absent") {
+        const removed = gitWithIndex(repoRoot, index, ["update-index", "--force-remove", "--", capture.path])
+        if (removed.status !== 0) throw new Error(`cannot capture removal ${capture.path}: ${gitDetail(removed)}`)
+        continue
+      }
+      const blob = gitWithInput(repoRoot, ["hash-object", "-w", "--no-filters", "--stdin"], capture.bytes)
+      if (blob.status !== 0) throw new Error(`cannot save ${capture.path} bytes: ${gitDetail(blob)}`)
+      const staged = gitWithIndex(repoRoot, index, [
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        `${capture.mode},${blob.stdout},${capture.path}`,
+      ])
+      if (staged.status !== 0) throw new Error(`cannot capture ${capture.path} mode: ${gitDetail(staged)}`)
+    }
+    const tree = gitWithIndex(repoRoot, index, ["write-tree"])
+    if (tree.status !== 0 || tree.stdout === "") throw new Error(`cannot write preservation tree: ${gitDetail(tree)}`)
+    const preserveRef = `refs/preserve/state-checkout/${localTip}-${tree.stdout}`
+    const existing = git(repoRoot, readonlyArgs(["rev-parse", "--verify", "--quiet", preserveRef]))
+    if (existing.status === 0) {
+      const existingTree = git(repoRoot, readonlyArgs(["rev-parse", `${existing.stdout}^{tree}`]))
+      const parent = git(repoRoot, readonlyArgs(["rev-parse", `${existing.stdout}^`]))
+      if (
+        existingTree.status !== 0 ||
+        existingTree.stdout !== tree.stdout ||
+        parent.status !== 0 ||
+        parent.stdout !== localTip
+      ) {
+        throw new Error(`${preserveRef} exists but does not hold the captured tree over ${localTip}`)
+      }
+      return { preserveRef, commit: existing.stdout }
+    }
+    const message = `unattributed direct edit, found at ${new Date().toISOString()}\n\nSet aside blocking checkout paths:\n${captures.map((capture) => `${capture.kind === "absent" ? "rm" : "put"} ${capture.path}`).join("\n")}\n`
+    const commit = gitWithInput(repoRoot, ["commit-tree", tree.stdout, "-p", localTip], Buffer.from(message), {
+      GIT_AUTHOR_NAME: "unattributed direct edit",
+      GIT_AUTHOR_EMAIL: "unattributed@invalid",
+      GIT_COMMITTER_NAME: "gitomic",
+      GIT_COMMITTER_EMAIL: "gitomic@invalid",
+    })
+    if (commit.status !== 0 || commit.stdout === "") {
+      throw new Error(`cannot commit preservation tree: ${gitDetail(commit)}`)
+    }
+    const format = git(repoRoot, readonlyArgs(["rev-parse", "--show-object-format"]))
+    if (format.status !== 0) throw new Error(`cannot read object format: ${gitDetail(format)}`)
+    const absent = "0".repeat(format.stdout === "sha256" ? 64 : 40)
+    const saved = git(repoRoot, ["update-ref", preserveRef, commit.stdout, absent])
+    if (saved.status !== 0) throw new Error(`cannot create absent-only ${preserveRef}: ${gitDetail(saved)}`)
+    return { preserveRef, commit: commit.stdout }
+  } finally {
+    rmSync(scratch, { recursive: true, force: true })
+  }
+}
+
+/** Rename away an exact captured entry, then restore the local tip through create-if-absent. */
+function clearCapturedPaths(repoRoot: string, localTip: string, captures: readonly CapturedPath[]): void {
+  const gitDir = git(repoRoot, readonlyArgs(["rev-parse", "--absolute-git-dir"]))
+  if (gitDir.status !== 0 || gitDir.stdout === "") throw new Error(`cannot locate git directory: ${gitDetail(gitDir)}`)
+  const backup = mkdtempSync(join(gitDir.stdout, "gitomic-preserve-working-"))
+  let complete = false
+  try {
+    for (const [index, capture] of captures.entries()) {
+      const observed = readCapturedPath(repoRoot, capture.path)
+      if (!capturesEqual(capture, observed)) {
+        throw new Error(`${capture.path} changed since preservation; backup ${backup} retained`)
+      }
+      const absolute = join(repoRoot, capture.path)
+      const baseline = baselinePath(repoRoot, localTip, capture.path)
+      if (capture.kind !== "absent") {
+        const moved = join(backup, String(index))
+        renameSync(absolute, moved)
+        const movedRead = readCapturedPath(backup, String(index))
+        if (!capturesEqual(capture, movedRead)) {
+          throw new Error(`${capture.path} changed during move; backup ${moved} retained`)
+        }
+      }
+      if (baseline.kind === "absent") continue
+      if (baseline.kind === "symlink") {
+        symlinkSync(baseline.bytes, absolute)
+      } else {
+        const temp = join(backup, `baseline-${index}`)
+        writeFileSync(temp, baseline.bytes)
+        chmodSync(temp, baseline.mode === "100755" ? 0o755 : 0o644)
+        linkSync(temp, absolute)
+        unlinkSync(temp)
+      }
+    }
+    complete = true
+  } catch (error) {
+    throw new Error(
+      `captured-path movement stopped; backup directory ${backup} is retained: ${error instanceof Error ? error.message : String(error)}`,
+    )
+  } finally {
+    if (complete) rmSync(backup, { recursive: true, force: true })
+  }
+}
+
+function selectOldBlockingPaths(
+  repoRoot: string,
+  changedPaths: ReadonlySet<string>,
+  quietSeconds: number,
+  reservedPaths: readonly string[],
+): { readonly ok: true; readonly captures: readonly CapturedPath[] } | { readonly ok: false; readonly error: string } {
+  try {
+    const blockers = worktreeDirtyPaths(repoRoot).filter((path) => changedPaths.has(path))
+    const reserved = new Set(reservedPaths)
+    const owned = blockers.filter((path) => reserved.has(path))
+    if (owned.length > 0) {
+      return { ok: false, error: `reserved writer paths [${owned.join(", ")}] may not be captured or cleared` }
+    }
+    const captures: CapturedPath[] = []
+    for (const path of blockers) {
+      const captured = readCapturedPath(repoRoot, path)
+      const statPath = captured.kind === "absent" ? dirname(join(repoRoot, path)) : join(repoRoot, path)
+      const ageMs = Math.max(0, Date.now() - lstatSync(statPath).mtimeMs)
+      if (path !== ".gitomic.conf" && ageMs < quietSeconds * 1000) {
+        return {
+          ok: false,
+          error: `${path} is only ${Math.round(ageMs)} ms old; its ${quietSeconds}-second quiet period has not elapsed`,
+        }
+      }
+      captures.push(captured)
+    }
+    return { ok: true, captures }
+  } catch (error) {
+    return {
+      ok: false,
+      error: `blocking paths could not be classified (${error instanceof Error ? error.message : String(error)})`,
+    }
+  }
+}
+
+/**
+ * Repair blocking local-only commits or old conflicting checkout dirt. All
+ * calls hold the checkout lock borrowed from their Km or timer caller.
+ */
+export async function projectCheckoutWithSetAside(
+  request: StateCheckoutRepairRequest,
+): Promise<StateCheckoutRepairOutcome> {
+  const projected = await projectCheckout(request)
+  if (projected.to === undefined || projected.localTip === undefined) return projected
+  const { repoRoot } = request
+  const ref = request.ref ?? "refs/heads/main"
+  const branchRef = ref.startsWith("refs/heads/") ? ref : `refs/heads/${ref}`
+  const remote = request.remote ?? "origin"
+  const { to, localTip } = projected
+  const refused = (reason: string, preserveRef?: string): StateCheckoutRepairOutcome => ({
+    ok: false,
+    kind: "set-aside-refused",
+    localTip,
+    to,
+    ...(preserveRef === undefined ? {} : { preserveRef }),
+    error: `${branchRef} in ${repoRoot}: ${reason}. Local ${localTip}; origin ${to}. Nothing was published.`,
+  })
+  let policy: Awaited<ReturnType<typeof readStateCheckoutDeclaration>>
+  try {
+    policy = await readStateCheckoutDeclaration(repoRoot, to)
+  } catch (error) {
+    return refused(`origin checkout policy cannot be read (${error instanceof Error ? error.message : String(error)})`)
+  }
+  if (policy === undefined) return projected
+  if (projected.ok) {
+    if (!worktreeDirtyPaths(repoRoot).includes(".gitomic.conf")) return projected
+    if (request.reservedPaths?.includes(".gitomic.conf")) {
+      return refused("reserved writer path .gitomic.conf may not be captured or cleared")
+    }
+    const index = indexTreeFromCopy(repoRoot)
+    const tipTree = git(repoRoot, readonlyArgs(["rev-parse", `${to}^{tree}`]))
+    if (!index.ok || tipTree.status !== 0 || index.tree !== tipTree.stdout) {
+      return refused("the index holds staged or unprovable work")
+    }
+    let capture: CapturedPath
+    let saved: ReturnType<typeof preserveDirtyTree>
+    try {
+      capture = readCapturedPath(repoRoot, ".gitomic.conf")
+      saved = preserveDirtyTree(repoRoot, to, [capture])
+    } catch (error) {
+      return refused(
+        `local declaration preservation refused (${error instanceof Error ? error.message : String(error)})`,
+      )
+    }
+    const readback = git(repoRoot, readonlyArgs(["rev-parse", "--verify", saved.preserveRef]))
+    if (readback.status !== 0 || readback.stdout !== saved.commit) {
+      return refused(`${saved.preserveRef} failed exact readback`, saved.preserveRef)
+    }
+    request.afterPreserveRef?.()
+    try {
+      clearCapturedPaths(repoRoot, to, [capture])
+    } catch (error) {
+      return refused(
+        `clearing the preserved local declaration refused (${error instanceof Error ? error.message : String(error)})`,
+        saved.preserveRef,
+      )
+    }
+    request.afterWorktreeClear?.()
+    const verified = await projectCheckout({ repoRoot, remote, ref: branchRef })
+    if (!verified.ok) {
+      return refused(
+        `declaration was preserved but checkout verification refused (${verified.kind}: ${verified.error})`,
+        saved.preserveRef,
+      )
+    }
+    return {
+      ok: true,
+      kind: "set-aside",
+      preserveRef: saved.preserveRef,
+      localTip,
+      to: verified.to ?? to,
+      localOnly: [],
+    }
+  }
+  if (projected.kind === "worktree-update-refused") {
+    const index = indexTreeFromCopy(repoRoot)
+    const localTree = git(repoRoot, readonlyArgs(["rev-parse", `${localTip}^{tree}`]))
+    if (!index.ok || localTree.status !== 0 || index.tree !== localTree.stdout) {
+      return refused("the index holds staged, unmerged or unprovable work, so no dirty path may be cleared")
+    }
+    const changed = git(repoRoot, readonlyArgs(["diff", "--name-only", "-z", localTip, to, "--"]))
+    if (changed.status !== 0) return refused(`origin's changed paths cannot be listed (${gitDetail(changed)})`)
+    const changedSet = new Set(nulPaths(changed.stdout))
+    const selection = selectOldBlockingPaths(repoRoot, changedSet, policy.quietSeconds, request.reservedPaths ?? [])
+    if (!selection.ok) return refused(selection.error)
+    const captures = selection.captures
+    if (captures.length === 0) {
+      return refused(`projection refused without a named overlapping dirty path (${projected.error})`)
+    }
+    let saved: ReturnType<typeof preserveDirtyTree>
+    try {
+      saved = preserveDirtyTree(repoRoot, localTip, captures)
+    } catch (error) {
+      return refused(`dirty-path preservation refused (${error instanceof Error ? error.message : String(error)})`)
+    }
+    const readback = git(repoRoot, readonlyArgs(["rev-parse", "--verify", saved.preserveRef]))
+    const savedTree = git(repoRoot, readonlyArgs(["rev-parse", `${saved.preserveRef}^{tree}`]))
+    const commitTree = git(repoRoot, readonlyArgs(["rev-parse", `${saved.commit}^{tree}`]))
+    if (
+      readback.status !== 0 ||
+      readback.stdout !== saved.commit ||
+      savedTree.status !== 0 ||
+      commitTree.status !== 0 ||
+      savedTree.stdout !== commitTree.stdout
+    ) {
+      return refused(`${saved.preserveRef} did not read back as the captured commit and tree`, saved.preserveRef)
+    }
+    request.afterPreserveRef?.()
+    try {
+      clearCapturedPaths(repoRoot, localTip, captures)
+    } catch (error) {
+      return refused(
+        `clearing exact captured paths refused (${error instanceof Error ? error.message : String(error)})`,
+        saved.preserveRef,
+      )
+    }
+    request.afterWorktreeClear?.()
+    const caughtUp = await projectCheckout({ repoRoot, remote, ref: branchRef })
+    if (!caughtUp.ok) {
+      return refused(
+        `preserved ${saved.preserveRef}, but projection refused (${caughtUp.kind}: ${caughtUp.error})`,
+        saved.preserveRef,
+      )
+    }
+    return {
+      ok: true,
+      kind: "set-aside",
+      preserveRef: saved.preserveRef,
+      localTip,
+      to: caughtUp.to ?? to,
+      localOnly: [],
+    }
+  }
+  if (projected.kind !== "landed-but-unsynchronized" && projected.kind !== "stranded-local-commits") {
+    return projected
+  }
+  const baseRead = git(repoRoot, readonlyArgs(["merge-base", localTip, to]))
+  if (baseRead.status !== 0 || baseRead.stdout === "") {
+    return refused(`common base cannot be read (${gitDetail(baseRead)})`)
+  }
+  const base = baseRead.stdout
+  if (base === localTip) return projected
+  const localOnlyRead = git(repoRoot, readonlyArgs(["rev-list", `${to}..${localTip}`]))
+  if (localOnlyRead.status !== 0) return refused(`local-only commits cannot be listed (${gitDetail(localOnlyRead)})`)
+  const localOnly = localOnlyRead.stdout.split("\n").filter(Boolean)
+  if (localOnly.length === 0) {
+    return refused("the local tip is not an origin ancestor, but no local-only commit is visible")
+  }
+
+  const index = indexTreeFromCopy(repoRoot)
+  if (!index.ok) return refused(`index cannot be verified (${index.detail})`)
+  const localTreeRead = git(repoRoot, readonlyArgs(["rev-parse", `${localTip}^{tree}`]))
+  const baseTreeRead = git(repoRoot, readonlyArgs(["rev-parse", `${base}^{tree}`]))
+  if (localTreeRead.status !== 0 || baseTreeRead.status !== 0) {
+    return refused("the local or common-base tree cannot be read")
+  }
+  const indexAtBase = index.tree === baseTreeRead.stdout
+  if (!indexAtBase && index.tree !== localTreeRead.stdout) return refused("the index carries staged or unprovable work")
+  let preserveRef: string | undefined
+  let preservedOid: string = localTip
+  let combinedCaptures: readonly CapturedPath[] = []
+  if (!indexAtBase) {
+    const localChanges = git(repoRoot, readonlyArgs(["diff", "--name-only", "-z", base, localTip, "--"]))
+    const remoteChanges = git(repoRoot, readonlyArgs(["diff", "--name-only", "-z", base, to, "--"]))
+    if (localChanges.status !== 0 || remoteChanges.status !== 0) {
+      return refused("local or remote changed paths cannot be listed")
+    }
+    const changed = new Set([...nulPaths(localChanges.stdout), ...nulPaths(remoteChanges.stdout)])
+    const selection = selectOldBlockingPaths(repoRoot, changed, policy.quietSeconds, request.reservedPaths ?? [])
+    if (!selection.ok) return refused(selection.error)
+    if (selection.captures.length > 0) {
+      combinedCaptures = selection.captures
+      let saved: ReturnType<typeof preserveDirtyTree>
+      try {
+        saved = preserveDirtyTree(repoRoot, localTip, selection.captures)
+      } catch (error) {
+        return refused(
+          `combined local work could not be preserved (${error instanceof Error ? error.message : String(error)})`,
+        )
+      }
+      preserveRef = saved.preserveRef
+      preservedOid = saved.commit
+    }
+  }
+  preserveRef ??= `refs/preserve/state-checkout/${localTip}`
+  const prior = git(repoRoot, readonlyArgs(["rev-parse", "--verify", "--quiet", preserveRef]))
+  if (prior.status === 0 && prior.stdout !== preservedOid) {
+    return refused(`preservation ref ${preserveRef} points to ${prior.stdout}`, preserveRef)
+  }
+  if (prior.status !== 0) {
+    const format = git(repoRoot, readonlyArgs(["rev-parse", "--show-object-format"]))
+    if (format.status !== 0) return refused(`object format cannot be read (${gitDetail(format)})`)
+    const absent = "0".repeat(format.stdout === "sha256" ? 64 : 40)
+    const saved = git(repoRoot, ["update-ref", preserveRef, preservedOid, absent])
+    if (saved.status !== 0) return refused(`creating ${preserveRef} failed (${gitDetail(saved)})`, preserveRef)
+  }
+  const readback = git(repoRoot, readonlyArgs(["rev-parse", "--verify", preserveRef]))
+  if (readback.status !== 0 || readback.stdout !== preservedOid) {
+    return refused(`preservation ref ${preserveRef} failed exact readback (${gitDetail(readback)})`, preserveRef)
+  }
+  request.afterPreserveRef?.()
+
+  if (combinedCaptures.length > 0 && !indexAtBase) {
+    try {
+      clearCapturedPaths(repoRoot, localTip, combinedCaptures)
+    } catch (error) {
+      return refused(
+        `clearing combined captured paths refused (${error instanceof Error ? error.message : String(error)})`,
+        preserveRef,
+      )
+    }
+    request.afterWorktreeClear?.()
+  }
+
+  if (!indexAtBase) {
+    const reverted = git(repoRoot, ["read-tree", "-m", "-u", localTip, base])
+    if (reverted.status !== 0) {
+      return refused(`two-way movement to ${base} refused (${gitDetail(reverted)})`, preserveRef)
+    }
+  }
+  const advanced = git(repoRoot, ["update-ref", branchRef, base, localTip])
+  if (advanced.status !== 0) return refused(`local ref CAS to ${base} refused (${gitDetail(advanced)})`, preserveRef)
+  request.afterLocalRefMove?.()
+
+  const caughtUp = await projectCheckout({ repoRoot, remote, ref: branchRef })
+  if (!caughtUp.ok) {
+    return refused(
+      `preserved ${preserveRef}, but projection refused (${caughtUp.kind}: ${caughtUp.error})`,
+      preserveRef,
+    )
+  }
+  return { ok: true, kind: "set-aside", preserveRef, localTip, to: caughtUp.to ?? to, localOnly }
 }

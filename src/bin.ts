@@ -16,7 +16,7 @@ import {
   open,
   openReader,
   openRemoteRepository,
-  projectCheckout,
+  projectCheckoutWithSetAside,
   projectRemoteFirstFastForward,
   readPublishDeclaration,
   readRepositoryDeclaration,
@@ -1040,7 +1040,7 @@ async function runProject(args: string[], stdout: CliWriter, stderr: CliWriter):
   const lockTimeoutMs = lockTimeoutRaw === undefined ? undefined : parseLockTimeout(lockTimeoutRaw)
   using checkoutLock = await holdCheckoutLockFor("project", checkoutPath, stderr, lockTimeoutMs)
   if (checkoutLock === undefined) return CHECKOUT_LOCK_BUSY
-  const outcome = await projectCheckout({
+  const outcome = await projectCheckoutWithSetAside({
     repoRoot: checkoutPath,
     remote,
     ref,
@@ -1050,8 +1050,19 @@ async function runProject(args: string[], stdout: CliWriter, stderr: CliWriter):
   if (outcome.ok) {
     const repairedFrom = outcome.kind === "synchronized" ? outcome.repairedIndexFrom : undefined
     const repaired = repairedFrom === undefined ? "" : ` repaired-from=${repairedFrom}`
-    stdout.write(`kind=${outcome.kind} local=${outcome.localTip ?? ""} to=${outcome.to ?? ""}${repaired}\n`)
+    const preserved =
+      outcome.kind === "set-aside"
+        ? ` preserveRef=${outcome.preserveRef} localOnly=${JSON.stringify(outcome.localOnly)}`
+        : ""
+    stdout.write(`kind=${outcome.kind} local=${outcome.localTip ?? ""} to=${outcome.to ?? ""}${repaired}${preserved}\n`)
     return OK
+  }
+
+  if (outcome.kind === "set-aside-refused") {
+    stderr.write(
+      `${outcome.error}\nkind=${outcome.kind} local=${outcome.localTip ?? ""} to=${outcome.to ?? ""} preserveRef=${outcome.preserveRef ?? ""}\n`,
+    )
+    return CANDIDATE_REFUSED
   }
 
   if (PROJECT_LEAVES_UNSYNCHRONIZED[outcome.kind]) {
