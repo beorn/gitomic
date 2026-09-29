@@ -1477,7 +1477,8 @@ function selectOldBlockingPaths(
     for (const path of blockers) {
       const captured = readCapturedPath(repoRoot, path)
       const statPath = captured.kind === "absent" ? dirname(join(repoRoot, path)) : join(repoRoot, path)
-      const ageMs = Math.max(0, Date.now() - lstatSync(statPath).mtimeMs)
+      const stat = lstatSync(statPath)
+      const ageMs = Math.max(0, Date.now() - Math.max(stat.mtimeMs, stat.ctimeMs))
       if (path !== ".gitomic.conf" && ageMs < quietSeconds * 1000) {
         return {
           ok: false,

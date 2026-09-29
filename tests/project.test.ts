@@ -40,6 +40,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  vi.restoreAllMocks()
   vi.unstubAllEnvs()
 })
 
@@ -62,6 +63,10 @@ function git(root: string, ...args: string[]): string {
     throw new Error(`git ${args.join(" ")} failed: ${result.stderr || result.stdout}`)
   }
   return (result.stdout ?? "").trim()
+}
+
+function advancePastQuietPeriod(): void {
+  vi.spyOn(Date, "now").mockReturnValue(Date.now() + 180_000)
 }
 
 /**
@@ -224,10 +229,9 @@ describe("gitomic project and checkout synchronization", () => {
     test("old conflicting direct dirt is saved by exact blob and origin then projects", async () => {
       const { checkout, landAtOrigin } = remoteFixture(true)
       writeFileSync(join(checkout, "tracked.md"), "# direct local edit\n")
-      const old = new Date(Date.now() - 180_000)
-      utimesSync(join(checkout, "tracked.md"), old, old)
       const localTip = git(checkout, "rev-parse", "HEAD")
       const remoteTip = landAtOrigin("tracked.md", "# remote edit\n")
+      advancePastQuietPeriod()
 
       const result = await projectCheckoutWithSetAside({ repoRoot: checkout })
 
@@ -242,10 +246,9 @@ describe("gitomic project and checkout synchronization", () => {
     test("dirty capture restarts from the verified ref after a crash before movement", async () => {
       const { checkout, landAtOrigin } = remoteFixture(true)
       writeFileSync(join(checkout, "tracked.md"), "# direct local edit\n")
-      const old = new Date(Date.now() - 180_000)
-      utimesSync(join(checkout, "tracked.md"), old, old)
       const localTip = git(checkout, "rev-parse", "HEAD")
       const remoteTip = landAtOrigin("tracked.md", "# remote edit\n")
+      advancePastQuietPeriod()
 
       await expect(
         projectCheckoutWithSetAside({
@@ -268,10 +271,9 @@ describe("gitomic project and checkout synchronization", () => {
     test("a crash after clearing the captured path leaves an ordinary projection retry", async () => {
       const { checkout, landAtOrigin } = remoteFixture(true)
       writeFileSync(join(checkout, "tracked.md"), "# direct local edit\n")
-      const old = new Date(Date.now() - 180_000)
-      utimesSync(join(checkout, "tracked.md"), old, old)
       const localTip = git(checkout, "rev-parse", "HEAD")
       const remoteTip = landAtOrigin("tracked.md", "# remote edit\n")
+      advancePastQuietPeriod()
 
       await expect(
         projectCheckoutWithSetAside({
@@ -295,10 +297,9 @@ describe("gitomic project and checkout synchronization", () => {
     test("a writer's reserved path is untouched even after the quiet period", async () => {
       const { checkout, landAtOrigin } = remoteFixture(true)
       writeFileSync(join(checkout, "tracked.md"), "# writer's preauthored bytes\n")
-      const old = new Date(Date.now() - 180_000)
-      utimesSync(join(checkout, "tracked.md"), old, old)
       const localTip = git(checkout, "rev-parse", "HEAD")
       landAtOrigin("tracked.md", "# remote edit\n")
+      advancePastQuietPeriod()
 
       const result = await projectCheckoutWithSetAside({ repoRoot: checkout, reservedPaths: ["tracked.md"] })
 
@@ -325,12 +326,30 @@ describe("gitomic project and checkout synchronization", () => {
       expect(git(checkout, "for-each-ref", "refs/preserve/state-checkout")).toBe("")
     })
 
+    // Backdating mtime alone must not make a fresh edit eligible for capture; ctime records the metadata change.
+    test("a fresh ctime keeps a backdated conflicting edit inside the quiet period", async () => {
+      const { checkout, landAtOrigin } = remoteFixture(true)
+      const edited = join(checkout, "tracked.md")
+      writeFileSync(edited, "# direct edit in progress\n")
+      const old = new Date(Date.now() - 180_000)
+      utimesSync(edited, old, old)
+      const localTip = git(checkout, "rev-parse", "HEAD")
+      landAtOrigin("tracked.md", "# remote edit\n")
+
+      const result = await projectCheckoutWithSetAside({ repoRoot: checkout })
+
+      expect(result).toMatchObject({ ok: false, kind: "set-aside-refused", localTip })
+      if (result.ok) throw new Error("expected quiet-period refusal")
+      expect(result.error).toContain("quiet period has not elapsed")
+      expect(readFileSync(edited, "utf8")).toBe("# direct edit in progress\n")
+      expect(git(checkout, "for-each-ref", "refs/preserve/state-checkout")).toBe("")
+    })
+
     test("a blocking removal is saved as an absent tree entry before origin bytes arrive", async () => {
       const { checkout, landAtOrigin } = remoteFixture(true)
       rmSync(join(checkout, "tracked.md"))
-      const old = new Date(Date.now() - 180_000)
-      utimesSync(checkout, old, old)
       const remoteTip = landAtOrigin("tracked.md", "# remote edit\n")
+      advancePastQuietPeriod()
 
       const result = await projectCheckoutWithSetAside({ repoRoot: checkout })
 
@@ -344,9 +363,8 @@ describe("gitomic project and checkout synchronization", () => {
     test("a blocking executable-mode change keeps its mode in the preserved tree", async () => {
       const { checkout, landAtOrigin } = remoteFixture(true)
       chmodSync(join(checkout, "tracked.md"), 0o755)
-      const old = new Date(Date.now() - 180_000)
-      utimesSync(join(checkout, "tracked.md"), old, old)
       landAtOrigin("tracked.md", "# remote edit\n")
+      advancePastQuietPeriod()
 
       const result = await projectCheckoutWithSetAside({ repoRoot: checkout })
 
@@ -402,9 +420,8 @@ describe("gitomic project and checkout synchronization", () => {
       git(checkout, "commit", "-qm", "suspected bypass")
       const localTip = git(checkout, "rev-parse", "HEAD")
       writeFileSync(join(checkout, "tracked.md"), "# direct local edit\n")
-      const old = new Date(Date.now() - 180_000)
-      utimesSync(join(checkout, "tracked.md"), old, old)
       const remoteTip = landAtOrigin("tracked.md", "# remote edit\n")
+      advancePastQuietPeriod()
 
       const result = await projectCheckoutWithSetAside({ repoRoot: checkout })
 
