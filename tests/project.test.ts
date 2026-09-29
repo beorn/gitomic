@@ -264,6 +264,21 @@ describe("gitomic project and checkout synchronization", () => {
     })
   })
 
+  test("project reconciles a dirty checkout file whose bytes already equal the remote landing", async () => {
+    const { checkout, landAtOrigin } = remoteFixture()
+    const content = "# assignment already written locally\n"
+    writeFileSync(join(checkout, "tracked.md"), content)
+    const landed = landAtOrigin("tracked.md", content)
+
+    const result = await runCli(["project", checkout])
+
+    expect(result.code).toBe(0)
+    expect(git(checkout, "rev-parse", "HEAD")).toBe(landed)
+    expect(git(checkout, "diff", "--name-only")).toBe("")
+    expect(git(checkout, "diff", "--cached", "--name-only")).toBe("")
+    expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe(content)
+  })
+
   /**
    * 25393: a commit hook advanced the ref, then its checkout update was refused (another git held index.lock), so
    * the index and tree stayed at the parent: `git status` shows the commit's whole inverse delta. Once the commit
@@ -289,12 +304,26 @@ describe("gitomic project and checkout synchronization", () => {
       git(checkout, "push", "-q", "origin", "main")
 
       const result = await runCli(["project", checkout])
-      expect(result.code).toBe(0)
+      expect(result.code, result.stderr).toBe(0)
       expect(result.stdout).toContain(`repaired-from=${parent}`)
       expect(git(checkout, "rev-parse", "HEAD")).toBe(head)
       expect(worktreeDirtyPaths(checkout)).toEqual([])
       expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# committed by the hook\n")
       expect(readFileSync(join(checkout, "added.md"), "utf8")).toBe("# added by the hook\n")
+    })
+
+    test("repair accepts a checkout file already equal to the pushed tip", async () => {
+      const { checkout } = remoteFixture()
+      const { parent, head } = commitThenLeaveIndexAtParent(checkout)
+      git(checkout, "push", "-q", "origin", "main")
+      writeFileSync(join(checkout, "tracked.md"), "# committed by the hook\n")
+
+      const result = await runCli(["project", checkout])
+
+      expect(result.code, result.stderr).toBe(0)
+      expect(result.stdout).toContain(`repaired-from=${parent}`)
+      expect(git(checkout, "rev-parse", "HEAD")).toBe(head)
+      expect(worktreeDirtyPaths(checkout)).toEqual([])
     })
 
     test("when origin has moved on, project repairs the index and then fast-forwards", async () => {

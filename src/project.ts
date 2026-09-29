@@ -33,7 +33,7 @@
 
 import { spawnSync } from "node:child_process"
 import { randomUUID } from "node:crypto"
-import { copyFileSync, readFileSync, rmSync, statSync } from "node:fs"
+import { copyFileSync, lstatSync, readFileSync, rmSync, statSync } from "node:fs"
 import { dirname, join } from "node:path"
 
 import { objectOid } from "./git-object.js"
@@ -416,19 +416,27 @@ function carryIndexTo(
         `(${gitDetail(delta)}). Nothing was changed.`,
     )
   }
+  // Dirt is measured against HEAD (`tip`), so a worktree file already equal to tip is absent from `expected` even
+  // though the stale index still holds `ancestor`. Inspect the skipped commit's delta instead.
+  const matching = matchingLandingDirt(repoRoot, ancestor, tip, nulPaths(delta.stdout))
+  if (!matching.ok) return refuse(`${ref} in ${repoRoot}: ${matching.detail}. Nothing was changed.`)
+  const staged = stageAuthoredPaths(repoRoot, ref, ancestor, tip, matching.paths, expected)
+  if (!staged.ok) return { ok: false, outcome: staged.outcome }
   const merged = git(repoRoot, ["read-tree", "-m", "-u", ancestor, tip])
   if (merged.status !== 0) {
+    const unstaged = unstageAuthoredPaths(repoRoot, ancestor, matching.paths)
+    const unstageNote = unstaged === undefined ? "" : ` The matching paths could not be unstaged: ${unstaged}.`
     return {
       ok: false,
       outcome: classifyReadTreeFailure(merged, expected, {
         refused: (detail) =>
           `${ref} in the checkout ${repoRoot} is at ${tip}, but its index still holds ${ancestor}'s tree and could ` +
           `not be brought forward without overwriting an uncommitted local edit (${detail}). The index ` +
-          "and working tree are unchanged.",
+          `and working tree are unchanged.${unstageNote}`,
         locked: ({ lockPath, lockAge, detail }) =>
           `${ref} in the checkout ${repoRoot} is at ${tip}, but its index still holds ${ancestor}'s tree and could ` +
           `not be brought forward: another git process holds ${lockPath} (${lockAge}; ${detail}). No dirt was ` +
-          "weighed; the index and working tree are unchanged.",
+          `weighed; the index and working tree are unchanged.${unstageNote}`,
       }),
     }
   }
@@ -495,6 +503,51 @@ type DirtRead = { readonly ok: true; readonly paths: string[] } | { readonly ok:
 type AuthoredStage =
   | { readonly ok: true; readonly expectedDirtyPaths: string[] }
   | { readonly ok: false; readonly outcome: Extract<CheckoutSyncOutcome, { readonly ok: false }> }
+
+/** A dirty regular file (or removal) already at the landing's exact content is safe to stage for projection. */
+function matchingLandingDirt(
+  repoRoot: string,
+  from: string,
+  to: string,
+  dirtyPaths: readonly string[],
+): { readonly ok: true; readonly paths: string[] } | { readonly ok: false; readonly detail: string } {
+  const changed = git(repoRoot, readonlyArgs(["diff", "--name-only", "-z", "--no-renames", from, to, "--"]))
+  if (changed.status !== 0) return { ok: false, detail: `reading the landing's changed paths: ${gitDetail(changed)}` }
+  const landingPaths = new Set(nulPaths(changed.stdout))
+  const candidates = dirtyPaths.filter((path) => landingPaths.has(path))
+  if (candidates.length === 0) return { ok: true, paths: [] }
+  const listed = git(repoRoot, readonlyArgs(["ls-tree", "--full-tree", "-z", to, "--", ...candidates]))
+  if (listed.status !== 0) return { ok: false, detail: `reading the landing's tree: ${gitDetail(listed)}` }
+  const landed = new Map<string, { mode: string; oid: string }>()
+  for (const entry of nulPaths(listed.stdout)) {
+    const tab = entry.indexOf("\t")
+    const [mode, , oid] = entry.slice(0, tab).split(" ")
+    if (mode !== undefined && oid !== undefined) landed.set(entry.slice(tab + 1), { mode, oid })
+  }
+  const algorithm = /^[0-9a-f]{64}$/.test(to) ? "sha256" : "sha1"
+  const paths: string[] = []
+  for (const path of candidates) {
+    let stat: ReturnType<typeof lstatSync> | undefined
+    try {
+      stat = lstatSync(join(repoRoot, path))
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        return { ok: false, detail: `reading ${path}: ${error instanceof Error ? error.message : String(error)}` }
+      }
+    }
+    const target = landed.get(path)
+    if (stat === undefined) {
+      if (target === undefined) paths.push(path)
+    } else if (stat.isFile() && (target?.mode === "100644" || target?.mode === "100755")) {
+      try {
+        if (objectOid("blob", readFileSync(join(repoRoot, path)), algorithm) === target.oid) paths.push(path)
+      } catch (error) {
+        return { ok: false, detail: `reading ${path}: ${error instanceof Error ? error.message : String(error)}` }
+      }
+    }
+  }
+  return { ok: true, paths }
+}
 
 /**
  * Stage exactly the paths whose checkout content IS the landing `from` -> `to` (25350 S3, @cto 7473e4ec), and drop
@@ -978,11 +1031,20 @@ export async function projectRemoteFirstFastForward(
   // why the verification cannot run before the ref moves.
   // Authored paths are staged here, on the fast-forward alone: the probe then keeps them (index matches `to`) and
   // every other path moves. A refused probe unstages them again, so no refusal leaves an index no commit holds.
-  const authored = stageAuthoredPaths(repoRoot, ref, localTip, to, authoredPaths, expectedDirtyPaths)
+  const matching = matchingLandingDirt(repoRoot, localTip, to, expectedDirtyPaths)
+  if (!matching.ok) {
+    return {
+      ok: false,
+      kind: "dirt-unverifiable",
+      error: `${ref} in ${repoRoot}: ${matching.detail}. The landing is safe at ${remote}; nothing was changed.`,
+    }
+  }
+  const stagedPaths = [...new Set([...authoredPaths, ...matching.paths])]
+  const authored = stageAuthoredPaths(repoRoot, ref, localTip, to, stagedPaths, expectedDirtyPaths)
   if (!authored.ok) return authored.outcome
   const probed = git(repoRoot, ["read-tree", "-m", "-u", localTip, to])
   if (probed.status !== 0) {
-    const unstaged = unstageAuthoredPaths(repoRoot, localTip, authoredPaths)
+    const unstaged = unstageAuthoredPaths(repoRoot, localTip, stagedPaths)
     const expected = [...expectedDirtyPaths].sort()
     const unstageNote =
       unstaged === undefined
