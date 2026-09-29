@@ -30,6 +30,7 @@ import {
   GitTimeout,
   PublicationRejected,
   PublicationUnknown,
+  RelativeOnlyEditRefused,
   RetriesExhausted,
   TreePathCollision,
 } from "./errors.js"
@@ -73,11 +74,12 @@ export {
   GitTimeout,
   PublicationRejected,
   PublicationUnknown,
+  RelativeOnlyEditRefused,
   RetriesExhausted,
   TreePathCollision,
 }
 export type { EditKind, PreconditionType } from "./errors.js"
-export { applyEdits } from "./edits.js"
+export { applyEdits, countOccurrences, parseEditsDeclaration, type EditsDeclaration } from "./edits.js"
 export { editsFromCheckout } from "./checkout-edits.js"
 export {
   CANDIDATE_CONFIG,

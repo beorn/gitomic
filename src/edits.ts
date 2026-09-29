@@ -1,5 +1,6 @@
 import { objectOid, validateOid } from "./git-object.js"
-import { EditDoesNotApply } from "./errors.js"
+import { EditDoesNotApply, RelativeOnlyEditRefused } from "./errors.js"
+import { CANDIDATE_CONFIG } from "./candidate.js"
 import type { BlobValue, GitMap, Oid, Update } from "./types.js"
 
 /**
@@ -29,7 +30,7 @@ export type PrefetchingUpdate = Update & { readonly [PREFETCH_PATHS]?: readonly 
 
 /** Every path an edit list reads before it writes: the anchor of each edit, both ends of a move. */
 export function editPaths(edits: readonly Edit[]): readonly string[] {
-  const paths = new Set<string>()
+  const paths = new Set<string>([CANDIDATE_CONFIG])
   for (const edit of edits) {
     if (edit.kind === "mv") {
       paths.add(edit.from)
@@ -49,6 +50,7 @@ export function editPaths(edits: readonly Edit[]): readonly string[] {
  * `--base` per R46 ("the read's oid is the natural base"). `null` on a `put`
  * means the path must be ABSENT (a create). `append` carries no anchor: it is
  * the one edit with no precondition, so it always re-applies on the new tip.
+ * `replace` checks that `oldText` occurs exactly once in the path's content (`text-unique`).
  */
 export type Edit =
   | { readonly kind: "put"; readonly path: string; readonly content: string; readonly expect: Oid | null }
@@ -56,6 +58,57 @@ export type Edit =
   | { readonly kind: "append"; readonly path: string; readonly content: string }
   | { readonly kind: "rm"; readonly path: string; readonly expect: Oid }
   | { readonly kind: "mv"; readonly from: string; readonly to: string; readonly expect: Oid }
+  | { readonly kind: "replace"; readonly path: string; readonly oldText: string; readonly newText: string }
+
+/** Count all positions where `search` begins in `text`, including overlapping occurrences. */
+export function countOccurrences(text: string, search: string): number {
+  if (search.length === 0) return 0
+  let count = 0
+  let pos = 0
+  while ((pos = text.indexOf(search, pos)) !== -1) {
+    count++
+    pos += 1
+  }
+  return count
+}
+
+export type EditsDeclaration = {
+  readonly relativeOnly: readonly string[]
+}
+
+/** Parse [edits] section of .gitomic.conf at `head`. */
+export function parseEditsDeclaration(content: string, head: string): EditsDeclaration {
+  const relativeOnly: string[] = []
+  let inEdits = false
+  const lines = content.split("\n")
+  for (const rawLine of lines) {
+    const trimmed = rawLine.trim()
+    if (trimmed === "" || trimmed.startsWith("#") || trimmed.startsWith(";")) continue
+    if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+      const section = trimmed.slice(1, -1).trim().toLowerCase()
+      inEdits = section === "edits"
+      continue
+    }
+    if (!inEdits) continue
+    const eq = trimmed.indexOf("=")
+    if (eq < 0) {
+      throw new Error(`${CANDIDATE_CONFIG} at ${head}: invalid [edits] entry ${JSON.stringify(trimmed)}`)
+    }
+    const key = trimmed.slice(0, eq).trim().toLowerCase()
+    let value = trimmed.slice(eq + 1).trim()
+    if (value.startsWith('"') && value.endsWith('"') && value.length >= 2) {
+      value = value.slice(1, -1)
+    }
+    if (key !== "relative-only") {
+      throw new Error(`${CANDIDATE_CONFIG} at ${head}: unknown [edits] key '${key}'`)
+    }
+    if (value === "" || value.startsWith("/") || value.includes("..") || value.endsWith("/")) {
+      throw new Error(`${CANDIDATE_CONFIG} at ${head}: invalid relative-only ${JSON.stringify(value)}`)
+    }
+    relativeOnly.push(value)
+  }
+  return { relativeOnly }
+}
 
 /** The git blob oid of some content, or `null` when the path is absent. */
 function blobOid(content: string | undefined, algorithm: "sha1" | "sha256"): Oid | null {
@@ -86,6 +139,27 @@ async function currentOid(map: GitMap, path: string, algorithm: "sha1" | "sha256
  * holding and both writers land.
  */
 export async function applyEdits(map: GitMap, base: Oid, head: Oid, edits: readonly Edit[]): Promise<void> {
+  const conf = await map.get(CANDIDATE_CONFIG)
+  if (conf !== undefined) {
+    const { relativeOnly } = parseEditsDeclaration(conf, head)
+    if (relativeOnly.length > 0) {
+      const declared = new Set(relativeOnly)
+      for (const edit of edits) {
+        if (edit.kind === "put" || edit.kind === "put-bytes" || edit.kind === "rm") {
+          if (declared.has(edit.path)) {
+            throw new RelativeOnlyEditRefused(edit.path, edit.kind, head)
+          }
+        } else if (edit.kind === "mv") {
+          if (declared.has(edit.to)) {
+            throw new RelativeOnlyEditRefused(edit.to, edit.kind, head)
+          }
+          if (declared.has(edit.from)) {
+            throw new RelativeOnlyEditRefused(edit.from, edit.kind, head)
+          }
+        }
+      }
+    }
+  }
   const algorithm = validateOid(head).length === 64 ? "sha256" : "sha1"
   for (const [index, edit] of edits.entries()) {
     switch (edit.kind) {
@@ -182,17 +256,47 @@ export async function applyEdits(map: GitMap, base: Oid, head: Oid, edits: reado
         // Source is present: its oid equalled a non-null expect. Copy raw bytes without decoding them.
         const raw = (map as BlobEditMap)[GET_RAW_VALUE]
         const source = raw === undefined ? await map.get(edit.from) : await raw(edit.from)
-        if (source === undefined)
+        if (source === undefined) {
           throw new Error(`move source ${JSON.stringify(edit.from)} vanished after its OID check`)
+        }
         if (typeof source === "string") map.set(edit.to, source)
         else {
           const setBytes = (map as BlobEditMap)[SET_BYTES]
-          if (setBytes === undefined)
+          if (setBytes === undefined) {
             throw new TypeError("moving a binary blob requires a Gitomic byte-capable transaction map")
+          }
           setBytes(edit.to, source)
         }
         map.delete(edit.from)
         ;(map as ModeKeepingMap)[KEEP_MODE_OF]?.(edit.to, edit.from)
+        break
+      }
+      case "replace": {
+        if (edit.oldText.length === 0) {
+          throw new TypeError("replace old text cannot be empty")
+        }
+        const current = await map.get(edit.path)
+        if (current === undefined) {
+          throw new EditDoesNotApply(index, "replace", "text-unique", edit.path, edit.path, "1", null, base, head)
+        }
+        const occurrences = countOccurrences(current, edit.oldText)
+        if (occurrences !== 1) {
+          throw new EditDoesNotApply(
+            index,
+            "replace",
+            "text-unique",
+            edit.path,
+            edit.path,
+            "1",
+            String(occurrences),
+            base,
+            head,
+          )
+        }
+        map.set(
+          edit.path,
+          current.replace(edit.oldText, () => edit.newText),
+        )
         break
       }
     }

@@ -145,6 +145,97 @@ describe.each(targets)("the CLI exit contract on $name", (target) => {
     expect(refused.stderr).toContain(`code=candidate-refused base=${before.ref} reasons=["a.md: refused by the gate"]`)
     expect(await tip()).toEqual(before)
   })
+
+  test("replace exits 3 on text-unique failure with facts only, prints no receipt, and leaves ref unchanged", async () => {
+    const address = target.address(fixture.repo)
+    const seeded = await cli(target, [
+      "apply",
+      address,
+      "-m",
+      "seed",
+      "put",
+      "a.md",
+      await file("a-seed.md", "row 1\nrow 2\n"),
+    ])
+    expect(seeded.code).toBe(0)
+    const before = await tip()
+
+    const refused = await cli(target, [
+      "apply",
+      address,
+      "-m",
+      "replace absent",
+      "replace",
+      "a.md",
+      await file("old-absent.md", "absent row\n"),
+      await file("new.md", "new row\n"),
+    ])
+    expect(refused.code).toBe(3)
+    expect(refused.stdout).toBe("")
+    expect(refused.stderr).toContain("kind=replace")
+    expect(refused.stderr).toContain("precondition=text-unique")
+    expect(refused.stderr).toContain("expected 1 occurrence of old text")
+    expect(refused.stderr).toContain("expected=1")
+    expect(refused.stderr).toContain("actual=0")
+    expect(await tip()).toEqual(before)
+  })
+
+  test("a put onto a relative-only path exits 2, prints no receipt, and the ref does not move", async () => {
+    const declarer = await open({ repo: fixture.repo, ref: "main", writer: "declare", backend: createShellBackend() })
+    const gate = await declarer.transact(async (map) => {
+      map.set(CANDIDATE_CONFIG, "[edits]\nrelative-only = protected.md\n")
+      map.set("protected.md", "initial line\n")
+    }, "gate")
+    const url = target.backend === undefined ? target.address(fixture.repo).replace(/#main$/u, "") : undefined
+    const declaration = await readRepositoryDeclaration(fixture.repo, gate.oid)
+    await trustDeclaration({ repo: fixture.repo, ...(url === undefined ? {} : { url }) }, declaration?.blob ?? "")
+    const before = await tip()
+
+    const address = target.address(fixture.repo)
+    const refused = await cli(target, [
+      "apply",
+      address,
+      "-m",
+      "clobber protected",
+      "put",
+      "protected.md",
+      await file("clobber.md", "clobber\n"),
+    ])
+    expect(refused.code).toBe(2)
+    expect(refused.stdout).toBe("")
+    expect(refused.stderr).toContain("gitomic: protected.md is declared relative-only in .gitomic.conf")
+    expect(refused.stderr).toContain("put, put-bytes, rm, and mv are refused; use 'replace' or 'append'")
+    expect(await tip()).toEqual(before)
+  })
+
+  test("replace with empty old text exits 2 as usage error", async () => {
+    const address = target.address(fixture.repo)
+    const before = await tip()
+    const result = await cli(target, [
+      "apply",
+      address,
+      "-m",
+      "empty old",
+      "replace",
+      "a.md",
+      await file("empty.md", ""),
+      await file("new.md", "something\n"),
+    ])
+    expect(result.code).toBe(2)
+    expect(result.stdout).toBe("")
+    expect(result.stderr).toContain("gitomic: replace old text cannot be empty")
+    expect(await tip()).toEqual(before)
+  })
+
+  test("two stdin '-' operands in one apply exit 2 as usage error", async () => {
+    const address = target.address(fixture.repo)
+    const before = await tip()
+    const result = await cli(target, ["apply", address, "-m", "two stdin", "put", "a.md", "-", "append", "b.md", "-"])
+    expect(result.code).toBe(2)
+    expect(result.stdout).toBe("")
+    expect(result.stderr).toContain("gitomic: apply: stdin ('-') may only be used once in one apply invocation")
+    expect(await tip()).toEqual(before)
+  })
 })
 
 /**
@@ -161,12 +252,13 @@ test.each(["rejected", "unknown"])("apply exits 1 and reports a %s publication w
     backend: {
       ...shell,
       async compareAndSwap(_repo, ref, next, expected) {
-        if (kind === "rejected")
+        if (kind === "rejected") {
           throw new PublicationRejected(
             [{ ref, oid: next, expect: expected }],
             ["[remote rejected] (failed)"],
             "remote unpack failed: index-pack failed",
           )
+        }
         throw new Error("publication connection lost")
       },
     },
