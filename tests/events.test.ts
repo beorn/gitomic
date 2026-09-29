@@ -4,7 +4,7 @@
 // @level l1
 // @consumer yrd's event chains (slice 3b, @i/10-yrd/25040) and anything reading refs like Redis keys
 /**
- * @reach fs-walk vendor/gitomic/README.md vendor/gitomic/CHANGELOG.md
+ * @reach fs-walk <fixture-only: history walks use isolated Git repositories; package docs use exact paths>
  */
 //
 // Acceptance of @i/10-yrd/25039. Each describe block names the acceptance row it proves.
