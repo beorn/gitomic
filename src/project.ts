@@ -681,12 +681,36 @@ function sameSet(left: readonly string[], right: readonly string[]): boolean {
 export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): CheckoutSyncOutcome {
   const { repoRoot, from, to, ref } = request
   if (isBareRepository(repoRoot)) return { ok: true, kind: "bare" }
+  if (from !== to) {
+    const branch = checkedOutRef(repoRoot)
+    if (branch !== ref) {
+      return {
+        ok: false,
+        kind: "wrong-branch",
+        checkedOutRef: branch,
+        error:
+          `${ref} in the checkout ${repoRoot} advanced ${from} -> ${to}, but that checkout has ` +
+          `${branch === null ? "a detached HEAD" : `${branch} checked out`}, so no two-way merge can reconcile it. ` +
+          "The commit is complete and safe in the ref; nothing here was changed.",
+      }
+    }
+  }
 
   // The index must hold `from` (or already `to`) before the two-way merge can be trusted: carry a stale one forward.
   const carried = carryIndexTo(repoRoot, from, ref, request.expectedDirtyPaths, to)
   if (!carried.ok) return carried.outcome
   const repaired = carried.repairedIndexFrom === undefined ? {} : { repairedIndexFrom: carried.repairedIndexFrom }
-  const authored = stageAuthoredPaths(repoRoot, ref, from, to, request.authoredPaths ?? [], carried.expectedDirtyPaths)
+  const matching =
+    from === to ? { ok: true as const, paths: [] } : matchingLandingDirt(repoRoot, from, to, carried.expectedDirtyPaths)
+  if (!matching.ok) {
+    return {
+      ok: false,
+      kind: "dirt-unverifiable",
+      error: `${ref} in ${repoRoot}: ${matching.detail}. Nothing was changed.`,
+    }
+  }
+  const stagedPaths = [...new Set([...(request.authoredPaths ?? []), ...matching.paths])]
+  const authored = stageAuthoredPaths(repoRoot, ref, from, to, stagedPaths, carried.expectedDirtyPaths)
   if (!authored.ok) return authored.outcome
   const expected = [...authored.expectedDirtyPaths].sort()
   if (from === to) {
@@ -736,22 +760,9 @@ export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): Check
     return { ok: true, kind: "already-current", dirtyPaths: current.paths }
   }
 
-  const branch = checkedOutRef(repoRoot)
-  if (branch !== ref) {
-    return {
-      ok: false,
-      kind: "wrong-branch",
-      checkedOutRef: branch,
-      error:
-        `${ref} in the checkout ${repoRoot} advanced ${from} -> ${to}, but that checkout has ` +
-        `${branch === null ? "a detached HEAD" : `${branch} checked out`}, so no two-way merge can reconcile it. ` +
-        "The commit is complete and safe in the ref; nothing here was changed.",
-    }
-  }
-
   const merged = git(repoRoot, ["read-tree", "-m", "-u", from, to])
   if (merged.status !== 0) {
-    const unstaged = unstageAuthoredPaths(repoRoot, from, request.authoredPaths ?? [])
+    const unstaged = unstageAuthoredPaths(repoRoot, from, stagedPaths)
     const unstageNote =
       unstaged === undefined
         ? ""

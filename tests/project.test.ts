@@ -157,6 +157,28 @@ describe("gitomic project and checkout synchronization", () => {
       expect(outcome.ok).toBe(false)
       expect(outcome.kind).toBe("wrong-branch")
     })
+
+    test("direct synchronization accepts checkout bytes already equal to an object-side landing", () => {
+      const { checkout, landAtOrigin } = remoteFixture()
+      const from = git(checkout, "rev-parse", "HEAD")
+      const content = "# object-side landing\n"
+      writeFileSync(join(checkout, "tracked.md"), content)
+      const to = landAtOrigin("tracked.md", content)
+      git(checkout, "fetch", "-q", "origin", "main")
+      git(checkout, "update-ref", "refs/heads/main", to, from)
+
+      const outcome = synchronizeCheckoutToCommit({
+        repoRoot: checkout,
+        from,
+        to,
+        ref: "refs/heads/main",
+        expectedDirtyPaths: ["tracked.md"],
+      })
+
+      expect(outcome).toEqual({ ok: true, kind: "synchronized", dirtyPaths: [] })
+      expect(git(checkout, "diff", "--cached", "--name-only")).toBe("")
+      expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe(content)
+    })
   })
 
   describe("Witness 1: behind by one commit -> project fast-forwards clean tree", () => {
