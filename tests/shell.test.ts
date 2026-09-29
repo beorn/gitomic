@@ -1,6 +1,9 @@
 // @failure Git plumbing could scan all history, normalize commit metadata, or hide a real ref-update failure as contention.
 // @level l1
 // @consumer default shell-backend users and optional iso reader users
+/**
+ * @reach fs-walk <fixture-only: shell backends run against temporary Git repositories and their trace files>
+ */
 
 import { spawnSync } from "node:child_process"
 import { chmod, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises"
@@ -18,6 +21,7 @@ import {
   isMissingObjectFetchError,
   open,
   openReader,
+  objectOid,
 } from "../src/index.js"
 import type { GitomicBackend } from "../src/index.js"
 import { createIsoBackend } from "../src/iso.js"
@@ -237,6 +241,26 @@ describe.sequential("shell backend failure boundaries", () => {
           "-w",
           "--stdin",
         )
+        // 26450: a caller preparing visible bytes needs the repository's format, not a HEAD/blob read.
+        // Snapshot/transaction coverage alone never requests this public cached property or hash export.
+        const trace = join(fixture.repo, "object-format-trace.json")
+        const backend = createShellBackend({ baseEnv: { ...process.env, GIT_TRACE2_EVENT: trace } })
+        expect(await Promise.all([backend.objectFormat(fixture.repo), backend.objectFormat(fixture.repo)])).toEqual([
+          objectFormat,
+          objectFormat,
+        ])
+        expect(await backend.objectFormat(fixture.repo)).toBe(objectFormat)
+        const starts = (await readFile(trace, "utf8"))
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line) as TraceEvent)
+          .filter((event) => event.event === "start")
+        expect(starts.filter((event) => event.argv?.includes("--show-object-format=storage"))).toHaveLength(1)
+        expect(
+          starts.filter((event) => event.argv?.some((arg) => ["HEAD", "cat-file", "show", "ls-tree"].includes(arg))),
+        ).toHaveLength(0)
+        expect(objectOid("blob", Buffer.from("native text\n"), objectFormat)).toBe(textOid)
+        expect(objectOid("blob", Buffer.from([0xff, 0xfe, 0x00, 0x80]), objectFormat)).toBe(binaryOid)
         const tree = await gitWithInput(
           fixture.repo,
           `100644 blob ${textOid}\ttext\n100644 blob ${binaryOid}\tbinary\n`,
@@ -575,6 +599,11 @@ describe.sequential("shell backend failure boundaries", () => {
   })
 
   test("names an unusable selected executable at the first Git command", async () => {
+    const backend = createShellBackend({
+      gitExecutable: "missing-gitomic-executable",
+      baseEnv: { PATH: "/nonexistent" },
+    })
+    await expect(backend.objectFormat("ignored")).rejects.toThrow("missing-gitomic-executable")
     await expect(
       createShellBackend({ gitExecutable: "missing-gitomic-executable", baseEnv: { PATH: "/nonexistent" } }).head(
         "ignored",

@@ -274,6 +274,7 @@ export function createMemBackend(): GitomicBackend {
   }
 
   const backend: GitomicBackend = {
+    objectFormat: async () => "sha1",
     head,
     readCommit: (name, oid) =>
       Promise.resolve().then(() => {

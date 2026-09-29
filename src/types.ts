@@ -189,6 +189,8 @@ export type TreeEntry = { readonly oid: Oid; readonly mode: "100644" | "100755" 
 export type TreeListing = ReadonlyMap<string, TreeEntry>
 
 export type GitomicBackend = {
+  /** Repository object format, independent of refs and object contents; shell caches it per Git directory. */
+  objectFormat(repo: string): Promise<"sha1" | "sha256">
   head(repo: string, ref: string): Promise<Oid>
   readCommit(repo: string, oid: Oid): Promise<CommitMeta>
   /**

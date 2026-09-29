@@ -154,6 +154,7 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
     }
   }
   const backend: GitomicBackend = {
+    objectFormat,
     head: async (repo, ref) => head(await resolveGitDir(repo), ref, baseEnv),
     readCommit: async (repo, oid) => {
       validateOid(oid)

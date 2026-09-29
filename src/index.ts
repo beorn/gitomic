@@ -89,7 +89,7 @@ export {
   type RepositoryDeclaration,
   type TrustScope,
 } from "./candidate.js"
-export { identProblem } from "./git-object.js"
+export { identProblem, objectOid } from "./git-object.js"
 export type { Edit } from "./edits.js"
 export { matchGlob } from "./glob.js"
 export {
