@@ -101,6 +101,8 @@ export type ShellBackendOptions = {
    * past it rejects with `GitTimeout`. Defaults to 20 000.
    */
   remoteTimeoutMs?: number
+  /** Forward host SIGTERM immediately, or let bounded commands drain to their own deadlines. */
+  sigterm?: "forward" | "drain"
 }
 
 /** The default limit for one fetch or push to a remote. */
@@ -110,8 +112,8 @@ const DANGLING_REF_SCAN_TIMEOUT_MS = 30_000
 const GROUP_STOP_GRACE_MS = 2_000
 
 const DURABLE_GIT_CONFIG = ["-c", "core.fsync=loose-object,reference", "-c", "core.fsyncMethod=fsync"] as const
-const shellExecutable = new AsyncLocalStorage<string>()
-const selectedGit = (): string => shellExecutable.getStore() ?? "git"
+const shellRuntime = new AsyncLocalStorage<{ executable: string; sigterm: "forward" | "drain" }>()
+const selectedGit = (): string => shellRuntime.getStore()?.executable ?? "git"
 
 export function createShellBackend(options: ShellBackendOptions = {}): GitomicBackend {
   return createShellRuntime(options).backend
@@ -125,6 +127,8 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
 } {
   const executable = options.gitExecutable ?? "git"
   if (executable.trim() === "") throw new TypeError("gitExecutable must name a Git executable")
+  const sigterm = options.sigterm === undefined ? "forward" : options.sigterm
+  if (sigterm !== "forward" && sigterm !== "drain") throw new TypeError('sigterm must be "forward" or "drain"')
   const remoteTimeoutMs = normalizeTimeoutMs(options.remoteTimeoutMs ?? DEFAULT_REMOTE_TIMEOUT_MS, "remoteTimeoutMs")
   const baseEnv = snapshotEnvironment(options.baseEnv)
   const resolveGitDir = createGitDirResolver(baseEnv)
@@ -231,7 +235,7 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
   // Each backend owns its executable even when two backends run concurrently.
   // Keeping the selection in the async call chain lets the Git plumbing below
   // use one runner without adding an executable argument to every operation.
-  const inRuntime = <T>(work: () => Promise<T>): Promise<T> => shellExecutable.run(executable, work)
+  const inRuntime = <T>(work: () => Promise<T>): Promise<T> => shellRuntime.run({ executable, sigterm }, work)
   const selectedBackend = Object.fromEntries(
     Object.entries(backend).map(([name, operation]) => {
       const invoke = (operation as (...args: unknown[]) => Promise<unknown>).bind(backend)
@@ -438,7 +442,10 @@ async function run(command: string, args: readonly string[], options: GitOptions
     let exitSignal: NodeJS.Signals | null = null
     let limit: ReturnType<typeof setTimeout> | undefined
     let escalation: ReturnType<typeof setTimeout> | undefined
-    const release = bounded && child.pid !== undefined ? holdGroup(child.pid) : () => {}
+    const release =
+      bounded && child.pid !== undefined
+        ? holdGroup(child.pid, shellRuntime.getStore()?.sigterm ?? "forward")
+        : () => {}
     const settle = (finish: () => void): void => {
       if (settled) return
       settled = true
@@ -554,35 +561,56 @@ function stopProcess(child: ChildProcess, signal: NodeJS.Signals, group: boolean
 /**
  * Process groups this process leads right now. A group does not receive the
  * terminal's SIGINT or the SIGTERM sent to this process, so while any is held
- * those signals are forwarded to it; when this process has no other handler
- * for the signal, it is raised again after forwarding so the default exit
- * still happens.
+ * signals are forwarded unless that backend defers the first SIGTERM until
+ * its bounded commands settle. When this process has no other handler, the
+ * signal is raised again after forwarding or draining so the default exit
+ * still happens. Deadlines and subsequent termination signals remain active.
  */
-const heldGroups = new Set<number>()
+const heldGroups = new Map<number, "forward" | "drain">()
 const forwardedSignals = ["SIGINT", "SIGTERM", "SIGHUP"] as const
+let deferredTermination = false
+
+function removeSignalForwarders(): void {
+  for (const signal of forwardedSignals) process.removeListener(signal, forwardSignal)
+}
 
 function forwardSignal(signal: NodeJS.Signals): void {
-  for (const pid of heldGroups) {
+  const firstTermination = signal === "SIGTERM" && !deferredTermination
+  let deferred = false
+  for (const [pid, policy] of heldGroups) {
+    if (firstTermination && policy === "drain") {
+      deferred = true
+      continue
+    }
     try {
       process.kill(-pid, signal)
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error
     }
+    heldGroups.delete(pid)
   }
-  for (const forwarded of forwardedSignals) process.removeListener(forwarded, forwardSignal)
+  if (deferred) {
+    deferredTermination = true
+    return
+  }
+  removeSignalForwarders()
   heldGroups.clear()
+  deferredTermination = false
   if (process.listenerCount(signal) === 0) process.kill(process.pid, signal)
 }
 
-function holdGroup(pid: number): () => void {
+function holdGroup(pid: number, policy: "forward" | "drain"): () => void {
   if (heldGroups.size === 0) {
     for (const signal of forwardedSignals) process.on(signal, forwardSignal)
   }
-  heldGroups.add(pid)
+  heldGroups.set(pid, policy)
   return () => {
     heldGroups.delete(pid)
     if (heldGroups.size === 0) {
-      for (const signal of forwardedSignals) process.removeListener(signal, forwardSignal)
+      removeSignalForwarders()
+      const terminate = deferredTermination
+      deferredTermination = false
+      if (terminate && process.listenerCount("SIGTERM") === 0) process.kill(process.pid, "SIGTERM")
     }
   }
 }
