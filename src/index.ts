@@ -81,6 +81,13 @@ export {
   TreePathCollision,
 }
 export type { EditKind, PreconditionType } from "./errors.js"
+export {
+  ACTOR_TOKEN_MAX_BYTES,
+  actorTrailersFromToken,
+  parseActorTokenDeclaration,
+  type ActorTokenDeclaration,
+  type ActorTrailersResult,
+} from "./actor-token.js"
 export { applyEdits, countOccurrences, parseEditsDeclaration, type EditsDeclaration } from "./edits.js"
 export { editsFromCheckout } from "./checkout-edits.js"
 export {
