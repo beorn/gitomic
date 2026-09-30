@@ -15,6 +15,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import { afterEach, describe, expect, test, vi } from "vitest"
+import { tempTree } from "removely"
 
 import { createShellBackend, open, openRemoteRepository, runGit } from "../src/index.js"
 import { createBareRepo, createRemoteRepos, createWorktreeRepo, git, gitFrom } from "./helpers/git.js"
@@ -562,7 +563,8 @@ describe("a kept remote repository", () => {
   test("a kept repository recorded for another origin is refused, naming the recorded origin", async () => {
     const fixture = await createBareRepo()
     const other = await createBareRepo()
-    const cacheDir = join(await mkdtemp(join(tmpdir(), "gitomic-kept-origin-")), "remotes")
+    await using cache = await tempTree("gitomic-kept-origin-")
+    const cacheDir = cache.resolve("remotes")
     try {
       const source = pathToFileURL(fixture.repo).href
       const recorded = pathToFileURL(other.repo).href
@@ -572,7 +574,6 @@ describe("a kept remote repository", () => {
       await expect(openRemoteRepository(source, { cacheDir })).rejects.toThrow(recorded)
       expect(await git(keptPath(cacheDir, source), "config", "--get", "remote.origin.url")).toBe(recorded)
     } finally {
-      await rm(join(cacheDir, ".."), { recursive: true, force: true })
       await other.cleanup()
       await fixture.cleanup()
     }
