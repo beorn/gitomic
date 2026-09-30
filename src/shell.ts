@@ -561,9 +561,10 @@ function stopProcess(child: ChildProcess, signal: NodeJS.Signals, group: boolean
 /**
  * Process groups this process leads right now. A group does not receive the
  * terminal's SIGINT or the SIGTERM sent to this process, so while any is held
- * those signals are forwarded to it; when this process has no other handler
- * for the signal, it is raised again after forwarding so the default exit
- * still happens.
+ * signals are forwarded unless that backend defers the first SIGTERM until
+ * its bounded commands settle. When this process has no other handler, the
+ * signal is raised again after forwarding or draining so the default exit
+ * still happens. Deadlines and subsequent termination signals remain active.
  */
 const heldGroups = new Map<number, "forward" | "drain">()
 const forwardedSignals = ["SIGINT", "SIGTERM", "SIGHUP"] as const
