@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.0 — 2026-09-30
+
+### Added
+
+- `GitSignaled`, exported from `gitomic`: a native Git process interrupted by a signal rejects with its command, signal and captured stderr. The runner preserves the signal on both normal close and bounded commands whose helpers keep their pipes open, instead of inventing exit code 1. Ordinary numeric exit codes and live-command `GitTimeout` failures keep their existing behavior.
+
 ## 0.7.0 — 2026-09-26
 
 ### Added
