@@ -7,7 +7,7 @@ import { join, resolve } from "node:path"
 
 import { fullJitter, type RandomUnit } from "@bearly/pacing"
 
-import { Conflict, GitTimeout, PublicationRejected } from "./errors.js"
+import { Conflict, GitSignaled, GitTimeout, PublicationRejected } from "./errors.js"
 import { journalLeaseRejection } from "./lease-journal.js"
 import { rejectLegacyProvenance } from "./options.js"
 import {
@@ -435,6 +435,7 @@ async function run(command: string, args: readonly string[], options: GitOptions
     let settled = false
     let timedOut = false
     let exitCode: number | null | undefined
+    let exitSignal: NodeJS.Signals | null = null
     let limit: ReturnType<typeof setTimeout> | undefined
     let escalation: ReturnType<typeof setTimeout> | undefined
     const release = bounded && child.pid !== undefined ? holdGroup(child.pid) : () => {}
@@ -446,11 +447,18 @@ async function run(command: string, args: readonly string[], options: GitOptions
       release()
       finish()
     }
-    const result = (code: number | null): GitResult => ({
-      stdout: Buffer.concat(stdout),
-      stderr: Buffer.concat(stderr),
-      code: code ?? 1,
-    })
+    const settleOutcome = (code: number | null, signal: NodeJS.Signals | null): void => {
+      settle(() => {
+        const capturedStderr = Buffer.concat(stderr)
+        if (signal !== null) {
+          reject(new GitSignaled(describeGitCommand(command, args), signal, capturedStderr.toString("utf8")))
+        } else if (code === null) {
+          reject(new Error(`${describeGitCommand(command, args)} ended without an exit code or signal`))
+        } else {
+          resolveResult({ stdout: Buffer.concat(stdout), stderr: capturedStderr, code })
+        }
+      })
+    }
     // Stops what is left of a bounded command's group and stops reading pipes a
     // helper that left the group could otherwise hold open indefinitely.
     const abandonHelpers = (): void => {
@@ -465,7 +473,7 @@ async function run(command: string, args: readonly string[], options: GitOptions
           // The command finished inside its limit; only a helper it started
           // still holds the output pipes, so the command's own result stands.
           abandonHelpers()
-          settle(() => resolveResult(result(exited)))
+          settleOutcome(exited, exitSignal)
           return
         }
         timedOut = true
@@ -477,15 +485,16 @@ async function run(command: string, args: readonly string[], options: GitOptions
     child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk))
     child.once("error", (error) => settle(() => reject(error)))
     // A stopped command settles when its own process exits, not when its pipes close.
-    child.once("exit", (code) => {
+    child.once("exit", (code, signal) => {
       exitCode = code
+      exitSignal = signal
       if (!timedOut) return
       abandonHelpers()
       settle(() => reject(new GitTimeout(describeGitCommand(command, args), timeoutMs ?? 0)))
     })
-    child.once("close", (code) => {
+    child.once("close", (code, signal) => {
       if (timedOut) return
-      settle(() => resolveResult(result(code)))
+      settleOutcome(code, signal)
     })
     child.stdin.on("error", (error: NodeJS.ErrnoException) => {
       // A command stopped at its limit closes stdin under a pending write; the
@@ -1410,8 +1419,9 @@ function rejectedPush(
       fate?.flag !== "!" ||
       fate.spec !== `${oid ?? ""}:${ref}` ||
       !/^\[remote rejected\](?: \([^\r\n]*\))?$/.test(fate.summary)
-    )
+    ) {
       return undefined
+    }
     reasons.push(fate.summary)
   }
   return new PublicationRejected(updates, reasons, detail)
