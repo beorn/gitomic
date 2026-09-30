@@ -4,6 +4,7 @@
 
 ### Added
 
+- `actorTrailersFromToken(raw, declaration)` and `parseActorTokenDeclaration(value, label?)`, exported from `gitomic`: the one decoder from an actor token (a compact JWS, decoded, never verified) to the `Actor-Session` and `Actor-Generation` trailers. The declaration names the variable and the two claims, so gitomic holds no issuer's names. An unreadable token answers `{ reason }` instead of trailers, naming the cause without quoting the token.
 - `GitSignaled`, exported from `gitomic`: a native Git process interrupted by a signal rejects with its command, signal and captured stderr. The runner preserves the signal on both normal close and bounded commands whose helpers keep their pipes open, instead of inventing exit code 1. Ordinary numeric exit codes and live-command `GitTimeout` failures keep their existing behavior.
 
 ## 0.7.0 — 2026-09-26
