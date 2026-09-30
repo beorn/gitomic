@@ -193,6 +193,20 @@ export class GitTimeout extends Error {
   }
 }
 
+/** A native Git process terminated by an observed signal. The caller owns cancellation policy. */
+export class GitSignaled extends Error {
+  override readonly name = "GitSignaled"
+
+  constructor(
+    readonly command: string,
+    readonly signal: NodeJS.Signals,
+    readonly stderr: string,
+    options?: ErrorOptions,
+  ) {
+    super(`${command} was interrupted by ${signal}${stderr.trim() ? `: ${stderr.trim()}` : ""}`, options)
+  }
+}
+
 /**
  * The repository's candidate check refused the tree this write would land. Nothing landed and the ref did not move.
  * `reasons` are the check's own lines, verbatim. `base` is the tip the candidate was built on. Facts only: gitomic

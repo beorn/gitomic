@@ -1,5 +1,6 @@
 // @failure A remote that stalls blocks the caller's event loop, outlives its killed caller, and leaks a temporary clone.
 // @failure Every open of a remote clones the whole repository again instead of reusing one kept bare repository.
+// @failure A signalled Git process becomes exit 1, falsely reporting missing history; held pipes erase its native outcome.
 // @level l1
 // @consumer km's STATE rail in the km daemon, which must keep answering while a write waits on its remote
 /**
@@ -224,6 +225,30 @@ describe("a remote that stalls", () => {
 })
 
 describe("a bounded command", () => {
+  // #26595: timeout/held-pipe success cases do not exercise an externally signalled Git parent.
+  // The real Git alias signals only its own Git parent; no production injection seam is needed.
+  test.each([
+    ["SIGTERM", false],
+    ["SIGKILL", false],
+    ["SIGTERM", true],
+    ["SIGKILL", true],
+  ] as const)(
+    "preserves native %s with held pipes %s",
+    async (signal, heldPipes) => {
+      const helper = heldPipes ? "sleep 3600 & echo $!; " : ""
+      const alias = `!${helper}echo native-signal >&2; kill -${signal.slice(3)} "$PPID"`
+      const outcome = runGit(["-c", `alias.signal=${alias}`, "signal"], { timeoutMs: 500 })
+
+      await expect(outcome).rejects.toMatchObject({
+        name: "GitSignaled",
+        signal,
+        command: "git signal",
+        stderr: expect.stringContaining("native-signal"),
+      })
+    },
+    10_000,
+  )
+
   test("settles by its limit with its own result when a helper it started still holds the output pipes", async () => {
     const startedAt = Date.now()
 
