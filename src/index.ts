@@ -27,9 +27,11 @@ import {
   CandidateRefused,
   Conflict,
   EditDoesNotApply,
+  GitSignaled,
   GitTimeout,
   PublicationRejected,
   PublicationUnknown,
+  RelativeOnlyEditRefused,
   RetriesExhausted,
   TreePathCollision,
 } from "./errors.js"
@@ -70,25 +72,29 @@ export {
   CandidateRefused,
   Conflict,
   EditDoesNotApply,
+  GitSignaled,
   GitTimeout,
   PublicationRejected,
   PublicationUnknown,
+  RelativeOnlyEditRefused,
   RetriesExhausted,
   TreePathCollision,
 }
 export type { EditKind, PreconditionType } from "./errors.js"
-export { applyEdits } from "./edits.js"
+export { applyEdits, countOccurrences, parseEditsDeclaration, type EditsDeclaration } from "./edits.js"
 export { editsFromCheckout } from "./checkout-edits.js"
 export {
   CANDIDATE_CONFIG,
   DEFAULT_CANDIDATE_TIMEOUT_MS,
   TRUST_CONFIG,
   readPublishDeclaration,
+  readStateCheckoutDeclaration,
   readRepositoryDeclaration,
   repositoryCandidate,
   trustDeclaration,
   type RepositoryCandidateOptions,
   type RepositoryDeclaration,
+  type StateCheckoutDeclaration,
   type TrustScope,
 } from "./candidate.js"
 export { identProblem, objectOid } from "./git-object.js"
@@ -117,6 +123,7 @@ export {
   checkedOutRef,
   isBareRepository,
   projectCheckout,
+  projectCheckoutWithSetAside,
   projectRemoteFirstFastForward,
   synchronizeCheckoutToCommit,
   worktreeDirtyPaths,
@@ -124,6 +131,8 @@ export {
   type CheckoutSyncRequest,
   type ProjectCheckoutOutcome,
   type ProjectCheckoutRequest,
+  type StateCheckoutRepairOutcome,
+  type StateCheckoutRepairRequest,
   type RemoteFirstProjectionOutcome,
   type RemoteFirstProjectionRequest,
 } from "./project.js"

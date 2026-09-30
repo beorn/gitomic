@@ -87,16 +87,21 @@ export class PublicationRejected extends Error {
 }
 
 /** The edit kinds `apply` carries. */
-export type EditKind = "put" | "put-bytes" | "append" | "rm" | "mv"
+export type EditKind = "put" | "put-bytes" | "append" | "rm" | "mv" | "replace"
 
 /**
  * Which precondition an edit failed. `put` and `rm` check the path's blob is
  * identical to the base's (`blob-identical`, or `blob-absent` for a create);
  * `mv` checks the source is identical (`source-identical`) AND the destination
- * is absent (`destination-absent`); `append` has no precondition and never
- * fails this way.
+ * is absent (`destination-absent`); `replace` checks the old text occurs exactly
+ * once (`text-unique`); `append` has no precondition and never fails this way.
  */
-export type PreconditionType = "blob-identical" | "blob-absent" | "source-identical" | "destination-absent"
+export type PreconditionType =
+  | "blob-identical"
+  | "blob-absent"
+  | "source-identical"
+  | "destination-absent"
+  | "text-unique"
 
 /**
  * A single edit could not be applied against the tree the transaction actually
@@ -105,6 +110,9 @@ export type PreconditionType = "blob-identical" | "blob-absent" | "source-identi
  * apply — and this error names, as machine-branchable fields, exactly which
  * edit failed which precondition and the two commits between which it moved.
  * Facts only: no owner, role, routing, or remediation prose.
+ *
+ * For `text-unique`, `expected` holds `"1"` and `actual` holds the occurrence
+ * count as decimal text, or `null` when the path is absent.
  */
 export class EditDoesNotApply extends Error {
   override readonly name = "EditDoesNotApply"
@@ -124,9 +132,9 @@ export class EditDoesNotApply extends Error {
      * without changing it.
      */
     readonly anchor: string,
-    /** The content the precondition names — the expected git blob oid, or `null` for "absent". */
+    /** The content the precondition names — the expected git blob oid, "1" for text-unique, or `null` for "absent". */
     readonly expected: string | null,
-    /** What was actually there at the attempted tree — a git blob oid, or `null` for "absent". */
+    /** What was actually there at the attempted tree — a git blob oid, decimal count for text-unique, or `null` for "absent". */
     readonly actual: string | null,
     /** The commit the edit was authored against. */
     readonly base: string,
@@ -134,9 +142,33 @@ export class EditDoesNotApply extends Error {
     readonly head: string,
     options?: ErrorOptions,
   ) {
+    const expectedDesc = preconditionType === "text-unique" ? "1 occurrence of old text" : (expected ?? "absent")
+    const actualDesc = actual ?? "absent"
     super(
       `edit-does-not-apply: ${kind} ${path} failed ${preconditionType}; ` +
-        `expected ${expected ?? "absent"}, found ${actual ?? "absent"} at head ${head} (authored against ${base})`,
+        `expected ${expectedDesc}, found ${actualDesc} at head ${head} (authored against ${base})`,
+      options,
+    )
+  }
+}
+
+/**
+ * An edit attempted a non-relative mutation (`put`, `put-bytes`, `rm`, `mv`)
+ * on a path declared `relative-only` in `.gitomic.conf` [edits].
+ */
+export class RelativeOnlyEditRefused extends Error {
+  override readonly name = "RelativeOnlyEditRefused"
+  readonly code = "relative-only-edit-refused" as const
+
+  constructor(
+    readonly path: string,
+    readonly kind: EditKind,
+    readonly head: string,
+    options?: ErrorOptions,
+  ) {
+    super(
+      `gitomic: ${path} is declared relative-only in .gitomic.conf ([edits] relative-only at head ${head}); ` +
+        `put, put-bytes, rm, and mv are refused; use 'replace' or 'append'`,
       options,
     )
   }
@@ -158,6 +190,20 @@ export class GitTimeout extends Error {
     options?: ErrorOptions,
   ) {
     super(`${command} did not finish within its ${timeoutMs} ms limit; its process group was stopped`, options)
+  }
+}
+
+/** A native Git process terminated by an observed signal. The caller owns cancellation policy. */
+export class GitSignaled extends Error {
+  override readonly name = "GitSignaled"
+
+  constructor(
+    readonly command: string,
+    readonly signal: NodeJS.Signals,
+    readonly stderr: string,
+    options?: ErrorOptions,
+  ) {
+    super(`${command} was interrupted by ${signal}${stderr.trim() ? `: ${stderr.trim()}` : ""}`, options)
   }
 }
 

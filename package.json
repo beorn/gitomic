@@ -1,6 +1,6 @@
 {
   "name": "gitomic",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Atomic, merge-free state commits over git: compare-and-swap on a ref with semantic replay.",
   "keywords": [
     "atomic",
@@ -74,7 +74,7 @@
   },
   "scripts": {
     "bench": "bun benchmarks/backends.ts",
-    "build": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.build.json && node scripts/fix-dist-shebang.mjs",
+    "build": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.build.json && bun scripts/publish-shebang.ts",
     "check": "bun run format && bun run lint && bun run typecheck && bun run test && bun run build && bun run smoke:node",
     "format": "oxfmt --check .",
     "format:write": "oxfmt .",

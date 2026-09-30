@@ -12,11 +12,12 @@ import {
   CANDIDATE_CONFIG,
   CandidateRefused,
   EditDoesNotApply,
+  RelativeOnlyEditRefused,
   matchGlob,
   open,
   openReader,
   openRemoteRepository,
-  projectCheckout,
+  projectCheckoutWithSetAside,
   projectRemoteFirstFastForward,
   readPublishDeclaration,
   readRepositoryDeclaration,
@@ -96,6 +97,7 @@ import { decodeUtf8 } from "./utf8.js"
  *     - `put <path> <file> [--expect <oid> | --create]`
  *     - `put-bytes <path> <file> [--expect <oid> | --create]`
  *     - `append <path> <file>`
+ *     - `replace <path> <old-file> <new-file>`
  *     - `rm <path> [--expect <oid>]`
  *     - `mv <from> <to> [--expect <oid>]`
  *   `<file>` is read from the local filesystem, or stdin for `-`. `put`,
@@ -103,15 +105,16 @@ import { decodeUtf8 } from "./utf8.js"
  *   auto-read their path's current oid at `--base` (default: the current
  *   head) — the same rule `write` uses above; `put --create` is a strict
  *   create; `append` carries no anchor at all, per the library's own `Edit`
- *   shape. Clause ORDER is apply order against the SAME attempted tree, so a
- *   later clause can depend on an earlier one: `rm to.md` then
- *   `mv from.md to.md` frees `to.md` for the move inside one commit, while
- *   the reverse order refuses on `destination-absent`. A PATH spelled like a
- *   clause keyword (`put`/`append`/`rm`/`mv`) is named by prefixing it `./` —
- *   git's own "this is a path" form, which a gitomic tree path never begins
- *   with, so the `./` is an unambiguous escape and is stripped. A FILE argument
- *   spelled like a keyword is written `./rm` too, a normal relative path read
- *   straight from disk.
+ *   shape; `replace` replaces exactly one occurrence of `<old-file>`'s text
+ *   with `<new-file>`'s text. Clause ORDER is apply order against the SAME
+ *   attempted tree, so a later clause can depend on an earlier one: `rm to.md`
+ *   then `mv from.md to.md` frees `to.md` for the move inside one commit,
+ *   while the reverse order refuses on `destination-absent`. A PATH spelled like
+ *   a clause keyword (`put`/`append`/`rm`/`mv`/`replace`) is named by prefixing
+ *   it `./` — git's own "this is a path" form, which a gitomic tree path never
+ *   begins with, so the `./` is an unambiguous escape and is stripped. A FILE
+ *   argument spelled like a keyword is written `./rm` too, a normal relative
+ *   path read straight from disk.
  *
  * Every write verb prints the landed commit oid to stdout on success — or,
  * with `--json`, a one-line `{"oid":<oid>,"retries":<n>}` receipt of the oid
@@ -562,7 +565,7 @@ async function runMv(args: string[], stdout: CliWriter, stderr: CliWriter, sourc
 
 // --- apply verb ------------------------------------------------------------
 
-const CLAUSE_KEYWORDS = new Set(["put", "put-bytes", "append", "rm", "mv"])
+const CLAUSE_KEYWORDS = new Set(["put", "put-bytes", "append", "rm", "mv", "replace"])
 
 async function runApply(
   args: string[],
@@ -634,9 +637,18 @@ async function runApply(
   const startBase = base ?? (await store.head())
   await refuseCheckoutOfPublishedRepository(repository, store, startBase)
   const snapshot = store.at(startBase)
+  let stdinClaimed = false
+  const claimStdin = async (): Promise<string> => {
+    if (stdinClaimed) {
+      throw new UsageError("apply: stdin ('-') may only be used once in one apply invocation")
+    }
+    stdinClaimed = true
+    return readStdin(stdin)
+  }
+
   const edits: Edit[] = []
   for (const clause of splitClauses(queue)) {
-    edits.push(await parseClause(clause, snapshot, stdin, address))
+    edits.push(await parseClause(clause, snapshot, claimStdin, address))
   }
   const committed = await apply(store, startBase, edits, message, await writeOptions(attribution, repository, stderr))
   let projectionOutcome: ProjectOutcomeReceipt | undefined
@@ -669,7 +681,7 @@ function requireQueuedValue(queue: string[], flag: string): string {
   return value
 }
 
-/** Split `apply`'s clause-region tokens into groups, each starting with `put`/`append`/`rm`/`mv`. */
+/** Split `apply`'s clause-region tokens into groups, each starting with `put`/`append`/`rm`/`mv`/`replace`. */
 function splitClauses(tokens: readonly string[]): string[][] {
   const clauses: string[][] = []
   for (const token of tokens) {
@@ -679,35 +691,38 @@ function splitClauses(tokens: readonly string[]): string[][] {
     }
     const current = clauses.at(-1)
     if (current === undefined) {
-      throw new UsageError(`apply: expected a clause keyword (put/put-bytes/append/rm/mv), got: ${token}`)
+      throw new UsageError(`apply: expected a clause keyword (put/put-bytes/append/rm/mv/replace), got: ${token}`)
     }
     current.push(token)
   }
-  if (clauses.length === 0) throw new UsageError("apply requires at least one clause (put/put-bytes/append/rm/mv)")
+  if (clauses.length === 0)
+    throw new UsageError("apply requires at least one clause (put/put-bytes/append/rm/mv/replace)")
   return clauses
 }
 
 /**
  * Parse one clause's tokens (its kind keyword plus that clause's own args and
- * flags) into the `Edit` it names. A bare `put`/`append`/`rm`/`mv` token starts
+ * flags) into the `Edit` it names. A bare `put`/`append`/`rm`/`mv`/`replace` token starts
  * a new clause (see {@link splitClauses}); a path spelled like a keyword is
  * escaped `./name` and de-escaped by {@link clausePath}.
  */
 async function parseClause(
   tokens: readonly string[],
   snapshot: Snapshot,
-  stdin: CliStdin,
+  claimStdin: () => Promise<string>,
   address: string,
 ): Promise<Edit> {
   const keyword = tokens.at(0)
   const rest = tokens.slice(1)
   switch (keyword) {
     case "put":
-      return parsePutClause(rest, snapshot, stdin)
+      return parsePutClause(rest, snapshot, claimStdin)
     case "put-bytes":
       return parsePutBytesClause(rest, snapshot)
     case "append":
-      return parseAppendClause(rest, stdin)
+      return parseAppendClause(rest, claimStdin)
+    case "replace":
+      return parseReplaceClause(rest, claimStdin)
     case "rm":
       return parseRmClause(rest, snapshot, address)
     case "mv":
@@ -715,13 +730,13 @@ async function parseClause(
     default:
       // Unreachable: splitClauses only ever starts a group with one of these keywords.
       throw new UsageError(
-        `apply: expected a clause keyword (put/put-bytes/append/rm/mv), got: ${JSON.stringify(keyword)}`,
+        `apply: expected a clause keyword (put/put-bytes/append/rm/mv/replace), got: ${JSON.stringify(keyword)}`,
       )
   }
 }
 
 /**
- * De-escape a clause PATH operand. A bare `put`/`append`/`rm`/`mv` token starts
+ * De-escape a clause PATH operand. A bare `put`/`append`/`rm`/`mv`/`replace` token starts
  * a new clause (see {@link splitClauses}), so a path spelled like a keyword is
  * written `./name` — git's own "this is a path" form. A gitomic tree path never
  * begins with `./` (a `.` segment is rejected), so a leading `./` is an
@@ -733,7 +748,11 @@ function clausePath(operand: string): string {
   return operand.startsWith("./") ? operand.slice(2) : operand
 }
 
-async function parsePutClause(tokens: readonly string[], snapshot: Snapshot, stdin: CliStdin): Promise<Edit> {
+async function parsePutClause(
+  tokens: readonly string[],
+  snapshot: Snapshot,
+  claimStdin: () => Promise<string>,
+): Promise<Edit> {
   const { positionals, flags } = extractFlags(tokens, { "--expect": "value", "--create": "boolean" })
   assertNoExtraPositionals(positionals, 2, "put <path> <file>")
   const path = clausePath(requirePositional(positionals, 0, "put <path>"))
@@ -741,7 +760,7 @@ async function parsePutClause(tokens: readonly string[], snapshot: Snapshot, std
   const expectFlag = optionalStringFlag(flags, "--expect")
   const createFlag = flags.get("--create") === true
   assertNotContradictoryPrecondition(path, expectFlag !== undefined, createFlag)
-  const content = file === "-" ? await readStdin(stdin) : await readTextFile(file)
+  const content = file === "-" ? await claimStdin() : await readTextFile(file)
   const anchor = await putPrecondition(path, expectFlag, createFlag, snapshot)
   return { kind: "put", path, content, expect: anchor }
 }
@@ -760,13 +779,27 @@ async function parsePutBytesClause(tokens: readonly string[], snapshot: Snapshot
   return { kind: "put-bytes", path, content, expect: anchor }
 }
 
-async function parseAppendClause(tokens: readonly string[], stdin: CliStdin): Promise<Edit> {
+async function parseAppendClause(tokens: readonly string[], claimStdin: () => Promise<string>): Promise<Edit> {
   const { positionals } = extractFlags(tokens, {})
   assertNoExtraPositionals(positionals, 2, "append <path> <file>")
   const path = clausePath(requirePositional(positionals, 0, "append <path>"))
   const file = requirePositional(positionals, 1, "append <path> <file>")
-  const content = file === "-" ? await readStdin(stdin) : await readTextFile(file)
+  const content = file === "-" ? await claimStdin() : await readTextFile(file)
   return { kind: "append", path, content }
+}
+
+async function parseReplaceClause(tokens: readonly string[], claimStdin: () => Promise<string>): Promise<Edit> {
+  const { positionals } = extractFlags(tokens, {})
+  assertNoExtraPositionals(positionals, 3, "replace <path> <old-file> <new-file>")
+  const path = clausePath(requirePositional(positionals, 0, "replace <path>"))
+  const oldFile = requirePositional(positionals, 1, "replace <path> <old-file>")
+  const newFile = requirePositional(positionals, 2, "replace <path> <old-file> <new-file>")
+  const oldText = oldFile === "-" ? await claimStdin() : await readTextFile(oldFile)
+  if (oldText.length === 0) {
+    throw new UsageError("replace old text cannot be empty")
+  }
+  const newText = newFile === "-" ? await claimStdin() : await readTextFile(newFile)
+  return { kind: "replace", path, oldText, newText }
 }
 
 async function parseRmClause(tokens: readonly string[], snapshot: Snapshot, address: string): Promise<Edit> {
@@ -1040,7 +1073,7 @@ async function runProject(args: string[], stdout: CliWriter, stderr: CliWriter):
   const lockTimeoutMs = lockTimeoutRaw === undefined ? undefined : parseLockTimeout(lockTimeoutRaw)
   using checkoutLock = await holdCheckoutLockFor("project", checkoutPath, stderr, lockTimeoutMs)
   if (checkoutLock === undefined) return CHECKOUT_LOCK_BUSY
-  const outcome = await projectCheckout({
+  const outcome = await projectCheckoutWithSetAside({
     repoRoot: checkoutPath,
     remote,
     ref,
@@ -1050,8 +1083,19 @@ async function runProject(args: string[], stdout: CliWriter, stderr: CliWriter):
   if (outcome.ok) {
     const repairedFrom = outcome.kind === "synchronized" ? outcome.repairedIndexFrom : undefined
     const repaired = repairedFrom === undefined ? "" : ` repaired-from=${repairedFrom}`
-    stdout.write(`kind=${outcome.kind} local=${outcome.localTip ?? ""} to=${outcome.to ?? ""}${repaired}\n`)
+    const preserved =
+      outcome.kind === "set-aside"
+        ? ` preserveRef=${outcome.preserveRef} localOnly=${JSON.stringify(outcome.localOnly)}`
+        : ""
+    stdout.write(`kind=${outcome.kind} local=${outcome.localTip ?? ""} to=${outcome.to ?? ""}${repaired}${preserved}\n`)
     return OK
+  }
+
+  if (outcome.kind === "set-aside-refused") {
+    stderr.write(
+      `${outcome.error}\nkind=${outcome.kind} local=${outcome.localTip ?? ""} to=${outcome.to ?? ""} preserveRef=${outcome.preserveRef ?? ""}\n`,
+    )
+    return CANDIDATE_REFUSED
   }
 
   if (PROJECT_LEAVES_UNSYNCHRONIZED[outcome.kind]) {
@@ -1169,7 +1213,7 @@ function extractFlags(
     if (token === undefined) break
     const kind = spec[token]
     if (kind === undefined) {
-      if (token.startsWith("-")) throw new UsageError(`unrecognized flag: ${token}`)
+      if (token.startsWith("-") && token !== "-") throw new UsageError(`unrecognized flag: ${token}`)
       positionals.push(token)
       continue
     }
@@ -1401,6 +1445,10 @@ function describeFailure(error: unknown): string {
 function reportError(error: unknown, stderr: CliWriter): number {
   if (error instanceof UsageError) {
     stderr.write(`gitomic: ${error.message}\n`)
+    return USAGE_ERROR
+  }
+  if (error instanceof RelativeOnlyEditRefused) {
+    stderr.write(`${error.message}\n`)
     return USAGE_ERROR
   }
   if (error instanceof EditDoesNotApply) {

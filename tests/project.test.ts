@@ -6,13 +6,27 @@
  */
 
 import { spawnSync } from "node:child_process"
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs"
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import { afterAll, afterEach, beforeEach, describe, expect, test, vi } from "vitest"
 
-import { projectRemoteFirstFastForward, synchronizeCheckoutToCommit, worktreeDirtyPaths } from "../src/index.js"
+import {
+  projectCheckoutWithSetAside,
+  projectRemoteFirstFastForward,
+  synchronizeCheckoutToCommit,
+  worktreeDirtyPaths,
+} from "../src/index.js"
 import { gitOutcomeForTest } from "../src/project.js"
 import { fileURLToPath } from "node:url"
 
@@ -26,6 +40,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  vi.restoreAllMocks()
   vi.unstubAllEnvs()
 })
 
@@ -48,6 +63,10 @@ function git(root: string, ...args: string[]): string {
     throw new Error(`git ${args.join(" ")} failed: ${result.stderr || result.stdout}`)
   }
   return (result.stdout ?? "").trim()
+}
+
+function advancePastQuietPeriod(): void {
+  vi.spyOn(Date, "now").mockReturnValue(Date.now() + 180_000)
 }
 
 /**
@@ -77,7 +96,7 @@ function runCliSubprocess(args: string[]): { code: number; stdout: string; stder
   }
 }
 
-function remoteFixture(): {
+function remoteFixture(withStateCheckoutPolicy = false): {
   root: string
   bare: string
   checkout: string
@@ -91,6 +110,12 @@ function remoteFixture(): {
   git(seed, "config", "user.name", "Test")
   writeFileSync(join(seed, "tracked.md"), "# original\n")
   writeFileSync(join(seed, "bystander.md"), "# bystander\n")
+  if (withStateCheckoutPolicy) {
+    writeFileSync(
+      join(seed, ".gitomic.conf"),
+      "[state-checkout]\n\tquiet-seconds = 120\n\tmax-file-bytes = 4194304\n\tmax-paths = 25\n\tmax-removals = 6\n\tnew-root = docs/\n",
+    )
+  }
   git(seed, "add", ".")
   git(seed, "commit", "-qm", "baseline")
   const bare = join(root, "origin.git")
@@ -119,6 +144,296 @@ function remoteFixture(): {
 }
 
 describe("gitomic project and checkout synchronization", () => {
+  describe("STATE set-aside repair", () => {
+    test("preserves a local-only commit before bringing the checkout to origin", async () => {
+      const { checkout, landAtOrigin } = remoteFixture(true)
+      writeFileSync(join(checkout, "local.md"), "# local only\n")
+      git(checkout, "add", "local.md")
+      git(checkout, "commit", "-qm", "local commit")
+      const localTip = git(checkout, "rev-parse", "HEAD")
+      const remoteTip = landAtOrigin("tracked.md", "# remote advance\n")
+
+      const result = await projectCheckoutWithSetAside({ repoRoot: checkout })
+
+      expect(result).toMatchObject({ ok: true, kind: "set-aside", to: remoteTip, localTip })
+      if (!result.ok || result.kind !== "set-aside") throw new Error("expected set-aside outcome")
+      expect(git(checkout, "rev-parse", result.preserveRef)).toBe(localTip)
+      expect(git(checkout, "rev-parse", "HEAD")).toBe(remoteTip)
+      expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# remote advance\n")
+      expect(worktreeDirtyPaths(checkout)).toEqual([])
+    })
+
+    test("the existing project command reports a verified set-aside ref", async () => {
+      const { checkout, landAtOrigin } = remoteFixture(true)
+      writeFileSync(join(checkout, "local.md"), "# local only\n")
+      git(checkout, "add", "local.md")
+      git(checkout, "commit", "-qm", "local commit")
+      const localTip = git(checkout, "rev-parse", "HEAD")
+      const remoteTip = landAtOrigin("tracked.md", "# remote advance\n")
+
+      const result = await runCli(["project", checkout])
+
+      expect(result.code, result.stderr).toBe(0)
+      expect(result.stdout).toContain(`kind=set-aside local=${localTip} to=${remoteTip}`)
+      expect(result.stdout).toContain(`preserveRef=refs/preserve/state-checkout/${localTip}`)
+      expect(git(checkout, "rev-parse", "HEAD")).toBe(remoteTip)
+    })
+
+    test("retries after a crash immediately after the preserve ref is read back", async () => {
+      const { checkout, landAtOrigin } = remoteFixture(true)
+      writeFileSync(join(checkout, "local.md"), "# local only\n")
+      git(checkout, "add", "local.md")
+      git(checkout, "commit", "-qm", "local commit")
+      const localTip = git(checkout, "rev-parse", "HEAD")
+      const remoteTip = landAtOrigin("tracked.md", "# remote advance\n")
+
+      await expect(
+        projectCheckoutWithSetAside({
+          repoRoot: checkout,
+          afterPreserveRef: () => {
+            throw new Error("crash")
+          },
+        }),
+      ).rejects.toThrow("crash")
+      expect(git(checkout, "rev-parse", "HEAD")).toBe(localTip)
+      expect(git(checkout, "rev-parse", `refs/preserve/state-checkout/${localTip}`)).toBe(localTip)
+      const retried = await projectCheckoutWithSetAside({ repoRoot: checkout })
+      expect(retried).toMatchObject({ ok: true, kind: "set-aside", to: remoteTip })
+      expect(worktreeDirtyPaths(checkout)).toEqual([])
+    })
+
+    test("a crash after the local ref moves leaves an ordinary projectable checkout", async () => {
+      const { checkout, landAtOrigin } = remoteFixture(true)
+      writeFileSync(join(checkout, "local.md"), "# local only\n")
+      git(checkout, "add", "local.md")
+      git(checkout, "commit", "-qm", "local commit")
+      const localTip = git(checkout, "rev-parse", "HEAD")
+      const remoteTip = landAtOrigin("tracked.md", "# remote advance\n")
+
+      await expect(
+        projectCheckoutWithSetAside({
+          repoRoot: checkout,
+          afterLocalRefMove: () => {
+            throw new Error("crash")
+          },
+        }),
+      ).rejects.toThrow("crash")
+      expect(git(checkout, "rev-parse", `refs/preserve/state-checkout/${localTip}`)).toBe(localTip)
+      expect(git(checkout, "rev-parse", "HEAD")).not.toBe(remoteTip)
+      const retried = await projectCheckoutWithSetAside({ repoRoot: checkout })
+      expect(retried).toMatchObject({ ok: true, kind: "synchronized", to: remoteTip })
+      expect(git(checkout, "rev-parse", "HEAD")).toBe(remoteTip)
+      expect(worktreeDirtyPaths(checkout)).toEqual([])
+    })
+
+    test("old conflicting direct dirt is saved by exact blob and origin then projects", async () => {
+      const { checkout, landAtOrigin } = remoteFixture(true)
+      writeFileSync(join(checkout, "tracked.md"), "# direct local edit\n")
+      const localTip = git(checkout, "rev-parse", "HEAD")
+      const remoteTip = landAtOrigin("tracked.md", "# remote edit\n")
+      advancePastQuietPeriod()
+
+      const result = await projectCheckoutWithSetAside({ repoRoot: checkout })
+
+      expect(result).toMatchObject({ ok: true, kind: "set-aside", to: remoteTip, localTip })
+      if (!result.ok || result.kind !== "set-aside") throw new Error("expected set-aside outcome")
+      expect(git(checkout, "show", `${result.preserveRef}:tracked.md`)).toBe("# direct local edit")
+      expect(git(checkout, "rev-parse", "HEAD")).toBe(remoteTip)
+      expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# remote edit\n")
+      expect(worktreeDirtyPaths(checkout)).toEqual([])
+    })
+
+    test("dirty capture restarts from the verified ref after a crash before movement", async () => {
+      const { checkout, landAtOrigin } = remoteFixture(true)
+      writeFileSync(join(checkout, "tracked.md"), "# direct local edit\n")
+      const localTip = git(checkout, "rev-parse", "HEAD")
+      const remoteTip = landAtOrigin("tracked.md", "# remote edit\n")
+      advancePastQuietPeriod()
+
+      await expect(
+        projectCheckoutWithSetAside({
+          repoRoot: checkout,
+          afterPreserveRef: () => {
+            throw new Error("crash")
+          },
+        }),
+      ).rejects.toThrow("crash")
+      expect(git(checkout, "rev-parse", "HEAD")).toBe(localTip)
+      expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# direct local edit\n")
+      const saved = git(checkout, "for-each-ref", "--format=%(refname)", "refs/preserve/state-checkout/")
+      expect(saved).toContain("refs/preserve/state-checkout/")
+
+      const retried = await projectCheckoutWithSetAside({ repoRoot: checkout })
+      expect(retried).toMatchObject({ ok: true, kind: "set-aside", preserveRef: saved, to: remoteTip })
+      expect(git(checkout, "show", `${saved}:tracked.md`)).toBe("# direct local edit")
+    })
+
+    test("a crash after clearing the captured path leaves an ordinary projection retry", async () => {
+      const { checkout, landAtOrigin } = remoteFixture(true)
+      writeFileSync(join(checkout, "tracked.md"), "# direct local edit\n")
+      const localTip = git(checkout, "rev-parse", "HEAD")
+      const remoteTip = landAtOrigin("tracked.md", "# remote edit\n")
+      advancePastQuietPeriod()
+
+      await expect(
+        projectCheckoutWithSetAside({
+          repoRoot: checkout,
+          afterWorktreeClear: () => {
+            throw new Error("crash")
+          },
+        }),
+      ).rejects.toThrow("crash")
+      const saved = git(checkout, "for-each-ref", "--format=%(refname)", "refs/preserve/state-checkout/")
+      expect(git(checkout, "rev-parse", "HEAD")).toBe(localTip)
+      expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# original\n")
+      expect(git(checkout, "show", `${saved}:tracked.md`)).toBe("# direct local edit")
+
+      const retried = await projectCheckoutWithSetAside({ repoRoot: checkout })
+      expect(retried).toMatchObject({ ok: true, kind: "synchronized", to: remoteTip })
+      expect(git(checkout, "rev-parse", "HEAD")).toBe(remoteTip)
+      expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# remote edit\n")
+    })
+
+    test("a writer's reserved path is untouched even after the quiet period", async () => {
+      const { checkout, landAtOrigin } = remoteFixture(true)
+      writeFileSync(join(checkout, "tracked.md"), "# writer's preauthored bytes\n")
+      const localTip = git(checkout, "rev-parse", "HEAD")
+      landAtOrigin("tracked.md", "# remote edit\n")
+      advancePastQuietPeriod()
+
+      const result = await projectCheckoutWithSetAside({ repoRoot: checkout, reservedPaths: ["tracked.md"] })
+
+      expect(result).toMatchObject({ ok: false, kind: "set-aside-refused", localTip })
+      if (result.ok) throw new Error("expected refusal")
+      expect(result.error).toContain("reserved writer paths")
+      expect(git(checkout, "rev-parse", "HEAD")).toBe(localTip)
+      expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# writer's preauthored bytes\n")
+      expect(git(checkout, "for-each-ref", "refs/preserve/state-checkout")).toBe("")
+    })
+
+    test("a recent conflicting edit waits without a preserve ref or changed bytes", async () => {
+      const { checkout, landAtOrigin } = remoteFixture(true)
+      writeFileSync(join(checkout, "tracked.md"), "# direct edit in progress\n")
+      const localTip = git(checkout, "rev-parse", "HEAD")
+      landAtOrigin("tracked.md", "# remote edit\n")
+
+      const result = await projectCheckoutWithSetAside({ repoRoot: checkout })
+
+      expect(result).toMatchObject({ ok: false, kind: "set-aside-refused", localTip })
+      if (result.ok) throw new Error("expected quiet-period refusal")
+      expect(result.error).toContain("quiet period has not elapsed")
+      expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# direct edit in progress\n")
+      expect(git(checkout, "for-each-ref", "refs/preserve/state-checkout")).toBe("")
+    })
+
+    // Backdating mtime alone must not make a fresh edit eligible for capture; ctime records the metadata change.
+    test("a fresh ctime keeps a backdated conflicting edit inside the quiet period", async () => {
+      const { checkout, landAtOrigin } = remoteFixture(true)
+      const edited = join(checkout, "tracked.md")
+      writeFileSync(edited, "# direct edit in progress\n")
+      const old = new Date(Date.now() - 180_000)
+      utimesSync(edited, old, old)
+      const localTip = git(checkout, "rev-parse", "HEAD")
+      landAtOrigin("tracked.md", "# remote edit\n")
+
+      const result = await projectCheckoutWithSetAside({ repoRoot: checkout })
+
+      expect(result).toMatchObject({ ok: false, kind: "set-aside-refused", localTip })
+      if (result.ok) throw new Error("expected quiet-period refusal")
+      expect(result.error).toContain("quiet period has not elapsed")
+      expect(readFileSync(edited, "utf8")).toBe("# direct edit in progress\n")
+      expect(git(checkout, "for-each-ref", "refs/preserve/state-checkout")).toBe("")
+    })
+
+    test("a blocking removal is saved as an absent tree entry before origin bytes arrive", async () => {
+      const { checkout, landAtOrigin } = remoteFixture(true)
+      rmSync(join(checkout, "tracked.md"))
+      const remoteTip = landAtOrigin("tracked.md", "# remote edit\n")
+      advancePastQuietPeriod()
+
+      const result = await projectCheckoutWithSetAside({ repoRoot: checkout })
+
+      expect(result).toMatchObject({ ok: true, kind: "set-aside", to: remoteTip })
+      if (!result.ok || result.kind !== "set-aside") throw new Error("expected set-aside outcome")
+      expect(git(checkout, "ls-tree", result.preserveRef, "--", "tracked.md")).toBe("")
+      expect(git(checkout, "rev-parse", "HEAD")).toBe(remoteTip)
+      expect(worktreeDirtyPaths(checkout)).toEqual([])
+    })
+
+    test("a blocking executable-mode change keeps its mode in the preserved tree", async () => {
+      const { checkout, landAtOrigin } = remoteFixture(true)
+      chmodSync(join(checkout, "tracked.md"), 0o755)
+      landAtOrigin("tracked.md", "# remote edit\n")
+      advancePastQuietPeriod()
+
+      const result = await projectCheckoutWithSetAside({ repoRoot: checkout })
+
+      expect(result).toMatchObject({ ok: true, kind: "set-aside" })
+      if (!result.ok || result.kind !== "set-aside") throw new Error("expected set-aside outcome")
+      expect(git(checkout, "ls-tree", result.preserveRef, "--", "tracked.md")).toContain("100755 blob")
+      expect(git(checkout, "ls-tree", "HEAD", "--", "tracked.md")).toContain("100644 blob")
+    })
+
+    test("an unknown origin policy key refuses without treating the working copy as authority", async () => {
+      const { checkout, landAtOrigin } = remoteFixture(true)
+      landAtOrigin(
+        ".gitomic.conf",
+        "[state-checkout]\n\tquiet-seconds = 120\n\tmax-file-bytes = 4194304\n\tmax-paths = 25\n\tmax-removals = 6\n\tunknown = value\n",
+      )
+      const result = await projectCheckoutWithSetAside({ repoRoot: checkout })
+      expect(result).toMatchObject({ ok: false, kind: "set-aside-refused" })
+      if (result.ok) throw new Error("expected policy refusal")
+      expect(result.error).toContain("unknown [state-checkout] key")
+    })
+
+    test("a local declaration edit is set aside immediately even when origin is current", async () => {
+      const { checkout } = remoteFixture(true)
+      const tip = git(checkout, "rev-parse", "HEAD")
+      writeFileSync(join(checkout, ".gitomic.conf"), "[state-checkout]\n\tquiet-seconds = 1\n")
+
+      const result = await projectCheckoutWithSetAside({ repoRoot: checkout })
+
+      expect(result).toMatchObject({ ok: true, kind: "set-aside", to: tip })
+      if (!result.ok || result.kind !== "set-aside") throw new Error("expected set-aside outcome")
+      expect(git(checkout, "show", `${result.preserveRef}:.gitomic.conf`)).toContain("quiet-seconds = 1")
+      expect(worktreeDirtyPaths(checkout)).toEqual([])
+      expect(git(checkout, "rev-parse", "HEAD")).toBe(tip)
+    })
+
+    test("a local declaration edit is preserved after an unrelated origin advance", async () => {
+      const { checkout, landAtOrigin } = remoteFixture(true)
+      writeFileSync(join(checkout, ".gitomic.conf"), "[state-checkout]\n\tquiet-seconds = 1\n")
+      const remoteTip = landAtOrigin("tracked.md", "# remote advance\n")
+
+      const result = await projectCheckoutWithSetAside({ repoRoot: checkout })
+
+      expect(result).toMatchObject({ ok: true, kind: "set-aside", to: remoteTip })
+      if (!result.ok || result.kind !== "set-aside") throw new Error("expected set-aside outcome")
+      expect(git(checkout, "rev-parse", `${result.preserveRef}^`)).toBe(remoteTip)
+      expect(worktreeDirtyPaths(checkout)).toEqual([])
+    })
+
+    test("a local commit and old conflicting dirt share one durable preservation ref", async () => {
+      const { checkout, landAtOrigin } = remoteFixture(true)
+      writeFileSync(join(checkout, "local.md"), "# local commit\n")
+      git(checkout, "add", "local.md")
+      git(checkout, "commit", "-qm", "suspected bypass")
+      const localTip = git(checkout, "rev-parse", "HEAD")
+      writeFileSync(join(checkout, "tracked.md"), "# direct local edit\n")
+      const remoteTip = landAtOrigin("tracked.md", "# remote edit\n")
+      advancePastQuietPeriod()
+
+      const result = await projectCheckoutWithSetAside({ repoRoot: checkout })
+
+      expect(result).toMatchObject({ ok: true, kind: "set-aside", to: remoteTip, localTip })
+      if (!result.ok || result.kind !== "set-aside") throw new Error("expected set-aside outcome")
+      expect(git(checkout, "show", `${result.preserveRef}:local.md`)).toBe("# local commit")
+      expect(git(checkout, "show", `${result.preserveRef}:tracked.md`)).toBe("# direct local edit")
+      expect(git(checkout, "rev-parse", "HEAD")).toBe(remoteTip)
+      expect(worktreeDirtyPaths(checkout)).toEqual([])
+    })
+  })
+
   describe("library routines", () => {
     test("worktreeDirtyPaths reports tracked and untracked files, ignoring ignored ones", () => {
       const { checkout } = remoteFixture()
@@ -265,6 +580,22 @@ describe("gitomic project and checkout synchronization", () => {
       expect(result.stderr).toContain("landed-but-unsynchronized")
       expect(result.stderr).toContain(`kind=landed-but-unsynchronized local=${localTip}`)
     })
+  })
+
+  test("project refuses a local deletion that origin replaced without losing the removal", async () => {
+    const { checkout, landAtOrigin } = remoteFixture()
+    const localTip = git(checkout, "rev-parse", "HEAD")
+    rmSync(join(checkout, "tracked.md"))
+    expect(worktreeDirtyPaths(checkout)).toEqual(["tracked.md"])
+    landAtOrigin("tracked.md", "# remote edit\n")
+    expect(worktreeDirtyPaths(checkout)).toEqual(["tracked.md"])
+
+    const result = await runCli(["project", checkout])
+
+    expect(result.code).toBe(4)
+    expect(result.stderr).toContain("tracked.md")
+    expect(git(checkout, "rev-parse", "HEAD")).toBe(localTip)
+    expect(worktreeDirtyPaths(checkout)).toEqual(["tracked.md"])
   })
 
   describe("Witness 3: pre-existing dirt on untouched path survives exactly", () => {

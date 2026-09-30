@@ -151,6 +151,79 @@ export async function readPublishDeclaration(repo: string, base: string): Promis
   return { remote, branch }
 }
 
+/** A checkout-repair policy declared by the origin commit, never by its working copy. */
+export type StateCheckoutDeclaration = {
+  readonly quietSeconds: number
+  readonly maxFileBytes: number
+  readonly maxPaths: number
+  readonly maxRemovals: number
+  readonly newRoots: readonly string[]
+}
+
+/** No section disables repair. A partial or unknown section refuses instead of supplying Gitomic-owned defaults. */
+export async function readStateCheckoutDeclaration(
+  repo: string,
+  originTip: string,
+): Promise<StateCheckoutDeclaration | undefined> {
+  const declaration = await readRepositoryDeclaration(repo, originTip)
+  if (declaration === undefined) return undefined
+  const result = await runGit(["-C", repo, "config", "--blob", declaration.blob, "--get-regexp", "^state-checkout\\."])
+  if (result.code === 1 && result.stdout.length === 0) {
+    const text = await runGit(["-C", repo, "cat-file", "blob", declaration.blob])
+    if (text.code !== 0) throw new Error(`${CANDIDATE_CONFIG}: cannot read declaration blob ${declaration.blob}`)
+    if (/^\s*\[state-checkout\s*\]/imu.test(decodeUtf8(text.stdout, CANDIDATE_CONFIG))) {
+      throw new Error(
+        `${CANDIDATE_CONFIG} at ${originTip}: [state-checkout] lacks quiet-seconds, max-file-bytes, max-paths and max-removals`,
+      )
+    }
+    return undefined
+  }
+  if (result.code !== 0) {
+    throw new Error(
+      `${CANDIDATE_CONFIG}: cannot read [state-checkout] at ${originTip}: ${result.stderr.toString("utf8").trim()}`,
+    )
+  }
+  const numbers = new Map<string, number>()
+  const newRoots: string[] = []
+  const allowed = new Set(["quiet-seconds", "max-file-bytes", "max-paths", "max-removals", "new-root"])
+  for (const line of decodeUtf8(result.stdout, CANDIDATE_CONFIG).split("\n")) {
+    if (line === "") continue
+    const space = line.indexOf(" ")
+    const key = space < 0 ? line : line.slice(0, space)
+    const value = space < 0 ? "" : line.slice(space + 1).trim()
+    const name = key.slice("state-checkout.".length)
+    if (!allowed.has(name)) {
+      throw new Error(`${CANDIDATE_CONFIG} at ${originTip}: unknown [state-checkout] key '${key}'`)
+    }
+    if (name === "new-root") {
+      if (value === "" || value.startsWith("/") || value.includes("..") || !value.endsWith("/")) {
+        throw new Error(`${CANDIDATE_CONFIG} at ${originTip}: invalid new-root ${JSON.stringify(value)}`)
+      }
+      newRoots.push(value)
+      continue
+    }
+    const number = Number(value)
+    if (!Number.isSafeInteger(number) || number <= 0 || numbers.has(name)) {
+      throw new Error(
+        `${CANDIDATE_CONFIG} at ${originTip}: ${key} needs one positive integer, got ${JSON.stringify(value)}`,
+      )
+    }
+    numbers.set(name, number)
+  }
+  const requiredNumber = (name: string): number => {
+    const value = numbers.get(name)
+    if (value === undefined) throw new Error(`${CANDIDATE_CONFIG} at ${originTip}: [state-checkout] lacks ${name}`)
+    return value
+  }
+  return {
+    quietSeconds: requiredNumber("quiet-seconds"),
+    maxFileBytes: requiredNumber("max-file-bytes"),
+    maxPaths: requiredNumber("max-paths"),
+    maxRemovals: requiredNumber("max-removals"),
+    newRoots,
+  }
+}
+
 type Declaration = { derive?: string; check?: string; timeoutMs: number }
 
 /** The candidate that runs the repository's own declared derive and check commands. Shell-backed repositories only. */
