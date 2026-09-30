@@ -225,6 +225,55 @@ describe("a remote that stalls", () => {
 })
 
 describe("a bounded command", () => {
+  // #26689: signalling Git itself does not cover TERM sent to its graceful host.
+  test("a graceful host drains an admitted publication after TERM", async () => {
+    const fixture = await createRemoteRepos()
+    const gate = await mkdtemp(join(tmpdir(), "gitomic-publication-gate-"))
+    const entered = join(gate, "entered")
+    const release = join(gate, "release")
+    const hook = join(fixture.remote, "hooks", "pre-receive")
+    await writeFile(
+      hook,
+      `#!/usr/bin/env bun\nimport { existsSync, writeFileSync } from "node:fs"\nwriteFileSync(${JSON.stringify(entered)}, String(process.pid))\nconst deadline = Date.now() + 10000\nwhile (!existsSync(${JSON.stringify(release)})) {\n  if (Date.now() > deadline) process.exit(1)\n  await new Promise(resolve => setTimeout(resolve, 10))\n}\n`,
+    )
+    await chmod(hook, 0o755)
+    try {
+      const child = await runInChild(
+        [
+          'const { existsSync, writeFileSync } = await import("node:fs")',
+          "let signalled = false",
+          'process.on("SIGTERM", () => { signalled = true })',
+          `const store = await gitomic.open({ repo: ${JSON.stringify(fixture.left)}, ref: "main", remote: "origin", backend: gitomic.createShellBackend({ sigterm: "drain", remoteTimeoutMs: 5000 }) })`,
+          'const publication = store.transact(map => map.set("note.md", "drained publication\\n"), "drain publication").then(result => ({ ok: true, oid: result.oid }), error => ({ ok: false, name: error.name, message: error.message }))',
+          "const admissionBound = Date.now() + 8000",
+          `while (!existsSync(${JSON.stringify(entered)})) {`,
+          '  if (Date.now() > admissionBound) throw new Error("real publication never reached its receive hook")',
+          "  await new Promise(resolve => setTimeout(resolve, 10))",
+          "}",
+          'process.kill(process.pid, "SIGTERM")',
+          "while (!signalled) await new Promise(resolve => setTimeout(resolve, 10))",
+          `writeFileSync(${JSON.stringify(release)}, "release")`,
+          "outcome = { ...(await publication), parentPid: process.pid }",
+        ].join("\n"),
+        { ...process.env },
+        15000,
+      )
+      expect(child.exitedOnItsOwn, child.output).toBe(true)
+      expect(child.result, child.output).toMatchObject({
+        ok: true,
+        parentPid: expect.any(Number),
+        oid: expect.any(String),
+      })
+      expect(await git(fixture.remote, "show", "main:note.md")).toBe("drained publication")
+      const hookPid = Number(await readFile(entered, "utf8"))
+      expect(await survivors([hookPid])).toEqual([])
+    } finally {
+      await writeFile(release, "release")
+      await fixture.cleanup()
+      await rm(gate, { recursive: true, force: true })
+    }
+  }, 20000)
+
   // #26595: timeout/held-pipe success cases do not exercise an externally signalled Git parent.
   // The real Git alias signals only its own Git parent; no production injection seam is needed.
   test.each([
