@@ -142,8 +142,13 @@ and hands to `update` (its third argument) and `beside` as `tips`, a map from
 ref to id in which a ref that does not exist yet is simply absent. On a remote
 store they ride the SAME `git fetch` as the store's ref, one process per attempt
 and never one per ref; absence is tolerated for the listed refs only, while the
-store's own ref stays strict. On a local store they are read from the
-repository. It refuses at the call for the store's own ref, a name outside
+store's own ref stays strict. On a local store they are read together from the
+repository in one exact-array `backend.listRefs` call per attempt. Custom
+backends implementing `listRefs` must support both a string prefix and an array
+of exact full ref names; prefix-only implementations must migrate. Exact arrays
+omit absent refs, retain ref-name order, refuse malformed or repeated names
+before I/O, and answer an empty array without I/O. This is a breaking backend
+contract change. It refuses at the call for the store's own ref, a name outside
 `refs/`, a repeat, or a backend that cannot read them. `fetchRefs` itself takes `{ absent: "omit" }` for the same tolerance, and
 the events door's `events({ at })` reads a chain at such a fetched tip without
 another round trip.

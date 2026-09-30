@@ -499,9 +499,10 @@ async function prepareStore(options: OpenOptions): Promise<StoreContext> {
       const tip = await refresh("initial")
       const listRefs = backend.listRefs
       if (listRefs === undefined) throw new TypeError("fetch on a local store needs a backend with listRefs")
+      const observed = await listRefs(repo, fetch)
       const tips = new Map<string, Oid>()
       for (const name of fetch) {
-        const found = (await listRefs(repo, name)).get(name)
+        const found = observed.get(name)
         if (found !== undefined) tips.set(name, found)
       }
       return { tip, tips }

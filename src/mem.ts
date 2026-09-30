@@ -32,7 +32,7 @@ import type {
   TreeEntry,
   TreeListing,
 } from "./types.js"
-import { rejectLegacyProvenance } from "./options.js"
+import { rejectLegacyProvenance, validateRefNames } from "./options.js"
 import { assertGitPrefixMatched, normalizePrefix } from "./path.js"
 
 type MemCommit = {
@@ -244,9 +244,17 @@ export function createMemBackend(): GitomicBackend {
     return undefined
   }
 
-  const listRefs = async (name: string, prefix: string, remote?: string): Promise<ReadonlyMap<string, Oid>> => {
+  const listRefs = async (
+    name: string,
+    selection: string | readonly string[],
+    remote?: string,
+  ): Promise<ReadonlyMap<string, Oid>> => {
     if (remote !== undefined) throw new TypeError("the mem backend has no remotes; omit remote")
-    const listed = [...getRepo(name).refs].filter(([ref]) => refUnderPrefix(ref, prefix))
+    const selected = typeof selection === "string" ? selection : validateRefNames(selection)
+    if (typeof selected !== "string" && selected.size === 0) return new Map()
+    const listed = [...getRepo(name).refs].filter(([ref]) =>
+      typeof selected === "string" ? refUnderPrefix(ref, selected) : selected.has(ref),
+    )
     return new Map(listed.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
   }
 

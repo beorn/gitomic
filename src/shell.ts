@@ -11,7 +11,7 @@ import { fullJitter, type RandomUnit } from "@bearly/pacing"
 import { syncDirectory } from "./durable.js"
 import { Conflict, GitSignaled, GitTimeout, PublicationRejected } from "./errors.js"
 import { journalLeaseRejection } from "./lease-journal.js"
-import { rejectLegacyProvenance } from "./options.js"
+import { rejectLegacyProvenance, validateRefNames } from "./options.js"
 import {
   assertRefUpdates,
   commitIdents,
@@ -233,8 +233,11 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
       findTransaction(await resolveGitDir(repo), tip, base, instance, seq, baseEnv),
     fetchRemote: async (repo, ref, remote) =>
       fetchRemote(await resolveGitDir(repo), ref, remote, remoteTimeoutMs, syncRefs, baseEnv),
-    listRefs: async (repo, prefix, remote) =>
-      listRefs(await resolveGitDir(repo), prefix, remote, remoteTimeoutMs, baseEnv),
+    listRefs: async (repo, selection, remote) => {
+      const selected = typeof selection === "string" ? selection : validateRefNames(selection)
+      if (typeof selected !== "string" && selected.size === 0) return new Map()
+      return listRefs(await resolveGitDir(repo), selected, remote, remoteTimeoutMs, baseEnv)
+    },
     readHistory: async (repo, tips, historyOptions) =>
       readHistory(await resolveGitDir(repo), tips, historyOptions, baseEnv),
     writeGenesis: async (repo) => {
@@ -978,24 +981,30 @@ async function writeGenesis(repo: string, format: "sha1" | "sha256", baseEnv?: N
  */
 async function listRefs(
   repo: string,
-  prefix: string,
+  selection: string | ReadonlySet<string>,
   remote: string | undefined,
   timeoutMs: number,
   baseEnv?: NodeJS.ProcessEnv,
 ): Promise<ReadonlyMap<string, Oid>> {
-  if (typeof prefix !== "string" || !prefix.startsWith("refs/")) {
-    throw new TypeError(`listRefs prefix must start with refs/: ${JSON.stringify(prefix)}`)
+  if (typeof selection === "string" && !selection.startsWith("refs/")) {
+    throw new TypeError(`listRefs prefix must start with refs/: ${JSON.stringify(selection)}`)
   }
   const pairs: Array<[string, Oid]> = []
   if (remote === undefined) {
-    const output = await git(repo, ["for-each-ref", "--format=%(objectname) %(refname)", prefix], { baseEnv })
+    const patterns = typeof selection === "string" ? [selection] : [...selection]
+    const output = await git(repo, ["for-each-ref", "--format=%(objectname) %(refname)", ...patterns], { baseEnv })
     for (const line of decodeUtf8(output, "git for-each-ref").split("\n")) {
       if (line === "") continue
       const space = line.indexOf(" ")
       pairs.push([line.slice(space + 1), validateOid(line.slice(0, space), "git for-each-ref returned a malformed id")])
     }
   } else {
-    const patterns = prefix.endsWith("/") ? [`${prefix}*`] : [prefix, `${prefix}/*`]
+    const patterns =
+      typeof selection === "string"
+        ? selection.endsWith("/")
+          ? [`${selection}*`]
+          : [selection, `${selection}/*`]
+        : [...selection]
     const output = await git(repo, ["ls-remote", "--refs", remote, ...patterns], { baseEnv, timeoutMs })
     for (const line of decodeUtf8(output, "git ls-remote").split("\n")) {
       if (line === "") continue
@@ -1003,7 +1012,9 @@ async function listRefs(
       pairs.push([line.slice(tab + 1), validateOid(line.slice(0, tab), "git ls-remote returned a malformed id")])
     }
   }
-  const matching = pairs.filter(([ref]) => refUnderPrefix(ref, prefix))
+  const matching = pairs.filter(([ref]) =>
+    typeof selection === "string" ? refUnderPrefix(ref, selection) : selection.has(ref),
+  )
   const seen = new Set<string>()
   for (const [ref] of matching) {
     if (seen.has(ref)) throw new Error(`git ref listing returned duplicate ref ${ref}`)
@@ -1390,9 +1401,11 @@ async function publishLocal(
   const firstHeld = lockHeld(firstDetail)
   if (firstHeld !== undefined) throw firstHeld
 
-  const current = await readExactRefs(
+  const current = await listRefs(
     repo,
-    updates.map(({ ref }) => ref),
+    validateRefNames(updates.map(({ ref }) => ref)),
+    undefined,
+    DEFAULT_REMOTE_TIMEOUT_MS,
     baseEnv,
   )
   const lost = updates
@@ -1417,25 +1430,6 @@ async function publishLocal(
     throw leaseConflict([{ ref: movedUpdate.ref, expect: movedUpdate.expect, observed: movedAgain.at }])
   }
   throw failed(second.code, secondDetail)
-}
-
-/** Exactly these refs and their tips, in ONE `for-each-ref`; an absent ref is simply missing. */
-async function readExactRefs(
-  repo: string,
-  refs: readonly string[],
-  baseEnv?: NodeJS.ProcessEnv,
-): Promise<ReadonlyMap<string, Oid>> {
-  const output = await git(repo, ["for-each-ref", "--format=%(objectname) %(refname)", ...refs], { baseEnv })
-  const wanted = new Set(refs)
-  const tips = new Map<string, Oid>()
-  for (const line of decodeUtf8(output, "git for-each-ref").split("\n")) {
-    if (line === "") continue
-    const space = line.indexOf(" ")
-    const ref = line.slice(space + 1)
-    // A pattern also matches refs below it; keep only the exact names asked for.
-    if (wanted.has(ref)) tips.set(ref, validateOid(line.slice(0, space), "git for-each-ref returned a malformed id"))
-  }
-  return tips
 }
 
 function isStaleLease(summary: string): boolean {

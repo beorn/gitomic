@@ -620,6 +620,64 @@ describe("acceptance: spawn counts on the shell backend", () => {
 })
 
 describe("acceptance: listRefs answers locally and through ls-remote --refs", () => {
+  /**
+   * @failure exact side-ref reads include descendants or omit requested tips; prefix callers change meaning.
+   * @level l0
+   * @consumer 26718 CTO b7b1bfec: one exact-set backend observation with absent refs omitted.
+   */
+  test("exact ref arrays select present names without widening string prefixes", async () => {
+    await withTargets(async (target) => {
+      const prefix = "refs/events/exact/"
+      const names = ["two", "one", "branch/child", "one-lookalike"]
+      const tips = new Map<string, Oid>()
+      for (const name of names) {
+        const events = await openEvents({ repo: target.repo, ref: prefix + name, backend: target.backend })
+        await events.append([{ type: "opened" }], { expect: null })
+        tips.set(prefix + name, (await events.head()) as Oid)
+      }
+      const selection = [prefix + "two", prefix + "missing", prefix + "branch", prefix + "one"]
+      const read = target.backend.listRefs
+      if (read === undefined) throw new Error("ref-list fixture lacks listRefs")
+      expect([...(await read(target.repo, selection))], target.name).toEqual([
+        [prefix + "one", tips.get(prefix + "one")],
+        [prefix + "two", tips.get(prefix + "two")],
+      ])
+      expect(
+        [...(await read(target.repo, prefix))].map(([ref]) => ref),
+        target.name,
+      ).toEqual([prefix + "branch/child", prefix + "one", prefix + "one-lookalike", prefix + "two"])
+    })
+  })
+
+  /**
+   * @failure an empty selection lists all refs, or malformed arrays touch a repository before refusal.
+   * @level l0
+   * @consumer 26718 CTO b7b1bfec: validate exact arrays and answer empty before native I/O.
+   */
+  test("empty and invalid exact arrays perform no native I/O", async () => {
+    const backend = createShellBackend()
+    const spawn = vi.spyOn(childProcess, "spawn")
+    try {
+      const read = backend.listRefs
+      if (read === undefined) throw new Error("shell fixture lacks listRefs")
+      for (const names of [
+        ["main"],
+        ["refs/events/a", "refs/events/a"],
+        ["refs/events/a/"],
+        ["refs/events/a*"],
+        [null],
+      ]) {
+        await expect(read("/gitomic-no-such-repository", names as unknown as readonly string[])).rejects.toBeInstanceOf(
+          TypeError,
+        )
+      }
+      expect(await read("/gitomic-no-such-repository", [])).toEqual(new Map())
+      expect(gitSpawns(spawn)).toBe(0)
+    } finally {
+      spawn.mockRestore()
+    }
+  })
+
   test("local for-each-ref and a remote ls-remote agree", async () => {
     const remote = await createBareRepo()
     const local = await createBareRepo()
@@ -637,6 +695,19 @@ describe("acceptance: listRefs answers locally and through ls-remote --refs", ()
       expect([...there]).toEqual([["refs/events/x/one", tip]])
 
       expect(await listRefs("refs/events/none/", { repo: remote.repo, backend })).toEqual(new Map())
+
+      // Native remote patterns can match descendants and ref-name tails too.
+      for (const ref of ["refs/events/x/branch/child", "refs/other/refs/events/x/one"]) {
+        const extra = await openEvents({ repo: remote.repo, ref, backend })
+        await extra.append([{ type: "opened" }], { expect: null })
+      }
+      expect([
+        ...(await backend.listRefs!(
+          local.repo,
+          ["refs/events/x/one", "refs/events/x/branch", "refs/events/x/missing"],
+          "origin",
+        )),
+      ]).toEqual([["refs/events/x/one", tip]])
     } finally {
       await remote.cleanup()
       await local.cleanup()
