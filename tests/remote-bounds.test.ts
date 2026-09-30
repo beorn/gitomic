@@ -289,10 +289,22 @@ describe("a bounded command", () => {
       failure: undefined,
       hostHandler: false,
     },
+    {
+      name: "isolates a drained publication from a concurrent default fetch",
+      policy: "drain",
+      signals: ["SIGTERM"],
+      release: true,
+      failure: undefined,
+      hostHandler: true,
+    },
   ])(
     "a graceful host $name",
-    async ({ policy, signals, release: releasePublication, failure, hostHandler }) => {
+    async ({ name, policy, signals, release: releasePublication, failure, hostHandler }) => {
+      const mixed = name === "isolates a drained publication from a concurrent default fetch"
       const fixture = await createRemoteRepos()
+      const stall = mixed ? await createStallingSsh() : undefined
+      const forwardRepo = mixed ? await createBareRepo() : undefined
+      if (forwardRepo !== undefined) await git(forwardRepo.repo, "remote", "add", "origin", STALLING_SOURCE)
       const gate = await mkdtemp(join(tmpdir(), "gitomic-publication-gate-"))
       const entered = join(gate, "entered")
       const release = join(gate, "release")
@@ -313,9 +325,14 @@ describe("a bounded command", () => {
               ? ['for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(signal, () => { signalCount += 1 })']
               : []),
             `const store = await gitomic.open({ repo: ${JSON.stringify(fixture.left)}, ref: "main", remote: "origin", backend: gitomic.createShellBackend(${JSON.stringify({ sigterm: policy, remoteTimeoutMs: 1000 })}) })`,
+            ...(forwardRepo === undefined
+              ? []
+              : [
+                  `const forwarded = gitomic.open({ repo: ${JSON.stringify(forwardRepo.repo)}, ref: "main", remote: "origin", backend: gitomic.createShellBackend({ remoteTimeoutMs: 5000 }) }).then(() => ({ ok: true }), error => ({ ok: false, name: error.name }))`,
+                ]),
             'const publication = store.transact(map => map.set("note.md", "drained publication\\n"), "drain publication").then(result => ({ ok: true, oid: result.oid }), error => ({ ok: false, name: error.name, message: error.message, failure: error.cause?.cause?.name }))',
             "const admissionBound = Date.now() + 8000",
-            `while (!existsSync(${JSON.stringify(entered)})) {`,
+            `while (!existsSync(${JSON.stringify(entered)})${stall === undefined ? "" : ` || !existsSync(${JSON.stringify(join(stall.script, "..", "pids"))})`}) {`,
             '  if (Date.now() > admissionBound) throw new Error("real publication never reached its receive hook")',
             "  await new Promise(resolve => setTimeout(resolve, 10))",
             "}",
@@ -329,16 +346,18 @@ describe("a bounded command", () => {
                   `  writeFileSync(${JSON.stringify(deferred)}, "parent survived TERM with publication held")`,
                 ]),
             "}",
+            ...(forwardRepo === undefined ? [] : ["const forwardedResult = await forwarded"]),
             ...(releasePublication ? [`writeFileSync(${JSON.stringify(release)}, "release")`] : []),
-            "outcome = { ...(await publication), parentPid: process.pid }",
+            `outcome = { ...(await publication), parentPid: process.pid${forwardRepo === undefined ? "" : ", forwarded: forwardedResult"} }`,
           ].join("\n"),
-          { ...process.env },
+          { ...process.env, ...(stall === undefined ? {} : { GIT_SSH_COMMAND: stall.script }) },
           15000,
         )
         expect(child.exitedOnItsOwn, child.output).toBe(true)
         expect(Number(await readFile(parent, "utf8"))).toBeGreaterThan(0)
         if (hostHandler) {
           expect(child.result, child.output).toMatchObject({ ok: failure === undefined, parentPid: expect.any(Number) })
+          if (mixed) expect(child.result, child.output).toMatchObject({ forwarded: { ok: false, name: "GitSignaled" } })
         } else {
           expect(await readFile(deferred, "utf8")).toBe("parent survived TERM with publication held")
           expect(child.exitSignal, child.output).toBe("SIGTERM")
@@ -351,9 +370,11 @@ describe("a bounded command", () => {
           expect(await git(fixture.remote, "rev-parse", "main")).toBe(fixture.initial)
         }
         const hookPid = Number(await readFile(entered, "utf8"))
-        expect(await survivors([hookPid])).toEqual([])
+        expect(await survivors([hookPid, ...(stall === undefined ? [] : await stall.pids())])).toEqual([])
       } finally {
         await writeFile(release, "release")
+        await stall?.cleanup()
+        await forwardRepo?.cleanup()
         await fixture.cleanup()
         await rm(gate, { recursive: true, force: true })
       }

@@ -127,7 +127,7 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
 } {
   const executable = options.gitExecutable ?? "git"
   if (executable.trim() === "") throw new TypeError("gitExecutable must name a Git executable")
-  const sigterm = options.sigterm ?? "forward"
+  const sigterm = options.sigterm === undefined ? "forward" : options.sigterm
   if (sigterm !== "forward" && sigterm !== "drain") throw new TypeError('sigterm must be "forward" or "drain"')
   const remoteTimeoutMs = normalizeTimeoutMs(options.remoteTimeoutMs ?? DEFAULT_REMOTE_TIMEOUT_MS, "remoteTimeoutMs")
   const baseEnv = snapshotEnvironment(options.baseEnv)
