@@ -248,6 +248,21 @@ describe.sequential("shell backend failure boundaries", () => {
       expect(synced).toContain(cacheDir)
       expect(synced).toContain(dirname(cacheDir))
       expect(synced).toContain(fixture.repo)
+
+      synced.length = 0
+      const remoteRef = "refs/km/remote/cache/probe"
+      const backend = createShellBackend()
+      await expect(
+        backend.compareAndSwapRemote!(kept.repo, remoteRef, committed, "0".repeat(40), "origin"),
+      ).resolves.toEqual({ landed: true, kept: "swapped" })
+      expect(synced).toContain(join(kept.repo, "refs", "km", "remote", "cache"))
+      expect(synced).toContain(kept.repo)
+
+      synced.length = 0
+      expect(await backend.fetchRemote!(kept.repo, remoteRef, "origin")).toBe(committed)
+      expect(synced).toContain(join(kept.repo, "refs"))
+      expect(synced).toContain(kept.repo)
+      expect(await git(kept.repo, "for-each-ref", "refs/gitomic/fetch/")).toBe("")
     } finally {
       openSpy.mockRestore()
       if (previousTrace === undefined) delete process.env.GIT_TRACE2_EVENT

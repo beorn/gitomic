@@ -232,7 +232,7 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
     findTransaction: async (repo, tip, base, instance, seq) =>
       findTransaction(await resolveGitDir(repo), tip, base, instance, seq, baseEnv),
     fetchRemote: async (repo, ref, remote) =>
-      fetchRemote(await resolveGitDir(repo), ref, remote, remoteTimeoutMs, baseEnv),
+      fetchRemote(await resolveGitDir(repo), ref, remote, remoteTimeoutMs, syncRefs, baseEnv),
     listRefs: async (repo, prefix, remote) =>
       listRefs(await resolveGitDir(repo), prefix, remote, remoteTimeoutMs, baseEnv),
     readHistory: async (repo, tips, historyOptions) =>
@@ -254,8 +254,12 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
         throw error
       }
     },
-    compareAndSwapRemote: async (repo, ref, next, expected, remote) =>
-      compareAndSwapRemote(await resolveGitDir(repo), ref, next, expected, remote, remoteTimeoutMs, baseEnv),
+    compareAndSwapRemote: async (repo, ref, next, expected, remote) => {
+      const gitdir = await resolveGitDir(repo)
+      const result = await compareAndSwapRemote(gitdir, ref, next, expected, remote, remoteTimeoutMs, baseEnv)
+      if (result.landed && result.kept === "swapped") await syncRefs(gitdir, [{ ref, oid: next, expect: expected }])
+      return result
+    },
     publish: async (repo, updates, remote) => {
       const gitdir = await resolveGitDir(repo)
       const checked = assertRefUpdates(updates)
@@ -1227,6 +1231,7 @@ async function fetchRemote(
   ref: string,
   remote: string,
   timeoutMs: number,
+  syncRefs: (repo: string, updates: readonly RefUpdate[]) => Promise<void>,
   baseEnv?: NodeJS.ProcessEnv,
 ): Promise<Oid> {
   const scratch = `refs/gitomic/fetch/${randomUUID()}`
@@ -1242,6 +1247,7 @@ async function fetchRemote(
     const temporary = fetched ?? (await optionalRef(repo, scratch, baseEnv))
     if (temporary !== undefined) {
       await deleteRef(repo, scratch, temporary, `cannot release temporary fetch ref ${scratch}`, baseEnv)
+      await syncRefs(repo, [{ ref: scratch, oid: null, expect: temporary }])
     }
   }
 }
