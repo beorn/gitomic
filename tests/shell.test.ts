@@ -6,9 +6,10 @@
  */
 
 import { spawnSync } from "node:child_process"
+import fs from "node:fs"
 import { chmod, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { delimiter, join } from "node:path"
+import { delimiter, dirname, join } from "node:path"
 
 import { describe, expect, test, vi } from "vitest"
 
@@ -21,6 +22,7 @@ import {
   isMissingObjectFetchError,
   open,
   openReader,
+  openRemoteRepository,
   objectOid,
 } from "../src/index.js"
 import type { GitomicBackend } from "../src/index.js"
@@ -151,19 +153,35 @@ describe.sequential("shell backend failure boundaries", () => {
     }
   })
 
-  test("passes repository durability config on every transaction write command", async () => {
+  /** @failure Git sync flags alone leave newly written object and ref directory entries outside the acknowledged syncs. */
+  test("syncs object and ref directories as well as configuring durable Git writes", async () => {
     const fixture = await createBareRepo()
     const previousTrace = process.env.GIT_TRACE2_EVENT
+    const synced: string[] = []
+    let failSyncAt: string | undefined
+    const originalOpen = fs.promises.open.bind(fs.promises)
+    const openSpy = vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
+      const handle = await originalOpen(...args)
+      const sync = handle.sync.bind(handle)
+      vi.spyOn(handle, "sync").mockImplementation(async () => {
+        if (String(args[0]) === failSyncAt) throw new Error(`cannot sync directory ${failSyncAt}`)
+        await sync()
+        synced.push(String(args[0]))
+      })
+      return handle
+    })
     try {
       const trace = join(fixture.repo, "write-durability-trace.json")
       const store = await open({ repo: fixture.repo, ref: "main", writer: "durable-writer" })
       await store.transact(async (map) => map.set("obsolete", "remove me"), "seed deletion")
+      const base = await store.head()
+      synced.length = 0
       process.env.GIT_TRACE2_EVENT = trace
 
       await store.transact(async (map) => {
         map.set("first", "durable")
         map.set("second", "durable")
-        map.set("third", "durable")
+        map.set("one/two/third", "durable")
         map.delete("obsolete")
       }, "durable write")
 
@@ -187,7 +205,51 @@ describe.sequential("shell backend failure boundaries", () => {
       const refWrites = events.filter((event) => event.event === "start" && event.argv?.includes("update-ref"))
       expect(refWrites).toHaveLength(1)
       expect(refWrites[0]?.argv).not.toContain("--stdin")
+      if (process.platform !== "linux") return
+      const committed = await store.head()
+      const objects = (
+        await git(fixture.repo, "rev-list", "--objects", "--no-object-names", committed, `^${base}`)
+      ).split("\n")
+      for (const oid of objects) expect(synced).toContain(join(fixture.repo, "objects", oid.slice(0, 2)))
+      expect(synced).toContain(join(fixture.repo, "objects"))
+      expect(synced).toContain(join(fixture.repo, "refs", "heads"))
+      expect(synced).toContain(join(fixture.repo, "refs"))
+      expect(synced).toContain(fixture.repo)
+      expect(synced.indexOf(join(fixture.repo, "objects"))).toBeLessThan(
+        synced.indexOf(join(fixture.repo, "refs", "heads")),
+      )
+
+      synced.length = 0
+      const refs = ["refs/km/retained/heads/main", "refs/km/writes/2026-09-30", "refs/km/landed/writes/2026-09-30"]
+      await createShellBackend().publish!(
+        fixture.repo,
+        refs.map((ref) => ({ ref, expect: "0".repeat(40), oid: committed })),
+      )
+      for (const ref of refs) {
+        let directory = dirname(join(fixture.repo, ref))
+        while (directory !== fixture.repo) {
+          expect(synced).toContain(directory)
+          directory = dirname(directory)
+        }
+      }
+      expect(synced).toContain(fixture.repo)
+      failSyncAt = join(fixture.repo, "refs", "km", "writes")
+      await expect(
+        createShellBackend().publish!(fixture.repo, [
+          { ref: "refs/km/writes/2026-10-01", expect: "0".repeat(40), oid: committed },
+        ]),
+      ).rejects.toThrow("cannot sync directory")
+      failSyncAt = undefined
+
+      synced.length = 0
+      const cacheDir = join(fixture.repo, "kept-cache", "nested")
+      using kept = await openRemoteRepository(fixture.repo, { cacheDir, seed: fixture.repo })
+      expect(synced).toContain(kept.repo)
+      expect(synced).toContain(cacheDir)
+      expect(synced).toContain(dirname(cacheDir))
+      expect(synced).toContain(fixture.repo)
     } finally {
+      openSpy.mockRestore()
       if (previousTrace === undefined) delete process.env.GIT_TRACE2_EVENT
       else process.env.GIT_TRACE2_EVENT = previousTrace
       await fixture.cleanup()

@@ -1,13 +1,15 @@
 import { AsyncLocalStorage } from "node:async_hooks"
 import childProcess, { type ChildProcess } from "node:child_process"
 import { randomUUID } from "node:crypto"
+import fs from "node:fs"
 import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join, resolve } from "node:path"
+import { dirname, join, resolve } from "node:path"
 
 import { fullJitter, type RandomUnit } from "@bearly/pacing"
 
 import { Conflict, GitTimeout, PublicationRejected } from "./errors.js"
+import { syncDirectory } from "./durable.js"
 import { journalLeaseRejection } from "./lease-journal.js"
 import { rejectLegacyProvenance } from "./options.js"
 import {
@@ -133,6 +135,27 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
   const genesisByGitDir = new Map<string, Promise<Oid>>()
   const refStorage = async (repo: string): Promise<"files" | "native"> =>
     resolveRefStorage(await resolveGitDir(repo), refStorages, baseEnv)
+  const syncRefs = async (repo: string, updates: readonly RefUpdate[]): Promise<void> => {
+    if (process.platform !== "linux" || (await refStorage(repo)) !== "files") return
+    const directories = new Map<string, boolean>()
+    for (const { ref, oid } of updates) {
+      let directory = dirname(join(repo, ref))
+      for (;;) {
+        directories.set(directory, (directories.get(directory) ?? true) && oid === null)
+        if (directory === repo) break
+        directory = dirname(directory)
+      }
+    }
+    // Leaves before their parents: names must be durable before their ancestors.
+    for (const [directory, mayBeDeleted] of [...directories].sort(([a], [b]) => b.length - a.length)) {
+      try {
+        await syncDirectory(fs.promises, directory)
+      } catch (error) {
+        if (mayBeDeleted && (error as NodeJS.ErrnoException).code === "ENOENT") continue
+        throw error
+      }
+    }
+  }
   const objectFormat = async (repo: string): Promise<"sha1" | "sha256"> => {
     const gitdir = await resolveGitDir(repo)
     let format = objectFormats.get(gitdir)
@@ -194,9 +217,18 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
     // object instead of moving the ref (see the pruned-mid-flight test in
     // tests/concurrency.test.ts). To close the hole rather than accept it, a
     // reachability ref belongs here — and the README claim must change with it.
-    writeCommit: async (repo, input) => writeCommit(await resolveGitDir(repo), input, baseEnv),
-    compareAndSwap: async (repo, ref, next, expected) =>
-      compareAndSwap(await resolveGitDir(repo), ref, next, expected, baseEnv),
+    writeCommit: async (repo, input) => {
+      const gitdir = await resolveGitDir(repo)
+      const oid = await writeCommit(gitdir, input, baseEnv)
+      await syncCommitDirectories(gitdir, oid, input.changes.size === 0 ? undefined : commitParents(input), baseEnv)
+      return oid
+    },
+    compareAndSwap: async (repo, ref, next, expected) => {
+      const gitdir = await resolveGitDir(repo)
+      const result = await compareAndSwap(gitdir, ref, next, expected, baseEnv)
+      if (result === "swapped") await syncRefs(gitdir, [{ ref, oid: next, expect: expected }])
+      return result
+    },
     findTransaction: async (repo, tip, base, instance, seq) =>
       findTransaction(await resolveGitDir(repo), tip, base, instance, seq, baseEnv),
     fetchRemote: async (repo, ref, remote) =>
@@ -209,7 +241,10 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
       const gitdir = await resolveGitDir(repo)
       let genesis = genesisByGitDir.get(gitdir)
       if (genesis === undefined) {
-        genesis = writeGenesis(gitdir, await objectFormat(repo), baseEnv)
+        genesis = writeGenesis(gitdir, await objectFormat(repo), baseEnv).then(async (oid) => {
+          await syncCommitDirectories(gitdir, oid, undefined, baseEnv)
+          return oid
+        })
         genesisByGitDir.set(gitdir, genesis)
       }
       try {
@@ -221,10 +256,14 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
     },
     compareAndSwapRemote: async (repo, ref, next, expected, remote) =>
       compareAndSwapRemote(await resolveGitDir(repo), ref, next, expected, remote, remoteTimeoutMs, baseEnv),
-    publish: async (repo, updates, remote) =>
-      remote === undefined
-        ? publishLocal(await resolveGitDir(repo), assertRefUpdates(updates), baseEnv)
-        : publishRemote(await resolveGitDir(repo), assertRefUpdates(updates), remote, remoteTimeoutMs, baseEnv),
+    publish: async (repo, updates, remote) => {
+      const gitdir = await resolveGitDir(repo)
+      const checked = assertRefUpdates(updates)
+      if (remote !== undefined) return publishRemote(gitdir, checked, remote, remoteTimeoutMs, baseEnv)
+      const result = await publishLocal(gitdir, checked, baseEnv)
+      await syncRefs(gitdir, checked)
+      return result
+    },
     fetchRefs: async (repo, refs, remote, options) =>
       fetchRefs(await resolveGitDir(repo), refs, remote, remoteTimeoutMs, baseEnv, options?.absent ?? "throw"),
   }
@@ -797,6 +836,44 @@ async function writeCommit(repo: string, input: CommitInput, baseEnv?: NodeJS.Pr
   } finally {
     await rm(indexDir, { recursive: true, force: true })
   }
+}
+
+/** Git synced loose-object bytes; now sync the names before any ref adopts them. */
+async function syncCommitDirectories(
+  repo: string,
+  oid: Oid,
+  parents: readonly Oid[] | undefined,
+  baseEnv?: NodeJS.ProcessEnv,
+): Promise<void> {
+  if (process.platform !== "linux") return
+  // An unchanged tree (including genesis) writes only its commit. Preserve the
+  // event path's process budget; tree discovery is needed only for content writes.
+  const objects =
+    parents === undefined
+      ? [oid]
+      : text(
+          await git(
+            repo,
+            ["rev-list", "--objects", "--no-object-names", oid, ...parents.map((parent) => `^${parent}`)],
+            { baseEnv },
+          ),
+        ).split("\n")
+  const directories = new Set<string>()
+  for (const object of objects) {
+    validateOid(object)
+    const directory = join(repo, "objects", object.slice(0, 2))
+    try {
+      await fs.promises.stat(join(directory, object.slice(2)))
+    } catch (error) {
+      // rev-list proved it exists in Git's object database; packed and virtual
+      // empty-tree objects have no loose filename for this write to sync.
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue
+      throw error
+    }
+    directories.add(directory)
+  }
+  await Promise.all([...directories].map((directory) => syncDirectory(fs.promises, directory)))
+  if (directories.size > 0) await syncDirectory(fs.promises, join(repo, "objects"))
 }
 
 /**
@@ -1410,8 +1487,9 @@ function rejectedPush(
       fate?.flag !== "!" ||
       fate.spec !== `${oid ?? ""}:${ref}` ||
       !/^\[remote rejected\](?: \([^\r\n]*\))?$/.test(fate.summary)
-    )
+    ) {
       return undefined
+    }
     reasons.push(fate.summary)
   }
   return new PublicationRejected(updates, reasons, detail)

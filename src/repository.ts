@@ -1,9 +1,10 @@
 import { createHash, randomUUID } from "node:crypto"
 import fs from "node:fs"
 import { tmpdir } from "node:os"
-import { join, resolve } from "node:path"
+import { dirname, join, resolve } from "node:path"
 
 import { GitTimeout } from "./errors.js"
+import { syncDirectory } from "./durable.js"
 import { runGit } from "./shell.js"
 
 /** One owned object repository shared by existing Store and Reader handles. */
@@ -104,7 +105,7 @@ async function openKept(
   timeoutMs: number,
 ): Promise<OpenedRemoteRepository> {
   const repo = join(cacheDir, `${createHash("sha256").update(source).digest("hex")}.git`)
-  fs.mkdirSync(cacheDir, { recursive: true })
+  const firstCreatedDirectory = fs.mkdirSync(cacheDir, { recursive: true })
   sweepAbandonedBuilds(cacheDir)
   if (!fs.existsSync(repo)) {
     const building = join(cacheDir, `.tmp-${process.pid}-${randomUUID()}.git`)
@@ -126,6 +127,16 @@ async function openKept(
       }
       // Another open placed it first; this build is redundant.
       fs.rmSync(building, { recursive: true, force: true })
+    }
+    if (process.platform === "linux") {
+      await syncDirectory(fs.promises, repo)
+      let directory = cacheDir
+      const lastDirectory = firstCreatedDirectory === undefined ? cacheDir : dirname(firstCreatedDirectory)
+      for (;;) {
+        await syncDirectory(fs.promises, directory)
+        if (directory === lastDirectory) break
+        directory = dirname(directory)
+      }
     }
   }
   await assertKeptOrigin(source, repo, timeoutMs)
