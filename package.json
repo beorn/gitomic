@@ -97,7 +97,6 @@
     "oxlint": "1.85.0",
     "typescript": "^7.0.2",
     "unstorage": "^1.17.5",
-    "verify-publishable": "github:beorn/verify-publishable#7657e6b176113eae4ae5ff32a2cf2d6371bc1016",
     "vitest": "^4.1.10"
   },
   "peerDependencies": {
