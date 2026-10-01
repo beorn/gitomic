@@ -153,6 +153,45 @@ describe("gitomic project and checkout synchronization", () => {
   // @failure Retained commits cannot be projected without advancing origin, or a present object outside the fetched history is admitted.
   // @level l1 @consumer retained STATE rail checkout projection @testonly none
   describe("retained sourceRef", () => {
+    // @failure A repair preserves local work but changes its source back to main during the continuation.
+    test.each(["declaration", "dirty", "local-commit"] as const)(
+      "%s repair keeps the retained sourceRef through its continuation",
+      async (mode) => {
+        const { root, bare, checkout } = remoteFixture(true)
+        const retained = join(root, "retained")
+        git(root, "clone", "-q", bare, "retained")
+        writeFileSync(join(retained, "tracked.md"), "# retained source\n")
+        git(retained, "add", "tracked.md")
+        git(retained, "commit", "-qm", "retained source")
+        const to = git(retained, "rev-parse", "HEAD")
+        const sourceRef = "refs/km/retained/state"
+        git(retained, "update-ref", sourceRef, to)
+        const originTip = git(retained, "rev-parse", "refs/remotes/origin/main")
+        git(retained, "update-ref", "refs/heads/main", originTip, to)
+        const refsBefore = git(retained, "for-each-ref", "--format=%(refname) %(objectname)")
+        const capturedPath = mode === "declaration" ? ".gitomic.conf" : mode === "dirty" ? "tracked.md" : "local.md"
+        const original = mode === "declaration" ? readFileSync(join(checkout, capturedPath), "utf8") : ""
+        const captured = `${original}# local work\n`
+        writeFileSync(join(checkout, capturedPath), captured)
+        if (mode === "local-commit") {
+          git(checkout, "add", capturedPath)
+          git(checkout, "commit", "-qm", "local work")
+        }
+        advancePastQuietPeriod()
+
+        const result = await projectCheckoutWithSetAside({ repoRoot: checkout, remote: retained, sourceRef })
+
+        expect(result).toMatchObject({ ok: true, kind: "set-aside", to })
+        if (!result.ok || result.kind !== "set-aside") throw new Error("expected preserved local work")
+        expect(git(checkout, "show", `${result.preserveRef}:${capturedPath}`)).toBe(captured.trimEnd())
+        expect(git(checkout, "rev-parse", "HEAD")).toBe(to)
+        expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# retained source\n")
+        expect(worktreeDirtyPaths(checkout)).toEqual([])
+        expect(git(checkout, "rev-parse", "refs/remotes/origin/main")).toBe(originTip)
+        expect(git(retained, "for-each-ref", "--format=%(refname) %(objectname)")).toBe(refsBefore)
+      },
+    )
+
     test.each(["receipt", "tip", "superseded"] as const)(
       "%s projection uses the retained ref and preserves source refs",
       async (mode) => {

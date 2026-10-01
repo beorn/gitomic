@@ -962,7 +962,7 @@ export async function projectRemoteFirstFastForward(
       ok: false,
       kind: "fetch-failed",
       error:
-        `${ref} in the checkout ${repoRoot}: fetching ${sourceRef} from ${remote} failed ` +
+        `${ref} in the checkout ${repoRoot}: fetching ${sourceRef} from ${remote} for commit ${to} failed ` +
         `(${fetched.detail}). Nothing here was changed.`,
     }
   }
@@ -1544,6 +1544,7 @@ export async function projectCheckoutWithSetAside(
   const ref = request.ref ?? "refs/heads/main"
   const branchRef = ref.startsWith("refs/heads/") ? ref : `refs/heads/${ref}`
   const remote = request.remote ?? "origin"
+  const sourceRef = request.sourceRef ?? branchRef
   const { to, localTip } = projected
   const refused = (reason: string, preserveRef?: string): StateCheckoutRepairOutcome => ({
     ok: false,
@@ -1551,13 +1552,13 @@ export async function projectCheckoutWithSetAside(
     localTip,
     to,
     ...(preserveRef === undefined ? {} : { preserveRef }),
-    error: `${branchRef} in ${repoRoot}: ${reason}. Local ${localTip}; origin ${to}. Nothing was published.`,
+    error: `${branchRef} in ${repoRoot}: ${reason}. Local ${localTip}; source ${sourceRef} at ${remote} (${to}). Nothing was published.`,
   })
   let policy: Awaited<ReturnType<typeof readStateCheckoutDeclaration>>
   try {
     policy = await readStateCheckoutDeclaration(repoRoot, to)
   } catch (error) {
-    return refused(`origin checkout policy cannot be read (${error instanceof Error ? error.message : String(error)})`)
+    return refused(`source checkout policy cannot be read (${error instanceof Error ? error.message : String(error)})`)
   }
   if (policy === undefined) return projected
   if (projected.ok) {
@@ -1594,7 +1595,7 @@ export async function projectCheckoutWithSetAside(
       )
     }
     request.afterWorktreeClear?.()
-    const verified = await projectCheckout({ repoRoot, remote, ref: branchRef })
+    const verified = await projectCheckout({ repoRoot, remote, ref: branchRef, sourceRef })
     if (!verified.ok) {
       return refused(
         `declaration was preserved but checkout verification refused (${verified.kind}: ${verified.error})`,
@@ -1617,7 +1618,7 @@ export async function projectCheckoutWithSetAside(
       return refused("the index holds staged, unmerged or unprovable work, so no dirty path may be cleared")
     }
     const changed = git(repoRoot, readonlyArgs(["diff", "--name-only", "-z", localTip, to, "--"]))
-    if (changed.status !== 0) return refused(`origin's changed paths cannot be listed (${gitDetail(changed)})`)
+    if (changed.status !== 0) return refused(`source commit's changed paths cannot be listed (${gitDetail(changed)})`)
     const changedSet = new Set(nulPaths(changed.stdout))
     const selection = selectOldBlockingPaths(repoRoot, changedSet, policy.quietSeconds, request.reservedPaths ?? [])
     if (!selection.ok) return refused(selection.error)
@@ -1653,7 +1654,7 @@ export async function projectCheckoutWithSetAside(
       )
     }
     request.afterWorktreeClear?.()
-    const caughtUp = await projectCheckout({ repoRoot, remote, ref: branchRef })
+    const caughtUp = await projectCheckout({ repoRoot, remote, ref: branchRef, sourceRef })
     if (!caughtUp.ok) {
       return refused(
         `preserved ${saved.preserveRef}, but projection refused (${caughtUp.kind}: ${caughtUp.error})`,
@@ -1682,7 +1683,7 @@ export async function projectCheckoutWithSetAside(
   if (localOnlyRead.status !== 0) return refused(`local-only commits cannot be listed (${gitDetail(localOnlyRead)})`)
   const localOnly = localOnlyRead.stdout.split("\n").filter(Boolean)
   if (localOnly.length === 0) {
-    return refused("the local tip is not an origin ancestor, but no local-only commit is visible")
+    return refused("the local tip is not a source commit ancestor, but no local-only commit is visible")
   }
 
   const index = indexTreeFromCopy(repoRoot)
@@ -1760,7 +1761,7 @@ export async function projectCheckoutWithSetAside(
   if (advanced.status !== 0) return refused(`local ref CAS to ${base} refused (${gitDetail(advanced)})`, preserveRef)
   request.afterLocalRefMove?.()
 
-  const caughtUp = await projectCheckout({ repoRoot, remote, ref: branchRef })
+  const caughtUp = await projectCheckout({ repoRoot, remote, ref: branchRef, sourceRef })
   if (!caughtUp.ok) {
     return refused(
       `preserved ${preserveRef}, but projection refused (${caughtUp.kind}: ${caughtUp.error})`,
