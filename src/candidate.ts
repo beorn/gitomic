@@ -345,6 +345,12 @@ async function derive(
 ): Promise<CandidateVerdict | undefined> {
   const ran = await runDeclared(gitDir, context, command, timeoutMs)
   if ("timedOut" in ran) return { refuse: [`derive \`${command}\` did not finish within its ${timeoutMs} ms limit`] }
+  if (ran.code === 1) {
+    const reasons = lines(ran.stdout)
+    return {
+      refuse: reasons.length > 0 ? reasons : [`derive \`${command}\` refused without a reason: ${tail(ran.stderr)}`],
+    }
+  }
   if (ran.code !== 0) return { refuse: [`derive \`${command}\` could not run (exit ${ran.code}): ${tail(ran.stderr)}`] }
   let parsed: unknown
   try {
