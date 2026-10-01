@@ -5,9 +5,11 @@
 ### Breaking
 
 - `GitomicBackend.listRefs` accepts `string | readonly string[]`: strings retain
-  prefix behavior; arrays select exact full names, omit absent refs, and list
-  once per local Store attempt. Custom backends must implement the array arm.
-  Malformed/repeated names refuse before I/O; empty arrays perform no I/O.
+  local and remote prefix behavior; arrays select exact full names locally only,
+  omit absent refs, and list once per local Store attempt. Remote arrays and
+  malformed/repeated names refuse before I/O; local empty arrays perform no I/O.
+  Custom backends must implement the local array arm: a prefix-only implementation
+  fails at its first array call. The external custom-backend population is unknown.
   This backend migration belongs in the next minor release on 0.x.
 
 ## 0.9.0 — 2026-09-30

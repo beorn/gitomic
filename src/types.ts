@@ -236,10 +236,11 @@ export type GitomicBackend = {
    */
   fetchRemote?(repo: string, ref: string, remote: string): Promise<Oid>
   /**
-   * A string selects every ref under that prefix; an array selects exact full
-   * ref names, omitting absent refs. Results are in ref-name order. Arrays
-   * refuse malformed/repeated names; an empty array performs no I/O.
-   * `for-each-ref` locally, `ls-remote --refs` against `remote`. Never moves a ref.
+   * A string selects every ref under that prefix, locally or against `remote`.
+   * An array selects exact full ref names locally only, omitting absent refs.
+   * Results are in ref-name order. Arrays refuse malformed/repeated names and
+   * any remote before I/O; a local empty array performs no I/O.
+   * `for-each-ref` locally, `ls-remote --refs` for a remote prefix. Never moves a ref.
    */
   listRefs?(repo: string, selection: string | readonly string[], remote?: string): Promise<ReadonlyMap<string, Oid>>
   /**

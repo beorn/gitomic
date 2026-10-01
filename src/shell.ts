@@ -239,6 +239,9 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
       fetchRemote(await resolveGitDir(repo), ref, remote, remoteTimeoutMs, syncRefs, baseEnv),
     listRefs: async (repo, selection, remote) => {
       const selected = typeof selection === "string" ? selection : validateRefNames(selection)
+      if (typeof selected !== "string" && remote !== undefined) {
+        throw new TypeError("listRefs exact ref names are local only; omit remote")
+      }
       if (typeof selected !== "string" && selected.size === 0) return new Map()
       return listRefs(await resolveGitDir(repo), selected, remote, remoteTimeoutMs, baseEnv)
     },
@@ -1027,12 +1030,8 @@ async function listRefs(
       pairs.push([line.slice(space + 1), validateOid(line.slice(0, space), "git for-each-ref returned a malformed id")])
     }
   } else {
-    const patterns =
-      typeof selection === "string"
-        ? selection.endsWith("/")
-          ? [`${selection}*`]
-          : [selection, `${selection}/*`]
-        : [...selection]
+    if (typeof selection !== "string") throw new TypeError("listRefs exact ref names are local only; omit remote")
+    const patterns = selection.endsWith("/") ? [`${selection}*`] : [selection, `${selection}/*`]
     const output = await git(repo, ["ls-remote", "--refs", remote, ...patterns], { baseEnv, timeoutMs })
     for (const line of decodeUtf8(output, "git ls-remote").split("\n")) {
       if (line === "") continue

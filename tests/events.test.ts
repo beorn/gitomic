@@ -672,6 +672,11 @@ describe("acceptance: listRefs answers locally and through ls-remote --refs", ()
         )
       }
       expect(await read("/gitomic-no-such-repository", [])).toEqual(new Map())
+      // Remote exact-name selections are outside the local-only capability,
+      // including an empty selection: refuse before resolving a repo or remote.
+      for (const names of [[], ["refs/events/a"]]) {
+        await expect(read("/gitomic-no-such-repository", names, "origin")).rejects.toThrow(/local only/)
+      }
       expect(gitSpawns(spawn)).toBe(0)
     } finally {
       spawn.mockRestore()
@@ -695,19 +700,6 @@ describe("acceptance: listRefs answers locally and through ls-remote --refs", ()
       expect([...there]).toEqual([["refs/events/x/one", tip]])
 
       expect(await listRefs("refs/events/none/", { repo: remote.repo, backend })).toEqual(new Map())
-
-      // Native remote patterns can match descendants and ref-name tails too.
-      for (const ref of ["refs/events/x/branch/child", "refs/other/refs/events/x/one"]) {
-        const extra = await openEvents({ repo: remote.repo, ref, backend })
-        await extra.append([{ type: "opened" }], { expect: null })
-      }
-      expect([
-        ...(await backend.listRefs!(
-          local.repo,
-          ["refs/events/x/one", "refs/events/x/branch", "refs/events/x/missing"],
-          "origin",
-        )),
-      ]).toEqual([["refs/events/x/one", tip]])
     } finally {
       await remote.cleanup()
       await local.cleanup()
