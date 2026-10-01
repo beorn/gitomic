@@ -3,6 +3,9 @@
 // `apply` land an empty commit.
 // @level l1
 // @consumer yrd's event chains (slice 3b, @i/10-yrd/25040) and anything reading refs like Redis keys
+/**
+ * @reach fs-walk <fixture-only: history walks use isolated Git repositories; package docs use exact paths>
+ */
 //
 // Acceptance of @i/10-yrd/25039. Each describe block names the acceptance row it proves.
 
@@ -796,6 +799,23 @@ describe("readHistory returns exactly what readCommit returns (ruling C: Reader.
       }
       // The walk reached both roots-of-interest: the genesis and the work chain's root.
       expect((history ?? []).filter((meta) => meta.parents.length === 0).length, target.name).toBeGreaterThanOrEqual(1)
+      // A batched revision input must preserve exclusions and limits, and an
+      // empty selection must never fall through to a default HEAD walk (25203).
+      const excluded = await target.backend.readHistory!(target.repo, [tip, kept], { exclude: [kept] })
+      expect(
+        excluded.map((meta) => meta.oid),
+        target.name,
+      ).toContain(tip)
+      expect(
+        excluded.map((meta) => meta.oid),
+        target.name,
+      ).not.toContain(kept)
+      const limited = await target.backend.readHistory!(target.repo, [tip], { limit: 1 })
+      expect(
+        limited.map((meta) => meta.oid),
+        target.name,
+      ).toEqual([tip])
+      expect(await target.backend.readHistory!(target.repo, []), target.name).toEqual([])
     })
   })
 
