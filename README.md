@@ -585,7 +585,7 @@ $ gitomic write 'repo#main' -m edit a.md=./a --json
 
 ```ini
 [candidate]
-	derive = <command>   # prints {"put": {path: content}, "rm": [path]}; lands in the same commit
+	derive = <command>   # exit 0 prints {"put": {path: content}, "rm": [path]}; exit 1 refuses (stdout lines are reasons)
 	check = <command>    # exit 0 lands (stdout lines are the report); exit 1 refuses (stdout lines are the reasons)
 	timeoutMs = 30000
 ```
