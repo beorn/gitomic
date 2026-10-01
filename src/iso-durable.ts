@@ -5,6 +5,7 @@ import { deflate } from "node:zlib"
 
 import type { FsClient } from "isomorphic-git"
 
+import { syncDirectory } from "./durable.js"
 import type { GitObject } from "./git-object.js"
 
 type AtomicFileHandle = {
@@ -62,8 +63,8 @@ export function createDurableObjectWriter(fs: FsClient): DurableObjectWriter {
           await writeDurableFile(atomic, directories, parents, join(directory, object.oid.slice(2)), compressed)
         }),
       )
-      await Promise.all([...directories].map(async (directory) => await syncDirectory(atomic, directory)))
-      await Promise.all([...parents].map(async (directory) => await syncDirectory(atomic, directory)))
+      await Promise.all([...directories].map(async (directory) => syncDirectory(atomic, directory)))
+      await Promise.all([...parents].map(async (directory) => syncDirectory(atomic, directory)))
     },
   }
 }
@@ -93,15 +94,6 @@ async function writeDurableFile(
       if (!isNodeError(unlinkError) || unlinkError.code !== "ENOENT") throw unlinkError
     })
     throw error
-  }
-}
-
-async function syncDirectory(fs: AtomicFsPromises, directory: string): Promise<void> {
-  const handle = await fs.open(directory, "r")
-  try {
-    await handle.sync()
-  } finally {
-    await handle.close()
   }
 }
 

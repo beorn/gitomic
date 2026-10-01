@@ -236,10 +236,12 @@ export type GitomicBackend = {
    */
   fetchRemote?(repo: string, ref: string, remote: string): Promise<Oid>
   /**
-   * Every ref under `prefix` and its tip, in ref-name order: `for-each-ref`
-   * locally, `ls-remote --refs` against `remote`. Never moves a ref.
+   * A string selects every ref under that prefix; an array selects exact full
+   * ref names, omitting absent refs. Results are in ref-name order. Arrays
+   * refuse malformed/repeated names; an empty array performs no I/O.
+   * `for-each-ref` locally, `ls-remote --refs` against `remote`. Never moves a ref.
    */
-  listRefs?(repo: string, prefix: string, remote?: string): Promise<ReadonlyMap<string, Oid>>
+  listRefs?(repo: string, selection: string | readonly string[], remote?: string): Promise<ReadonlyMap<string, Oid>>
   /**
    * Newest-first first-parent history of every tip in ONE read, stopping at any
    * `exclude` commit. Commits reachable from several tips are returned once.

@@ -110,6 +110,21 @@ export function normalizeRef(ref: string): string {
   return normalized
 }
 
+/** Snapshot an exact selection without repairing names or collapsing duplicates. */
+export function validateRefNames(names: readonly string[]): ReadonlySet<string> {
+  if (!Array.isArray(names)) throw new TypeError("listRefs names must be an array of full ref names")
+  const selected = new Set<string>()
+  for (const name of names) {
+    if (typeof name !== "string" || !name.startsWith("refs/")) {
+      throw new TypeError(`listRefs name must be a full refs/ name: ${JSON.stringify(name)}`)
+    }
+    normalizeRef(name)
+    if (selected.has(name)) throw new TypeError(`listRefs names ${name} more than once`)
+    selected.add(name)
+  }
+  return selected
+}
+
 function isInvalidRefCharacter(character: string): boolean {
   const codePoint = character.codePointAt(0) ?? 0
   return codePoint <= 0x20 || codePoint === 0x7f || "~^:?*[\\".includes(character)

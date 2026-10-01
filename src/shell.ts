@@ -1,15 +1,17 @@
 import { AsyncLocalStorage } from "node:async_hooks"
 import childProcess, { type ChildProcess } from "node:child_process"
 import { randomUUID } from "node:crypto"
+import fs from "node:fs"
 import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join, resolve } from "node:path"
+import { dirname, join, resolve } from "node:path"
 
 import { fullJitter, type RandomUnit } from "@bearly/pacing"
 
+import { syncDirectory } from "./durable.js"
 import { Conflict, GitSignaled, GitTimeout, PublicationRejected } from "./errors.js"
 import { journalLeaseRejection } from "./lease-journal.js"
-import { rejectLegacyProvenance } from "./options.js"
+import { rejectLegacyProvenance, validateRefNames } from "./options.js"
 import {
   assertRefUpdates,
   commitIdents,
@@ -137,6 +139,27 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
   const genesisByGitDir = new Map<string, Promise<Oid>>()
   const refStorage = async (repo: string): Promise<"files" | "native"> =>
     resolveRefStorage(await resolveGitDir(repo), refStorages, baseEnv)
+  const syncRefs = async (repo: string, updates: readonly RefUpdate[]): Promise<void> => {
+    if (process.platform !== "linux" || (await refStorage(repo)) !== "files") return
+    const directories = new Map<string, boolean>()
+    for (const { ref, oid } of updates) {
+      let directory = dirname(join(repo, ref))
+      for (;;) {
+        directories.set(directory, (directories.get(directory) ?? true) && oid === null)
+        if (directory === repo) break
+        directory = dirname(directory)
+      }
+    }
+    // Leaves before their parents: names must be durable before their ancestors.
+    for (const [directory, mayBeDeleted] of [...directories].sort(([a], [b]) => b.length - a.length)) {
+      try {
+        await syncDirectory(fs.promises, directory)
+      } catch (error) {
+        if (mayBeDeleted && (error as NodeJS.ErrnoException).code === "ENOENT") continue
+        throw error
+      }
+    }
+  }
   const objectFormat = async (repo: string): Promise<"sha1" | "sha256"> => {
     const gitdir = await resolveGitDir(repo)
     let format = objectFormats.get(gitdir)
@@ -198,22 +221,37 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
     // object instead of moving the ref (see the pruned-mid-flight test in
     // tests/concurrency.test.ts). To close the hole rather than accept it, a
     // reachability ref belongs here — and the README claim must change with it.
-    writeCommit: async (repo, input) => writeCommit(await resolveGitDir(repo), input, baseEnv),
-    compareAndSwap: async (repo, ref, next, expected) =>
-      compareAndSwap(await resolveGitDir(repo), ref, next, expected, baseEnv),
+    writeCommit: async (repo, input) => {
+      const gitdir = await resolveGitDir(repo)
+      const oid = await writeCommit(gitdir, input, baseEnv)
+      await syncCommitDirectories(gitdir, oid, input.changes.size === 0 ? undefined : commitParents(input), baseEnv)
+      return oid
+    },
+    compareAndSwap: async (repo, ref, next, expected) => {
+      const gitdir = await resolveGitDir(repo)
+      const result = await compareAndSwap(gitdir, ref, next, expected, baseEnv)
+      if (result === "swapped") await syncRefs(gitdir, [{ ref, oid: next, expect: expected }])
+      return result
+    },
     findTransaction: async (repo, tip, base, instance, seq) =>
       findTransaction(await resolveGitDir(repo), tip, base, instance, seq, baseEnv),
     fetchRemote: async (repo, ref, remote) =>
-      fetchRemote(await resolveGitDir(repo), ref, remote, remoteTimeoutMs, baseEnv),
-    listRefs: async (repo, prefix, remote) =>
-      listRefs(await resolveGitDir(repo), prefix, remote, remoteTimeoutMs, baseEnv),
+      fetchRemote(await resolveGitDir(repo), ref, remote, remoteTimeoutMs, syncRefs, baseEnv),
+    listRefs: async (repo, selection, remote) => {
+      const selected = typeof selection === "string" ? selection : validateRefNames(selection)
+      if (typeof selected !== "string" && selected.size === 0) return new Map()
+      return listRefs(await resolveGitDir(repo), selected, remote, remoteTimeoutMs, baseEnv)
+    },
     readHistory: async (repo, tips, historyOptions) =>
       readHistory(await resolveGitDir(repo), tips, historyOptions, baseEnv),
     writeGenesis: async (repo) => {
       const gitdir = await resolveGitDir(repo)
       let genesis = genesisByGitDir.get(gitdir)
       if (genesis === undefined) {
-        genesis = writeGenesis(gitdir, await objectFormat(repo), baseEnv)
+        genesis = writeGenesis(gitdir, await objectFormat(repo), baseEnv).then(async (oid) => {
+          await syncCommitDirectories(gitdir, oid, undefined, baseEnv)
+          return oid
+        })
         genesisByGitDir.set(gitdir, genesis)
       }
       try {
@@ -223,12 +261,20 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
         throw error
       }
     },
-    compareAndSwapRemote: async (repo, ref, next, expected, remote) =>
-      compareAndSwapRemote(await resolveGitDir(repo), ref, next, expected, remote, remoteTimeoutMs, baseEnv),
-    publish: async (repo, updates, remote) =>
-      remote === undefined
-        ? publishLocal(await resolveGitDir(repo), assertRefUpdates(updates), baseEnv)
-        : publishRemote(await resolveGitDir(repo), assertRefUpdates(updates), remote, remoteTimeoutMs, baseEnv),
+    compareAndSwapRemote: async (repo, ref, next, expected, remote) => {
+      const gitdir = await resolveGitDir(repo)
+      const result = await compareAndSwapRemote(gitdir, ref, next, expected, remote, remoteTimeoutMs, baseEnv)
+      if (result.landed && result.kept === "swapped") await syncRefs(gitdir, [{ ref, oid: next, expect: expected }])
+      return result
+    },
+    publish: async (repo, updates, remote) => {
+      const gitdir = await resolveGitDir(repo)
+      const checked = assertRefUpdates(updates)
+      if (remote !== undefined) return publishRemote(gitdir, checked, remote, remoteTimeoutMs, baseEnv)
+      const result = await publishLocal(gitdir, checked, baseEnv)
+      await syncRefs(gitdir, checked)
+      return result
+    },
     fetchRefs: async (repo, refs, remote, options) =>
       fetchRefs(await resolveGitDir(repo), refs, remote, remoteTimeoutMs, baseEnv, options?.absent ?? "throw"),
   }
@@ -836,6 +882,44 @@ async function writeCommit(repo: string, input: CommitInput, baseEnv?: NodeJS.Pr
   }
 }
 
+/** Git synced loose-object bytes; now sync the names before any ref adopts them. */
+async function syncCommitDirectories(
+  repo: string,
+  oid: Oid,
+  parents: readonly Oid[] | undefined,
+  baseEnv?: NodeJS.ProcessEnv,
+): Promise<void> {
+  if (process.platform !== "linux") return
+  // An unchanged tree (including genesis) writes only its commit. Preserve the
+  // event path's process budget; tree discovery is needed only for content writes.
+  const objects =
+    parents === undefined
+      ? [oid]
+      : text(
+          await git(
+            repo,
+            ["rev-list", "--objects", "--no-object-names", oid, ...parents.map((parent) => `^${parent}`)],
+            { baseEnv },
+          ),
+        ).split("\n")
+  const directories = new Set<string>()
+  for (const object of objects) {
+    validateOid(object)
+    const directory = join(repo, "objects", object.slice(0, 2))
+    try {
+      await fs.promises.stat(join(directory, object.slice(2)))
+    } catch (error) {
+      // rev-list proved it exists in Git's object database; packed and virtual
+      // empty-tree objects have no loose filename for this write to sync.
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue
+      throw error
+    }
+    directories.add(directory)
+  }
+  await Promise.all([...directories].map((directory) => syncDirectory(fs.promises, directory)))
+  if (directories.size > 0) await syncDirectory(fs.promises, join(repo, "objects"))
+}
+
 /**
  * The 100755 paths of the parent tree the temp index holds, read only when the commit writes content. One
  * `ls-files --stage` (git 2.36 has no NUL-safe per-path mode query); STATE's 19,561 entries list in under 10 ms.
@@ -925,24 +1009,30 @@ async function writeGenesis(repo: string, format: "sha1" | "sha256", baseEnv?: N
  */
 async function listRefs(
   repo: string,
-  prefix: string,
+  selection: string | ReadonlySet<string>,
   remote: string | undefined,
   timeoutMs: number,
   baseEnv?: NodeJS.ProcessEnv,
 ): Promise<ReadonlyMap<string, Oid>> {
-  if (typeof prefix !== "string" || !prefix.startsWith("refs/")) {
-    throw new TypeError(`listRefs prefix must start with refs/: ${JSON.stringify(prefix)}`)
+  if (typeof selection === "string" && !selection.startsWith("refs/")) {
+    throw new TypeError(`listRefs prefix must start with refs/: ${JSON.stringify(selection)}`)
   }
   const pairs: Array<[string, Oid]> = []
   if (remote === undefined) {
-    const output = await git(repo, ["for-each-ref", "--format=%(objectname) %(refname)", prefix], { baseEnv })
+    const patterns = typeof selection === "string" ? [selection] : [...selection]
+    const output = await git(repo, ["for-each-ref", "--format=%(objectname) %(refname)", ...patterns], { baseEnv })
     for (const line of decodeUtf8(output, "git for-each-ref").split("\n")) {
       if (line === "") continue
       const space = line.indexOf(" ")
       pairs.push([line.slice(space + 1), validateOid(line.slice(0, space), "git for-each-ref returned a malformed id")])
     }
   } else {
-    const patterns = prefix.endsWith("/") ? [`${prefix}*`] : [prefix, `${prefix}/*`]
+    const patterns =
+      typeof selection === "string"
+        ? selection.endsWith("/")
+          ? [`${selection}*`]
+          : [selection, `${selection}/*`]
+        : [...selection]
     const output = await git(repo, ["ls-remote", "--refs", remote, ...patterns], { baseEnv, timeoutMs })
     for (const line of decodeUtf8(output, "git ls-remote").split("\n")) {
       if (line === "") continue
@@ -950,7 +1040,9 @@ async function listRefs(
       pairs.push([line.slice(tab + 1), validateOid(line.slice(0, tab), "git ls-remote returned a malformed id")])
     }
   }
-  const matching = pairs.filter(([ref]) => refUnderPrefix(ref, prefix))
+  const matching = pairs.filter(([ref]) =>
+    typeof selection === "string" ? refUnderPrefix(ref, selection) : selection.has(ref),
+  )
   const seen = new Set<string>()
   for (const [ref] of matching) {
     if (seen.has(ref)) throw new Error(`git ref listing returned duplicate ref ${ref}`)
@@ -1187,6 +1279,7 @@ async function fetchRemote(
   ref: string,
   remote: string,
   timeoutMs: number,
+  syncRefs: (repo: string, updates: readonly RefUpdate[]) => Promise<void>,
   baseEnv?: NodeJS.ProcessEnv,
 ): Promise<Oid> {
   const scratch = `refs/gitomic/fetch/${randomUUID()}`
@@ -1202,6 +1295,7 @@ async function fetchRemote(
     const temporary = fetched ?? (await optionalRef(repo, scratch, baseEnv))
     if (temporary !== undefined) {
       await deleteRef(repo, scratch, temporary, `cannot release temporary fetch ref ${scratch}`, baseEnv)
+      await syncRefs(repo, [{ ref: scratch, oid: null, expect: temporary }])
     }
   }
 }
@@ -1335,9 +1429,11 @@ async function publishLocal(
   const firstHeld = lockHeld(firstDetail)
   if (firstHeld !== undefined) throw firstHeld
 
-  const current = await readExactRefs(
+  const current = await listRefs(
     repo,
-    updates.map(({ ref }) => ref),
+    validateRefNames(updates.map(({ ref }) => ref)),
+    undefined,
+    DEFAULT_REMOTE_TIMEOUT_MS,
     baseEnv,
   )
   const lost = updates
@@ -1362,25 +1458,6 @@ async function publishLocal(
     throw leaseConflict([{ ref: movedUpdate.ref, expect: movedUpdate.expect, observed: movedAgain.at }])
   }
   throw failed(second.code, secondDetail)
-}
-
-/** Exactly these refs and their tips, in ONE `for-each-ref`; an absent ref is simply missing. */
-async function readExactRefs(
-  repo: string,
-  refs: readonly string[],
-  baseEnv?: NodeJS.ProcessEnv,
-): Promise<ReadonlyMap<string, Oid>> {
-  const output = await git(repo, ["for-each-ref", "--format=%(objectname) %(refname)", ...refs], { baseEnv })
-  const wanted = new Set(refs)
-  const tips = new Map<string, Oid>()
-  for (const line of decodeUtf8(output, "git for-each-ref").split("\n")) {
-    if (line === "") continue
-    const space = line.indexOf(" ")
-    const ref = line.slice(space + 1)
-    // A pattern also matches refs below it; keep only the exact names asked for.
-    if (wanted.has(ref)) tips.set(ref, validateOid(line.slice(0, space), "git for-each-ref returned a malformed id"))
-  }
-  return tips
 }
 
 function isStaleLease(summary: string): boolean {

@@ -845,12 +845,14 @@ export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): Check
 export interface RemoteFirstProjectionRequest {
   /** The checkout whose projection catches up. */
   readonly repoRoot: string
-  /** The commit that LANDED at the remote — the transport's returned oid. */
+  /** The durable commit returned by the transport, contained in the fetched source. */
   readonly to: string
   /** Fully-qualified branch to project, e.g. `refs/heads/main`. */
   readonly ref: string
-  /** Remote the landing went through; fetched to obtain `to` locally. */
+  /** Repository path or configured remote to fetch the source from. */
   readonly remote: string
+  /** Fully-qualified source ref to fetch; defaults to the destination `ref`. */
+  readonly sourceRef?: string | undefined
   /** Dirt observed before projecting, under the same lock; must survive exactly. */
   readonly expectedDirtyPaths: readonly string[]
   /**
@@ -907,8 +909,8 @@ export type RemoteFirstProjectionOutcome =
     }
 
 /**
- * Project a checkout after its intent landed REMOTE-FIRST through the shared
- * off-checkout transport (the 24161 seam): fetch the landing, fast-forward the
+ * Project a checkout from a durable commit in the transport's fetched source
+ * (the 24161 seam): fetch sourceRef, fast-forward the
  * local branch ONLY when it is a strict ancestor, then reuse the existing
  * two-way index merge above — this arm is a composition, never a third
  * synchronizer. Runs under the caller's checkout lock (`gitomic/checkout-lock`),
@@ -922,8 +924,8 @@ export type RemoteFirstProjectionOutcome =
  * to the caller, and this module never prescribes a force, a rewrite, or a
  * semantic retry.
  *
- * The fetch is the one remote command, bounded through Gitomic's runner. It
- * runs after publication succeeded, so a fetch stopped at its limit is the
+ * The fetch is the one remote command, bounded through Gitomic's runner. A
+ * retained source proves local durability, not publication. A fetch stopped at its limit is the
  * `fetch-failed` outcome naming the limit, never a throw a caller could read
  * as an unpublished write.
  */
@@ -931,6 +933,14 @@ export async function projectRemoteFirstFastForward(
   request: RemoteFirstProjectionRequest,
 ): Promise<RemoteFirstProjectionOutcome> {
   const { repoRoot, to, ref, remote } = request
+  const sourceRef = request.sourceRef ?? ref
+  if (!sourceRef.startsWith("refs/") || sourceRef === "refs/") {
+    return {
+      ok: false,
+      kind: "fetch-failed",
+      error: `sourceRef ${sourceRef} at ${remote} must be fully qualified under refs/. No Git command ran.`,
+    }
+  }
   if (isBareRepository(repoRoot)) return { ok: true, kind: "bare" }
 
   const branch = checkedOutRef(repoRoot)
@@ -940,31 +950,38 @@ export async function projectRemoteFirstFastForward(
       kind: "wrong-branch",
       checkedOutRef: branch,
       error:
-        `${ref} in the checkout ${repoRoot} has ${to} landed at ${remote}, but that checkout has ` +
+        `${ref} in the checkout ${repoRoot} would project commit ${to} from ${sourceRef} at ${remote}, but that checkout has ` +
         `${branch === null ? "a detached HEAD" : `${branch} checked out`}, so no projection can reconcile it. ` +
-        "The landing is complete and safe at the remote; nothing here was changed.",
+        "Nothing here was changed.",
     }
   }
 
-  const branchName = ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : ref
-  const fetched = await fetchTip(repoRoot, remote, ref, request.remoteTimeoutMs ?? DEFAULT_REMOTE_TIMEOUT_MS)
+  const fetched = await fetchTip(repoRoot, remote, sourceRef, request.remoteTimeoutMs ?? DEFAULT_REMOTE_TIMEOUT_MS)
   if (!fetched.ok) {
     return {
       ok: false,
       kind: "fetch-failed",
       error:
-        `${ref} in the checkout ${repoRoot}: fetching ${branchName} from ${remote} failed ` +
-        `(${fetched.detail}). The landing ${to} is safe at the remote; nothing here was changed.`,
+        `${ref} in the checkout ${repoRoot}: fetching ${sourceRef} from ${remote} for commit ${to} failed ` +
+        `(${fetched.detail}). Nothing here was changed.`,
     }
   }
-  const landedPresent = git(repoRoot, readonlyArgs(["rev-parse", "--verify", `${to}^{commit}`]))
-  if (landedPresent.status !== 0) {
+  const outcome = projectFetchedCommit(request, fetched.oid)
+  return outcome.ok ? outcome : { ...outcome, error: `${outcome.error} Source: ${sourceRef} at ${remote}.` }
+}
+
+/** Both public entries fetch once, then use this same checkout reconciliation. */
+function projectFetchedCommit(request: RemoteFirstProjectionRequest, sourceOid: string): RemoteFirstProjectionOutcome {
+  const { repoRoot, to, ref, remote } = request
+  const sourceRef = request.sourceRef ?? ref
+  const contained = git(repoRoot, readonlyArgs(["merge-base", "--is-ancestor", to, sourceOid]))
+  if (contained.status !== 0) {
     return {
       ok: false,
       kind: "fetch-failed",
       error:
-        `${ref} in the checkout ${repoRoot}: the landed commit ${to} is not reachable after fetching ` +
-        `${branchName} from ${remote} (${gitDetail(landedPresent)}). Nothing here was changed.`,
+        `${ref} in the checkout ${repoRoot}: commit ${to} is not proved reachable from fetched ` +
+        `${sourceRef} at ${remote} (${sourceOid}; ${gitDetail(contained)}). Nothing here was changed.`,
     }
   }
 
@@ -1006,8 +1023,7 @@ export async function projectRemoteFirstFastForward(
       // on the remote main fetched at the start of this projection. A
       // descendant absent from the remote is a stranded local commit — its
       // own refusal, naming the local-only commits, prescribing nothing.
-      const remoteRef = `refs/remotes/${remote}/${branchName}`
-      const published = git(repoRoot, readonlyArgs(["merge-base", "--is-ancestor", localTip, remoteRef]))
+      const published = git(repoRoot, readonlyArgs(["merge-base", "--is-ancestor", localTip, sourceOid]))
       if (published.status === 0) {
         // The published tip supersedes this receipt, but the checkout may not
         // reflect it: a projection that lost the ref CAS mid-call left the
@@ -1025,12 +1041,19 @@ export async function projectRemoteFirstFastForward(
           ok: false,
           kind: "ancestry-unverifiable",
           error:
-            `${ref} in the checkout ${repoRoot}: containment of local ${localTip} in ${remoteRef} could not be ` +
+            `${ref} in the checkout ${repoRoot}: containment of local ${localTip} in fetched ${sourceOid} could not be ` +
             `decided (${gitDetail(published)}). Nothing was changed.`,
         }
       }
-      const localOnlyRead = git(repoRoot, readonlyArgs(["rev-list", `${remoteRef}..${localTip}`]))
-      const localOnly = localOnlyRead.status === 0 ? localOnlyRead.stdout.split("\n").filter(Boolean) : []
+      const localOnlyRead = git(repoRoot, readonlyArgs(["rev-list", `${sourceOid}..${localTip}`]))
+      if (localOnlyRead.status !== 0) {
+        return {
+          ok: false,
+          kind: "ancestry-unverifiable",
+          error: `Local commits above fetched ${sourceOid} could not be listed (${gitDetail(localOnlyRead)}). Nothing was changed.`,
+        }
+      }
+      const localOnly = localOnlyRead.stdout.split("\n").filter(Boolean)
       return {
         ok: false,
         kind: "stranded-local-commits",
@@ -1038,10 +1061,10 @@ export async function projectRemoteFirstFastForward(
         localTip,
         localOnly,
         error:
-          `${ref} in the checkout ${repoRoot}: the landed commit ${to} is contained in local ${localTip}, but ` +
+          `${ref} in the checkout ${repoRoot}: commit ${to} is contained in local ${localTip}, but ` +
           `${localOnly.length > 0 ? localOnly.length : "an unknown number of"} local-only commit(s) above ` +
-          `${remoteRef} strand that tip${localOnly.length > 0 ? ` (${localOnly.join(", ")})` : ""}. All work is ` +
-          `preserved and nothing was changed here; the landing is complete and this stale receipt prescribes nothing.`,
+          `fetched ${sourceOid} strand that tip${localOnly.length > 0 ? ` (${localOnly.join(", ")})` : ""}. All work is ` +
+          `preserved and nothing was changed here; this stale receipt prescribes nothing.`,
       }
     }
     if (superseded.status !== 1) {
@@ -1049,7 +1072,7 @@ export async function projectRemoteFirstFastForward(
         ok: false,
         kind: "ancestry-unverifiable",
         error:
-          `${ref} in the checkout ${repoRoot}: ancestry between landed ${to} and local ${localTip} could not be ` +
+          `${ref} in the checkout ${repoRoot}: ancestry between commit ${to} and local ${localTip} could not be ` +
           `decided (${gitDetail(superseded)}). Nothing was changed.`,
       }
     }
@@ -1059,9 +1082,9 @@ export async function projectRemoteFirstFastForward(
       landedOid: to,
       localTip,
       error:
-        `${ref} in the checkout ${repoRoot}: the landed commit ${to} is at ${remote}, but the local branch holds ` +
-        `${localTip}, which is not an ancestor — a local-only commit strands the projection. The landing is ` +
-        `complete and safe at the remote, nothing here was changed, and the intent is already committed, so ` +
+        `${ref} in the checkout ${repoRoot}: commit ${to} is contained in ${sourceRef} at ${remote}, but the local branch holds ` +
+        `${localTip}, which is not an ancestor — a local-only commit strands the projection. ` +
+        `Nothing here was changed, and the intent is already committed, so ` +
         "repeating the semantic operation would duplicate it.",
     }
   }
@@ -1070,7 +1093,7 @@ export async function projectRemoteFirstFastForward(
       ok: false,
       kind: "ancestry-unverifiable",
       error:
-        `${ref} in the checkout ${repoRoot}: ancestry between local ${localTip} and landed ${to} could not be ` +
+        `${ref} in the checkout ${repoRoot}: ancestry between local ${localTip} and commit ${to} could not be ` +
         `decided (${gitDetail(ancestry)}). Nothing was changed.`,
     }
   }
@@ -1089,7 +1112,7 @@ export async function projectRemoteFirstFastForward(
     return {
       ok: false,
       kind: "dirt-unverifiable",
-      error: `${ref} in ${repoRoot}: ${matching.detail}. The landing is safe at ${remote}; nothing was changed.`,
+      error: `${ref} in ${repoRoot}: ${matching.detail}. Nothing was changed.`,
     }
   }
   const stagedPaths = [...new Set([...authoredPaths, ...matching.paths])]
@@ -1103,8 +1126,8 @@ export async function projectRemoteFirstFastForward(
       expectedDirtyPaths: [...expectedDirtyPaths].sort(),
       gitDetail: `preflight overlap [${matching.blockers.join(", ")}]`,
       error:
-        `${ref} in ${repoRoot}: origin ${to} would overwrite locally edited or removed paths ` +
-        `[${matching.blockers.join(", ")}]. The branch still holds ${localTip}; the remote commit is safe and ` +
+        `${ref} in ${repoRoot}: commit ${to} would overwrite locally edited or removed paths ` +
+        `[${matching.blockers.join(", ")}]. The branch still holds ${localTip} and ` +
         "the working tree was not changed." +
         (unstage === undefined ? "" : ` Could not unstage matching paths: ${unstage}.`),
     }
@@ -1119,16 +1142,15 @@ export async function projectRemoteFirstFastForward(
         : ` The authored paths could NOT be unstaged back to ${localTip} (${unstaged}); the index holds them staged.`
     return classifyReadTreeFailure(probed, expected, {
       refused: (detail) =>
-        `${ref} in the checkout ${repoRoot}: the landed commit ${to} is at ${remote}, but the checkout could not ` +
+        `${ref} in the checkout ${repoRoot}: commit ${to} is contained in ${sourceRef} at ${remote}, but the checkout could not ` +
         `be brought forward without overwriting an uncommitted local edit to a path the landing wrote ` +
         `(${detail}). The ref still holds ${localTip} and nothing was changed. Dirty at projection ` +
-        `time: [${expected.join(", ")}]. The landing ${to} is complete and safe at ${remote}.` +
+        `time: [${expected.join(", ")}].` +
         unstageNote,
       locked: ({ lockPath, lockAge, detail }) =>
-        `${ref} in the checkout ${repoRoot}: the landed commit ${to} is at ${remote}, but the checkout could not ` +
+        `${ref} in the checkout ${repoRoot}: commit ${to} is contained in ${sourceRef} at ${remote}, but the checkout could not ` +
         `be brought forward: another git process holds ${lockPath} (${lockAge}; ${detail}). No dirt was weighed; ` +
-        `the ref still holds ${localTip} and nothing was changed. The landing ${to} is complete and safe at ` +
-        `${remote}; project again once the lock is released.` +
+        `the ref still holds ${localTip} and nothing was changed; project again once the lock is released.` +
         unstageNote,
     })
   }
@@ -1157,6 +1179,8 @@ export interface ProjectCheckoutRequest {
   readonly remote?: string | undefined
   /** Fully-qualified ref to project. Defaults to "refs/heads/main". */
   readonly ref?: string | undefined
+  /** Fully-qualified source ref to fetch; defaults to the destination `ref`. */
+  readonly sourceRef?: string | undefined
   /** Timeout for remote fetch in ms. */
   readonly remoteTimeoutMs?: number | undefined
   /** Test seam invoked before ref advance. */
@@ -1181,14 +1205,19 @@ export type ProjectCheckoutOutcome = RemoteFirstProjectionOutcome & {
  */
 export async function projectCheckout(request: ProjectCheckoutRequest): Promise<ProjectCheckoutOutcome> {
   const { repoRoot } = request
+  const remote = request.remote ?? "origin"
+  const requestedRef = request.ref ?? "refs/heads/main"
+  const ref = requestedRef.startsWith("refs/heads/") ? requestedRef : `refs/heads/${requestedRef}`
+  const sourceRef = request.sourceRef ?? ref
+  if (!sourceRef.startsWith("refs/") || sourceRef === "refs/") {
+    return {
+      ok: false,
+      kind: "fetch-failed",
+      error: `sourceRef ${sourceRef} at ${remote} must be fully qualified under refs/. No Git command ran.`,
+    }
+  }
   if (isBareRepository(repoRoot)) {
     return { ok: true, kind: "bare" }
-  }
-
-  const remote = request.remote ?? "origin"
-  let ref = request.ref ?? "refs/heads/main"
-  if (!ref.startsWith("refs/heads/")) {
-    ref = `refs/heads/${ref}`
   }
 
   const branch = checkedOutRef(repoRoot)
@@ -1198,20 +1227,19 @@ export async function projectCheckout(request: ProjectCheckoutRequest): Promise<
       kind: "wrong-branch",
       checkedOutRef: branch,
       error:
-        `${ref} in the checkout ${repoRoot}: that checkout has ` +
+        `${ref} in the checkout ${repoRoot}, projecting ${sourceRef} at ${remote}: that checkout has ` +
         `${branch === null ? "a detached HEAD" : `${branch} checked out`}, so no projection can reconcile it. ` +
         "Nothing here was changed.",
     }
   }
 
-  const branchName = ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : ref
-  const fetched = await fetchTip(repoRoot, remote, ref, request.remoteTimeoutMs ?? DEFAULT_REMOTE_TIMEOUT_MS)
+  const fetched = await fetchTip(repoRoot, remote, sourceRef, request.remoteTimeoutMs ?? DEFAULT_REMOTE_TIMEOUT_MS)
   if (!fetched.ok) {
     return {
       ok: false,
       kind: "fetch-failed",
       error:
-        `${ref} in the checkout ${repoRoot}: fetching ${branchName} from ${remote} failed ` +
+        `${ref} in the checkout ${repoRoot}: fetching ${sourceRef} from ${remote} failed ` +
         `(${fetched.detail}). Nothing here was changed.`,
     }
   }
@@ -1221,15 +1249,22 @@ export async function projectCheckout(request: ProjectCheckoutRequest): Promise<
   const localTip = localTipRead.status === 0 ? localTipRead.stdout : undefined
 
   const expectedDirtyPaths = worktreeDirtyPaths(repoRoot)
-  const projectionOutcome = await projectRemoteFirstFastForward({
-    repoRoot,
-    to,
-    ref,
-    remote,
-    expectedDirtyPaths,
-    ...(request.remoteTimeoutMs !== undefined ? { remoteTimeoutMs: request.remoteTimeoutMs } : {}),
-    ...(request.beforeRefAdvance !== undefined ? { beforeRefAdvance: request.beforeRefAdvance } : {}),
-  })
+  const outcome = projectFetchedCommit(
+    {
+      repoRoot,
+      to,
+      ref,
+      remote,
+      sourceRef,
+      expectedDirtyPaths,
+      ...(request.remoteTimeoutMs !== undefined ? { remoteTimeoutMs: request.remoteTimeoutMs } : {}),
+      ...(request.beforeRefAdvance !== undefined ? { beforeRefAdvance: request.beforeRefAdvance } : {}),
+    },
+    fetched.oid,
+  )
+  const projectionOutcome = outcome.ok
+    ? outcome
+    : { ...outcome, error: `${outcome.error} Source: ${sourceRef} at ${remote}.` }
 
   return {
     ...projectionOutcome,
@@ -1509,6 +1544,7 @@ export async function projectCheckoutWithSetAside(
   const ref = request.ref ?? "refs/heads/main"
   const branchRef = ref.startsWith("refs/heads/") ? ref : `refs/heads/${ref}`
   const remote = request.remote ?? "origin"
+  const sourceRef = request.sourceRef ?? branchRef
   const { to, localTip } = projected
   const refused = (reason: string, preserveRef?: string): StateCheckoutRepairOutcome => ({
     ok: false,
@@ -1516,13 +1552,13 @@ export async function projectCheckoutWithSetAside(
     localTip,
     to,
     ...(preserveRef === undefined ? {} : { preserveRef }),
-    error: `${branchRef} in ${repoRoot}: ${reason}. Local ${localTip}; origin ${to}. Nothing was published.`,
+    error: `${branchRef} in ${repoRoot}: ${reason}. Local ${localTip}; source ${sourceRef} at ${remote} (${to}). Nothing was published.`,
   })
   let policy: Awaited<ReturnType<typeof readStateCheckoutDeclaration>>
   try {
     policy = await readStateCheckoutDeclaration(repoRoot, to)
   } catch (error) {
-    return refused(`origin checkout policy cannot be read (${error instanceof Error ? error.message : String(error)})`)
+    return refused(`source checkout policy cannot be read (${error instanceof Error ? error.message : String(error)})`)
   }
   if (policy === undefined) return projected
   if (projected.ok) {
@@ -1559,7 +1595,7 @@ export async function projectCheckoutWithSetAside(
       )
     }
     request.afterWorktreeClear?.()
-    const verified = await projectCheckout({ repoRoot, remote, ref: branchRef })
+    const verified = await projectCheckout({ repoRoot, remote, ref: branchRef, sourceRef })
     if (!verified.ok) {
       return refused(
         `declaration was preserved but checkout verification refused (${verified.kind}: ${verified.error})`,
@@ -1582,7 +1618,7 @@ export async function projectCheckoutWithSetAside(
       return refused("the index holds staged, unmerged or unprovable work, so no dirty path may be cleared")
     }
     const changed = git(repoRoot, readonlyArgs(["diff", "--name-only", "-z", localTip, to, "--"]))
-    if (changed.status !== 0) return refused(`origin's changed paths cannot be listed (${gitDetail(changed)})`)
+    if (changed.status !== 0) return refused(`source commit's changed paths cannot be listed (${gitDetail(changed)})`)
     const changedSet = new Set(nulPaths(changed.stdout))
     const selection = selectOldBlockingPaths(repoRoot, changedSet, policy.quietSeconds, request.reservedPaths ?? [])
     if (!selection.ok) return refused(selection.error)
@@ -1618,7 +1654,7 @@ export async function projectCheckoutWithSetAside(
       )
     }
     request.afterWorktreeClear?.()
-    const caughtUp = await projectCheckout({ repoRoot, remote, ref: branchRef })
+    const caughtUp = await projectCheckout({ repoRoot, remote, ref: branchRef, sourceRef })
     if (!caughtUp.ok) {
       return refused(
         `preserved ${saved.preserveRef}, but projection refused (${caughtUp.kind}: ${caughtUp.error})`,
@@ -1647,7 +1683,7 @@ export async function projectCheckoutWithSetAside(
   if (localOnlyRead.status !== 0) return refused(`local-only commits cannot be listed (${gitDetail(localOnlyRead)})`)
   const localOnly = localOnlyRead.stdout.split("\n").filter(Boolean)
   if (localOnly.length === 0) {
-    return refused("the local tip is not an origin ancestor, but no local-only commit is visible")
+    return refused("the local tip is not a source commit ancestor, but no local-only commit is visible")
   }
 
   const index = indexTreeFromCopy(repoRoot)
@@ -1725,7 +1761,7 @@ export async function projectCheckoutWithSetAside(
   if (advanced.status !== 0) return refused(`local ref CAS to ${base} refused (${gitDetail(advanced)})`, preserveRef)
   request.afterLocalRefMove?.()
 
-  const caughtUp = await projectCheckout({ repoRoot, remote, ref: branchRef })
+  const caughtUp = await projectCheckout({ repoRoot, remote, ref: branchRef, sourceRef })
   if (!caughtUp.ok) {
     return refused(
       `preserved ${preserveRef}, but projection refused (${caughtUp.kind}: ${caughtUp.error})`,

@@ -21,8 +21,14 @@ import { join } from "node:path"
 
 import { afterAll, afterEach, beforeEach, describe, expect, test, vi } from "vitest"
 
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>()
+  return { ...actual, spawnSync: vi.fn(actual.spawnSync) }
+})
+
 import {
   projectCheckoutWithSetAside,
+  projectCheckout,
   projectRemoteFirstFastForward,
   synchronizeCheckoutToCommit,
   worktreeDirtyPaths,
@@ -144,6 +150,138 @@ function remoteFixture(withStateCheckoutPolicy = false): {
 }
 
 describe("gitomic project and checkout synchronization", () => {
+  // @failure Retained commits cannot be projected without advancing origin, or a present object outside the fetched history is admitted.
+  // @level l1 @consumer retained STATE rail checkout projection @testonly none
+  describe("retained sourceRef", () => {
+    // @failure A repair preserves local work but changes its source back to main during the continuation.
+    test.each(["declaration", "dirty", "local-commit"] as const)(
+      "%s repair keeps the retained sourceRef through its continuation",
+      async (mode) => {
+        const { root, bare, checkout } = remoteFixture(true)
+        const retained = join(root, "retained")
+        git(root, "clone", "-q", bare, "retained")
+        writeFileSync(join(retained, "tracked.md"), "# retained source\n")
+        git(retained, "add", "tracked.md")
+        git(retained, "commit", "-qm", "retained source")
+        const to = git(retained, "rev-parse", "HEAD")
+        const sourceRef = "refs/km/retained/state"
+        git(retained, "update-ref", sourceRef, to)
+        const originTip = git(retained, "rev-parse", "refs/remotes/origin/main")
+        git(retained, "update-ref", "refs/heads/main", originTip, to)
+        const refsBefore = git(retained, "for-each-ref", "--format=%(refname) %(objectname)")
+        const capturedPath = mode === "declaration" ? ".gitomic.conf" : mode === "dirty" ? "tracked.md" : "local.md"
+        const original = mode === "declaration" ? readFileSync(join(checkout, capturedPath), "utf8") : ""
+        const captured = `${original}# local work\n`
+        writeFileSync(join(checkout, capturedPath), captured)
+        if (mode === "local-commit") {
+          git(checkout, "add", capturedPath)
+          git(checkout, "commit", "-qm", "local work")
+        }
+        advancePastQuietPeriod()
+
+        const result = await projectCheckoutWithSetAside({ repoRoot: checkout, remote: retained, sourceRef })
+
+        expect(result).toMatchObject({ ok: true, kind: "set-aside", to })
+        if (!result.ok || result.kind !== "set-aside") throw new Error("expected preserved local work")
+        expect(git(checkout, "show", `${result.preserveRef}:${capturedPath}`)).toBe(captured.trimEnd())
+        expect(git(checkout, "rev-parse", "HEAD")).toBe(to)
+        expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# retained source\n")
+        expect(worktreeDirtyPaths(checkout)).toEqual([])
+        expect(git(checkout, "rev-parse", "refs/remotes/origin/main")).toBe(originTip)
+        expect(git(retained, "for-each-ref", "--format=%(refname) %(objectname)")).toBe(refsBefore)
+      },
+    )
+
+    test.each(["receipt", "tip", "superseded"] as const)(
+      "%s projection uses the retained ref and preserves source refs",
+      async (mode) => {
+        const { root, bare, checkout } = remoteFixture()
+        const retained = join(root, "retained")
+        git(root, "clone", "-q", bare, "retained")
+        writeFileSync(join(retained, "tracked.md"), "# first retained\n")
+        git(retained, "add", "tracked.md")
+        git(retained, "commit", "-qm", "first retained")
+        const first = git(retained, "rev-parse", "HEAD")
+        writeFileSync(join(retained, "tracked.md"), "# second retained\n")
+        git(retained, "add", "tracked.md")
+        git(retained, "commit", "-qm", "second retained")
+        const second = git(retained, "rev-parse", "HEAD")
+        const sourceRef = "refs/km/retained/state"
+        git(retained, "update-ref", sourceRef, second)
+        git(retained, "update-ref", "refs/heads/main", git(retained, "rev-parse", "refs/remotes/origin/main"), second)
+        const sourceRefs = git(retained, "for-each-ref", "--format=%(refname) %(objectname)")
+        const originTip = git(checkout, "rev-parse", "refs/remotes/origin/main")
+        writeFileSync(join(checkout, "bystander.md"), "# local dirt\n")
+        const request = {
+          repoRoot: checkout,
+          remote: retained,
+          ref: "refs/heads/main",
+          sourceRef,
+          expectedDirtyPaths: worktreeDirtyPaths(checkout),
+        }
+        if (mode === "superseded") {
+          expect(await projectRemoteFirstFastForward({ ...request, to: second })).toMatchObject({ ok: true })
+        }
+        const result =
+          mode === "tip"
+            ? await projectCheckout(request)
+            : await projectRemoteFirstFastForward({ ...request, to: first })
+        expect(result).toMatchObject({ ok: true })
+        expect(git(checkout, "rev-parse", "HEAD")).toBe(mode === "receipt" ? first : second)
+        expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe(
+          mode === "receipt" ? "# first retained\n" : "# second retained\n",
+        )
+        expect(readFileSync(join(checkout, "bystander.md"), "utf8")).toBe("# local dirt\n")
+        expect(git(checkout, "rev-parse", "refs/remotes/origin/main")).toBe(originTip)
+        expect(git(retained, "for-each-ref", "--format=%(refname) %(objectname)")).toBe(sourceRefs)
+      },
+    )
+
+    test("refuses an object-present commit outside the fetched history before changing the checkout", async () => {
+      const { root, bare, checkout } = remoteFixture()
+      git(root, "clone", "-q", bare, "unpublished")
+      const unpublished = join(root, "unpublished")
+      writeFileSync(join(unpublished, "tracked.md"), "# not on origin\n")
+      git(unpublished, "add", "tracked.md")
+      git(unpublished, "commit", "-qm", "unpublished object")
+      const to = git(unpublished, "rev-parse", "HEAD")
+      git(checkout, "fetch", "-q", unpublished, "refs/heads/main")
+      expect(git(checkout, "cat-file", "-t", to)).toBe("commit")
+      const before = git(checkout, "rev-parse", "HEAD")
+      const outcome = await projectRemoteFirstFastForward({
+        repoRoot: checkout,
+        to,
+        ref: "refs/heads/main",
+        remote: "origin",
+        expectedDirtyPaths: [],
+      })
+      expect(outcome).toMatchObject({ ok: false, kind: "fetch-failed" })
+      expect(outcome.ok ? "" : outcome.error).toContain("refs/heads/main")
+      expect(git(checkout, "rev-parse", "HEAD")).toBe(before)
+      expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# original\n")
+    })
+
+    test.each(["receipt", "tip"] as const)("%s refuses an unqualified sourceRef before querying Git", async (mode) => {
+      const root = mkdtempSync(join(tmpdir(), "gitomic-unqualified-source-"))
+      roots.push(root)
+      const request = {
+        repoRoot: root,
+        remote: "origin",
+        ref: "refs/heads/main",
+        sourceRef: "main",
+        to: "0".repeat(40),
+        expectedDirtyPaths: [],
+      }
+      vi.stubEnv("PATH", root)
+      vi.mocked(spawnSync).mockClear()
+      const result = mode === "tip" ? await projectCheckout(request) : await projectRemoteFirstFastForward(request)
+      expect(result).toMatchObject({ ok: false, kind: "fetch-failed" })
+      expect(result.ok ? "" : result.error).toContain("sourceRef main")
+      expect(spawnSync).not.toHaveBeenCalled()
+      expect(readdirSync(root)).toEqual([])
+    })
+  })
+
   describe("STATE set-aside repair", () => {
     test("preserves a local-only commit before bringing the checkout to origin", async () => {
       const { checkout, landAtOrigin } = remoteFixture(true)

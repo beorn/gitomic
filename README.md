@@ -142,8 +142,13 @@ and hands to `update` (its third argument) and `beside` as `tips`, a map from
 ref to id in which a ref that does not exist yet is simply absent. On a remote
 store they ride the SAME `git fetch` as the store's ref, one process per attempt
 and never one per ref; absence is tolerated for the listed refs only, while the
-store's own ref stays strict. On a local store they are read from the
-repository. It refuses at the call for the store's own ref, a name outside
+store's own ref stays strict. On a local store they are read together from the
+repository in one exact-array `backend.listRefs` call per attempt. Custom
+backends implementing `listRefs` must support both a string prefix and an array
+of exact full ref names; prefix-only implementations must migrate. Exact arrays
+omit absent refs, retain ref-name order, refuse malformed or repeated names
+before I/O, and answer an empty array without I/O. This is a breaking backend
+contract change. It refuses at the call for the store's own ref, a name outside
 `refs/`, a repeat, or a backend that cannot read them. `fetchRefs` itself takes `{ absent: "omit" }` for the same tolerance, and
 the events door's `events({ at })` reads a chain at such a fetched tip without
 another round trip.
@@ -616,6 +621,8 @@ Trust pins the declaration's text, not the scripts it names. A trusted `check = 
 A write verb addressed to a checkout of it (a path, or a `file://` URL, to a non-bare repository) whose base declares `[publish]` for the addressed branch exits `2` and writes nothing, since it would land on the checkout's local ref and push nothing. The refusal names the address to use, read from the checkout's `remote.<remote>.url`: `gitomic apply '<url>#main' --base <oid> --writer '@seat' -m <message> put <path> <file>`; when that remote is not configured, it says so. A bare repository, a URL to one, and a branch `[publish]` does not name are written as before. The section is data and runs nothing, but it is part of the declaration, so adding it changes the blob and needs `gitomic trust` again.
 
 ### Projecting a checkout
+
+**Decision 2 — retained sources.** The library owns `sourceRef?: string` on `RemoteFirstProjectionRequest` and `ProjectCheckoutRequest`. It defaults to the destination `ref`; an explicit value must be fully qualified under `refs/` and is refused before Git runs otherwise. Set `remote` to a retained repository path and `sourceRef` to its retained ref to project a durable local commit without advancing origin. This proves local durability, not remote publication. Existing callers still fetch their destination branch, but a requested commit now must be that fetched tip or its ancestor: an object merely present in the checkout is refused. Superseded receipts prove the local tip against the same fetched oid. The existing checkout lock, fast-forward CAS, dirt preservation and outcome kinds remain the contract.
 
 Writes land object-side, so a checkout of the written branch goes stale. `gitomic project <path>` fetches the branch (`--remote`, default `origin`; `--ref`, default `main`) and fast-forwards the checkout's index and working tree to it, preserving unrelated dirt; `apply --checkout <path>` does the same right after its write. One stdout line names the outcome: `kind=<kind> local=<oid> to=<oid>`.
 

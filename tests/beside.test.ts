@@ -270,6 +270,75 @@ describe("beside: refs that land in the same atomic publish as the transaction",
     expect(plain?.size).toBe(0)
   })
 
+  /**
+   * @failure a side-ref-only lease loss reuses stale/absent tips or lists once per requested ref.
+   * @level l0
+   * @consumer 26718 CTO b7b1bfec: one fresh exact observation per local attempt, same atomic publish.
+   */
+  test("local exact fetch retries side-only leases with fresh presence in update and beside", async () => {
+    await forEachTarget(async (target) => {
+      const store = await open({ repo: target.repo, ref: MAIN, writer: "rail", backend: target.backend })
+      const seed = await store.transact(async (map) => map.set("seed.md", "seed\n"), "seed")
+      await target.backend.publish?.(target.repo, [{ ref: ITEM, expect: "0".repeat(seed.oid.length), oid: seed.oid }])
+      const updates: Array<ReadonlyMap<string, Oid>> = []
+      const beside: Array<ReadonlyMap<string, Oid>> = []
+      const spawn = vi.spyOn(childProcess, "spawn")
+      const committed = await store.transact(
+        async (map, _base, attempt) => {
+          if (attempt === undefined) throw new Error("exact fetch fixture lacks attempt context")
+          updates.push(new Map(attempt.tips))
+          map.set("exact.md", "exact\n")
+        },
+        "exact fetch",
+        {
+          fetch: [LOG, ITEM],
+          beside: async (attempt) => {
+            beside.push(new Map(attempt.tips))
+            if (beside.length === 1) {
+              // Only side refs move: content stays at seed, LOG appears, ITEM disappears.
+              await target.backend.publish?.(target.repo, [
+                { ref: LOG, expect: "0".repeat(seed.oid.length), oid: seed.oid },
+                { ref: ITEM, expect: seed.oid, oid: null },
+              ])
+            }
+            return [LOG, ITEM].map((ref) => ({ ref, expect: attempt.tips.get(ref) ?? null, oid: attempt.next }))
+          },
+        },
+      )
+      expect(committed.retries, target.name).toBe(1)
+      expect(
+        updates.map((tips) => [tips.get(LOG), tips.get(ITEM)]),
+        target.name,
+      ).toEqual([
+        [undefined, seed.oid],
+        [seed.oid, undefined],
+      ])
+      expect(beside, target.name).toEqual(updates)
+      // Failed atomic publication also diagnoses its full ref set (including MAIN).
+      // Count only the side-ref observations, not that required lease diagnosis.
+      const listings = spawn.mock.calls.filter((call) => {
+        const args = call[1] as string[]
+        return (
+          call[0] === "git" &&
+          args.includes("for-each-ref") &&
+          args.includes(LOG) &&
+          args.includes(ITEM) &&
+          !args.includes(MAIN)
+        )
+      })
+      expect(listings.length, target.name).toBe(target.name === "mem" ? 0 : 2)
+      const diagnosis = spawn.mock.calls.filter((call) => {
+        const args = call[1] as string[]
+        return call[0] === "git" && args.includes("for-each-ref") && args.includes(MAIN)
+      })
+      expect(diagnosis.length, target.name).toBe(target.name === "mem" ? 0 : 1)
+      spawn.mockRestore()
+      expect(await tipOf(target, MAIN)).toBe(committed.oid)
+      expect(await tipOf(target, LOG)).toBe(committed.oid)
+      expect(await tipOf(target, ITEM)).toBe(committed.oid)
+    })
+  })
+
   test("fetch refuses at the call: the store's ref, a name outside refs/, a repeat, or a backend that cannot read", async () => {
     const backend = createMemBackend()
     const store = await open({ repo: "beside-fetch-refuse", ref: MAIN, writer: "rail", backend })
