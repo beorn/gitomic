@@ -977,6 +977,7 @@ async function readHistory(
   for (const tip of tips) validateOid(tip, "invalid history tip")
   const exclude = (options.exclude ?? []).map((oid) => `^${validateOid(oid, "invalid history exclusion")}`)
   const limit = options.limit === undefined ? [] : [`--max-count=${options.limit}`]
+  const revisions = [...tips, ...exclude].join("\n") + "\n"
   const output = await git(
     repo,
     [
@@ -985,10 +986,9 @@ async function readHistory(
       ...limit,
       "--no-commit-header",
       "--format=%H%x00%P%x00%ct%x00%an%x00%ae%x00%cn%x00%ce%x00%B%x00",
-      ...tips,
-      ...exclude,
+      "--stdin",
     ],
-    { baseEnv },
+    { baseEnv, input: revisions },
   )
   const fields = decodeUtf8(output, "git rev-list history").split("\0")
   const trailing = fields.pop()
