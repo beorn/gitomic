@@ -1,6 +1,6 @@
 {
   "name": "gitomic",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Atomic, merge-free state commits over git: compare-and-swap on a ref with semantic replay.",
   "keywords": [
     "atomic",
@@ -92,9 +92,10 @@
   },
   "devDependencies": {
     "@types/node": "26.6.3",
-    "isomorphic-git": "1.42.3",
+    "isomorphic-git": "1.42.5",
     "oxfmt": "^0.59.0",
     "oxlint": "1.85.0",
+    "removely": "0.3.0",
     "typescript": "^7.0.2",
     "unstorage": "^1.17.5",
     "vitest": "^4.1.10"

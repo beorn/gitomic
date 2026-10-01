@@ -507,6 +507,13 @@ describe.sequential("shell backend failure boundaries", () => {
     }
   }, 30_000)
 
+  // #26689: runtime callers must not silently receive forwarding for an invalid host policy.
+  test.each(["", "ignore", null, 0, false])("rejects an invalid SIGTERM policy %j at construction", (sigterm) => {
+    expect(() => Reflect.apply(createShellBackend, undefined, [{ sigterm }])).toThrow(
+      'sigterm must be "forward" or "drain"',
+    )
+  })
+
   test("pins every Git subprocess to the C locale", async () => {
     const wrapper = await createGitWrapper()
     const expected = "1".repeat(40)

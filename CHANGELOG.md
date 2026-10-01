@@ -1,9 +1,22 @@
 # Changelog
 
+## 0.9.0 — 2026-09-30
+
+### Added
+
+- `shellBackend({ sigterm: "drain" })` lets a host drain already-running bounded Git commands on its first SIGTERM. The default remains `"forward"`; separate backends retain their own policy. Existing command deadlines still send TERM and then KILL after the existing grace period. SIGINT, SIGHUP and a second SIGTERM interrupt remaining commands.
+- A draining host without another SIGTERM handler terminates by SIGTERM after its last bounded command settles. Hosts with their own handler retain control of their shutdown.
+
+### Limits
+
+- Deadlines belong to the parent process. Parent SIGKILL cannot run those deadlines or clean up Git descendants in separate process groups; external supervision must retain custody. Hab tracks this containment gap in [#26861](https://github.com/beorn/hh/blob/main/pm/@i/4-supervision/26861-escaped-descendant-custody.md).
+- This release also includes the unpublished 0.6.0–0.8.0 changes below. Custom backends must adopt the `RefSwap` return contract introduced in 0.6.0.
+
 ## 0.8.0 — 2026-09-30
 
 ### Added
 
+- `actorTrailersFromToken(raw, declaration)` and `parseActorTokenDeclaration(value, label?)`, exported from `gitomic`: the one decoder from an actor token (a compact JWS, decoded, never verified) to the `Actor-Session` and `Actor-Generation` trailers. The declaration names the variable and the two claims, so gitomic holds no issuer's names. An unreadable token answers `{ reason }` instead of trailers, naming the cause without quoting the token.
 - `GitSignaled`, exported from `gitomic`: a native Git process interrupted by a signal rejects with its command, signal and captured stderr. The runner preserves the signal on both normal close and bounded commands whose helpers keep their pipes open, instead of inventing exit code 1. Ordinary numeric exit codes and live-command `GitTimeout` failures keep their existing behavior.
 
 ## 0.7.0 — 2026-09-26

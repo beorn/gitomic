@@ -15,6 +15,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import { afterEach, describe, expect, test, vi } from "vitest"
+import { tempTree } from "removely"
 
 import { createShellBackend, open, openRemoteRepository, runGit } from "../src/index.js"
 import { createBareRepo, createRemoteRepos, createWorktreeRepo, git, gitFrom } from "./helpers/git.js"
@@ -83,6 +84,7 @@ async function survivors(pids: readonly number[]): Promise<number[]> {
 
 type ChildOutcome = {
   readonly exitedOnItsOwn: boolean
+  readonly exitSignal: string | undefined
   readonly result: Record<string, unknown> | undefined
   readonly output: string
 }
@@ -125,7 +127,12 @@ async function runInChild(body: string, env: NodeJS.ProcessEnv, boundMs: number)
           }
         }
         const killed = error !== null && (error as { killed?: boolean }).killed === true
-        resolveOutcome({ exitedOnItsOwn: !killed, result, output: `${stdout}\n${stderr}` })
+        resolveOutcome({
+          exitedOnItsOwn: !killed,
+          exitSignal: error === null ? undefined : (error as { signal?: string }).signal,
+          result,
+          output: `${stdout}\n${stderr}`,
+        })
       },
     )
   })
@@ -225,6 +232,157 @@ describe("a remote that stalls", () => {
 })
 
 describe("a bounded command", () => {
+  // #26689: signalling Git itself does not cover TERM sent to its graceful host.
+  test.each([
+    {
+      name: "drains an admitted publication after TERM",
+      policy: "drain",
+      signals: ["SIGTERM"],
+      release: true,
+      failure: undefined,
+      hostHandler: true,
+    },
+    {
+      name: "keeps its publication deadline after TERM",
+      policy: "drain",
+      signals: ["SIGTERM"],
+      release: false,
+      failure: "GitTimeout",
+      hostHandler: true,
+    },
+    {
+      name: "forwards INT even with drain enabled",
+      policy: "drain",
+      signals: ["SIGINT"],
+      release: false,
+      failure: "GitSignaled",
+      hostHandler: true,
+    },
+    {
+      name: "forwards HUP even with drain enabled",
+      policy: "drain",
+      signals: ["SIGHUP"],
+      release: false,
+      failure: "GitSignaled",
+      hostHandler: true,
+    },
+    {
+      name: "forwards TERM with the default policy",
+      policy: undefined,
+      signals: ["SIGTERM"],
+      release: false,
+      failure: "GitSignaled",
+      hostHandler: true,
+    },
+    {
+      name: "forwards a second TERM while draining",
+      policy: "drain",
+      signals: ["SIGTERM", "SIGTERM"],
+      release: false,
+      failure: "GitSignaled",
+      hostHandler: true,
+    },
+    {
+      name: "exits by deferred TERM after publication without another handler",
+      policy: "drain",
+      signals: ["SIGTERM"],
+      release: true,
+      failure: undefined,
+      hostHandler: false,
+    },
+    {
+      name: "isolates a drained publication from a concurrent default fetch",
+      policy: "drain",
+      signals: ["SIGTERM"],
+      release: true,
+      failure: undefined,
+      hostHandler: true,
+    },
+  ])(
+    "a graceful host $name",
+    async ({ name, policy, signals, release: releasePublication, failure, hostHandler }) => {
+      const mixed = name === "isolates a drained publication from a concurrent default fetch"
+      const fixture = await createRemoteRepos()
+      const stall = mixed ? await createStallingSsh() : undefined
+      const forwardRepo = mixed ? await createBareRepo() : undefined
+      if (forwardRepo !== undefined) await git(forwardRepo.repo, "remote", "add", "origin", STALLING_SOURCE)
+      const gate = await mkdtemp(join(tmpdir(), "gitomic-publication-gate-"))
+      const entered = join(gate, "entered")
+      const release = join(gate, "release")
+      const parent = join(gate, "parent")
+      const deferred = join(gate, "deferred")
+      const hook = join(fixture.remote, "hooks", "pre-receive")
+      await writeFile(
+        hook,
+        `#!/usr/bin/env bun\nimport { existsSync, writeFileSync } from "node:fs"\nwriteFileSync(${JSON.stringify(entered)}, String(process.pid))\nconst deadline = Date.now() + 10000\nwhile (!existsSync(${JSON.stringify(release)})) {\n  if (Date.now() > deadline) process.exit(1)\n  await new Promise(resolve => setTimeout(resolve, 10))\n}\n`,
+      )
+      await chmod(hook, 0o755)
+      try {
+        const child = await runInChild(
+          [
+            'const { existsSync, writeFileSync } = await import("node:fs")',
+            "let signalCount = 0",
+            ...(hostHandler
+              ? ['for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(signal, () => { signalCount += 1 })']
+              : []),
+            `const store = await gitomic.open({ repo: ${JSON.stringify(fixture.left)}, ref: "main", remote: "origin", backend: gitomic.createShellBackend(${JSON.stringify({ sigterm: policy, remoteTimeoutMs: 1000 })}) })`,
+            ...(forwardRepo === undefined
+              ? []
+              : [
+                  `const forwarded = gitomic.open({ repo: ${JSON.stringify(forwardRepo.repo)}, ref: "main", remote: "origin", backend: gitomic.createShellBackend({ remoteTimeoutMs: 5000 }) }).then(() => ({ ok: true }), error => ({ ok: false, name: error.name }))`,
+                ]),
+            'const publication = store.transact(map => map.set("note.md", "drained publication\\n"), "drain publication").then(result => ({ ok: true, oid: result.oid }), error => ({ ok: false, name: error.name, message: error.message, failure: error.cause?.cause?.name }))',
+            "const admissionBound = Date.now() + 8000",
+            `while (!existsSync(${JSON.stringify(entered)})${stall === undefined ? "" : ` || !existsSync(${JSON.stringify(join(stall.script, "..", "pids"))})`}) {`,
+            '  if (Date.now() > admissionBound) throw new Error("real publication never reached its receive hook")',
+            "  await new Promise(resolve => setTimeout(resolve, 10))",
+            "}",
+            `writeFileSync(${JSON.stringify(parent)}, String(process.pid))`,
+            `for (const [index, signal] of ${JSON.stringify(signals)}.entries()) {`,
+            "  process.kill(process.pid, signal)",
+            ...(hostHandler
+              ? ["  while (signalCount <= index) await new Promise(resolve => setTimeout(resolve, 10))"]
+              : [
+                  "  await new Promise(resolve => setTimeout(resolve, 50))",
+                  `  writeFileSync(${JSON.stringify(deferred)}, "parent survived TERM with publication held")`,
+                ]),
+            "}",
+            ...(forwardRepo === undefined ? [] : ["const forwardedResult = await forwarded"]),
+            ...(releasePublication ? [`writeFileSync(${JSON.stringify(release)}, "release")`] : []),
+            `outcome = { ...(await publication), parentPid: process.pid${forwardRepo === undefined ? "" : ", forwarded: forwardedResult"} }`,
+          ].join("\n"),
+          { ...process.env, ...(stall === undefined ? {} : { GIT_SSH_COMMAND: stall.script }) },
+          15000,
+        )
+        expect(child.exitedOnItsOwn, child.output).toBe(true)
+        expect(Number(await readFile(parent, "utf8"))).toBeGreaterThan(0)
+        if (hostHandler) {
+          expect(child.result, child.output).toMatchObject({ ok: failure === undefined, parentPid: expect.any(Number) })
+          if (mixed) expect(child.result, child.output).toMatchObject({ forwarded: { ok: false, name: "GitSignaled" } })
+        } else {
+          expect(await readFile(deferred, "utf8")).toBe("parent survived TERM with publication held")
+          expect(child.exitSignal, child.output).toBe("SIGTERM")
+        }
+        if (failure === undefined) {
+          if (hostHandler) expect(child.result, child.output).toMatchObject({ oid: expect.any(String) })
+          expect(await git(fixture.remote, "show", "main:note.md")).toBe("drained publication")
+        } else {
+          expect(child.result, child.output).toMatchObject({ failure })
+          expect(await git(fixture.remote, "rev-parse", "main")).toBe(fixture.initial)
+        }
+        const hookPid = Number(await readFile(entered, "utf8"))
+        expect(await survivors([hookPid, ...(stall === undefined ? [] : await stall.pids())])).toEqual([])
+      } finally {
+        await writeFile(release, "release")
+        await stall?.cleanup()
+        await forwardRepo?.cleanup()
+        await fixture.cleanup()
+        await rm(gate, { recursive: true, force: true })
+      }
+    },
+    20000,
+  )
+
   // #26595: timeout/held-pipe success cases do not exercise an externally signalled Git parent.
   // The real Git alias signals only its own Git parent; no production injection seam is needed.
   test.each([
@@ -405,7 +563,8 @@ describe("a kept remote repository", () => {
   test("a kept repository recorded for another origin is refused, naming the recorded origin", async () => {
     const fixture = await createBareRepo()
     const other = await createBareRepo()
-    const cacheDir = join(await mkdtemp(join(tmpdir(), "gitomic-kept-origin-")), "remotes")
+    await using cache = await tempTree("gitomic-kept-origin-")
+    const cacheDir = cache.resolve("remotes")
     try {
       const source = pathToFileURL(fixture.repo).href
       const recorded = pathToFileURL(other.repo).href
@@ -415,7 +574,6 @@ describe("a kept remote repository", () => {
       await expect(openRemoteRepository(source, { cacheDir })).rejects.toThrow(recorded)
       expect(await git(keptPath(cacheDir, source), "config", "--get", "remote.origin.url")).toBe(recorded)
     } finally {
-      await rm(join(cacheDir, ".."), { recursive: true, force: true })
       await other.cleanup()
       await fixture.cleanup()
     }
