@@ -590,7 +590,7 @@ $ gitomic write 'repo#main' -m edit a.md=./a --json
 	timeoutMs = 30000
 ```
 
-Each command runs through `sh -c` with `GITOMIC_REPO`, `GITOMIC_BASE` and `GITOMIC_CANDIDATE` (the unpublished candidate commit) set, and the changed paths on stdin, NUL-separated. Any other exit, or running past the limit, refuses. A write that changes `.gitomic.conf` must change nothing else. A landed write's report goes to stderr as `report: <line>`, or into the `--json` receipt. The library takes the same gate as `transact`'s `candidate` option (`repositoryCandidate({ repo })`).
+Each command runs through `sh -c` with `GITOMIC_REPO`, `GITOMIC_BASE` and `GITOMIC_CANDIDATE` (the unpublished candidate commit) set, and the changed paths on stdin, NUL-separated. Derive runs before check and its edits land in the same commit. Either command's exit 1 refuses with its stdout lines verbatim; without those lines, the refusal says "refused without a reason" and includes the last eight stderr lines. Any other nonzero exit says "could not run"; exceeding the time limit also refuses. A derive refusal ends the attempt before check runs. A write that changes `.gitomic.conf` must change nothing else. A landed write's report goes to stderr as `report: <line>`, or into the `--json` receipt. The library takes the same gate as `transact`'s `candidate` option (`repositoryCandidate({ repo })`).
 
 **Trust.** Nothing a repository declares runs until you have trusted that exact declaration, the way direnv allows an `.envrc` by its hash. A write whose base `.gitomic.conf` is not the trusted blob exits `4`, runs nothing, and names the blob and the command to run:
 

@@ -134,9 +134,21 @@ describe("repositoryCandidate — the gate the repository's trusted base declare
   })
 
   test.each([
-    { name: "exit 1 with reasons", body: 'echo "docs/a.md: first"; echo "docs/a.md: second"; exit 1', reasons: ["docs/a.md: first", "docs/a.md: second"] },
-    { name: "exit 1 without reasons", body: 'echo "diagnostic" >&2; exit 1', reasons: [expect.stringMatching(/derive .*refused without a reason: diagnostic/u)] },
-    { name: "exit 2", body: 'echo "diagnostic" >&2; exit 2', reasons: [expect.stringMatching(/derive .*could not run \(exit 2\): diagnostic/u)] },
+    {
+      name: "exit 1 with reasons",
+      body: 'echo "docs/a.md: first"; echo "docs/a.md: second"; exit 1',
+      reasons: ["docs/a.md: first", "docs/a.md: second"],
+    },
+    {
+      name: "exit 1 without reasons",
+      body: 'echo "diagnostic" >&2; exit 1',
+      reasons: [expect.stringMatching(/derive .*refused without a reason: diagnostic/u)],
+    },
+    {
+      name: "exit 2",
+      body: 'echo "diagnostic" >&2; exit 2',
+      reasons: [expect.stringMatching(/derive .*could not run \(exit 2\): diagnostic/u)],
+    },
   ])("a derive $name refuses before the ref moves", async ({ body, reasons }) => {
     const derive = await script("derive.sh", body)
     await declare(`[candidate]\n\tderive = ${derive}\n`)
