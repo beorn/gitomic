@@ -259,7 +259,9 @@ describe("gitomic trust — a repository's declared commands run only once their
     // 1. When rawKey is absent (exit 1 with empty output), write refuses normally with CandidateRefused
     const candidateNormal = repositoryCandidate({ repo: remote.repo, ref: "main", url: fixture.repo })
     try {
-      await store.transact(async (map) => map.set("doc.md", "content\n"), "untrusted write", { candidate: candidateNormal })
+      await store.transact(async (map) => map.set("doc.md", "content\n"), "untrusted write", {
+        candidate: candidateNormal,
+      })
       expect.unreachable("expected untrusted write to refuse")
     } catch (error) {
       expect(error).toBeInstanceOf(CandidateRefused)
