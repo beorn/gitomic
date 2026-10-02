@@ -276,6 +276,26 @@ export class GitSignaled extends Error {
  * `reasons` are the check's own lines, verbatim. `base` is the tip the candidate was built on. Facts only: gitomic
  * runs whatever check the caller or the repository's trusted base declares; it holds no policy of its own.
  */
+/**
+ * A transaction named a commit to keep that its base already contains: the merge is already made. Thrown on
+ * every attempt, so a retry on a tip that gained the commit refuses instead of writing a second merge.
+ */
+export class AlreadyKept extends Error {
+  /** The commit the transaction asked to keep. */
+  readonly keep: string
+  /** The base that already contains it. */
+  readonly base: string
+  override readonly name = "AlreadyKept"
+  /** Stable machine key; the same string across every backend and release. */
+  readonly code = "already-kept" as const
+
+  constructor(keep: string, base: string) {
+    super(`already kept: ${keep} is reachable from the base ${base}; nothing was written`)
+    this.keep = keep
+    this.base = base
+  }
+}
+
 export class CandidateRefused extends Error {
   readonly reasons: readonly string[]
   /** The commit the refused candidate was built on. */
