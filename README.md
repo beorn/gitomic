@@ -290,6 +290,12 @@ When Git itself dies of a native signal, the runner rejects with the exported `G
 
 **Sharing `main` with a delivery queue** needs a strict path partition: gitomic owns its declared state paths and the queue owns code paths; neither writes the other's. The ref only fast-forwards. The queue never rebases or rewrites already-published gitomic commits — if its candidate is stale, it must rebuild on the current tip. Without all three, use a separate ref.
 
+### Running a command
+
+`runCommand(command, args, options)` exposes the existing shell runner for a non-Git executable. It takes `RunGitOptions` (`input`, `env`, and optional `timeoutMs`) and returns `{ stdout: Buffer, stderr: Buffer, code: number }`. It invokes the executable directly without a shell and prints neither stream. Check `code`: a normal nonzero exit returns its exact code and captured output. A missing executable rejects with the native process error, including `ENOENT`; native signals reject with `GitSignaled`.
+
+Supply `timeoutMs` when the command must be bounded; omitting it imposes no deadline. A timeout rejects with `GitTimeout` and uses the same process-group stop behavior described above. The environment inherits `process.env`, with `env` overrides, `GIT_TERMINAL_PROMPT=0`, and `LC_ALL=C`. Callers must remove credentials that their child process should not inherit and avoid logging sensitive arguments or output.
+
 ### The map
 
 ```ts

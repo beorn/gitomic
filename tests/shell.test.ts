@@ -13,6 +13,7 @@ import { delimiter, dirname, join } from "node:path"
 
 import { describe, expect, test, vi } from "vitest"
 
+import * as gitomic from "../src/index.js"
 import {
   apply,
   Conflict,
@@ -29,6 +30,29 @@ import type { GitomicBackend } from "../src/index.js"
 import { createIsoBackend } from "../src/iso.js"
 import { isRemoteCompareAndSwapRejection, parseRefLockFailures } from "../src/shell.js"
 import { appendEmptyHistory, createBareRepo, createRemoteRepos, git, gitWithInput } from "./helpers/git.js"
+
+// @failure A public consumer cannot use the existing bounded command runner or loses a command's failure evidence.
+// @level l1
+// @consumer Node consumers of gitomic#runCommand, including Brain public-key verification
+test("public command runner preserves command output and refuses missing or timed-out executables", async () => {
+  const result = await gitomic.runCommand(
+    process.execPath,
+    [
+      "-e",
+      'process.stdin.on("data", bytes => process.stdout.write(bytes)); process.stdin.on("end", () => { process.stderr.write("command diagnostic"); process.exitCode = 7 })',
+    ],
+    { input: Buffer.from("command input"), timeoutMs: 5_000 },
+  )
+  expect(result.code).toBe(7)
+  expect(result.stdout.toString()).toBe("command input")
+  expect(result.stderr.toString()).toBe("command diagnostic")
+  await expect(
+    gitomic.runCommand(join(tmpdir(), "gitomic-required-command-does-not-exist"), [], { timeoutMs: 5_000 }),
+  ).rejects.toMatchObject({ code: "ENOENT" })
+  await expect(
+    gitomic.runCommand(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { timeoutMs: 100 }),
+  ).rejects.toBeInstanceOf(gitomic.GitTimeout)
+})
 
 const TRANSACTION_SEARCH_LIMIT = 1_024
 const gitInitHelp = spawnSync("git", ["init", "-h"], { encoding: "utf8" })
