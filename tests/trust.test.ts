@@ -245,4 +245,40 @@ describe("gitomic trust — a repository's declared commands run only once their
     }
     expect(await checkRan()).toBe(false)
   })
+
+  test("legacy raw-key fallback lookup succeeds when rawKey is trusted, but throws when rawKey lookup fails with git error", async () => {
+    const blob = await declare()
+    using remote = await openRemoteRepository(fixture.repo)
+    const store = await open({
+      repo: remote.repo,
+      ref: "main",
+      writer: "fixture-remote",
+      backend: shell,
+    })
+
+    // 1. When rawKey is absent (exit 1 with empty output), write refuses normally with CandidateRefused
+    const candidateNormal = repositoryCandidate({ repo: remote.repo, ref: "main", url: fixture.repo })
+    try {
+      await store.transact(async (map) => map.set("doc.md", "content\n"), "untrusted write", { candidate: candidateNormal })
+      expect.unreachable("expected untrusted write to refuse")
+    } catch (error) {
+      expect(error).toBeInstanceOf(CandidateRefused)
+    }
+
+    // 2. When rawKey is trusted in global config under the legacy raw URL key, write succeeds
+    const legacyRawKey = `gitomic.${fixture.repo}.trust`
+    await git(fixture.repo, "config", "--file", join(work, "global-gitconfig"), legacyRawKey, blob)
+    await store.transact(async (map) => map.set("doc.md", "content via legacy raw key\n"), "write with legacy trust", {
+      candidate: candidateNormal,
+    })
+    expect(await checkRan()).toBe(true)
+
+    // 3. When rawKey causes git error (e.g. invalid key with newline), trustedBlobs throws instead of silently swallowing
+    const candidateInvalid = repositoryCandidate({ repo: remote.repo, ref: "main", url: `${fixture.repo}\ninvalid` })
+    await expect(
+      store.transact(async (map) => map.set("doc.md", "content invalid\n"), "write with invalid rawKey", {
+        candidate: candidateInvalid,
+      }),
+    ).rejects.toThrow(/cannot read gitomic\.[\s\S]*invalid\.trust/u)
+  })
 })
