@@ -51,7 +51,6 @@ import {
 import { dirname, join } from "node:path"
 
 import { readStateCheckoutDeclaration } from "./candidate.ts"
-import { objectOid } from "./git-object.ts"
 import { DEFAULT_REMOTE_TIMEOUT_MS, runGit } from "./shell.ts"
 
 /**
@@ -532,6 +531,11 @@ type AuthoredStage =
   | { readonly ok: true; readonly expectedDirtyPaths: string[] }
   | { readonly ok: false; readonly outcome: Extract<CheckoutSyncOutcome, { readonly ok: false }> }
 
+/** Compare checkout bytes in the same clean-filtered representation that Git stages. */
+function filteredCheckoutBlob(repoRoot: string, path: string, content: Buffer): GitOutcome {
+  return gitWithInput(repoRoot, ["hash-object", `--path=${path}`, "--stdin"], content)
+}
+
 /** Prove exact matches and name every dirty landing path that Git's two-way merge must not overwrite. */
 function matchingLandingDirt(
   repoRoot: string,
@@ -559,7 +563,6 @@ function matchingLandingDirt(
     const [mode, , oid] = entry.slice(0, tab).split(" ")
     if (mode !== undefined && oid !== undefined) landed.set(entry.slice(tab + 1), { mode, oid })
   }
-  const algorithm = /^[0-9a-f]{64}$/.test(to) ? "sha256" : "sha1"
   const paths: string[] = []
   for (const path of candidates) {
     let stat: ReturnType<typeof lstatSync> | undefined
@@ -579,7 +582,9 @@ function matchingLandingDirt(
       (Number(stat.mode) & 0o111 ? "100755" : "100644") === target.mode
     ) {
       try {
-        if (objectOid("blob", readFileSync(join(topLevel, path)), algorithm) === target.oid) paths.push(path)
+        const filtered = filteredCheckoutBlob(topLevel, path, readFileSync(join(topLevel, path)))
+        if (filtered.status !== 0) return { ok: false, detail: `clean-filtering ${path}: ${gitDetail(filtered)}` }
+        if (filtered.stdout.trim() === target.oid) paths.push(path)
       } catch (error) {
         return { ok: false, detail: `reading ${path}: ${error instanceof Error ? error.message : String(error)}` }
       }
@@ -647,8 +652,6 @@ function stageAuthoredPaths(
     const tab = entry.indexOf("\t")
     landed.set(entry.slice(tab + 1), entry.slice(0, tab).split(" ")[2] ?? "")
   }
-  const algorithm = /^[0-9a-f]{64}$/.test(to) ? "sha256" : "sha1"
-
   // Verify every path before staging any: never a half-staged index.
   for (const path of authoredPaths) {
     const landedOid = landed.get(path) ?? null
@@ -664,7 +667,13 @@ function stageAuthoredPaths(
         })
       }
     }
-    const checkoutOid = content === undefined ? null : objectOid("blob", content, algorithm)
+    let checkoutOid: string | null = null
+    if (content !== undefined) {
+      // update-index applies the path's clean filter; compare exactly that Git representation.
+      const filtered = filteredCheckoutBlob(topLevel, path, content)
+      if (filtered.status !== 0) return unreadable(`the clean-filtered checkout file ${path}`, filtered)
+      checkoutOid = filtered.stdout.trim()
+    }
     if (!landingPaths.has(path)) return mismatch(path, checkoutOid, landedOid, "the landing did not change that path")
     if (checkoutOid !== landedOid) {
       return mismatch(path, checkoutOid, landedOid, "the checkout does not hold the landed content")
