@@ -4,6 +4,8 @@ import { readFile } from "node:fs/promises"
 import { isAbsolute, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 
+import { routeConsoleToStreams, runCliProcess } from "@bearly/cli-process"
+
 import type { CheckoutLock } from "./checkout-lock.js"
 import { type Address, parseAddress } from "./address.js"
 import { assertTrailers, identProblem, validateOid } from "./git-object.js"
@@ -695,8 +697,9 @@ function splitClauses(tokens: readonly string[]): string[][] {
     }
     current.push(token)
   }
-  if (clauses.length === 0)
+  if (clauses.length === 0) {
     throw new UsageError("apply requires at least one clause (put/put-bytes/append/rm/mv/replace)")
+  }
   return clauses
 }
 
@@ -1467,23 +1470,12 @@ function reportError(error: unknown, stderr: CliWriter): number {
   return RUNTIME_ERROR
 }
 
-/**
- * The process entry. It never calls `process.exit`: a write to a pipe is
- * asynchronous past the kernel's buffer, and exiting there discards the rest
- * of the output while still reporting success (25382). Setting `exitCode` and
- * returning lets the event loop drain stdout and stderr first. A stdout that
- * refuses the write (the reader closed early, EPIPE) is a failure of this
- * command, named with its arguments, never a truncated success.
- */
-async function runProcess(argv: string[]): Promise<void> {
-  process.stdout.on("error", (error: NodeJS.ErrnoException) => {
-    process.stderr.write(
-      `gitomic: stdout refused the output of \`gitomic ${argv.join(" ")}\`: ${error.code ?? error.message}\n`,
-    )
-    process.exitCode = RUNTIME_ERROR
-  })
-  const code = await main(argv)
-  if (!process.exitCode) process.exitCode = code
+// The process entry never calls `process.exit`: past the kernel's pipe buffer a
+// write is still pending when `main` returns, and exiting there hands the reader
+// a truncated value with exit 0 (25382). @bearly/cli-process sets the exit code
+// and lets stdout and stderr drain, and names an EPIPE from a reader that closed
+// early as this command's failure (exit 1, RUNTIME_ERROR).
+if (import.meta.main) {
+  routeConsoleToStreams()
+  await runCliProcess("gitomic", main)
 }
-
-if (import.meta.main) await runProcess(process.argv.slice(2))
