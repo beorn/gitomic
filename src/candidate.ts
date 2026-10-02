@@ -77,8 +77,14 @@ async function trustedBlobs(scope: TrustScope): Promise<string[]> {
       if (rawKey !== key) {
         const fallback = await runGit([...git, "--get-all", rawKey])
         if (fallback.code === 0) {
-          return lines(decodeUtf8(fallback.stdout, rawKey)).map((line) => line.trim())
+          const list = lines(decodeUtf8(fallback.stdout, rawKey)).map((line) => line.trim())
+          if (list.length > 0) return list
+          return []
         }
+        if (fallback.code === 1 && fallback.stderr.toString("utf8").trim() === "") {
+          return []
+        }
+        throw new Error(`cannot read ${rawKey}: ${fallback.stderr.toString("utf8").trim()}`)
       }
     }
     return []
