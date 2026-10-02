@@ -87,6 +87,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@bearly/cli-process": "^0.1.0",
     "@bearly/flock": "^0.1.1",
     "@bearly/pacing": "^0.1.0"
   },
