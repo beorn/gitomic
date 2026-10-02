@@ -1556,7 +1556,13 @@ describe("gitomic project and checkout synchronization", () => {
 
     test("a clean landing of an authored put and rm ends clean, with the index at the landing's tree", async () => {
       const { root, bare, checkout } = remoteFixture()
-      writeFileSync(join(checkout, "tracked.md"), "# authored\n")
+      // Authored checkout bytes may differ from Git's clean-filtered blob (CRLF or LFS).
+      git(checkout, "config", "core.autocrlf", "false")
+      writeFileSync(join(checkout, ".gitattributes"), "*.md text eol=lf\n")
+      git(checkout, "add", ".gitattributes")
+      git(checkout, "commit", "-qm", "tracked clean filter")
+      git(checkout, "push", "-q", "origin", "main")
+      writeFileSync(join(checkout, "tracked.md"), "# authored\r\n")
       rmSync(join(checkout, "bystander.md"))
       const expectedDirtyPaths = worktreeDirtyPaths(checkout)
       const to = landFiles(bare, root, "author", { "tracked.md": "# authored\n", "bystander.md": null })
@@ -1570,7 +1576,7 @@ describe("gitomic project and checkout synchronization", () => {
         authoredPaths: ["tracked.md", "bystander.md"],
       })
 
-      expect(outcome).toMatchObject({ ok: true, kind: "synchronized", dirtyPaths: [] })
+      expect(outcome, JSON.stringify(outcome)).toMatchObject({ ok: true, kind: "synchronized", dirtyPaths: [] })
       expect(git(checkout, "rev-parse", "HEAD")).toBe(to)
       expect(indexHolds(checkout, to)).toBe(true)
       expect(worktreeDirtyPaths(checkout)).toEqual([])
