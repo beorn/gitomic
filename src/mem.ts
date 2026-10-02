@@ -244,6 +244,21 @@ export function createMemBackend(): GitomicBackend {
     return undefined
   }
 
+  const isAncestor = async (name: string, ancestor: Oid, descendant: Oid): Promise<boolean> => {
+    const commits = getRepo(name).commits
+    const seen = new Set<Oid>()
+    const pending: Oid[] = [descendant]
+    for (let oid = pending.pop(); oid !== undefined; oid = pending.pop()) {
+      if (oid === ancestor) return true
+      if (seen.has(oid)) continue
+      seen.add(oid)
+      const commit = commits.get(oid)
+      if (commit === undefined) throw new Error(`unknown commit: ${oid}`)
+      pending.push(...commit.parents)
+    }
+    return false
+  }
+
   const listRefs = async (
     name: string,
     selection: string | readonly string[],
@@ -296,6 +311,7 @@ export function createMemBackend(): GitomicBackend {
     writeCommit,
     compareAndSwap,
     findTransaction,
+    isAncestor,
     listRefs,
     readHistory,
     publish,

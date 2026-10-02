@@ -24,6 +24,7 @@ import {
   waitForPoll,
 } from "./options.ts"
 import {
+  AlreadyKept,
   CandidateRefused,
   Conflict,
   EditDoesNotApply,
@@ -69,6 +70,7 @@ import type {
 import { assertUtf8, decodeUtf8 } from "./utf8.ts"
 
 export {
+  AlreadyKept,
   CandidateRefused,
   Conflict,
   EditDoesNotApply,
@@ -198,10 +200,12 @@ export async function open(options: OpenOptions): Promise<Store> {
       const candidate = options?.candidate
       const beside = options?.beside
       let fetch: readonly string[] | undefined
+      let keeps: readonly Oid[] | undefined
       const trailers =
         options?.trailers === undefined ? undefined : options.trailers.map(([key, value]) => [key, value] as const)
       try {
         rejectLegacyProvenance(options)
+        keeps = shapeKeeps(context, options?.keeps)
         author = cloneIdent(options?.author, "author")
         if (candidate !== undefined && typeof candidate !== "function") {
           throw new TypeError("candidate must be a function")
@@ -226,6 +230,7 @@ export async function open(options: OpenOptions): Promise<Store> {
               ...(author === undefined ? {} : { author }),
               ...(candidate === undefined ? {} : { candidate }),
               ...(trailers === undefined ? {} : { trailers }),
+              ...(keeps === undefined ? {} : { keeps }),
             }),
           {
             ...(fetch === undefined ? {} : { fetch }),
@@ -609,6 +614,24 @@ async function prepareReader(options: OpenReaderOptions): Promise<ReaderContext>
   return { repo, ref, backend, refresh }
 }
 
+type IsAncestor = NonNullable<GitomicBackend["isAncestor"]>
+
+/** The commits a transaction keeps, checked at the call: object ids, no repeat, and a backend that can refuse a kept one. */
+function shapeKeeps(
+  context: Pick<StoreContext, "backend">,
+  keeps: readonly Oid[] | undefined,
+): readonly Oid[] | undefined {
+  if (keeps === undefined) return undefined
+  if (!Array.isArray(keeps)) throw new TypeError("keeps must be an array of commit ids")
+  if (keeps.length === 0) return undefined
+  const shaped = keeps.map((oid) => validateOid(oid, "invalid kept commit id"))
+  if (new Set(shaped).size !== shaped.length) throw new TypeError("keeps names a commit more than once")
+  if (context.backend.isAncestor === undefined) {
+    throw new TypeError("keeps needs a backend with isAncestor: the shell, iso or mem backend")
+  }
+  return shaped
+}
+
 async function transactSequenceBody<R>(
   context: StoreContext,
   run: (attempt: SequenceAttempt) => Promise<R>,
@@ -671,6 +694,15 @@ async function transactSequenceBody<R>(
             // noops or are refused when this attempt is replayed on a new tip.
             const seq = (seqs[index] ??= context.nextSeq())
             const stepBase = current
+            // Every attempt, before `update`: a keep the base already contains is refused by name, so a retry on a
+            // tip that gained the commit can never write a second merge of it.
+            const keeps = shapeKeeps(context, stepOptions?.keeps)
+            for (const keep of keeps ?? []) {
+              await context.backend.readCommit(context.repo, keep)
+              if (await (context.backend.isAncestor as IsAncestor)(context.repo, keep, stepBase)) {
+                throw new AlreadyKept(keep, stepBase)
+              }
+            }
             const base = await readLazyBase(context.backend, context.repo, stepBase)
             const prefetch = (update as PrefetchingUpdate)[PREFETCH_PATHS]
             if (prefetch !== undefined) await base.prefetch(prefetch)
@@ -680,6 +712,7 @@ async function transactSequenceBody<R>(
               assertNextTree(base, effective)
               return {
                 parent: stepBase,
+                ...(keeps === undefined ? {} : { parents: [stepBase, ...keeps], allowEmpty: true }),
                 time: context.clock(),
                 changes: effective,
                 ...(modeSources.size === 0 ? {} : { modeSources }),
@@ -714,7 +747,8 @@ async function transactSequenceBody<R>(
               report = verdict?.report === undefined ? [] : [...verdict.report]
             }
             const effective = removeNoopChanges(base, changes)
-            if (effective.size === 0) {
+            // With keeps the parents are the change, so an unchanged tree still commits.
+            if (effective.size === 0 && keeps === undefined) {
               lastMap = map
               return { oid: current, committed: false, ...(report === undefined ? {} : { report }) }
             }

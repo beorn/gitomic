@@ -126,9 +126,10 @@ export type CommitInput = {
    */
   parents?: readonly Oid[]
   /**
-   * Land the commit even when `changes` leaves the tree unchanged. Opt-in and
-   * used by gitomic/events only: `transact` and `apply` still treat an unchanged
-   * tree as a no-op and never set it.
+   * Land the commit even when `changes` leaves the tree unchanged. Opt-in:
+   * gitomic/events sets it, and `transact` sets it exactly when the transaction
+   * names `keeps`. Without it `transact` and `apply` treat an unchanged tree as
+   * a no-op.
    */
   allowEmpty?: boolean
   /**
@@ -229,6 +230,12 @@ export type GitomicBackend = {
    * `base` is genuinely ambiguous and must throw rather than answer.
    */
   findTransaction(repo: string, head: Oid, base: Oid, instance: string, seq: number): Promise<Oid | undefined>
+  /**
+   * Whether `ancestor` is reachable from `descendant` through ANY parent; a commit is its own ancestor.
+   * `transact`'s `keeps` needs it to refuse a commit the base already contains. A store on a backend
+   * without it refuses a non-empty `keeps` at the call.
+   */
+  isAncestor?(repo: string, ancestor: Oid, descendant: Oid): Promise<boolean>
   /**
    * Fetch and return the remote tip without moving the selected application ref.
    * Object downloads and private temporary fetch refs are allowed. Readers rely
@@ -450,6 +457,16 @@ export type TransactOptions = {
   readonly candidate?: Candidate
   /** Caller trailers for this one transaction, written ahead of gitomic's own; `Gitomic-*` keys are reserved. */
   readonly trailers?: readonly Trailer[]
+  /**
+   * Commits this transaction keeps: written as extra parents after the base, in order, which makes the commit a
+   * merge. With `keeps` the commit lands even when `update` leaves the tree unchanged, because the parents are
+   * the change. The candidate, `beside`, the lease and the retry are as without it; a retry runs `update` again
+   * on the new tip. Refused at the call: a repeat, a value that is not an object id, a backend without
+   * `isAncestor`. Refused on EVERY attempt, before `update` runs: a keep that is not a commit in this
+   * repository, and a keep the attempt's base already contains ({@link AlreadyKept}), so a retry on a tip that
+   * gained the commit can never write a second merge of it.
+   */
+  readonly keeps?: readonly Oid[]
 }
 
 /** One unpublished step in a sequence. A thrown step leaves the prior steps intact. */

@@ -241,6 +241,8 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
     },
     findTransaction: async (repo, tip, base, instance, seq) =>
       findTransaction(await resolveGitDir(repo), tip, base, instance, seq, baseEnv),
+    isAncestor: async (repo, ancestor, descendant) =>
+      isAncestor(await resolveGitDir(repo), ancestor, descendant, baseEnv),
     fetchRemote: async (repo, ref, remote) =>
       fetchRemote(await resolveGitDir(repo), ref, remote, remoteTimeoutMs, syncRefs, baseEnv),
     listRefs: async (repo, selection, remote) => {
@@ -1182,6 +1184,15 @@ async function deleteRef(
     const detail = result.stderr.toString("utf8").trim()
     throw new Error(`${failure}${detail ? `: ${detail}` : ""}`)
   }
+}
+
+/** `merge-base --is-ancestor` answers 0 (reachable) or 1 (not); any other status is a fault, never an answer. */
+async function isAncestor(repo: string, ancestor: Oid, descendant: Oid, baseEnv?: NodeJS.ProcessEnv): Promise<boolean> {
+  const args = ["merge-base", "--is-ancestor", validateOid(ancestor), validateOid(descendant)]
+  const result = await run(selectedGit(), gitArgs(repo, args), { baseEnv })
+  if (result.code === 0) return true
+  if (result.code === 1) return false
+  throw commandFailure(repo, args, result)
 }
 
 async function findTransaction(

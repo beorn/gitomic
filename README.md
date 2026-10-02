@@ -99,7 +99,7 @@ type CommitProvenance = { readonly actor: string; readonly session: string; read
 
 store.head(): Promise<string>            // newest commit id
 store.at(commit?: string): Snapshot      // read-only view there — lazy
-store.transact(fn: Update, message: string, options?: { readonly author?: Ident; readonly trailers?: readonly Trailer[]; readonly beside?: (attempt: BesideAttempt) => BesideRef[] | Promise<BesideRef[]> }): Promise<Committed>
+store.transact(fn: Update, message: string, options?: { readonly author?: Ident; readonly trailers?: readonly Trailer[]; readonly beside?: (attempt: BesideAttempt) => BesideRef[] | Promise<BesideRef[]>; readonly keeps?: readonly string[] }): Promise<Committed>
 ```
 
 `writer` defaults to `gitomic`. A supplied label must be non-empty and single-line, with no control characters or `": "`: that separator delimits the writer in the stored commit subject. Invalid labels fail before the store opens. The same rule applies to `openEvents` and CLI `--writer`.
@@ -152,6 +152,25 @@ contract change. It refuses at the call for the store's own ref, a name outside
 `refs/`, a repeat, or a backend that cannot read them. `fetchRefs` itself takes `{ absent: "omit" }` for the same tolerance, and
 the events door's `events({ at })` reads a chain at such a fetched tip without
 another round trip.
+
+### A transaction that is a merge
+
+`transact` takes `keeps`: commits this transaction keeps, written as extra
+parents after the base, in order. That makes the commit a merge made by the
+same leased, gated write as any other: the candidate, `beside`, the lease and
+the retry are unchanged, and a retry runs `update` again on the new tip, so the
+merged tree is recomputed against it. With `keeps` the commit lands even when
+`update` leaves the tree unchanged, because the parents are the change; that is
+how a merge records a commit and takes none of its content.
+
+A keep the attempt's base already contains throws `AlreadyKept` (`code`
+`already-kept`) before `update` runs, on every attempt. So a retry on a tip that
+gained the commit, or a second call after a merge that already landed, writes
+nothing and can never merge the same commit twice. Refused at the call: a
+repeat, a value that is not an object id, and a backend without `isAncestor`
+(shell, iso and mem have it). A keep that is not a commit in the repository is
+refused on the attempt. gitomic does not compute the merged tree: `update`
+writes whatever the merge should contain.
 
 ### Author and committer
 
