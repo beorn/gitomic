@@ -3,9 +3,9 @@ import fs from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 
-import { GitTimeout } from "./errors.js"
-import { syncDirectory } from "./durable.js"
-import { runGit } from "./shell.js"
+import { GitTimeout } from "./errors.ts"
+import { syncDirectory } from "./durable.ts"
+import { runGit } from "./shell.ts"
 
 /** One owned object repository shared by existing Store and Reader handles. */
 export interface OpenedRemoteRepository extends Disposable {

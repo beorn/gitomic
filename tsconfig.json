@@ -10,7 +10,8 @@
     "skipLibCheck": true,
     "types": ["node", "vitest/globals"],
     "allowImportingTsExtensions": true,
-    "noEmit": true
+    "noEmit": true,
+    "erasableSyntaxOnly": true
   },
   "include": ["src/**/*.ts", "tests/**/*.ts", "vitest.config.ts", "vitest.stress.config.ts"]
 }

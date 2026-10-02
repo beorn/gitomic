@@ -1,7 +1,7 @@
-import { objectOid } from "./git-object.js"
-import { assertTreeShape, isPublicPath, normalizePath } from "./path.js"
+import { objectOid } from "./git-object.ts"
+import { assertTreeShape, isPublicPath, normalizePath } from "./path.ts"
 import type { BlobValue, GitomicBackend, Oid, TreeListing } from "./types.js"
-import { assertUtf8, decodeUtf8 } from "./utf8.js"
+import { assertUtf8, decodeUtf8 } from "./utf8.ts"
 
 /**
  * The base tree of one transaction attempt: whole-tree strict on SHAPE, lazy on

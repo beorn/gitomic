@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto"
 
 import type { BlobValue, CommitInput, CommitMeta, CommitProvenance, Ident, Oid, RefUpdate, Trailer } from "./types.js"
-import { Conflict } from "./errors.js"
-import { assertUtf8, decodeUtf8 } from "./utf8.js"
+import { Conflict } from "./errors.ts"
+import { assertUtf8, decodeUtf8 } from "./utf8.ts"
 
 export const GITOMIC_NAME = "gitomic"
 export const GITOMIC_EMAIL = "gitomic@localhost"

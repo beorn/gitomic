@@ -1,6 +1,6 @@
-import { objectOid, validateOid } from "./git-object.js"
-import { EditDoesNotApply, RelativeOnlyEditRefused } from "./errors.js"
-import { CANDIDATE_CONFIG } from "./candidate.js"
+import { objectOid, validateOid } from "./git-object.ts"
+import { EditDoesNotApply, RelativeOnlyEditRefused } from "./errors.ts"
+import { CANDIDATE_CONFIG } from "./candidate.ts"
 import type { BlobValue, GitMap, Oid, Update } from "./types.js"
 
 /**

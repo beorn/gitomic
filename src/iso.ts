@@ -18,14 +18,14 @@ import {
   transactionLookupExceeded,
   transactionMatches,
   validateOid,
-} from "./git-object.js"
+} from "./git-object.ts"
 import type { GitObject, GitTreeObjectEntry } from "./git-object.js"
-import { createDurableObjectWriter } from "./iso-durable.js"
-import { rejectLegacyProvenance } from "./options.js"
-import { assertGitPrefixMatched, assertRegularBlob, normalizePrefix } from "./path.js"
-import { createShellRuntime } from "./shell.js"
+import { createDurableObjectWriter } from "./iso-durable.ts"
+import { rejectLegacyProvenance } from "./options.ts"
+import { assertGitPrefixMatched, assertRegularBlob, normalizePrefix } from "./path.ts"
+import { createShellRuntime } from "./shell.ts"
 import type { BlobValue, CommitInput, GitomicBackend, Oid, TreeEntry, TreeListing } from "./types.js"
-import { decodeBlob } from "./utf8.js"
+import { decodeBlob } from "./utf8.ts"
 
 type BlobEntry = {
   kind: "blob" | "commit"

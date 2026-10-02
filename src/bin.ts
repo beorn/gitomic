@@ -7,8 +7,8 @@ import { fileURLToPath } from "node:url"
 import { routeConsoleToStreams, runCliProcess } from "@bearly/cli-process"
 
 import type { CheckoutLock } from "./checkout-lock.js"
-import { type Address, parseAddress } from "./address.js"
-import { assertTrailers, identProblem, validateOid } from "./git-object.js"
+import { type Address, parseAddress } from "./address.ts"
+import { assertTrailers, identProblem, validateOid } from "./git-object.ts"
 import {
   apply,
   CANDIDATE_CONFIG,
@@ -40,9 +40,9 @@ import {
   type RemoteFirstProjectionOutcome,
   type Snapshot,
   type Trailer,
-} from "./index.js"
-import { putPrecondition, readTextFile } from "./checkout-edits.js"
-import { decodeUtf8 } from "./utf8.js"
+} from "./index.ts"
+import { putPrecondition, readTextFile } from "./checkout-edits.ts"
+import { decodeUtf8 } from "./utf8.ts"
 
 /**
  * `gitomic` — the file-level door: read and write a Git ref by address, with
@@ -938,7 +938,7 @@ async function holdCheckoutLockFor(
 ): Promise<CheckoutLock | undefined> {
   let lockModule: typeof import("./checkout-lock.js")
   try {
-    lockModule = await import("./checkout-lock.js")
+    lockModule = await import("./checkout-lock.ts")
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error)
     throw new RuntimeUnsupported(

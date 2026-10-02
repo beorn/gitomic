@@ -5,8 +5,8 @@
  * repeat; a create is an all-zero expectation; a delete needs the real tip it
  * removes.
  */
-import { validateOid, zeroOid } from "./git-object.js"
-import { normalizeRef } from "./options.js"
+import { validateOid, zeroOid } from "./git-object.ts"
+import { normalizeRef } from "./options.ts"
 import type { Oid, RefUpdate } from "./types.js"
 
 /**
@@ -29,13 +29,15 @@ export function shapeRefUpdates(
   const seen = new Set<string>([chainRef])
   return (updates ?? []).map((update) => {
     const ref = normalizeRef(update.ref)
-    if (ref === chainRef)
+    if (ref === chainRef) {
       throw new TypeError(`${word === "also" ? "an also" : "a beside"} ref cannot be the chain itself: ${chainRef}`)
+    }
     if (seen.has(ref)) throw new TypeError(`${word} names ${ref} more than once`)
     seen.add(ref)
     if (update.oid === null) {
-      if (update.expect === null)
+      if (update.expect === null) {
         throw new TypeError(`${word === "also" ? "an also" : "a beside"} delete of ${ref} needs the tip it removes`)
+      }
       return { ref, expect: validateOid(update.expect, `${word} expect for ${ref} must be a commit id`), oid: null }
     }
     const oid = validateOid(update.oid, `${word} oid for ${ref} must be a commit id or null`)

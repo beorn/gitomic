@@ -19,10 +19,10 @@
  * declaration's text, not the scripts it names: a command that runs a file the repository can change runs the changed
  * file. Name commands by absolute paths outside the repository to close that.
  */
-import { GitTimeout } from "./errors.js"
-import { runCommand, runGit } from "./shell.js"
+import { GitTimeout } from "./errors.ts"
+import { runCommand, runGit } from "./shell.ts"
 import type { Candidate, CandidateContext, CandidateVerdict } from "./types.js"
-import { decodeUtf8 } from "./utf8.js"
+import { decodeUtf8 } from "./utf8.ts"
 
 /** The path of a repository's candidate declaration. */
 export const CANDIDATE_CONFIG = ".gitomic.conf"

@@ -50,9 +50,9 @@ import {
 } from "node:fs"
 import { dirname, join } from "node:path"
 
-import { readStateCheckoutDeclaration } from "./candidate.js"
-import { objectOid } from "./git-object.js"
-import { DEFAULT_REMOTE_TIMEOUT_MS, runGit } from "./shell.js"
+import { readStateCheckoutDeclaration } from "./candidate.ts"
+import { objectOid } from "./git-object.ts"
+import { DEFAULT_REMOTE_TIMEOUT_MS, runGit } from "./shell.ts"
 
 /**
  * Front read-only git invocations with `--no-optional-locks` so a repeated

@@ -1,4 +1,4 @@
-import { normalizePath } from "./path.js"
+import { normalizePath } from "./path.ts"
 
 export interface OwnershipManifest {
   readonly version: 1

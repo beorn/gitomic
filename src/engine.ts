@@ -5,7 +5,7 @@
  * contention, receipts and the retry budget, so there is exactly one of each.
  */
 import { fullJitter, type RandomUnit } from "@bearly/pacing"
-import { Conflict, PublicationRejected, PublicationUnknown, RetriesExhausted } from "./errors.js"
+import { Conflict, PublicationRejected, PublicationUnknown, RetriesExhausted } from "./errors.ts"
 import type { Oid, RefUpdate } from "./types.js"
 
 /** What one attempt decided against the tip it saw. */

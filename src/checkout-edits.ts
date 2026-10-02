@@ -9,9 +9,9 @@ import { readFile } from "node:fs/promises"
 import { join } from "node:path"
 
 import type { Edit } from "./edits.js"
-import { normalizePath } from "./path.js"
+import { normalizePath } from "./path.ts"
 import type { Oid, Snapshot } from "./types.js"
-import { decodeUtf8 } from "./utf8.js"
+import { decodeUtf8 } from "./utf8.ts"
 
 /** A file's content as UTF-8 text; a file that is not UTF-8 refuses, naming it. */
 export async function readTextFile(file: string): Promise<string> {

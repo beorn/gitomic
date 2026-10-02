@@ -2,10 +2,27 @@
 // @level l1
 // @consumer workspace and package consumers
 
+import { execFile } from "node:child_process"
 import { readFile, stat } from "node:fs/promises"
+import { promisify } from "node:util"
 
 import { describe, expect, test } from "vitest"
 import { openReader } from "../src/index.js"
+import { asFs } from "../src/adapters.js"
+import {
+  CandidateRefused,
+  EditDoesNotApply,
+  GitSignaled,
+  GitTimeout,
+  PublicationRejected,
+  PublicationUnknown,
+  RelativeOnlyEditRefused,
+  RetriesExhausted,
+  TreePathCollision,
+} from "../src/errors.js"
+import { open } from "../src/index.js"
+import { createMemBackend } from "../src/mem.js"
+import { batchCheck } from "../src/shell.js"
 
 type PackageManifest = {
   version: string
@@ -28,7 +45,81 @@ async function manifest(): Promise<PackageManifest> {
   return JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")) as PackageManifest
 }
 
+function expectParameterProperties(error: unknown, values: Record<string, unknown>) {
+  expect(error).toBeInstanceOf(Error)
+  const descriptors = Object.getOwnPropertyDescriptors(error)
+  for (const [field, value] of Object.entries(values)) {
+    expect(descriptors[field], field).toEqual({ value, writable: true, enumerable: true, configurable: true })
+  }
+  expect(Object.keys(error as Error).slice(0, Object.keys(values).length)).toEqual(Object.keys(values))
+}
+
 describe("package dependency boundary", () => {
+  test.each([
+    [new TreePathCollision("file", "file/child"), { file: "file", descendant: "file/child" }],
+    [new RetriesExhausted(2, 100), { retries: 2, budgetMs: 100 }],
+    [
+      new PublicationUnknown("origin", new Error("unreachable"), "no-receipt"),
+      { label: "origin", verified: "no-receipt", attempt: undefined },
+    ],
+    [new PublicationRejected([], [], "denied"), { updates: [], reasons: [], detail: "denied" }],
+    [
+      new EditDoesNotApply(0, "put", "blob-identical", "file", "file", null, null, "base", "head"),
+      {
+        editIndex: 0,
+        kind: "put",
+        preconditionType: "blob-identical",
+        path: "file",
+        anchor: "file",
+        expected: null,
+        actual: null,
+        base: "base",
+        head: "head",
+      },
+    ],
+    [new RelativeOnlyEditRefused("file", "put", "head"), { path: "file", kind: "put", head: "head" }],
+    [new GitTimeout("git fetch", 100), { command: "git fetch", timeoutMs: 100 }],
+    [
+      new GitSignaled("git fetch", "SIGTERM", "stopped"),
+      { command: "git fetch", signal: "SIGTERM", stderr: "stopped" },
+    ],
+    [new CandidateRefused([], "base"), { reasons: [], base: "base" }],
+  ] as const)("preserves parameter-property descriptors for %s", (error, values) => {
+    expectParameterProperties(error, values)
+  })
+
+  test("preserves private batch-check error properties through its public operation", async () => {
+    const error = await batchCheck("descriptor-test", ["HEAD"], {
+      run: async () => ({ code: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) }),
+    }).catch((reason: unknown) => reason)
+    expectParameterProperties(error, { answered: 0, requested: 1 })
+  })
+
+  test("preserves private filesystem error properties through the public adapter", async () => {
+    const store = await open({ repo: "descriptor-test", ref: "main", backend: createMemBackend() })
+    const error = await asFs(store)
+      .readFile("missing")
+      .catch((reason: unknown) => reason)
+    expectParameterProperties(error, { code: "ENOENT" })
+  })
+
+  test("imports tracked workspace source and executes the public runner under ordinary Node", async () => {
+    const entry = new URL("../src/index.ts", import.meta.url).href
+    const { stdout, stderr } = await promisify(execFile)(
+      "node",
+      [
+        "--input-type=module",
+        "-e",
+        `const { runCommand } = await import(${JSON.stringify(entry)});
+       const result = await runCommand(process.execPath, ["-e", "process.stdout.write('source-runner'); process.stderr.write('diagnostic'); process.exitCode = 7"]);
+       console.log(JSON.stringify({code: result.code, stdout: result.stdout.toString(), stderr: result.stderr.toString()}));`,
+      ],
+      { timeout: 10_000 },
+    )
+    expect(stderr).toBe("")
+    expect(JSON.parse(stdout)).toEqual({ code: 7, stdout: "source-runner", stderr: "diagnostic" })
+  })
+
   test("depends only on the checkout lock's flock and makes isomorphic-git an optional peer", async () => {
     const packageManifest = await manifest()
 

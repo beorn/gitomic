@@ -1,5 +1,5 @@
-import { TreePathCollision } from "./errors.js"
-import { assertUtf8 } from "./utf8.js"
+import { TreePathCollision } from "./errors.ts"
+import { assertUtf8 } from "./utf8.ts"
 
 /**
  * A tree path namespace gitomic reserves and does not itself write.

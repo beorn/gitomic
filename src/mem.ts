@@ -19,7 +19,7 @@ import {
   TRANSACTION_SEARCH_LIMIT,
   transactionLookupExceeded,
   validateOid,
-} from "./git-object.js"
+} from "./git-object.ts"
 import type {
   BlobValue,
   CommitInput,
@@ -32,8 +32,8 @@ import type {
   TreeEntry,
   TreeListing,
 } from "./types.js"
-import { rejectLegacyProvenance, validateRefNames } from "./options.js"
-import { assertGitPrefixMatched, normalizePrefix } from "./path.js"
+import { rejectLegacyProvenance, validateRefNames } from "./options.ts"
+import { assertGitPrefixMatched, normalizePrefix } from "./path.ts"
 
 type MemCommit = {
   oid: Oid

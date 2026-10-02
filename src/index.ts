@@ -9,9 +9,9 @@ import {
   SET_BYTES,
   type Edit,
   type PrefetchingUpdate,
-} from "./edits.js"
-import { runCasLoop } from "./engine.js"
-import { shapeRefUpdates } from "./ref-updates.js"
+} from "./edits.ts"
+import { runCasLoop } from "./engine.ts"
+import { shapeRefUpdates } from "./ref-updates.ts"
 import {
   assertWriter,
   DEFAULT_WRITER_LABEL,
@@ -22,7 +22,7 @@ import {
   rejectLegacyProvenance,
   untilAborted,
   waitForPoll,
-} from "./options.js"
+} from "./options.ts"
 import {
   CandidateRefused,
   Conflict,
@@ -34,11 +34,11 @@ import {
   RelativeOnlyEditRefused,
   RetriesExhausted,
   TreePathCollision,
-} from "./errors.js"
-import { cloneIdent, GITOMIC_IDENT, validateOid } from "./git-object.js"
-import { assertTreeShape, isGitPrefixNotFoundError, normalizePath, normalizePrefix } from "./path.js"
-import { createLazyBase, readLazyBase, type LazyBase } from "./lazy-base.js"
-import { createShellBackend } from "./shell.js"
+} from "./errors.ts"
+import { cloneIdent, GITOMIC_IDENT, validateOid } from "./git-object.ts"
+import { assertTreeShape, isGitPrefixNotFoundError, normalizePath, normalizePrefix } from "./path.ts"
+import { createLazyBase, readLazyBase, type LazyBase } from "./lazy-base.ts"
+import { createShellBackend } from "./shell.ts"
 import type {
   Candidate,
   BlobValue,
@@ -66,7 +66,7 @@ import type {
   Store,
   Trailer,
 } from "./types.js"
-import { assertUtf8, decodeUtf8 } from "./utf8.js"
+import { assertUtf8, decodeUtf8 } from "./utf8.ts"
 
 export {
   CandidateRefused,
@@ -87,9 +87,9 @@ export {
   parseActorTokenDeclaration,
   type ActorTokenDeclaration,
   type ActorTrailersResult,
-} from "./actor-token.js"
-export { applyEdits, countOccurrences, parseEditsDeclaration, type EditsDeclaration } from "./edits.js"
-export { editsFromCheckout } from "./checkout-edits.js"
+} from "./actor-token.ts"
+export { applyEdits, countOccurrences, parseEditsDeclaration, type EditsDeclaration } from "./edits.ts"
+export { editsFromCheckout } from "./checkout-edits.ts"
 export {
   CANDIDATE_CONFIG,
   DEFAULT_CANDIDATE_TIMEOUT_MS,
@@ -103,10 +103,10 @@ export {
   type RepositoryDeclaration,
   type StateCheckoutDeclaration,
   type TrustScope,
-} from "./candidate.js"
-export { identProblem, objectOid } from "./git-object.js"
+} from "./candidate.ts"
+export { identProblem, objectOid } from "./git-object.ts"
 export type { Edit } from "./edits.js"
-export { matchGlob } from "./glob.js"
+export { matchGlob } from "./glob.ts"
 export {
   batchCheck,
   createShellBackend,
@@ -123,10 +123,10 @@ export {
   type GitResult,
   type RunGitOptions,
   type ShellBackendOptions,
-} from "./shell.js"
-export { openRemoteRepository, type OpenedRemoteRepository, type OpenRemoteRepositoryOptions } from "./repository.js"
-export { normalizeRef } from "./options.js"
-export { parseOwnershipManifest } from "./ownership-manifest.js"
+} from "./shell.ts"
+export { openRemoteRepository, type OpenedRemoteRepository, type OpenRemoteRepositoryOptions } from "./repository.ts"
+export { normalizeRef } from "./options.ts"
+export { parseOwnershipManifest } from "./ownership-manifest.ts"
 export {
   checkedOutRef,
   isBareRepository,
@@ -143,7 +143,7 @@ export {
   type StateCheckoutRepairRequest,
   type RemoteFirstProjectionOutcome,
   type RemoteFirstProjectionRequest,
-} from "./project.js"
+} from "./project.ts"
 export type {
   BlobValue,
   Candidate,

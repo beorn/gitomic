@@ -2,18 +2,18 @@ import type { Oid, RefUpdate } from "./types.js"
 
 /** The proposed Git tree contains a file and one of that file's descendants. */
 export class TreePathCollision extends Error {
+  readonly file: string
+  readonly descendant: string
   override readonly name = "TreePathCollision"
   readonly code = "tree-path-collision" as const
 
-  constructor(
-    readonly file: string,
-    readonly descendant: string,
-    options?: ErrorOptions,
-  ) {
+  constructor(file: string, descendant: string, options?: ErrorOptions) {
     super(
       `Git tree path collision: ${JSON.stringify(file)} is both a file and a directory prefix for ${JSON.stringify(descendant)}; delete one side in the same transaction`,
       options,
     )
+    this.file = file
+    this.descendant = descendant
   }
 }
 
@@ -29,12 +29,15 @@ export class Conflict extends Error {
 }
 
 export class RetriesExhausted extends Error {
+  readonly retries: number
+  /** The time budget the transaction was given to land within, in milliseconds. */
+  readonly budgetMs: number
   override readonly name = "RetriesExhausted"
 
   constructor(
-    readonly retries: number,
+    retries: number,
     /** The time budget the transaction was given to land within, in milliseconds. */
-    readonly budgetMs: number,
+    budgetMs: number,
     options?: ErrorOptions,
   ) {
     super(
@@ -42,47 +45,71 @@ export class RetriesExhausted extends Error {
         `raise retryBudgetMs or reduce writer contention`,
       options,
     )
+    this.retries = retries
+    this.budgetMs = budgetMs
   }
 }
 
 /** A publish threw and its transaction receipt could not prove that it landed. */
 export class PublicationUnknown extends AggregateError {
+  readonly label: string
+  readonly verified: "no-receipt" | "unverified"
+  readonly attempt?:
+    | {
+        readonly candidate: Oid
+        readonly base: Oid
+        readonly expected: Oid | null
+        readonly observed?: Oid | null
+      }
+    | undefined
   override readonly name = "PublicationUnknown"
 
   constructor(
-    readonly label: string,
+    label: string,
     cause: unknown,
-    readonly verified: "no-receipt" | "unverified",
+    verified: "no-receipt" | "unverified",
     verificationError?: unknown,
-    readonly attempt?: {
-      readonly candidate: Oid
-      readonly base: Oid
-      readonly expected: Oid | null
-      readonly observed?: Oid | null
-    },
+    attempt?:
+      | {
+          readonly candidate: Oid
+          readonly base: Oid
+          readonly expected: Oid | null
+          readonly observed?: Oid | null
+        }
+      | undefined,
   ) {
     super(
       verified === "unverified" ? [cause, verificationError] : [cause],
       `Transaction publication to ${label} is unknown; do not blindly retry. ${cause instanceof Error ? cause.message : String(cause)}`,
       { cause },
     )
+    this.label = label
+    this.verified = verified
+    this.attempt = attempt
   }
 }
 
 /** The remote explicitly refused every requested update in this push. Nothing was retried. */
 export class PublicationRejected extends Error {
+  readonly updates: readonly RefUpdate[]
+  /** The remote's per-ref reasons, in the same order as updates. */
+  readonly reasons: readonly string[]
+  readonly detail: string
   override readonly name = "PublicationRejected"
 
   constructor(
-    readonly updates: readonly RefUpdate[],
+    updates: readonly RefUpdate[],
     /** The remote's per-ref reasons, in the same order as updates. */
-    readonly reasons: readonly string[],
-    readonly detail: string,
+    reasons: readonly string[],
+    detail: string,
   ) {
     super(
       `Publication to ${updates.map(({ ref, expect, oid }) => `${ref} (candidate ${oid ?? "delete"}, expected ${expect ?? "absent"})`).join(", ")} was rejected: the attempt did not land; nothing was retried. ` +
         `A fresh transaction can be submitted after resolving the rejection. ${detail}`,
     )
+    this.updates = updates
+    this.reasons = reasons
+    this.detail = detail
   }
 }
 
@@ -115,31 +142,51 @@ export type PreconditionType =
  * count as decimal text, or `null` when the path is absent.
  */
 export class EditDoesNotApply extends Error {
+  /** Position of the failing edit in the `apply` list (0-based). */
+  readonly editIndex: number
+  readonly kind: EditKind
+  readonly preconditionType: PreconditionType
+  /** The path whose precondition failed (the destination path for `destination-absent`). */
+  readonly path: string
+  /**
+   * What the precondition is anchored on. At the file level this equals
+   * `path`; U2's node layer anchors on a node identity, extending this shape
+   * without changing it.
+   */
+  readonly anchor: string
+  /** The content the precondition names — the expected git blob oid, "1" for text-unique, or `null` for "absent". */
+  readonly expected: string | null
+  /** What was actually there at the attempted tree — a git blob oid, decimal count for text-unique, or `null` for "absent". */
+  readonly actual: string | null
+  /** The commit the edit was authored against. */
+  readonly base: string
+  /** The commit the precondition was actually checked on (the attempted tree's tip). */
+  readonly head: string
   override readonly name = "EditDoesNotApply"
   /** Stable machine key; the same string across every backend and release. */
   readonly code = "edit-does-not-apply" as const
 
   constructor(
     /** Position of the failing edit in the `apply` list (0-based). */
-    readonly editIndex: number,
-    readonly kind: EditKind,
-    readonly preconditionType: PreconditionType,
+    editIndex: number,
+    kind: EditKind,
+    preconditionType: PreconditionType,
     /** The path whose precondition failed (the destination path for `destination-absent`). */
-    readonly path: string,
+    path: string,
     /**
      * What the precondition is anchored on. At the file level this equals
      * `path`; U2's node layer anchors on a node identity, extending this shape
      * without changing it.
      */
-    readonly anchor: string,
+    anchor: string,
     /** The content the precondition names — the expected git blob oid, "1" for text-unique, or `null` for "absent". */
-    readonly expected: string | null,
+    expected: string | null,
     /** What was actually there at the attempted tree — a git blob oid, decimal count for text-unique, or `null` for "absent". */
-    readonly actual: string | null,
+    actual: string | null,
     /** The commit the edit was authored against. */
-    readonly base: string,
+    base: string,
     /** The commit the precondition was actually checked on (the attempted tree's tip). */
-    readonly head: string,
+    head: string,
     options?: ErrorOptions,
   ) {
     const expectedDesc = preconditionType === "text-unique" ? "1 occurrence of old text" : (expected ?? "absent")
@@ -149,6 +196,15 @@ export class EditDoesNotApply extends Error {
         `expected ${expectedDesc}, found ${actualDesc} at head ${head} (authored against ${base})`,
       options,
     )
+    this.editIndex = editIndex
+    this.kind = kind
+    this.preconditionType = preconditionType
+    this.path = path
+    this.anchor = anchor
+    this.expected = expected
+    this.actual = actual
+    this.base = base
+    this.head = head
   }
 }
 
@@ -157,20 +213,21 @@ export class EditDoesNotApply extends Error {
  * on a path declared `relative-only` in `.gitomic.conf` [edits].
  */
 export class RelativeOnlyEditRefused extends Error {
+  readonly path: string
+  readonly kind: EditKind
+  readonly head: string
   override readonly name = "RelativeOnlyEditRefused"
   readonly code = "relative-only-edit-refused" as const
 
-  constructor(
-    readonly path: string,
-    readonly kind: EditKind,
-    readonly head: string,
-    options?: ErrorOptions,
-  ) {
+  constructor(path: string, kind: EditKind, head: string, options?: ErrorOptions) {
     super(
       `gitomic: ${path} is declared relative-only in .gitomic.conf ([edits] relative-only at head ${head}); ` +
         `put, put-bytes, rm, and mv are refused; use 'replace' or 'append'`,
       options,
     )
+    this.path = path
+    this.kind = kind
+    this.head = head
   }
 }
 
@@ -180,30 +237,37 @@ export class RelativeOnlyEditRefused extends Error {
  * index-pack) do not outlive it. Facts only: the command and the limit.
  */
 export class GitTimeout extends Error {
+  /** The Git command that was stopped, as `git <subcommand>` plus its target. */
+  readonly command: string
+  /** The limit it exceeded, in milliseconds. */
+  readonly timeoutMs: number
   override readonly name = "GitTimeout"
 
   constructor(
     /** The Git command that was stopped, as `git <subcommand>` plus its target. */
-    readonly command: string,
+    command: string,
     /** The limit it exceeded, in milliseconds. */
-    readonly timeoutMs: number,
+    timeoutMs: number,
     options?: ErrorOptions,
   ) {
     super(`${command} did not finish within its ${timeoutMs} ms limit; its process group was stopped`, options)
+    this.command = command
+    this.timeoutMs = timeoutMs
   }
 }
 
 /** A native Git process terminated by an observed signal. The caller owns cancellation policy. */
 export class GitSignaled extends Error {
+  readonly command: string
+  readonly signal: NodeJS.Signals
+  readonly stderr: string
   override readonly name = "GitSignaled"
 
-  constructor(
-    readonly command: string,
-    readonly signal: NodeJS.Signals,
-    readonly stderr: string,
-    options?: ErrorOptions,
-  ) {
+  constructor(command: string, signal: NodeJS.Signals, stderr: string, options?: ErrorOptions) {
     super(`${command} was interrupted by ${signal}${stderr.trim() ? `: ${stderr.trim()}` : ""}`, options)
+    this.command = command
+    this.signal = signal
+    this.stderr = stderr
   }
 }
 
@@ -213,16 +277,21 @@ export class GitSignaled extends Error {
  * runs whatever check the caller or the repository's trusted base declares; it holds no policy of its own.
  */
 export class CandidateRefused extends Error {
+  readonly reasons: readonly string[]
+  /** The commit the refused candidate was built on. */
+  readonly base: string
   override readonly name = "CandidateRefused"
   /** Stable machine key; the same string across every backend and release. */
   readonly code = "candidate-refused" as const
 
   constructor(
-    readonly reasons: readonly string[],
+    reasons: readonly string[],
     /** The commit the refused candidate was built on. */
-    readonly base: string,
+    base: string,
     options?: ErrorOptions,
   ) {
     super(`candidate-refused: ${reasons.length} reason(s) at base ${base}: ${reasons.join("; ")}`, options)
+    this.reasons = reasons
+    this.base = base
   }
 }

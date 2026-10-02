@@ -1,4 +1,4 @@
-import { assertUtf8 } from "./utf8.js"
+import { assertUtf8 } from "./utf8.ts"
 
 /**
  * Match one tree path against a glob pattern, using git's `:(glob)` pathspec

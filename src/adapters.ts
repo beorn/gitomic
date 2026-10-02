@@ -1,7 +1,7 @@
 import { posix } from "node:path"
 
 import type { GitMap, Store, Update } from "./types.js"
-import { decodeUtf8 } from "./utf8.js"
+import { decodeUtf8 } from "./utf8.ts"
 
 type PathLike = string
 type ReadEncoding = BufferEncoding | "buffer" | null
@@ -40,12 +40,10 @@ export class ReadOnlyError extends Error {
 }
 
 class FsError extends Error {
-  constructor(
-    readonly code: "ENOENT" | "EISDIR" | "ENOTDIR",
-    operation: string,
-    path: string,
-  ) {
+  readonly code: "ENOENT" | "EISDIR" | "ENOTDIR"
+  constructor(code: "ENOENT" | "EISDIR" | "ENOTDIR", operation: string, path: string) {
     super(`${code}: ${operation}, ${JSON.stringify(path)}`)
+    this.code = code
   }
 }
 

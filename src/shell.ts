@@ -8,10 +8,10 @@ import { dirname, join, resolve } from "node:path"
 
 import { fullJitter, type RandomUnit } from "@bearly/pacing"
 
-import { syncDirectory } from "./durable.js"
-import { Conflict, GitSignaled, GitTimeout, PublicationRejected } from "./errors.js"
-import { journalLeaseRejection } from "./lease-journal.js"
-import { rejectLegacyProvenance, validateRefNames } from "./options.js"
+import { syncDirectory } from "./durable.ts"
+import { Conflict, GitSignaled, GitTimeout, PublicationRejected } from "./errors.ts"
+import { journalLeaseRejection } from "./lease-journal.ts"
+import { rejectLegacyProvenance, validateRefNames } from "./options.ts"
 import {
   assertRefUpdates,
   commitIdents,
@@ -32,8 +32,8 @@ import {
   transactionLookupExceeded,
   transactionMatches,
   validateOid,
-} from "./git-object.js"
-import { assertGitPrefixMatched, assertRegularBlob, normalizePrefix } from "./path.js"
+} from "./git-object.ts"
+import { assertGitPrefixMatched, assertRegularBlob, normalizePrefix } from "./path.ts"
 import type {
   BlobValue,
   CommitInput,
@@ -47,7 +47,7 @@ import type {
   TreeEntry,
   TreeListing,
 } from "./types.js"
-import { decodeBlob, decodeUtf8 } from "./utf8.js"
+import { decodeBlob, decodeUtf8 } from "./utf8.ts"
 
 /** The complete output of one native Git command. */
 export type GitResult = {
@@ -365,12 +365,12 @@ export function isMissingObjectFetchError(detail: string): boolean {
 }
 
 class BatchCheckCountError extends Error {
-  constructor(
-    readonly answered: number,
-    readonly requested: number,
-    repository: string,
-  ) {
+  readonly answered: number
+  readonly requested: number
+  constructor(answered: number, requested: number, repository: string) {
     super(`git cat-file --batch-check answered ${answered} lines for ${requested} names in ${repository}`)
+    this.answered = answered
+    this.requested = requested
   }
 }
 

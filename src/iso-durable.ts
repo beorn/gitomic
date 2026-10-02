@@ -5,7 +5,7 @@ import { deflate } from "node:zlib"
 
 import type { FsClient } from "isomorphic-git"
 
-import { syncDirectory } from "./durable.js"
+import { syncDirectory } from "./durable.ts"
 import type { GitObject } from "./git-object.js"
 
 type AtomicFileHandle = {

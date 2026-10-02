@@ -11,8 +11,8 @@
  */
 import { randomUUID } from "node:crypto"
 
-import { runCasLoop } from "./engine.js"
-import { Conflict } from "./errors.js"
+import { runCasLoop } from "./engine.ts"
+import { Conflict } from "./errors.ts"
 import {
   assertTrailers,
   cloneIdent,
@@ -21,8 +21,8 @@ import {
   isCurrentGeneratedCommit,
   validateOid,
   zeroOid,
-} from "./git-object.js"
-import { shapeRefUpdates, type AlsoRef } from "./ref-updates.js"
+} from "./git-object.ts"
+import { shapeRefUpdates, type AlsoRef } from "./ref-updates.ts"
 import {
   assertWriter,
   DEFAULT_WRITER_LABEL,
@@ -33,10 +33,10 @@ import {
   rejectLegacyProvenance,
   untilAborted,
   waitForPoll,
-} from "./options.js"
-import { createShellBackend } from "./shell.js"
+} from "./options.ts"
+import { createShellBackend } from "./shell.ts"
 import type { Clock, CommitMeta, GitomicBackend, Ident, Oid, RefUpdate, Trailer } from "./types.js"
-import { assertUtf8 } from "./utf8.js"
+import { assertUtf8 } from "./utf8.ts"
 
 /** One trailer as written: key, then value. Order and duplicates are kept. */
 export type Prop = Trailer

@@ -2,7 +2,7 @@
  * Option validation shared by gitomic's doors (`open`, `openReader`,
  * `openEvents`). Internal: not exported from the package.
  */
-import { assertUtf8 } from "./utf8.js"
+import { assertUtf8 } from "./utf8.ts"
 
 export const DEFAULT_RETRY_BUDGET_MS = 30_000
 export const DEFAULT_READER_POLL_INTERVAL_MS = 1_000
