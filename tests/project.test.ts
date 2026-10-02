@@ -598,6 +598,11 @@ describe("gitomic project and checkout synchronization", () => {
       writeFileSync(join(checkout, "ignored.md"), "# should be ignored\n")
 
       expect(worktreeDirtyPaths(checkout)).toEqual([".gitignore", "new-untracked.md", "tracked.md"])
+      // NUL framing preserves whitespace in the first untracked and tracked path.
+      writeFileSync(join(checkout, " leading.md"), "# exact path\n")
+      expect(worktreeDirtyPaths(checkout)).toEqual([" leading.md", ".gitignore", "new-untracked.md", "tracked.md"])
+      git(checkout, "add", " leading.md")
+      expect(worktreeDirtyPaths(checkout)).toEqual([" leading.md", ".gitignore", "new-untracked.md", "tracked.md"])
     })
 
     test("synchronizeCheckoutToCommit reports bare for a bare repository", () => {
