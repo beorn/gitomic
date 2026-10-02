@@ -573,6 +573,21 @@ describe("gitomic project and checkout synchronization", () => {
   })
 
   describe("library routines", () => {
+    test("worktreeDirtyPaths preserves staged and untracked dirt before the first commit", () => {
+      const checkout = mkdtempSync(join(tmpdir(), "gitomic-unborn-dirt-"))
+      roots.push(checkout)
+      git(checkout, "init", "-q", "--initial-branch=main")
+      writeFileSync(join(checkout, ".gitignore"), "ignored.md\n")
+      writeFileSync(join(checkout, "staged.md"), "# staged\n")
+      git(checkout, "add", "staged.md")
+      writeFileSync(join(checkout, "staged.md"), "# changed after staging\n")
+      writeFileSync(join(checkout, "untracked.md"), "# untracked\n")
+      writeFileSync(join(checkout, "ignored.md"), "# ignored\n")
+      expect(worktreeDirtyPaths(checkout)).toEqual([".gitignore", "staged.md", "untracked.md"])
+      expect(git(checkout, "diff", "--cached", "--name-only")).toBe("staged.md")
+      expect(() => git(checkout, "rev-parse", "--verify", "HEAD")).toThrow()
+    })
+
     test("worktreeDirtyPaths reports tracked and untracked files, ignoring ignored ones", () => {
       const { checkout } = remoteFixture()
       expect(worktreeDirtyPaths(checkout)).toEqual([])

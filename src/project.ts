@@ -332,7 +332,19 @@ function nulPaths(output: string): string[] {
  * same things the guards that refuse on dirt see.
  */
 export function worktreeDirtyPaths(repoRoot: string): string[] {
-  const tracked = git(repoRoot, readonlyArgs(["diff", "--name-only", "-z", "HEAD", "--"]))
+  const head = git(repoRoot, readonlyArgs(["rev-parse", "--verify", "--quiet", "HEAD"]))
+  let trackedArgs = ["diff", "--name-only", "-z", "HEAD", "--"]
+  if (head.status !== 0) {
+    const branch = git(repoRoot, readonlyArgs(["symbolic-ref", "--quiet", "HEAD"]))
+    if (head.status !== 1 || branch.status !== 0) {
+      throw new Error(`read worktree HEAD failed: ${gitDetail(head)}; ${gitDetail(branch)}`)
+    }
+    const tip = git(repoRoot, readonlyArgs(["show-ref", "--verify", "--quiet", branch.stdout.trim()]))
+    if (tip.status !== 1) throw new Error(`read unborn worktree branch failed: ${gitDetail(tip)}`)
+    // A proven unborn branch has no base: every index entry is pending source.
+    trackedArgs = ["ls-files", "--cached", "-z"]
+  }
+  const tracked = git(repoRoot, readonlyArgs(trackedArgs))
   if (tracked.status !== 0) throw new Error(`read tracked worktree dirt failed: ${gitDetail(tracked)}`)
   const untracked = git(repoRoot, readonlyArgs(["ls-files", "--others", "--exclude-standard", "-z"]))
   if (untracked.status !== 0) throw new Error(`read untracked worktree dirt failed: ${gitDetail(untracked)}`)
