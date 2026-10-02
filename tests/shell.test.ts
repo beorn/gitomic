@@ -54,6 +54,62 @@ test("public command runner preserves command output and refuses missing or time
   ).rejects.toBeInstanceOf(gitomic.GitTimeout)
 })
 
+// @failure An opt-in signed batch is emitted unsigned or a failed configured signer silently falls back.
+// @level l1
+// @consumer Brain signed-batch production through the existing shell backend
+// Existing shell tests cover unsigned commits; this checks real Git signature and refusal at the public backend.
+test("configured commit signing signs the exact batch and refuses an unavailable signer", async () => {
+  const { repo, initial, cleanup } = await createBareRepo()
+  const directory = await mkdtemp(join(tmpdir(), "gitomic-signing-"))
+  try {
+    const key = join(directory, "key")
+    const generated = await gitomic.runCommand("ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-f", key], {
+      timeoutMs: 5000,
+    })
+    expect(generated.code, generated.stderr.toString()).toBe(0)
+    await git(repo, "config", "gpg.format", "ssh")
+    await git(repo, "config", "user.signingkey", key)
+    const allowed = join(directory, "allowed")
+    await writeFile(allowed, `gitomic@localhost ${await readFile(`${key}.pub`, "utf8")}`)
+    await git(repo, "config", "gpg.ssh.allowedSignersFile", allowed)
+    const input = {
+      parent: initial,
+      time: 946684900,
+      changes: new Map([["record.md", "durable accepted record"]]),
+      message: "signed batch",
+      writer: "Brain",
+      instance: "signing-test",
+      seq: 0,
+      trailers: [["Brain-Actor", "github:1"]] as const,
+    }
+    const backend = createShellBackend({ signing: { timeoutMs: 5000 } })
+    const signed = await backend.writeCommit(repo, input)
+    expect(await git(repo, "cat-file", "commit", signed)).toContain("-----BEGIN SSH SIGNATURE-----")
+    await git(repo, "verify-commit", signed)
+    const empty = await backend.writeCommit(repo, { ...input, changes: new Map() })
+    await git(repo, "verify-commit", empty)
+    expect(await git(repo, "show", `${signed}:record.md`)).toBe("durable accepted record")
+    expect(await git(repo, "rev-parse", "refs/heads/main")).toBe(initial)
+    await git(repo, "config", "user.signingkey", join(directory, "absent"))
+    await expect(backend.writeCommit(repo, input)).rejects.toThrow(/signer.*5000/i)
+    expect(await git(repo, "rev-parse", "refs/heads/main")).toBe(initial)
+    const unsigned = await createShellBackend().writeCommit(repo, input)
+    expect(await git(repo, "cat-file", "commit", unsigned)).not.toContain("-----BEGIN SSH SIGNATURE-----")
+    await git(repo, "config", "user.signingkey", key)
+    const blockedSigner = join(directory, "blocked-signer")
+    await writeFile(blockedSigner, "#!/usr/bin/env node\nsetInterval(() => {}, 1000)\n")
+    await chmod(blockedSigner, 0o755)
+    await git(repo, "config", "gpg.ssh.program", blockedSigner)
+    await expect(createShellBackend({ signing: { timeoutMs: 100 } }).writeCommit(repo, input)).rejects.toThrow(
+      /signer.*100/i,
+    )
+    expect(await git(repo, "rev-parse", "refs/heads/main")).toBe(initial)
+  } finally {
+    await cleanup()
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
 const TRANSACTION_SEARCH_LIMIT = 1_024
 const gitInitHelp = spawnSync("git", ["init", "-h"], { encoding: "utf8" })
 const supportsReftable = `${gitInitHelp.stdout}${gitInitHelp.stderr}`.includes("--ref-format")

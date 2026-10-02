@@ -89,6 +89,8 @@ export type BatchCheckOptions = Readonly<{
 
 /** Options for {@link createShellBackend}. */
 export type ShellBackendOptions = {
+  /** Opt into standard Git commit signing through the configured signer, under this required deadline. Unsigned by default. */
+  signing?: { timeoutMs: number }
   /** Git executable used for every shell-backend command. A bare name resolves through `baseEnv`'s PATH. Defaults to `git`. */
   gitExecutable?: string
   /**
@@ -132,6 +134,10 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
   const sigterm = options.sigterm === undefined ? "forward" : options.sigterm
   if (sigterm !== "forward" && sigterm !== "drain") throw new TypeError('sigterm must be "forward" or "drain"')
   const remoteTimeoutMs = normalizeTimeoutMs(options.remoteTimeoutMs ?? DEFAULT_REMOTE_TIMEOUT_MS, "remoteTimeoutMs")
+  const signing =
+    options.signing === undefined
+      ? undefined
+      : { timeoutMs: normalizeTimeoutMs(options.signing.timeoutMs, "signing.timeoutMs") }
   const baseEnv = snapshotEnvironment(options.baseEnv)
   const resolveGitDir = createGitDirResolver(baseEnv)
   const refStorages = new Map<string, Promise<"files" | "native">>()
@@ -223,7 +229,7 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
     // reachability ref belongs here — and the README claim must change with it.
     writeCommit: async (repo, input) => {
       const gitdir = await resolveGitDir(repo)
-      const oid = await writeCommit(gitdir, input, baseEnv)
+      const oid = await writeCommit(gitdir, input, baseEnv, signing)
       await syncCommitDirectories(gitdir, oid, input.changes.size === 0 ? undefined : commitParents(input), baseEnv)
       return oid
     },
@@ -808,7 +814,12 @@ function parseBatch(oids: readonly Oid[], output: Buffer): ReadonlyMap<Oid, Blob
   return blobs
 }
 
-async function writeCommit(repo: string, input: CommitInput, baseEnv?: NodeJS.ProcessEnv): Promise<Oid> {
+async function writeCommit(
+  repo: string,
+  input: CommitInput,
+  baseEnv?: NodeJS.ProcessEnv,
+  signing?: { timeoutMs: number },
+): Promise<Oid> {
   rejectLegacyProvenance(input)
   const parents = commitParents(input)
   const idents = commitIdents(input)
@@ -829,6 +840,7 @@ async function writeCommit(repo: string, input: CommitInput, baseEnv?: NodeJS.Pr
       message,
       idents,
       baseEnv,
+      signing,
     )
   }
   const indexDir = await mkdtemp(join(tmpdir(), "gitomic-index-"))
@@ -879,7 +891,7 @@ async function writeCommit(repo: string, input: CommitInput, baseEnv?: NodeJS.Pr
     })
     const tree = text(await gitWrite(repo, ["write-tree"], { baseEnv, env: indexEnv }))
     const parentTime = Number(text(await git(repo, ["show", "-s", "--format=%ct", input.parent], { baseEnv })))
-    return await commitTree(repo, tree, parents, parentTime, input.time, message, idents, baseEnv)
+    return await commitTree(repo, tree, parents, parentTime, input.time, message, idents, baseEnv, signing)
   } finally {
     await rm(indexDir, { recursive: true, force: true })
   }
@@ -959,11 +971,28 @@ async function commitTree(
   message: string,
   idents: { readonly author: Ident; readonly committer: Ident },
   baseEnv?: NodeJS.ProcessEnv,
+  signing?: { timeoutMs: number },
 ): Promise<Oid> {
   const timestamp = commitTimestamp(parentTime, time)
   const args = ["commit-tree", tree]
   for (const parent of parents) args.push("-p", parent)
-  return text(await gitWrite(repo, args, { baseEnv, env: identityEnv(timestamp, idents), input: message }))
+  if (signing !== undefined) args.push("-S")
+  try {
+    return text(
+      await gitWrite(repo, args, {
+        baseEnv,
+        env: identityEnv(timestamp, idents),
+        input: message,
+        ...(signing === undefined ? {} : { timeoutMs: signing.timeoutMs }),
+      }),
+    )
+  } catch (error) {
+    if (signing === undefined) throw error
+    throw new Error(
+      `Configured Git signer (-S) refused the signed commit (bound ${signing.timeoutMs} ms): ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    )
+  }
 }
 
 /**
