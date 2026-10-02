@@ -19,6 +19,9 @@
  * declaration's text, not the scripts it names: a command that runs a file the repository can change runs the changed
  * file. Name commands by absolute paths outside the repository to close that.
  */
+import { resolve } from "node:path"
+import { pathToFileURL } from "node:url"
+
 import { GitTimeout } from "./errors.ts"
 import { runCommand, runGit } from "./shell.ts"
 import type { Candidate, CandidateContext, CandidateVerdict } from "./types.js"
@@ -47,19 +50,41 @@ export type TrustScope = { readonly repo: string; readonly url?: string }
 /** The git config variable a path repository records its trusted declaration blob in. */
 export const TRUST_CONFIG = "gitomic.trust"
 
+function toUrl(urlOrPath: string): string {
+  const drivePath = /^[A-Za-z]:[\\\\/]/.test(urlOrPath)
+  const remote = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(urlOrPath) || (!drivePath && /^[^/\\\\:]+:/.test(urlOrPath))
+  if (remote) return urlOrPath
+  return pathToFileURL(resolve(urlOrPath)).href
+}
+
 function trustLocation(scope: TrustScope): { readonly git: string[]; readonly key: string; readonly file: string } {
   return scope.url === undefined
     ? { git: ["-C", scope.repo, "config", "--local"], key: TRUST_CONFIG, file: "local" }
-    : { git: ["config", "--global"], key: `gitomic.${scope.url}.trust`, file: "global" }
+    : { git: ["config", "--global"], key: `gitomic.${toUrl(scope.url)}.trust`, file: "global" }
 }
 
 async function trustedBlobs(scope: TrustScope): Promise<string[]> {
   const { git, key } = trustLocation(scope)
   const result = await runGit([...git, "--get-all", key])
+  if (result.code === 0) {
+    const list = lines(decodeUtf8(result.stdout, key)).map((line) => line.trim())
+    if (list.length > 0) return list
+  }
   // Exit 1 with no output: the variable is unset.
-  if (result.code === 1 && result.stdout.length === 0) return []
+  if (result.code === 1 && result.stdout.length === 0) {
+    if (scope.url !== undefined) {
+      const rawKey = `gitomic.${scope.url}.trust`
+      if (rawKey !== key) {
+        const fallback = await runGit([...git, "--get-all", rawKey])
+        if (fallback.code === 0) {
+          return lines(decodeUtf8(fallback.stdout, rawKey)).map((line) => line.trim())
+        }
+      }
+    }
+    return []
+  }
   if (result.code !== 0) throw new Error(`cannot read ${key}: ${result.stderr.toString("utf8").trim()}`)
-  return lines(decodeUtf8(result.stdout, key)).map((line) => line.trim())
+  return []
 }
 
 /** A repository's declaration at one commit: its blob, and its `[candidate]` lines as `git config` prints them. */
@@ -102,7 +127,8 @@ async function untrustedDeclaration(options: RepositoryCandidateOptions, base: s
   if (trusted.includes(declaration.blob)) return undefined
   const { key } = trustLocation(options)
   const recorded = trusted.length === 0 ? `${key} is unset` : `${key} is ${trusted.join(", ")}`
-  const address = `${options.url ?? options.repo}#${options.ref ?? "main"}`
+  const target = options.url === undefined ? options.repo : toUrl(options.url)
+  const address = `${target}#${options.ref ?? "main"}`
   return (
     `${CANDIDATE_CONFIG} ${declaration.blob} at ${base} is not trusted to run (${recorded}); ` +
     `read the commands it declares, then run: gitomic trust '${address}'`

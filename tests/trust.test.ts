@@ -11,7 +11,16 @@ import { pathToFileURL } from "node:url"
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest"
 
 import { main } from "../src/bin.js"
-import { CANDIDATE_CONFIG, createShellBackend, open, TRUST_CONFIG, type GitomicBackend } from "../src/index.js"
+import {
+  CANDIDATE_CONFIG,
+  CandidateRefused,
+  createShellBackend,
+  open,
+  openRemoteRepository,
+  repositoryCandidate,
+  TRUST_CONFIG,
+  type GitomicBackend,
+} from "../src/index.js"
 import { createBareRepo, git } from "./helpers/git.js"
 
 function capture(): { write(chunk: string): void; text(): string } {
@@ -173,5 +182,67 @@ describe("gitomic trust — a repository's declared commands run only once their
     expect(result.stderr).toContain(`declares no ${CANDIDATE_CONFIG} at`)
     expect(result.stderr).toContain("nothing to trust")
     expect(await localTrust()).toBe("")
+  })
+
+  test("a refused write through a remote opened from a filesystem path names a trust procedure that records the scope the next write actually reads", async () => {
+    const blob = await declare()
+    using remote = await openRemoteRepository(fixture.repo)
+    const candidate = repositoryCandidate({ repo: remote.repo, ref: "main", url: fixture.repo })
+    const store = await open({
+      repo: remote.repo,
+      ref: "main",
+      writer: "fixture-remote",
+      backend: shell,
+    })
+
+    let refusalReason = ""
+    try {
+      await store.transact(async (map) => map.set("doc.md", "content\n"), "attempt untrusted write", { candidate })
+      expect.unreachable("expected untrusted write to refuse")
+    } catch (error) {
+      expect(error).toBeInstanceOf(CandidateRefused)
+      refusalReason = (error as CandidateRefused).reasons[0] ?? ""
+    }
+
+    expect(await checkRan()).toBe(false)
+    const match = /run:\s+gitomic trust '([^']+)'/u.exec(refusalReason)
+    expect(match).not.toBeNull()
+    const address = match![1]!
+
+    // The address suggested by the refusal must be a URL address, not a raw filesystem path
+    expect(address).toBe(url())
+
+    // Run the trust procedure recommended by the refusal
+    const trusted = await run(["trust", address])
+    expect(trusted.code).toBe(0)
+    const key = `gitomic.${pathToFileURL(fixture.repo).href}.trust`
+    expect(trusted.stdout).toContain(`trusted: ${key} = ${blob} (global git config)`)
+    expect(await git(fixture.repo, "config", "--file", join(work, "global-gitconfig"), "--get", key)).toBe(blob)
+    // The bare remote repository's local config must not be polluted
+    expect(await localTrust()).toBe("")
+
+    // The next write through the remote candidate now succeeds and executes the check
+    await store.transact(async (map) => map.set("doc.md", "content\n"), "write after trust", { candidate })
+    expect(await checkRan()).toBe(true)
+
+    // Changing the declaration's blob refuses again before any command runs
+    await rm(ran, { force: true })
+    const edited = `[candidate]\n\tcheck = ${join(work, "check.sh")}\n\ttimeoutMs = 5000\n`
+    const fixtureStore = await open({ repo: fixture.repo, ref: "main", writer: "fixture", backend: shell })
+    await fixtureStore.transact(async (map) => map.set(CANDIDATE_CONFIG, edited), "edit the gate")
+    const secondBlob = await git(fixture.repo, "rev-parse", `main:${CANDIDATE_CONFIG}`)
+    expect(secondBlob).not.toBe(blob)
+
+    // Fetch the new commit into remote.repo
+    await git(remote.repo, "fetch", "origin", "+main:main")
+
+    // The write now refuses because secondBlob is not trusted
+    try {
+      await store.transact(async (map) => map.set("doc.md", "content 2\n"), "write after gate edit", { candidate })
+      expect.unreachable("expected write to refuse after gate edit")
+    } catch (error) {
+      expect(error).toBeInstanceOf(CandidateRefused)
+    }
+    expect(await checkRan()).toBe(false)
   })
 })
