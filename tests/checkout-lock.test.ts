@@ -1,4 +1,4 @@
-// @failure Two writers could project one checkout at once, a busy lock could read as a broken checkout or name no holder, a borrowed lock could deadlock its own child, and a Node runtime could fail every verb instead of the two that need the lock.
+// @failure Two writers could project one checkout at once, a busy lock could read as a broken checkout or name no holder, a borrowed lock could deadlock its own child, and Node and Bun writers could fail to share the same lock.
 // @level l1
 // @consumer gitomic project and apply --checkout callers: the checkout-sync timer, Tent and km writers that borrow the lock
 
@@ -182,38 +182,53 @@ describe("the checkout lock", () => {
     expect(result.stderr).toContain('got "stdin"')
   })
 
-  // The in-process CLI runs on whatever runs Vitest. This package's own runner
-  // is Node; a host that runs Vitest under Bun loads the lock and cannot see the
-  // refusal in process, so there `smoke:node` over the built package covers it.
+  // Native Node runs the real lock while the existing holder fixture runs Bun.
   test.runIf(!("Bun" in globalThis))(
-    "under Node, project and apply --checkout exit 6 naming the verb, the reason and the cure; other verbs run",
+    "Node projects and applies under the shared lock, and a Bun holder refuses its write",
     async () => {
-      const { bare, checkout } = fixture()
+      const { root, bare, checkout } = fixture()
       const chunks: string[] = []
       const stderr = { write: (chunk: string) => chunks.push(chunk) }
       const stdout = { write: (chunk: string) => chunks.push(chunk) }
       async function* empty(): AsyncGenerator<string> {}
+      const io = { stdin: empty(), stdout, stderr }
 
-      const projected = await main(["project", checkout], { stdin: empty(), stdout, stderr })
-      expect(projected).toBe(6)
-      const text = chunks.join("")
-      expect(text).toContain("project needs Bun: the checkout lock takes flock(2) through bun:ffi")
-      expect(text).toContain("Node has no flock API")
-      expect(text).toContain("run `gitomic project` under Bun")
-      expect(text).toContain("kind=runtime-unsupported")
-
+      expect(await main(["project", checkout], io)).toBe(0)
+      expect(chunks.join("")).toContain("kind=already-current")
+      const content = join(root, "content.md")
+      writeFileSync(content, "# node write\n")
       chunks.length = 0
-      const applied = await main(["apply", `${bare}#main`, "-m", "node", "--checkout", checkout, "rm", "tracked.md"], {
-        stdin: empty(),
-        stdout,
-        stderr,
-      })
-      expect(applied).toBe(6)
-      expect(chunks.join("")).toContain("apply --checkout needs Bun")
+      expect(
+        await main(["apply", `${bare}#main`, "-m", "node", "--checkout", checkout, "put", "tracked.md", content], io),
+      ).toBe(0)
+      expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# node write\n")
+      expect(git(checkout, "rev-parse", "HEAD")).toBe(git(bare, "rev-parse", "refs/heads/main"))
 
+      const before = git(bare, "rev-parse", "refs/heads/main")
+      await holdLock(checkout, "hold")
+      writeFileSync(content, "# refused write\n")
       chunks.length = 0
-      expect(await main(["read", `${bare}#main`, "tracked.md"], { stdin: empty(), stdout, stderr })).toBe(0)
-      expect(chunks.join("")).toBe("# original\n")
+      expect(
+        await main(
+          [
+            "apply",
+            `${bare}#main`,
+            "-m",
+            "busy node",
+            "--checkout",
+            checkout,
+            "--lock-timeout",
+            "100",
+            "put",
+            "tracked.md",
+            content,
+          ],
+          io,
+        ),
+      ).toBe(5)
+      expect(chunks.join("")).toContain("kind=checkout-lock-busy")
+      expect(git(bare, "rev-parse", "refs/heads/main")).toBe(before)
+      expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# node write\n")
     },
   )
 })

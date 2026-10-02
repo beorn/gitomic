@@ -157,8 +157,8 @@ import { decodeUtf8 } from "./utf8.js"
  * 15 s unless `--lock-timeout <ms>` says otherwise. A parent that
  * already holds it passes the descriptor as an inherited fd named by
  * `GITOMIC_CHECKOUT_LOCK_FD`; the child adopts it rather than waiting on it.
- * The lock uses @bearly/flock, which needs Bun: under Node, `project` and
- * `apply --checkout` exit 6, and every other verb is unaffected.
+ * The lock uses @bearly/flock on supported POSIX hosts under Bun or Node 24.
+ * A native binding that cannot load refuses with exit 6 before writing.
  *
  * Exit codes — the only seven, nothing else is a success:
  * - `0` ok: landed, or already current / fast-forwarded.
@@ -186,8 +186,8 @@ import { decodeUtf8 } from "./utf8.js"
  *   names the lock path and, when the lock records it, the holder's pid and
  *   argv, then one machine line `kind=checkout-lock-busy path=<path>`.
  * - `6` the runtime cannot hold the checkout lock: `project` and
- *   `apply --checkout` under Node. The lock uses flock(2) through bun:ffi and
- *   Node has no flock API, so these two verbs need Bun. Nothing was written.
+ *   `apply --checkout` when their native binding is unavailable. Nothing
+ *   was written; the diagnostic names the loading failure.
  *
  * Deliberately not built here (need new grammar or library plumbing this CLI
  * does not add): `read --log`, `commit <checkout>`.
@@ -927,8 +927,8 @@ type ProjectOutcomeReceipt = { readonly ok: boolean; readonly kind: string; read
 /**
  * Hold the checkout lock of `checkoutPath` for a verb that writes its index or
  * working tree, or report the busy refusal and return undefined. The module is
- * loaded here, not at the top, because @bearly/flock needs Bun and every other
- * verb must keep working under Node.
+ * loaded here, not at the top, so other verbs remain independent of native
+ * checkout-lock availability.
  */
 async function holdCheckoutLockFor(
   verb: string,
@@ -942,8 +942,9 @@ async function holdCheckoutLockFor(
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error)
     throw new RuntimeUnsupported(
-      `${verb} needs Bun: the checkout lock takes flock(2) through bun:ffi, and Node has no flock API; ` +
-        `run \`gitomic ${verb}\` under Bun (loading the lock failed: ${detail})`,
+      `${verb}: the native checkout lock could not load on ${process.platform} under ` +
+        `${process.versions.bun === undefined ? `Node ${process.versions.node}` : `Bun ${process.versions.bun}`}; ` +
+        `use a supported POSIX host with Bun or Node 24 and installed @bearly/flock native dependencies (loading failed: ${detail})`,
       { cause: error },
     )
   }

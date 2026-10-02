@@ -36,7 +36,7 @@ describe("package dependency boundary", () => {
     // @bearly/cli-process is the shared CLI entry that lets stdout drain (hh 27071). None imports gitomic.
     expect(packageManifest.dependencies).toEqual({
       "@bearly/cli-process": "^0.1.0",
-      "@bearly/flock": "^0.1.1",
+      "@bearly/flock": "^0.2.2",
       "@bearly/pacing": "^0.1.0",
     })
     expect(packageManifest.optionalDependencies).toBeUndefined()
@@ -87,8 +87,8 @@ describe("package dependency boundary", () => {
     expect(readme).not.toContain("Not on npm yet")
   })
 
-  test("keeps the root entry free of the Bun-only checkout lock", async () => {
-    // The lock's flock goes through bun:ffi. Only its subpath and the CLI's dynamic import may reach it, so the root
+  test("keeps the root entry free of the checkout lock", async () => {
+    // The optional checkout lock selects the runtime's native binding. Only its subpath and the CLI's dynamic import may reach it, so the root
     // entry imports under Node; scripts/node-smoke.mjs proves the same against the built package.
     const seen = new Set<string>()
     const pending = ["index.ts"]
