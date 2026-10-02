@@ -202,7 +202,8 @@ function git(repoRoot: string, args: readonly string[], maxBuffer?: number): Git
   }
   return {
     status: result.status,
-    stdout: (result.stdout ?? "").trim(),
+    // NUL framing owns the separators; trimming would change the first pathname.
+    stdout: args.includes("-z") ? (result.stdout ?? "") : (result.stdout ?? "").trim(),
     stderr: (result.stderr ?? "").trim(),
   }
 }
