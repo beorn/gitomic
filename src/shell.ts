@@ -148,7 +148,8 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
   const syncRefs = async (repo: string, updates: readonly RefUpdate[]): Promise<void> => {
     if (process.platform !== "linux" || (await refStorage(repo)) !== "files") return
     const directories = new Map<string, boolean>()
-    for (const { ref, oid } of updates) {
+    for (const { ref, oid, expect } of updates) {
+      if (oid === expect) continue // A successful no-op CAS writes no directory entry.
       let directory = dirname(join(repo, ref))
       for (;;) {
         directories.set(directory, (directories.get(directory) ?? true) && oid === null)
@@ -283,7 +284,13 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
       const checked = assertRefUpdates(updates)
       if (remote !== undefined) return publishRemote(gitdir, checked, remote, remoteTimeoutMs, baseEnv)
       const result = await publishLocal(gitdir, checked, baseEnv)
-      await syncRefs(gitdir, checked)
+      // An idempotent publish may only verify an already packed ref. Sync only
+      // names this transaction changed; their directory failures remain errors.
+      const changed = new Set(result.outcomes.filter(({ outcome }) => outcome !== "unchanged").map(({ ref }) => ref))
+      await syncRefs(
+        gitdir,
+        checked.filter(({ ref }) => changed.has(ref)),
+      )
       return result
     },
     fetchRefs: async (repo, refs, remote, options) =>

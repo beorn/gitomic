@@ -321,6 +321,30 @@ describe.sequential("shell backend failure boundaries", () => {
       ).rejects.toThrow("cannot sync directory")
       failSyncAt = undefined
 
+      // Repeated retention must succeed after Git has packed and pruned the
+      // loose ref directories. The original durability cases leave refs loose.
+      await git(fixture.repo, "pack-refs", "--all", "--prune")
+      const backendForPacked = createShellBackend()
+      const retained = refs.map((ref) => ({ ref, expect: "0".repeat(40), oid: committed }))
+      await expect(backendForPacked.publish!(fixture.repo, retained)).resolves.toEqual({
+        outcomes: refs.map((ref) => ({ ref, outcome: "unchanged" })),
+      })
+      await expect(backendForPacked.compareAndSwap(fixture.repo, refs[0]!, committed, committed)).resolves.toBe(
+        "swapped",
+      )
+      synced.length = 0
+      const freshRef = "refs/km/fresh/nested/retained"
+      await expect(
+        backendForPacked.publish!(fixture.repo, [
+          ...retained,
+          { ref: freshRef, expect: "0".repeat(40), oid: committed },
+        ]),
+      ).resolves.toEqual({
+        outcomes: [...refs.map((ref) => ({ ref, outcome: "unchanged" })), { ref: freshRef, outcome: "updated" }],
+      })
+      expect(synced).toContain(join(fixture.repo, "refs", "km", "fresh", "nested"))
+      for (const ref of [...refs, freshRef]) expect(await git(fixture.repo, "rev-parse", ref)).toBe(committed)
+
       synced.length = 0
       const cacheDir = join(fixture.repo, "kept-cache", "nested")
       using kept = await openRemoteRepository(fixture.repo, { cacheDir, seed: fixture.repo })
