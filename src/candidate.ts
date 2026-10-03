@@ -24,7 +24,7 @@ import { pathToFileURL } from "node:url"
 
 import { GitTimeout } from "./errors.ts"
 import { runCommand, runGit } from "./shell.ts"
-import type { Candidate, CandidateContext, CandidateVerdict } from "./types.js"
+import type { Candidate, CandidateContext, CandidateVerdict, Oid } from "./types.js"
 import { decodeUtf8 } from "./utf8.ts"
 
 /** The path of a repository's candidate declaration. */
@@ -274,12 +274,15 @@ export function repositoryCandidate(options: RepositoryCandidateOptions): Candid
     const declared = await readDeclaration(options.repo, context.base)
     if ("refuse" in declared) return declared
     const gitDir = await resolveGitDir(options.repo)
+    let materialized: Oid | undefined
     if (declared.derive !== undefined) {
-      const derived = await derive(gitDir, context, declared.derive, declared.timeoutMs)
-      if (derived !== undefined) return derived
+      materialized = await context.materialize()
+      const derived = await derive(gitDir, context, declared.derive, declared.timeoutMs, materialized)
+      if (derived === "edited") materialized = undefined
+      else if (derived !== undefined) return derived
     }
     if (declared.check === undefined) return { report: [] }
-    return check(gitDir, context, declared.check, declared.timeoutMs)
+    return check(gitDir, context, declared.check, declared.timeoutMs, materialized)
   }
 }
 
@@ -345,8 +348,9 @@ async function runDeclared(
   context: CandidateContext,
   command: string,
   timeoutMs: number,
+  materialized?: Oid,
 ): Promise<Ran> {
-  const candidate = await context.materialize()
+  const candidate = materialized ?? (await context.materialize())
   try {
     const result = await runCommand("sh", ["-c", command], {
       env: { GITOMIC_REPO: gitDir, GITOMIC_BASE: context.base, GITOMIC_CANDIDATE: candidate },
@@ -368,14 +372,15 @@ function tail(text: string): string {
   return lines(text).slice(-8).join(" | ") || "no stderr"
 }
 
-/** Apply the derive step's edits to the candidate map; a verdict only when it refuses. */
+/** Apply derive edits; every emitted put/rm operation invalidates the materialized candidate. */
 async function derive(
   gitDir: string,
   context: CandidateContext,
   command: string,
   timeoutMs: number,
-): Promise<CandidateVerdict | undefined> {
-  const ran = await runDeclared(gitDir, context, command, timeoutMs)
+  materialized: Oid,
+): Promise<CandidateVerdict | "edited" | undefined> {
+  const ran = await runDeclared(gitDir, context, command, timeoutMs, materialized)
   if ("timedOut" in ran) return { refuse: [`derive \`${command}\` did not finish within its ${timeoutMs} ms limit`] }
   if (ran.code === 1) {
     const reasons = lines(ran.stdout)
@@ -396,6 +401,7 @@ async function derive(
   if (typeof edits !== "object" || edits === null || Array.isArray(edits)) {
     return { refuse: [`derive \`${command}\` must print a JSON object {"put": {...}, "rm": [...]}`] }
   }
+  let edited = false
   if (edits.put !== undefined) {
     if (typeof edits.put !== "object" || edits.put === null || Array.isArray(edits.put)) {
       return { refuse: [`derive \`${command}\`: "put" must map paths to string content`] }
@@ -405,15 +411,19 @@ async function derive(
         return { refuse: [`derive \`${command}\`: "put" content for ${path} is not a string`] }
       }
       context.map.set(path, content)
+      edited = true
     }
   }
   if (edits.rm !== undefined) {
     if (!Array.isArray(edits.rm) || edits.rm.some((path) => typeof path !== "string")) {
       return { refuse: [`derive \`${command}\`: "rm" must be an array of paths`] }
     }
-    for (const path of edits.rm as string[]) context.map.delete(path)
+    for (const path of edits.rm as string[]) {
+      context.map.delete(path)
+      edited = true
+    }
   }
-  return undefined
+  return edited ? "edited" : undefined
 }
 
 async function check(
@@ -421,8 +431,9 @@ async function check(
   context: CandidateContext,
   command: string,
   timeoutMs: number,
+  materialized?: Oid,
 ): Promise<CandidateVerdict> {
-  const ran = await runDeclared(gitDir, context, command, timeoutMs)
+  const ran = await runDeclared(gitDir, context, command, timeoutMs, materialized)
   if ("timedOut" in ran) return { refuse: [`check \`${command}\` did not finish within its ${timeoutMs} ms limit`] }
   if (ran.code === 0) return { report: lines(ran.stdout) }
   if (ran.code === 1) {
