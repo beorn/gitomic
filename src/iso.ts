@@ -171,8 +171,7 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
     }
     if (content === undefined) {
       node.entries.delete(filename)
-      for (let index = ancestors.length - 1; index >= 0; index--) {
-        const ancestor = ancestors[index]!
+      for (const ancestor of ancestors.reverse()) {
         if (ancestor.child.entries.size !== 0) break
         ancestor.parent.entries.delete(ancestor.name)
       }
