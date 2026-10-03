@@ -32,6 +32,12 @@
  */
 
 import { spawnSync } from "node:child_process"
+import type {
+  SpawnSyncOptions,
+  SpawnSyncOptionsWithBufferEncoding,
+  SpawnSyncOptionsWithStringEncoding,
+  SpawnSyncReturns,
+} from "node:child_process"
 import { randomUUID } from "node:crypto"
 import {
   chmodSync,
@@ -67,6 +73,8 @@ function readonlyArgs(args: readonly string[]): string[] {
 }
 
 export interface CheckoutSyncRequest {
+  /** Exact child environment; omission inherits process.env. Private Git overlays win. */
+  readonly baseEnv?: NodeJS.ProcessEnv | undefined
   /** The checkout to bring forward. */
   readonly repoRoot: string
   /**
@@ -181,14 +189,43 @@ export function gitOutcomeForTest(repoRoot: string, args: readonly string[]): Gi
  * `maxBuffer` (ENOBUFS, default 1 MiB), or a signal stopped it — is a failure that names that cause, with no stdout:
  * what it printed is truncated, and offering it as the failure's detail would misstate what went wrong.
  */
-function git(repoRoot: string, args: readonly string[], maxBuffer?: number): GitOutcome {
-  const result = spawnSync("git", ["-C", repoRoot, ...args], {
-    encoding: "utf8",
-    // git's own words are read here (an index.lock refusal is classified from its stderr), so they must be English,
-    // as the shell backend's runner pins them.
-    env: { ...process.env, LC_ALL: "C" },
-    ...(maxBuffer === undefined ? {} : { maxBuffer }),
+function spawnProjectionGit(
+  repoRoot: string,
+  args: readonly string[],
+  options: SpawnSyncOptionsWithStringEncoding,
+  baseEnv?: NodeJS.ProcessEnv,
+): SpawnSyncReturns<string>
+function spawnProjectionGit(
+  repoRoot: string,
+  args: readonly string[],
+  options: SpawnSyncOptionsWithBufferEncoding,
+  baseEnv?: NodeJS.ProcessEnv,
+): SpawnSyncReturns<Buffer>
+function spawnProjectionGit(
+  repoRoot: string,
+  args: readonly string[],
+  options: SpawnSyncOptions,
+  baseEnv?: NodeJS.ProcessEnv,
+): SpawnSyncReturns<string | Buffer> {
+  return spawnSync("git", ["-C", repoRoot, ...args], {
+    ...options,
+    env: { ...(baseEnv ?? process.env), ...options.env },
   })
+}
+
+function git(repoRoot: string, args: readonly string[], maxBuffer?: number, baseEnv?: NodeJS.ProcessEnv): GitOutcome {
+  const result = spawnProjectionGit(
+    repoRoot,
+    args,
+    {
+      encoding: "utf8",
+      // git's own words are read here (an index.lock refusal is classified from its stderr), so they must be English,
+      // as the shell backend's runner pins them.
+      env: { LC_ALL: "C" },
+      ...(maxBuffer === undefined ? {} : { maxBuffer }),
+    },
+    baseEnv,
+  )
   if (result.error !== undefined || result.status === null) {
     const code = (result.error as NodeJS.ErrnoException | undefined)?.code
     const cause = result.error === undefined ? "" : (code ?? result.error.message)
@@ -331,22 +368,32 @@ function nulPaths(output: string): string[] {
  * This is the pathset reconciliation must preserve exactly, so it must see the
  * same things the guards that refuse on dirt see.
  */
-export function worktreeDirtyPaths(repoRoot: string): string[] {
-  const head = git(repoRoot, readonlyArgs(["rev-parse", "--verify", "--quiet", "HEAD"]))
+export function worktreeDirtyPaths(repoRoot: string, baseEnv?: NodeJS.ProcessEnv): string[] {
+  const head = git(repoRoot, readonlyArgs(["rev-parse", "--verify", "--quiet", "HEAD"]), undefined, baseEnv)
   let trackedArgs = ["diff", "--name-only", "-z", "HEAD", "--"]
   if (head.status !== 0) {
-    const branch = git(repoRoot, readonlyArgs(["symbolic-ref", "--quiet", "HEAD"]))
+    const branch = git(repoRoot, readonlyArgs(["symbolic-ref", "--quiet", "HEAD"]), undefined, baseEnv)
     if (head.status !== 1 || branch.status !== 0) {
       throw new Error(`read worktree HEAD failed: ${gitDetail(head)}; ${gitDetail(branch)}`)
     }
-    const tip = git(repoRoot, readonlyArgs(["show-ref", "--verify", "--quiet", branch.stdout.trim()]))
+    const tip = git(
+      repoRoot,
+      readonlyArgs(["show-ref", "--verify", "--quiet", branch.stdout.trim()]),
+      undefined,
+      baseEnv,
+    )
     if (tip.status !== 1) throw new Error(`read unborn worktree branch failed: ${gitDetail(tip)}`)
     // A proven unborn branch has no base: every index entry is pending source.
     trackedArgs = ["ls-files", "--cached", "-z"]
   }
-  const tracked = git(repoRoot, readonlyArgs(trackedArgs))
+  const tracked = git(repoRoot, readonlyArgs(trackedArgs), undefined, baseEnv)
   if (tracked.status !== 0) throw new Error(`read tracked worktree dirt failed: ${gitDetail(tracked)}`)
-  const untracked = git(repoRoot, readonlyArgs(["ls-files", "--others", "--exclude-standard", "-z"]))
+  const untracked = git(
+    repoRoot,
+    readonlyArgs(["ls-files", "--others", "--exclude-standard", "-z"]),
+    undefined,
+    baseEnv,
+  )
   if (untracked.status !== 0) throw new Error(`read untracked worktree dirt failed: ${gitDetail(untracked)}`)
   return [...new Set([...nulPaths(tracked.stdout), ...nulPaths(untracked.stdout)])].sort()
 }
@@ -378,6 +425,7 @@ function carryIndexTo(
   ref: string,
   expectedDirtyPaths: readonly string[],
   alreadyAt?: string,
+  baseEnv?: NodeJS.ProcessEnv,
 ): IndexCarry {
   const refuse = (error: string): IndexCarry => ({
     ok: false,
@@ -385,7 +433,7 @@ function carryIndexTo(
   })
   const expected = [...expectedDirtyPaths]
   for (const commit of alreadyAt === undefined ? [tip] : [tip, alreadyAt]) {
-    const same = git(repoRoot, readonlyArgs(["diff-index", "--cached", "--quiet", commit, "--"]))
+    const same = git(repoRoot, readonlyArgs(["diff-index", "--cached", "--quiet", commit, "--"]), undefined, baseEnv)
     if (same.status === 0) return { ok: true, expectedDirtyPaths: expected }
     if (same.status !== 1) {
       return refuse(
@@ -394,7 +442,7 @@ function carryIndexTo(
       )
     }
   }
-  const indexTree = indexTreeFromCopy(repoRoot)
+  const indexTree = indexTreeFromCopy(repoRoot, baseEnv)
   if (!indexTree.ok) {
     return refuse(
       `${ref} in the checkout ${repoRoot}: the index's tree could not be read (${indexTree.detail}). ` +
@@ -418,6 +466,7 @@ function carryIndexTo(
         "--",
       ]),
       count * WALK_LINE_BYTES_MAX,
+      baseEnv,
     )
     if (page.status !== 0) {
       return refuse(`${ref} in the checkout ${repoRoot}: the history of ${tip} could not be read (${gitDetail(page)}).`)
@@ -436,7 +485,7 @@ function carryIndexTo(
   }
   const ancestor = match.slice(0, match.indexOf(" "))
   if (ancestor === tip) return { ok: true, expectedDirtyPaths: expected }
-  const delta = git(repoRoot, readonlyArgs(["diff", "--name-only", "-z", ancestor, tip, "--"]))
+  const delta = git(repoRoot, readonlyArgs(["diff", "--name-only", "-z", ancestor, tip, "--"]), undefined, baseEnv)
   if (delta.status !== 0) {
     return refuse(
       `${ref} in the checkout ${repoRoot}: the paths between ${ancestor} and ${tip} could not be read ` +
@@ -445,13 +494,13 @@ function carryIndexTo(
   }
   // Dirt is measured against HEAD (`tip`), so a worktree file already equal to tip is absent from `expected` even
   // though the stale index still holds `ancestor`. Inspect the skipped commit's delta instead.
-  const matching = matchingLandingDirt(repoRoot, ancestor, tip, nulPaths(delta.stdout))
+  const matching = matchingLandingDirt(repoRoot, ancestor, tip, nulPaths(delta.stdout), baseEnv)
   if (!matching.ok) return refuse(`${ref} in ${repoRoot}: ${matching.detail}. Nothing was changed.`)
-  const staged = stageAuthoredPaths(repoRoot, ref, ancestor, tip, matching.paths, expected)
+  const staged = stageAuthoredPaths(repoRoot, ref, ancestor, tip, matching.paths, expected, baseEnv)
   if (!staged.ok) return { ok: false, outcome: staged.outcome }
-  const merged = git(repoRoot, ["read-tree", "-m", "-u", ancestor, tip])
+  const merged = git(repoRoot, ["read-tree", "-m", "-u", ancestor, tip], undefined, baseEnv)
   if (merged.status !== 0) {
-    const unstaged = unstageAuthoredPaths(repoRoot, ancestor, matching.paths)
+    const unstaged = unstageAuthoredPaths(repoRoot, ancestor, matching.paths, baseEnv)
     const unstageNote = unstaged === undefined ? "" : ` The matching paths could not be unstaged: ${unstaged}.`
     return {
       ok: false,
@@ -487,8 +536,16 @@ const WALK_LINE_BYTES_MAX = 160
  * beside the index, in the directory `git rev-parse --git-path index` names, because a split index finds its shared
  * file there; it is removed afterwards. `write-tree` only adds tree objects to the store.
  */
-function indexTreeFromCopy(repoRoot: string): { ok: true; tree: string } | { ok: false; detail: string } {
-  const located = git(repoRoot, readonlyArgs(["rev-parse", "--path-format=absolute", "--git-path", "index"]))
+function indexTreeFromCopy(
+  repoRoot: string,
+  baseEnv?: NodeJS.ProcessEnv,
+): { ok: true; tree: string } | { ok: false; detail: string } {
+  const located = git(
+    repoRoot,
+    readonlyArgs(["rev-parse", "--path-format=absolute", "--git-path", "index"]),
+    undefined,
+    baseEnv,
+  )
   if (located.status !== 0 || located.stdout === "") return { ok: false, detail: gitDetail(located) }
   const copy = join(dirname(located.stdout), `index.gitomic-read-${process.pid}-${randomUUID()}`)
   try {
@@ -497,10 +554,15 @@ function indexTreeFromCopy(repoRoot: string): { ok: true; tree: string } | { ok:
     return { ok: false, detail: `copying ${located.stdout}: ${error instanceof Error ? error.message : String(error)}` }
   }
   try {
-    const written = spawnSync("git", ["-C", repoRoot, "write-tree"], {
-      encoding: "utf8",
-      env: { ...process.env, GIT_INDEX_FILE: copy },
-    })
+    const written = spawnProjectionGit(
+      repoRoot,
+      ["write-tree"],
+      {
+        encoding: "utf8",
+        env: { GIT_INDEX_FILE: copy },
+      },
+      baseEnv,
+    )
     const tree = (written.stdout ?? "").trim()
     if ((written.status ?? 1) !== 0 || tree === "") {
       return {
@@ -515,13 +577,13 @@ function indexTreeFromCopy(repoRoot: string): { ok: true; tree: string } | { ok:
 }
 
 /** The branch HEAD points at, or null when HEAD is detached. */
-export function checkedOutRef(repoRoot: string): string | null {
-  const symbolic = git(repoRoot, readonlyArgs(["symbolic-ref", "--quiet", "HEAD"]))
+export function checkedOutRef(repoRoot: string, baseEnv?: NodeJS.ProcessEnv): string | null {
+  const symbolic = git(repoRoot, readonlyArgs(["symbolic-ref", "--quiet", "HEAD"]), undefined, baseEnv)
   return symbolic.status === 0 && symbolic.stdout !== "" ? symbolic.stdout : null
 }
 
-export function isBareRepository(repoRoot: string): boolean {
-  const bare = git(repoRoot, readonlyArgs(["rev-parse", "--is-bare-repository"]))
+export function isBareRepository(repoRoot: string, baseEnv?: NodeJS.ProcessEnv): boolean {
+  const bare = git(repoRoot, readonlyArgs(["rev-parse", "--is-bare-repository"]), undefined, baseEnv)
   return bare.status === 0 && bare.stdout === "true"
 }
 
@@ -532,8 +594,13 @@ type AuthoredStage =
   | { readonly ok: false; readonly outcome: Extract<CheckoutSyncOutcome, { readonly ok: false }> }
 
 /** Compare checkout bytes in the same clean-filtered representation that Git stages. */
-function filteredCheckoutBlob(repoRoot: string, path: string, content: Buffer): GitOutcome {
-  return gitWithInput(repoRoot, ["hash-object", `--path=${path}`, "--stdin"], content)
+function filteredCheckoutBlob(
+  repoRoot: string,
+  path: string,
+  content: Buffer,
+  baseEnv?: NodeJS.ProcessEnv,
+): GitOutcome {
+  return gitWithInput(repoRoot, ["hash-object", `--path=${path}`, "--stdin"], content, undefined, baseEnv)
 }
 
 /** Prove exact matches and name every dirty landing path that Git's two-way merge must not overwrite. */
@@ -542,20 +609,31 @@ function matchingLandingDirt(
   from: string,
   to: string,
   dirtyPaths: readonly string[],
+  baseEnv?: NodeJS.ProcessEnv,
 ):
   | { readonly ok: true; readonly paths: string[]; readonly blockers: string[] }
   | { readonly ok: false; readonly detail: string } {
-  const top = git(repoRoot, readonlyArgs(["rev-parse", "--show-toplevel"]))
+  const top = git(repoRoot, readonlyArgs(["rev-parse", "--show-toplevel"]), undefined, baseEnv)
   if (top.status !== 0 || top.stdout === "") {
     return { ok: false, detail: `reading the checkout's top level: ${gitDetail(top)}` }
   }
   const topLevel = top.stdout
-  const changed = git(topLevel, readonlyArgs(["diff", "--name-only", "-z", "--no-renames", from, to, "--"]))
+  const changed = git(
+    topLevel,
+    readonlyArgs(["diff", "--name-only", "-z", "--no-renames", from, to, "--"]),
+    undefined,
+    baseEnv,
+  )
   if (changed.status !== 0) return { ok: false, detail: `reading the landing's changed paths: ${gitDetail(changed)}` }
   const landingPaths = new Set(nulPaths(changed.stdout))
   const candidates = dirtyPaths.filter((path) => landingPaths.has(path))
   if (candidates.length === 0) return { ok: true, paths: [], blockers: [] }
-  const listed = git(topLevel, readonlyArgs(["ls-tree", "--full-tree", "-z", to, "--", ...candidates]))
+  const listed = git(
+    topLevel,
+    readonlyArgs(["ls-tree", "--full-tree", "-z", to, "--", ...candidates]),
+    undefined,
+    baseEnv,
+  )
   if (listed.status !== 0) return { ok: false, detail: `reading the landing's tree: ${gitDetail(listed)}` }
   const landed = new Map<string, { mode: string; oid: string }>()
   for (const entry of nulPaths(listed.stdout)) {
@@ -582,7 +660,7 @@ function matchingLandingDirt(
       (Number(stat.mode) & 0o111 ? "100755" : "100644") === target.mode
     ) {
       try {
-        const filtered = filteredCheckoutBlob(topLevel, path, readFileSync(join(topLevel, path)))
+        const filtered = filteredCheckoutBlob(topLevel, path, readFileSync(join(topLevel, path)), baseEnv)
         if (filtered.status !== 0) return { ok: false, detail: `clean-filtering ${path}: ${gitDetail(filtered)}` }
         if (filtered.stdout.trim() === target.oid) paths.push(path)
       } catch (error) {
@@ -607,6 +685,7 @@ function stageAuthoredPaths(
   to: string,
   authoredPaths: readonly string[],
   expectedDirtyPaths: readonly string[],
+  baseEnv?: NodeJS.ProcessEnv,
 ): AuthoredStage {
   if (authoredPaths.length === 0) return { ok: true, expectedDirtyPaths: [...expectedDirtyPaths] }
   const mismatch = (
@@ -639,13 +718,23 @@ function stageAuthoredPaths(
     },
   })
 
-  const top = git(repoRoot, readonlyArgs(["rev-parse", "--show-toplevel"]))
+  const top = git(repoRoot, readonlyArgs(["rev-parse", "--show-toplevel"]), undefined, baseEnv)
   if (top.status !== 0) return unreadable("the checkout's top level", top)
   const topLevel = top.stdout.trim()
-  const changed = git(topLevel, readonlyArgs(["diff", "--name-only", "-z", "--no-renames", from, to, "--"]))
+  const changed = git(
+    topLevel,
+    readonlyArgs(["diff", "--name-only", "-z", "--no-renames", from, to, "--"]),
+    undefined,
+    baseEnv,
+  )
   if (changed.status !== 0) return unreadable(`the landing's diff ${from} -> ${to}`, changed)
   const landingPaths = new Set(nulPaths(changed.stdout))
-  const listed = git(topLevel, readonlyArgs(["ls-tree", "--full-tree", "-z", to, "--", ...authoredPaths]))
+  const listed = git(
+    topLevel,
+    readonlyArgs(["ls-tree", "--full-tree", "-z", to, "--", ...authoredPaths]),
+    undefined,
+    baseEnv,
+  )
   if (listed.status !== 0) return unreadable(`${to}'s tree entries for the authored paths`, listed)
   const landed = new Map<string, string>()
   for (const entry of nulPaths(listed.stdout)) {
@@ -670,7 +759,7 @@ function stageAuthoredPaths(
     let checkoutOid: string | null = null
     if (content !== undefined) {
       // update-index applies the path's clean filter; compare exactly that Git representation.
-      const filtered = filteredCheckoutBlob(topLevel, path, content)
+      const filtered = filteredCheckoutBlob(topLevel, path, content, baseEnv)
       if (filtered.status !== 0) return unreadable(`the clean-filtered checkout file ${path}`, filtered)
       checkoutOid = filtered.stdout.trim()
     }
@@ -680,22 +769,32 @@ function stageAuthoredPaths(
     }
   }
 
-  const staged = git(topLevel, ["update-index", "--add", "--remove", "--", ...authoredPaths])
+  const staged = git(topLevel, ["update-index", "--add", "--remove", "--", ...authoredPaths], undefined, baseEnv)
   if (staged.status !== 0) return unreadable("staging the authored paths", staged)
   const authored = new Set(authoredPaths)
   return { ok: true, expectedDirtyPaths: expectedDirtyPaths.filter((path) => !authored.has(path)) }
 }
 
 /** Put the authored paths' index entries back to `tip`'s; the working tree is untouched. Returns the failure, if any. */
-function unstageAuthoredPaths(repoRoot: string, tip: string, authoredPaths: readonly string[]): string | undefined {
+function unstageAuthoredPaths(
+  repoRoot: string,
+  tip: string,
+  authoredPaths: readonly string[],
+  baseEnv?: NodeJS.ProcessEnv,
+): string | undefined {
   if (authoredPaths.length === 0) return undefined
-  const reset = git(repoRoot, ["reset", "-q", tip, "--", ...authoredPaths.map((path) => `:(top)${path}`)])
+  const reset = git(
+    repoRoot,
+    ["reset", "-q", tip, "--", ...authoredPaths.map((path) => `:(top)${path}`)],
+    undefined,
+    baseEnv,
+  )
   return reset.status === 0 ? undefined : gitDetail(reset)
 }
 
-function readDirt(repoRoot: string): DirtRead {
+function readDirt(repoRoot: string, baseEnv?: NodeJS.ProcessEnv): DirtRead {
   try {
-    return { ok: true, paths: worktreeDirtyPaths(repoRoot) }
+    return { ok: true, paths: worktreeDirtyPaths(repoRoot, baseEnv) }
   } catch (error) {
     return { ok: false, detail: error instanceof Error ? error.message : String(error) }
   }
@@ -719,10 +818,10 @@ function sameSet(left: readonly string[], right: readonly string[]): boolean {
  * timeout.
  */
 export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): CheckoutSyncOutcome {
-  const { repoRoot, from, to, ref } = request
-  if (isBareRepository(repoRoot)) return { ok: true, kind: "bare" }
+  const { repoRoot, from, to, ref, baseEnv } = request
+  if (isBareRepository(repoRoot, baseEnv)) return { ok: true, kind: "bare" }
   if (from !== to) {
-    const branch = checkedOutRef(repoRoot)
+    const branch = checkedOutRef(repoRoot, baseEnv)
     if (branch !== ref) {
       return {
         ok: false,
@@ -737,13 +836,13 @@ export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): Check
   }
 
   // The index must hold `from` (or already `to`) before the two-way merge can be trusted: carry a stale one forward.
-  const carried = carryIndexTo(repoRoot, from, ref, request.expectedDirtyPaths, to)
+  const carried = carryIndexTo(repoRoot, from, ref, request.expectedDirtyPaths, to, baseEnv)
   if (!carried.ok) return carried.outcome
   const repaired = carried.repairedIndexFrom === undefined ? {} : { repairedIndexFrom: carried.repairedIndexFrom }
   const matching =
     from === to
       ? { ok: true as const, paths: [], blockers: [] }
-      : matchingLandingDirt(repoRoot, from, to, carried.expectedDirtyPaths)
+      : matchingLandingDirt(repoRoot, from, to, carried.expectedDirtyPaths, baseEnv)
   if (!matching.ok) {
     return {
       ok: false,
@@ -752,10 +851,10 @@ export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): Check
     }
   }
   const stagedPaths = [...new Set([...(request.authoredPaths ?? []), ...matching.paths])]
-  const authored = stageAuthoredPaths(repoRoot, ref, from, to, stagedPaths, carried.expectedDirtyPaths)
+  const authored = stageAuthoredPaths(repoRoot, ref, from, to, stagedPaths, carried.expectedDirtyPaths, baseEnv)
   if (!authored.ok) return authored.outcome
   if (matching.blockers.length > 0) {
-    const unstage = unstageAuthoredPaths(repoRoot, from, stagedPaths)
+    const unstage = unstageAuthoredPaths(repoRoot, from, stagedPaths, baseEnv)
     return {
       ok: false,
       kind: "worktree-update-refused",
@@ -769,7 +868,7 @@ export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): Check
   }
   const expected = [...authored.expectedDirtyPaths].sort()
   if (from === to) {
-    const current = readDirt(repoRoot)
+    const current = readDirt(repoRoot, baseEnv)
     if (!current.ok) {
       return {
         ok: false,
@@ -797,7 +896,7 @@ export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): Check
     }
     // Current is a claim about the index too: HEAD at `to` over an index that holds some other tree is the
     // stale checkout 25393 reported as current.
-    const indexed = git(repoRoot, readonlyArgs(["diff-index", "--cached", "--quiet", to, "--"]))
+    const indexed = git(repoRoot, readonlyArgs(["diff-index", "--cached", "--quiet", to, "--"]), undefined, baseEnv)
     if (indexed.status !== 0) {
       return {
         ok: false,
@@ -815,9 +914,9 @@ export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): Check
     return { ok: true, kind: "already-current", dirtyPaths: current.paths }
   }
 
-  const merged = git(repoRoot, ["read-tree", "-m", "-u", from, to])
+  const merged = git(repoRoot, ["read-tree", "-m", "-u", from, to], undefined, baseEnv)
   if (merged.status !== 0) {
-    const unstaged = unstageAuthoredPaths(repoRoot, from, stagedPaths)
+    const unstaged = unstageAuthoredPaths(repoRoot, from, stagedPaths, baseEnv)
     const unstageNote =
       unstaged === undefined
         ? ""
@@ -839,7 +938,7 @@ export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): Check
     })
   }
 
-  const remaining = readDirt(repoRoot)
+  const remaining = readDirt(repoRoot, baseEnv)
   if (!remaining.ok) {
     return {
       ok: false,
@@ -1360,12 +1459,23 @@ function capturesEqual(a: CapturedPath, b: CapturedPath): boolean {
   return a.mode === b.mode && a.bytes.equals(b.bytes)
 }
 
-function gitWithInput(repoRoot: string, args: readonly string[], input: Buffer, env?: NodeJS.ProcessEnv): GitOutcome {
-  const result = spawnSync("git", ["-C", repoRoot, ...args], {
-    input,
-    encoding: "utf8",
-    env: { ...process.env, LC_ALL: "C", ...env },
-  })
+function gitWithInput(
+  repoRoot: string,
+  args: readonly string[],
+  input: Buffer,
+  env?: NodeJS.ProcessEnv,
+  baseEnv?: NodeJS.ProcessEnv,
+): GitOutcome {
+  const result = spawnProjectionGit(
+    repoRoot,
+    args,
+    {
+      input,
+      encoding: "utf8",
+      env: { LC_ALL: "C", ...env },
+    },
+    baseEnv,
+  )
   if (result.error !== undefined || result.status === null) {
     return {
       status: result.status ?? 1,
@@ -1381,10 +1491,10 @@ function gitWithIndex(repoRoot: string, index: string, args: readonly string[]):
 }
 
 function readGitBlob(repoRoot: string, oid: string): Buffer {
-  const result = spawnSync("git", ["-C", repoRoot, "cat-file", "blob", oid], {
+  const result = spawnProjectionGit(repoRoot, ["cat-file", "blob", oid], {
     encoding: null,
     maxBuffer: 64 * 1024 * 1024,
-    env: { ...process.env, LC_ALL: "C" },
+    env: { LC_ALL: "C" },
   })
   if (result.status !== 0 || result.error !== undefined) {
     throw new Error(`cannot read baseline blob ${oid}: ${result.stderr?.toString("utf8") ?? String(result.error)}`)

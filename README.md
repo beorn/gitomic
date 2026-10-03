@@ -647,6 +647,14 @@ A write verb addressed to a checkout of it (a path, or a `file://` URL, to a non
 
 ### Projecting a checkout
 
+`synchronizeCheckoutToCommit({ baseEnv })`, `worktreeDirtyPaths(root, baseEnv)`,
+`checkedOutRef(root, baseEnv)` and `isBareRepository(root, baseEnv)` accept an
+exact environment for their native Git children. Omit it to inherit the current
+process environment. When supplied, it replaces that environment; include
+`PATH` and any configuration Git needs. Private overlays, including scratch
+`GIT_INDEX_FILE`, take precedence. Callers remove credentials from their own
+environment before passing it; Gitomic knows no application credential names.
+
 **Decision 2 — retained sources.** The library owns `sourceRef?: string` on `RemoteFirstProjectionRequest` and `ProjectCheckoutRequest`. It defaults to the destination `ref`; an explicit value must be fully qualified under `refs/` and is refused before Git runs otherwise. Set `remote` to a retained repository path and `sourceRef` to its retained ref to project a durable local commit without advancing origin. This proves local durability, not remote publication. Existing callers still fetch their destination branch, but a requested commit now must be that fetched tip or its ancestor: an object merely present in the checkout is refused. Superseded receipts prove the local tip against the same fetched oid. The existing checkout lock, fast-forward CAS, dirt preservation and outcome kinds remain the contract.
 
 Writes land object-side, so a checkout of the written branch goes stale. `gitomic project <path>` fetches the branch (`--remote`, default `origin`; `--ref`, default `main`) and fast-forwards the checkout's index and working tree to it, preserving unrelated dirt; `apply --checkout <path>` does the same right after its write. One stdout line names the outcome: `kind=<kind> local=<oid> to=<oid>`.
