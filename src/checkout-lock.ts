@@ -52,14 +52,15 @@ export type HoldCheckoutLockOutcome =
 export interface HoldCheckoutLockOptions {
   /** Maximum wait for another holder, in ms. `0` tries once. Default {@link DEFAULT_CHECKOUT_LOCK_TIMEOUT_MS}. */
   readonly timeoutMs?: number
-  /** Environment to read {@link CHECKOUT_LOCK_FD_ENV} from. Default `process.env`. */
+  /** Exact environment for the Git resolver and {@link CHECKOUT_LOCK_FD_ENV} lookup. Omission inherits `process.env`. */
   readonly env?: Readonly<Record<string, string | undefined>>
 }
 
 /** `<git-common-dir>/km-state-write.lock` for the repository containing `repoRoot`. Throws when git cannot say. */
-export function checkoutLockPath(repoRoot: string): string {
+export function checkoutLockPath(repoRoot: string, env?: Readonly<NodeJS.ProcessEnv>): string {
   const result = spawnSync("git", ["-C", repoRoot, "rev-parse", "--path-format=absolute", "--git-common-dir"], {
     encoding: "utf8",
+    ...(env === undefined ? {} : { env }),
   })
   const directory = result.stdout?.trim() ?? ""
   if (result.error !== undefined || result.status !== 0 || directory.length === 0) {
@@ -81,7 +82,7 @@ export function checkoutLockPath(repoRoot: string): string {
  * throws — the caller's environment is wrong, and waiting would not fix it.
  */
 export function holdCheckoutLock(repoRoot: string, options: HoldCheckoutLockOptions = {}): HoldCheckoutLockOutcome {
-  const path = checkoutLockPath(repoRoot)
+  const path = checkoutLockPath(repoRoot, options.env)
   const env = options.env ?? process.env
   const inherited = env[CHECKOUT_LOCK_FD_ENV]
   if (inherited !== undefined) return { ok: true, lock: adoptCheckoutLock(path, inherited), borrowed: true }

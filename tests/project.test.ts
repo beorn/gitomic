@@ -34,6 +34,7 @@ import {
   worktreeDirtyPaths,
 } from "../src/index.js"
 import { gitOutcomeForTest } from "../src/project.js"
+import { checkoutLockPath, holdCheckoutLock } from "../src/checkout-lock.ts"
 import { fileURLToPath } from "node:url"
 
 const roots: string[] = []
@@ -408,6 +409,12 @@ describe("gitomic project and checkout synchronization", () => {
 
     test("a crash after clearing the captured path leaves an ordinary projection retry", async () => {
       const { checkout, landAtOrigin } = remoteFixture(true)
+      // Exact invalid UTF-8/NUL bytes in the baseline must survive native blob reads.
+      const binary = Buffer.from([0, 255, 128, 13, 10, 32, 0])
+      writeFileSync(join(checkout, "tracked.md"), binary)
+      git(checkout, "add", "tracked.md")
+      git(checkout, "commit", "-qm", "Synthetic binary baseline")
+      git(checkout, "push", "-q", "origin", "main")
       writeFileSync(join(checkout, "tracked.md"), "# direct local edit\n")
       const localTip = git(checkout, "rev-parse", "HEAD")
       const remoteTip = landAtOrigin("tracked.md", "# remote edit\n")
@@ -423,7 +430,7 @@ describe("gitomic project and checkout synchronization", () => {
       ).rejects.toThrow("crash")
       const saved = git(checkout, "for-each-ref", "--format=%(refname)", "refs/preserve/state-checkout/")
       expect(git(checkout, "rev-parse", "HEAD")).toBe(localTip)
-      expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# original\n")
+      expect(readFileSync(join(checkout, "tracked.md"))).toEqual(binary)
       expect(git(checkout, "show", `${saved}:tracked.md`)).toBe("# direct local edit")
 
       const retried = await projectCheckoutWithSetAside({ repoRoot: checkout })
@@ -615,6 +622,59 @@ describe("gitomic project and checkout synchronization", () => {
         expectedDirtyPaths: [],
       })
       expect(outcome).toEqual({ ok: true, kind: "bare" })
+    })
+
+    test("sync projection uses an exact caller environment and preserves its private scratch index", () => {
+      const { checkout, landAtOrigin } = remoteFixture()
+      const to = landAtOrigin("tracked.md", "# environment projection\n")
+      git(checkout, "fetch", "-q", "origin", "main")
+      git(checkout, "update-ref", "refs/heads/main", to)
+      writeFileSync(join(checkout, "unrelated.md"), "keep me\n")
+      vi.stubEnv("GITOMIC_SYNTHETIC_SECRET", "synthetic-private-value")
+      const spawned = vi.mocked(spawnSync)
+      spawned.mockClear()
+      worktreeDirtyPaths(checkout)
+      expect(spawned.mock.calls.length).toBeGreaterThan(0)
+      for (const call of spawned.mock.calls) expect(call[2]?.env).toEqual({ ...process.env, LC_ALL: "C" })
+      spawned.mockClear()
+      const baseEnv = {
+        ...process.env,
+        GITOMIC_SYNTHETIC_SECRET: undefined,
+        GITOMIC_MARKER: "explicit",
+        GIT_INDEX_FILE: join(checkout, ".git", "index"),
+      }
+      const outcome = synchronizeCheckoutToCommit({
+        repoRoot: checkout,
+        from: to,
+        to,
+        ref: "refs/heads/main",
+        expectedDirtyPaths: ["tracked.md", "unrelated.md"],
+        baseEnv,
+      })
+      expect(outcome).toMatchObject({ ok: true, kind: "synchronized", dirtyPaths: ["unrelated.md"] })
+      expect(readFileSync(join(checkout, "unrelated.md"), "utf8")).toBe("keep me\n")
+      expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# environment projection\n")
+      const calls = spawned.mock.calls
+      expect(calls.length).toBeGreaterThan(0)
+      for (const call of calls) {
+        expect(call[2]?.env?.GITOMIC_SYNTHETIC_SECRET).toBeUndefined()
+        expect(call[2]?.env?.GITOMIC_MARKER).toBe("explicit")
+      }
+      const scratch = calls.find((call) => (call[1] as string[]).includes("write-tree"))
+      expect(scratch).toBeDefined()
+      expect(scratch![2]?.env?.GIT_INDEX_FILE).not.toBe(baseEnv.GIT_INDEX_FILE)
+      spawned.mockClear()
+      checkoutLockPath(checkout)
+      expect(spawned.mock.calls).toHaveLength(1)
+      expect(spawned.mock.calls[0]![2]).not.toHaveProperty("env")
+      spawned.mockClear()
+      const held = holdCheckoutLock(checkout, { timeoutMs: 0, env: baseEnv })
+      expect(held.ok).toBe(true)
+      if (!held.ok) throw new Error("native synthetic lock was busy")
+      held.lock.release()
+      expect(spawned.mock.calls).toHaveLength(1)
+      expect(spawned.mock.calls[0]![2]?.env?.GITOMIC_MARKER).toBe("explicit")
+      expect(spawned.mock.calls[0]![2]?.env?.GITOMIC_SYNTHETIC_SECRET).toBeUndefined()
     })
 
     test("synchronizeCheckoutToCommit refuses when on wrong branch", () => {
