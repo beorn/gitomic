@@ -22,7 +22,7 @@ import {
 import type { GitObject, GitTreeObjectEntry } from "./git-object.js"
 import { createDurableObjectWriter } from "./iso-durable.ts"
 import { rejectLegacyProvenance } from "./options.ts"
-import { assertGitPrefixMatched, assertRegularBlob, normalizePrefix } from "./path.ts"
+import { assertGitPrefixMatched, assertRegularBlob, normalizePath, normalizePrefix } from "./path.ts"
 import { createShellRuntime } from "./shell.ts"
 import { assertTreeEntryMode } from "./types.ts"
 import type { BlobValue, CommitInput, GitomicBackend, Oid, TreeEntry, TreeEntryMode, TreeListing } from "./types.js"
@@ -55,19 +55,29 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
     return gitdir
   }
 
+  /**
+   * Prove a tree object's bytes round-trip: re-encoding its entries (trees as the encoder's own `40000`, non-trees at
+   * the real mode Git reported) must reproduce the object id it was read from. This is the UTF-8 and canonical Git
+   * tree-order check (27226); it says nothing about whether a mode is ACCEPTABLE, which is decided where an entry is
+   * exposed. `label` is the commit a refusal names, as `readTree` names it.
+   */
+  const assertCanonicalTree = (
+    entries: readonly { type: string; mode: string; path: string; oid: string }[],
+    treeOid: Oid,
+    label: Oid,
+  ): void => {
+    const canonicalEntries = entries.map((entry): GitTreeObjectEntry => {
+      if (entry.type === "tree") return { mode: "40000", path: entry.path, oid: entry.oid }
+      return { mode: assertTreeEntryMode(entry.mode, entry.path, label), path: entry.path, oid: entry.oid }
+    })
+    if (encodeTreeEntries(canonicalEntries).oid !== treeOid) {
+      throw new Error(`Git tree ${treeOid} contains path bytes that are not valid UTF-8 or canonical Git tree order`)
+    }
+  }
+
   const loadTree = async (gitdir: string, oid: Oid, commit: Oid, prefix = "", readPrefix = ""): Promise<TreeNode> => {
     const result = await readTree({ fs, gitdir, oid, cache })
-    if (readPrefix === "") {
-      const canonicalEntries = result.tree.map((entry): GitTreeObjectEntry => {
-        if (entry.type === "tree") return { mode: "40000", path: entry.path, oid: entry.oid }
-        // The real mode, so the canonical-order check below still proves UTF-8 and tree order for an admitted mode
-        // (27226): acceptability is decided where the entry is exposed, not by rewriting it here.
-        return { mode: assertTreeEntryMode(entry.mode, entry.path, commit), path: entry.path, oid: entry.oid }
-      })
-      if (encodeTreeEntries(canonicalEntries).oid !== oid) {
-        throw new Error(`Git tree ${oid} contains path bytes that are not valid UTF-8 or canonical Git tree order`)
-      }
-    }
+    if (readPrefix === "") assertCanonicalTree(result.tree, oid, commit)
     const entries = new Map<string, TreeNode | BlobEntry>()
     await Promise.all(
       result.tree.map(async (entry) => {
@@ -111,6 +121,34 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
     visit(root, "")
     assertGitPrefixMatched(listing.size, repo, oid, normalizedPrefix)
     return listing
+  }
+
+  /**
+   * Resolve ONE exact path by walking the tree from its root: isomorphic-git has no scoped tree read, so this reads
+   * one tree object per path component instead of the whole tree and its canonical check runs at each level. A missing
+   * component answers `undefined`, as does a final entry that is a tree — `listTree` recurses trees away, so a
+   * directory is not a listing member. A non-tree entry's mode is narrowed through the same `assertTreeEntryMode`
+   * boundary `listTree` uses.
+   */
+  const readTreeExact = async (repo: string, oid: Oid, path: string): Promise<TreeEntry | undefined> => {
+    const normalized = normalizePath(path)
+    const gitdir = await resolveGitDir(repo)
+    const { commit } = await readCommit({ fs, gitdir, oid, cache })
+    const parts = normalized.split("/")
+    let treeOid = commit.tree
+    for (let index = 0; index < parts.length; index += 1) {
+      const result = await readTree({ fs, gitdir, oid: treeOid, cache })
+      assertCanonicalTree(result.tree, treeOid, oid)
+      const entry = result.tree.find((candidate) => candidate.path === parts[index])
+      if (entry === undefined) return undefined
+      if (index === parts.length - 1) {
+        if (entry.type === "tree") return undefined
+        return { oid: entry.oid, mode: assertTreeEntryMode(entry.mode, normalized, oid) }
+      }
+      if (entry.type !== "tree") return undefined
+      treeOid = entry.oid
+    }
+    return undefined
   }
 
   const readBlobBatch = async (repo: string, oids: readonly Oid[]): Promise<ReadonlyMap<Oid, BlobValue>> => {
@@ -260,6 +298,7 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
       return (await refStorage(repo)) === "files" ? resolveRef({ fs, gitdir, ref }) : shell.head(repo, ref)
     },
     readTree: listTree,
+    readTreeExact,
     readBlobs: readBlobBatch,
     readCommit: async (repo, oid) => {
       validateOid(oid)

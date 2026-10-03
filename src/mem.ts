@@ -33,7 +33,7 @@ import type {
   TreeListing,
 } from "./types.js"
 import { rejectLegacyProvenance, validateRefNames } from "./options.ts"
-import { assertGitPrefixMatched, normalizePrefix } from "./path.ts"
+import { assertGitPrefixMatched, normalizePath, normalizePrefix } from "./path.ts"
 
 type MemCommit = {
   oid: Oid
@@ -120,6 +120,16 @@ export function createMemBackend(): GitomicBackend {
     }
     assertGitPrefixMatched(listing.size, name, commit, normalizedPrefix)
     return listing
+  }
+
+  const readTreeExact = async (name: string, commit: Oid, path: string): Promise<TreeEntry | undefined> => {
+    const repo = getRepo(name)
+    const found = repo.commits.get(commit)
+    if (found === undefined) throw new Error(`unknown commit: ${commit}`)
+    const normalized = normalizePath(path)
+    const content = found.files.get(normalized)
+    if (content === undefined) return undefined
+    return { oid: blobOid(repo, content), mode: "100644" }
   }
 
   const readBlobs = async (name: string, oids: readonly Oid[]): Promise<ReadonlyMap<Oid, BlobValue>> => {
@@ -307,6 +317,7 @@ export function createMemBackend(): GitomicBackend {
         return parseCommit(oid, found.content)
       }),
     readTree,
+    readTreeExact,
     readBlobs,
     writeCommit,
     compareAndSwap,

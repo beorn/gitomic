@@ -38,7 +38,7 @@ import {
 } from "./errors.ts"
 import { cloneIdent, GITOMIC_IDENT, validateOid } from "./git-object.ts"
 import { assertTreeShape, normalizePath, normalizePrefix } from "./path.ts"
-import { assertExposed, readLazyBase, readLazyBaseExposed, type LazyBase } from "./lazy-base.ts"
+import { assertExposed, createSnapshotBase, readLazyBase, type LazyBase } from "./lazy-base.ts"
 import { createShellBackend } from "./shell.ts"
 import type {
   Candidate,
@@ -798,41 +798,45 @@ function makeSnapshot(
   const pinned = (commit === undefined ? resolveCurrent().then(backendOid) : Promise.resolve(validateOid(commit))).then(
     (oid) => ({ oid, algorithm: oid.length === 64 ? ("sha256" as const) : ("sha1" as const) }),
   )
-  // ONE whole-tree listing for the snapshot's whole life, pinned at its one commit: readTree runs ls-tree with no
-  // pathspec, so a prefix-scoped read listed the whole tree anyway and filtered it in JS, and the old cache was
-  // keyed by prefix (a whole file path), so a session naming n distinct paths paid n whole-tree listings. The root
-  // listing answers oid, has and keys(prefix), and a value is fetched by oid only when get asks.
+  // TWO questions, two entry points, ONE map (27226 part 2, @cto 0f5c2039). `get`/`oid`/`has` resolve an EXACT
+  // path through one scoped lookup, memoised in the map, so a session naming n distinct paths pays n small children
+  // and a repeat pays nothing; `keys(prefix)` loads the WHOLE listing once, keeps it, and its `startsWith` contract
+  // is exactly what it always was. Once the whole listing is loaded every later exact path answers from the map with
+  // no child; the exact lookup never answers `keys`, and `keys` never assembles from partial lookups.
   //
-  // The listing is read with the "caller" exposure and each verb validates only the paths it EXPOSES (27226): a
+  // The map is read with the "caller" exposure and each verb validates only the paths it EXPOSES (27226): a
   // whole-tree refusal here would charge every read for the whole tree (measured 15-20 ms of assertion on STATE's
   // 25,138 entries) and would refuse a tree wholesale where the refusal was always scoped to what a read exposes
-  // (tests/iso.test.ts "scopes reader blob validation to the requested path prefix"). A path or prefix the listing
-  // does not hold stays an empty view, with no second read.
-  const root = pinned.then(({ oid }) => readLazyBaseExposed(context.backend, context.repo, oid))
-  const scope = async (paths: readonly string[]): Promise<LazyBase> => {
+  // (tests/iso.test.ts "scopes reader blob validation to the requested path prefix"). A path or prefix the map does
+  // not hold stays an empty view.
+  const root = pinned.then(({ oid }) => createSnapshotBase(context.backend, context.repo, oid))
+  const scope = async (path: string): Promise<LazyBase> => {
     const base = await root
-    assertExposed(base.listing, paths)
+    await base.resolveExact(path)
+    assertExposed(base.listing, [path])
     return base
   }
   return {
     async get(path) {
       const normalized = normalizePath(path)
-      return (await scope([normalized])).get(normalized)
+      return (await scope(normalized)).get(normalized)
     },
     async oid(path) {
       const normalized = normalizePath(path)
-      // Straight from the listing — never through a decoded value — so it answers for a binary blob `get` would
+      // Straight from the map — never through a decoded value — so it answers for a binary blob `get` would
       // refuse, and it is exactly the blob `apply`'s `expect` compares.
-      return (await scope([normalized])).oid(normalized)
+      return (await scope(normalized)).oid(normalized)
     },
     async has(path) {
       const normalized = normalizePath(path)
-      return (await scope([normalized])).has(normalized)
+      return (await scope(normalized)).has(normalized)
     },
     async keys(prefix = "") {
       const normalized = normalizePrefix(prefix)
       const base = await root
-      // A JS string prefix, exactly as readTree filtered before it (the path-prefix question is 27226 part 2).
+      // A JS string prefix, exactly as readTree filtered before it: loading the whole listing is what keeps that
+      // contract, where pushing the prefix to Git would return only the pathspec's own answer (27226 part 2).
+      await base.wholeListing()
       const exposed = [...base.listing.keys()].filter((path) => path.startsWith(normalized))
       assertExposed(base.listing, exposed)
       return base

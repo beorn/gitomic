@@ -242,6 +242,22 @@ export type GitomicBackend = {
    */
   readTree(repo: string, commit: Oid, prefix?: string): Promise<TreeListing>
   /**
+   * Resolve ONE exact path in `commit`'s tree — a scoped lookup, not a listing:
+   * the backend runs `git ls-tree -z --full-tree <commit> -- <path>` (or its
+   * equivalent) and answers that path's entry, or `undefined` when the tree
+   * holds no entry there. A directory answers `undefined` too: a listing recurses
+   * trees away, so a tree entry is not a member of the listing vocabulary, and a
+   * caller asking `has`/`oid`/`get` for a directory is asking a question whose
+   * answer is "no regular blob here".
+   *
+   * A mode outside the listing vocabulary is still REFUSED by name, exactly as
+   * `readTree` refuses it — the same `assertTreeEntryMode` boundary. This is the
+   * second entry point of the same question `readTree` answers, and its answer for
+   * a path `readTree` lists is that path's entry, byte for byte (27226 part 2,
+   * @cto 0f5c2039).
+   */
+  readTreeExact(repo: string, commit: Oid, path: string): Promise<TreeEntry | undefined>
+  /**
    * Read the named blobs, by oid, in ONE read. The oids are deduplicated; an
    * oid the repository does not hold, or that is not a blob, throws naming it.
    *

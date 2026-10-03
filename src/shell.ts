@@ -33,7 +33,7 @@ import {
   transactionMatches,
   validateOid,
 } from "./git-object.ts"
-import { assertGitPrefixMatched, normalizePrefix } from "./path.ts"
+import { assertGitPrefixMatched, normalizePath, normalizePrefix } from "./path.ts"
 import { assertTreeEntryMode } from "./types.ts"
 import type {
   BlobValue,
@@ -214,6 +214,7 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
       return parseCommit(oid, output.subarray(newline + 1, newline + 1 + size))
     },
     readTree: async (repo, commit, prefix) => readTree(await resolveGitDir(repo), commit, prefix, baseEnv),
+    readTreeExact: async (repo, commit, path) => readTreeExact(await resolveGitDir(repo), commit, path, baseEnv),
     readBlobs: async (repo, oids) => readBlobs(await resolveGitDir(repo), oids, baseEnv),
     // A completed commit is unreferenced until the compare-and-swap below adopts
     // it. Gitomic writes NO ref to protect that window: Git's default gc grace
@@ -788,6 +789,55 @@ async function readTree(repo: string, commit: Oid, prefix?: string, baseEnv?: No
   }
   assertGitPrefixMatched(entries.size, repo, commit, normalizedPrefix)
   return entries
+}
+
+/**
+ * One `ls-tree -z --full-tree <commit> -- <path>`: Git resolves the exact path as a LITERAL pathspec and prints at
+ * most one entry, so this reads one path instead of listing the whole tree. A path the tree does not hold prints
+ * nothing and answers `undefined` — a missing path is a legitimate answer here, not `GitPrefixNotFoundError`.
+ *
+ * The `:(literal)` magic keeps a path that carries glob characters from being read as a pathspec pattern, so the
+ * lookup names the byte path the listing would name. A directory prints its tree entry (type `tree`), which is not a
+ * member of the listing vocabulary because `readTree` recurses trees away, so it answers `undefined` too; a
+ * non-tree entry's mode is narrowed and refused by name through the same `assertTreeEntryMode` boundary readTree uses.
+ */
+async function readTreeExact(
+  repo: string,
+  commit: Oid,
+  path: string,
+  baseEnv?: NodeJS.ProcessEnv,
+): Promise<TreeEntry | undefined> {
+  const normalized = normalizePath(path)
+  const output = await git(repo, ["ls-tree", "-z", "--full-tree", commit, "--", `:(literal)${normalized}`], {
+    baseEnv,
+  })
+  const records = decodeUtf8(output, "Git tree paths").split("\0")
+  let found: TreeEntry | undefined
+  for (const record of records) {
+    if (!record) continue
+    const separator = record.indexOf("\t")
+    if (separator < 0) throw new Error("git ls-tree returned a malformed record")
+    const metadata = record.slice(0, separator).split(" ")
+    const mode = metadata[0]
+    const type = metadata[1]
+    const oid = metadata[2]
+    const listedPath = record.slice(separator + 1)
+    if (mode === undefined || type === undefined || oid === undefined) {
+      throw new Error("git ls-tree returned malformed entry metadata")
+    }
+    if (listedPath !== normalized) {
+      throw new Error(
+        `git ls-tree resolved ${JSON.stringify(normalized)} to ${JSON.stringify(listedPath)}; the exact lookup must name one path`,
+      )
+    }
+    if (found !== undefined) {
+      throw new Error(`git ls-tree returned more than one entry for the exact path ${JSON.stringify(normalized)}`)
+    }
+    // A tree entry is not a listing member (`readTree` recurses trees away), so a directory answers "no blob here".
+    found = type === "tree" ? undefined : { oid, mode: assertTreeEntryMode(mode, listedPath, commit) }
+    if (type === "tree") return undefined
+  }
+  return found
 }
 
 /** One `cat-file --batch` for the distinct oids; a missing object or a non-blob fails naming the oid. */

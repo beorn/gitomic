@@ -1,6 +1,6 @@
 import { objectOid } from "./git-object.ts"
 import { assertRegularBlob, assertTreeShape, isPublicPath, normalizePath } from "./path.ts"
-import type { BlobValue, GitomicBackend, Oid, TreeListing } from "./types.js"
+import type { BlobValue, GitomicBackend, Oid, TreeEntry, TreeListing } from "./types.js"
 import { assertUtf8, decodeUtf8 } from "./utf8.ts"
 
 /**
@@ -18,11 +18,10 @@ import { assertUtf8, decodeUtf8 } from "./utf8.ts"
  * A transaction's LazyBase is created inside one attempt and never outlives
  * it: a CAS replay builds a new one on the new parent, so no memoised value
  * crosses parents. A Snapshot keeps ONE LazyBase for its whole life, pinned at
- * its one commit and read with no prefix — a prefix-scoped read listed the
- * whole tree and filtered it in JS, so a per-prefix base only multiplied that
- * one listing; `keys(prefix)` now filters this listing. A value the Snapshot
- * memoises can never go stale; a read that failed is not memoised, so a later
- * read of the same path asks the backend again.
+ * its one commit, over the one map `createSnapshotBase` grows — a whole listing
+ * for `keys(prefix)`, or a memoised exact entry per path asked (27226 part 2).
+ * A value the Snapshot memoises can never go stale; a read that failed is not
+ * memoised, so a later read of the same path asks the backend again.
  */
 export type LazyBase = {
   readonly listing: TreeListing
@@ -62,7 +61,7 @@ export async function readLazyBase(
  * THE policy site for a listing exposed WHOLE: every entry must be a regular blob and the paths must be a tree,
  * refused by name before any value can be read. A transaction takes this exposure, so a base tree holding a
  * symlink or a gitlink refuses the write whatever paths it names. A reader that validates only what each verb
- * EXPOSES passes "caller" and calls this itself with the paths that verb exposes (see readLazyBaseExposed).
+ * EXPOSES passes "caller" and calls this itself with the paths that verb exposes (see createSnapshotBase).
  *
  * One predicate decides a supported mode: assertRegularBlob in path.ts, called from here and from that verb site,
  * never a second mode test (27226, @cto acb610e6).
@@ -76,14 +75,57 @@ export function assertExposed(listing: TreeListing, paths: readonly string[]): v
 }
 
 /**
- * Read a commit's whole listing for a reader that validates only what it EXPOSES (27226). A Snapshot names one
- * listing for its whole life and answers every verb from it, so the whole-tree refusal a transaction wants would
- * charge every read for the whole tree and would refuse a tree wholesale where the refusal was always scoped to
- * the paths a read exposes (tests/iso.test.ts "scopes reader blob validation to the requested path prefix").
- * The caller validates each verb's scope with assertExposed.
+ * The tree access of one Snapshot: ONE listing map that answers BOTH of a reader's questions, at the same commit
+ * (27226 part 2, @cto 0f5c2039).
+ *
+ * `keys(prefix)` is the whole-listing question. It loads `readTree` once and keeps it, so the one listing answers
+ * every later `keys` and every later exact path, and its `startsWith` contract is exactly what it always was.
+ *
+ * `get`/`oid`/`has` are the exact-path question. Each distinct path costs ONE scoped lookup (`readTreeExact`, one
+ * small `ls-tree` child on the shell backend) memoised into that same map, so a repeat costs nothing; a path the
+ * tree does not hold is remembered as absent too. The exact lookup NEVER answers `keys`, and `keys` never assembles
+ * from partial lookups — the map holds a subset of one whole listing, never a different tree.
+ *
+ * The base that reads VALUES is the ordinary LazyBase over that same live map, so the blob memo, the batching and
+ * the read-error wrapping are the one implementation, not a second. Exposure is "caller": each verb validates the
+ * paths it exposes with `assertExposed`, so a whole-tree refusal is not charged to a one-path read (27226), and the
+ * one `assertRegularBlob` predicate still decides acceptability at both entry points.
  */
-export async function readLazyBaseExposed(backend: GitomicBackend, repo: string, commit: Oid): Promise<LazyBase> {
-  return createLazyBase(backend, repo, commit, await backend.readTree(repo, commit), "caller")
+export type SnapshotBase = LazyBase & {
+  /** Resolve the exact path through the one map; the first ask costs one scoped lookup, a repeat nothing. */
+  resolveExact(path: string): Promise<void>
+  /** Load and keep the whole listing, so every later `keys` and every later exact path answers with no read. */
+  wholeListing(): Promise<void>
+}
+
+export function createSnapshotBase(backend: GitomicBackend, repo: string, commit: Oid): SnapshotBase {
+  const entries = new Map<string, TreeEntry>()
+  const base = createLazyBase(backend, repo, commit, entries, "caller")
+  const resolved = new Set<string>()
+  let whole: Promise<void> | undefined
+  const loadWhole = (): Promise<void> => {
+    whole ??= (async () => {
+      for (const [path, entry] of await backend.readTree(repo, commit)) entries.set(path, entry)
+    })()
+    return whole
+  }
+  return {
+    ...base,
+    async wholeListing() {
+      await loadWhole()
+    },
+    async resolveExact(path) {
+      if (whole !== undefined) {
+        await whole
+        return
+      }
+      const normalized = normalizePath(path)
+      if (resolved.has(normalized)) return
+      const entry = await backend.readTreeExact(repo, commit, normalized)
+      if (entry !== undefined) entries.set(normalized, entry)
+      resolved.add(normalized)
+    },
+  }
 }
 
 /** A lazy base over a listing already read: values fetched by oid on demand. */

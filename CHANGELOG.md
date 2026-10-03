@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.10.0 — 2026-10-03
 
 ### Breaking
 
@@ -11,6 +11,28 @@
   Custom backends must implement the local array arm: a prefix-only implementation
   fails at its first array call. The external custom-backend population is unknown.
   This backend migration belongs in the next minor release on 0.x.
+
+- `GitomicBackend.readTreeExact(repo, commit, path)` is required (27226 part 2):
+  the second tree entry point a Snapshot reads through. `get`, `oid` and `has`
+  resolve one exact path with one scoped read — `git ls-tree -z --full-tree
+<commit> -- <path>` on the shell backend — instead of listing the whole tree.
+  A path the tree does not hold answers `undefined`, and so does a directory,
+  because a listing recurses trees away; a mode outside the listing vocabulary is
+  refused by name, exactly as `readTree` refuses it. Custom backends must
+  implement it, and its answer for a path `readTree` lists must be that path's
+  entry byte for byte.
+
+### Added
+
+- A Snapshot has TWO entry points over ONE listing map (27226 part 2, @cto
+  0f5c2039). `get`/`oid`/`has` take one scoped lookup per distinct path, memoised,
+  so a reader naming n paths pays n small children and a repeat costs nothing;
+  `keys(prefix)` still loads the whole listing once and keeps its `startsWith`
+  contract, and once that listing is loaded every later exact read answers from it
+  with no child. A batch caller that already knows its paths loads the listing once
+  before reading them — km's authored land does — so a 300-path land is one
+  listing and zero per-path children. The exact lookup never answers `keys`, and
+  `keys` never assembles from partial lookups.
 
 ## 0.9.0 — 2026-09-30
 
