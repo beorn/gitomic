@@ -34,6 +34,7 @@ import {
   validateOid,
 } from "./git-object.ts"
 import { assertGitPrefixMatched, normalizePrefix } from "./path.ts"
+import { assertTreeEntryMode } from "./types.ts"
 import type {
   BlobValue,
   CommitInput,
@@ -783,7 +784,7 @@ async function readTree(repo: string, commit: Oid, prefix?: string, baseEnv?: No
       throw new Error("git ls-tree returned malformed entry metadata")
     }
     if (!path.startsWith(normalizedPrefix)) continue
-    entries.set(path, { oid, mode })
+    entries.set(path, { oid, mode: assertTreeEntryMode(mode, path, commit) })
   }
   assertGitPrefixMatched(entries.size, repo, commit, normalizedPrefix)
   return entries

@@ -9,6 +9,7 @@
 import { describe, expect, test } from "vitest"
 
 import { apply, createShellBackend, open, type GitomicBackend } from "../src/index.js"
+import { assertTreeEntryMode } from "../src/types.js"
 import { createIsoBackend } from "../src/iso.js"
 import { createBareRepo, git, gitWithInput } from "./helpers/git.js"
 
@@ -37,6 +38,20 @@ async function createExecutableRepo(): Promise<{ repo: string; cleanup(): Promis
 async function modeAt(repo: string, commit: string, path: string): Promise<string> {
   return (await git(repo, "ls-tree", commit, "--", path)).split(" ")[0] ?? ""
 }
+
+describe("the listing mode vocabulary", () => {
+  test("admits each of the four listing modes as its own literal", () => {
+    for (const mode of ["100644", "100755", "120000", "160000"] as const) {
+      expect(assertTreeEntryMode(mode, "a/b", "commit")).toBe(mode)
+    }
+  })
+
+  test("refuses an out-of-vocabulary mode by name, path and commit", () => {
+    expect(() => assertTreeEntryMode("123456", "foreign", "abc123")).toThrow(
+      'Git tree abc123 has unsupported mode 123456 at "foreign"',
+    )
+  })
+})
 
 describe.each(backends)("modes through the $name backend", ({ name, backend }) => {
   async function withStore(run: (store: Awaited<ReturnType<typeof open>>, repo: string) => Promise<void>) {

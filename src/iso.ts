@@ -24,12 +24,13 @@ import { createDurableObjectWriter } from "./iso-durable.ts"
 import { rejectLegacyProvenance } from "./options.ts"
 import { assertGitPrefixMatched, assertRegularBlob, normalizePrefix } from "./path.ts"
 import { createShellRuntime } from "./shell.ts"
-import type { BlobValue, CommitInput, GitomicBackend, Oid, TreeEntry, TreeListing } from "./types.js"
+import { assertTreeEntryMode } from "./types.ts"
+import type { BlobValue, CommitInput, GitomicBackend, Oid, TreeEntry, TreeEntryMode, TreeListing } from "./types.js"
 import { decodeBlob } from "./utf8.ts"
 
 type BlobEntry = {
   kind: "blob" | "commit"
-  mode: string
+  mode: TreeEntryMode
   oid: Oid
 }
 
@@ -54,14 +55,14 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
     return gitdir
   }
 
-  const loadTree = async (gitdir: string, oid: Oid, prefix = "", readPrefix = ""): Promise<TreeNode> => {
+  const loadTree = async (gitdir: string, oid: Oid, commit: Oid, prefix = "", readPrefix = ""): Promise<TreeNode> => {
     const result = await readTree({ fs, gitdir, oid, cache })
     if (readPrefix === "") {
       const canonicalEntries = result.tree.map((entry): GitTreeObjectEntry => {
         if (entry.type === "tree") return { mode: "40000", path: entry.path, oid: entry.oid }
-        // The real mode, so the canonical-order check below still proves UTF-8 and tree order for a foreign mode
+        // The real mode, so the canonical-order check below still proves UTF-8 and tree order for an admitted mode
         // (27226): acceptability is decided where the entry is exposed, not by rewriting it here.
-        return { mode: entry.mode, path: entry.path, oid: entry.oid }
+        return { mode: assertTreeEntryMode(entry.mode, entry.path, commit), path: entry.path, oid: entry.oid }
       })
       if (encodeTreeEntries(canonicalEntries).oid !== oid) {
         throw new Error(`Git tree ${oid} contains path bytes that are not valid UTF-8 or canonical Git tree order`)
@@ -77,9 +78,13 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
           (entry.type === "tree" && readPrefix.startsWith(`${path}/`))
         if (!intersects) return
         if (entry.type === "tree") {
-          entries.set(entry.path, await loadTree(gitdir, entry.oid, path, readPrefix))
+          entries.set(entry.path, await loadTree(gitdir, entry.oid, commit, path, readPrefix))
         } else {
-          entries.set(entry.path, { kind: entry.type, mode: entry.mode, oid: entry.oid })
+          entries.set(entry.path, {
+            kind: entry.type,
+            mode: assertTreeEntryMode(entry.mode, path, commit),
+            oid: entry.oid,
+          })
         }
       }),
     )
@@ -91,7 +96,7 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
     const normalizedPrefix = prefix === undefined ? "" : normalizePrefix(prefix)
     const gitdir = await resolveGitDir(repo)
     const { commit } = await readCommit({ fs, gitdir, oid, cache })
-    const root = await loadTree(gitdir, commit.tree, "", normalizedPrefix)
+    const root = await loadTree(gitdir, commit.tree, oid, "", normalizedPrefix)
     const listing = new Map<string, TreeEntry>()
     const visit = (node: TreeNode, prefix: string): void => {
       for (const [name, entry] of node.entries) {
@@ -194,7 +199,7 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
     // shell's commit-tree refuses a missing parent; an object writer would not,
     // so check the kept commits exist before writing anything that names them.
     for (const kept of parents.slice(1)) await readCommit({ fs, gitdir, oid: kept, cache })
-    const root = await loadTree(gitdir, parentResult.commit.tree)
+    const root = await loadTree(gitdir, parentResult.commit.tree, input.parent)
     const objects = new Map<Oid, GitObject>()
     const blobs = new Map<string, Oid>()
     for (const [path, content] of input.changes) {

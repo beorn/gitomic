@@ -1,6 +1,16 @@
 import { createHash } from "node:crypto"
 
-import type { BlobValue, CommitInput, CommitMeta, CommitProvenance, Ident, Oid, RefUpdate, Trailer } from "./types.js"
+import type {
+  BlobValue,
+  CommitInput,
+  CommitMeta,
+  CommitProvenance,
+  GitTreeObjectEntryMode,
+  Ident,
+  Oid,
+  RefUpdate,
+  Trailer,
+} from "./types.js"
 import { Conflict } from "./errors.ts"
 import { assertUtf8, decodeUtf8 } from "./utf8.ts"
 
@@ -33,11 +43,12 @@ export type GitObject = {
 
 export type GitTreeObjectEntry = {
   /**
-   * The mode this entry carries. Widened to the reported mode (27226, @cto acb610e6): the ISO backend's canonical
-   * check must encode a foreign entry with the mode Git actually has to prove tree order and UTF-8, and the writer
-   * below reaches here only after assertRegularBlob admitted the mode, so only 100644/100755/40000 are ever written.
+   * The mode this entry carries: the listing vocabulary widened by the tree mode this layer alone can see (27226,
+   * @cto 6c07a697). The ISO backend's canonical check must encode an admitted entry with the mode Git actually has
+   * to prove tree order and UTF-8, and the writer below reaches here only after assertRegularBlob admitted the mode,
+   * so only 100644/100755/40000 are ever written — but never `string`, so a switch over modes stays exhaustive.
    */
-  mode: string
+  mode: GitTreeObjectEntryMode
   path: string
   oid: Oid
 }

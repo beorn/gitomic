@@ -183,15 +183,46 @@ export type CommitMeta = {
 /** A changed projected blob identity; mode-only changes are not represented. */
 export type Change = { path: string; from: Oid | null; to: Oid | null }
 
+/**
+ * The four modes a tree listing exposes: regular blob, executable blob, symlink and gitlink. A listing tells the
+ * truth about the tree it read, so a mode Git reports outside this finite vocabulary is REFUSED by name at the read
+ * boundary (27226, @cto 6c07a697) rather than carried as data. Whether an ADMITTED mode is acceptable where an
+ * entry is EXPOSED stays the one predicate, `assertRegularBlob` in path.ts.
+ */
+export type TreeEntryMode = "100644" | "100755" | "120000" | "160000"
+
+/** The modes a raw tree-object entry may carry: the four above plus the tree mode the encoder writes. */
+export type GitTreeObjectEntryMode = TreeEntryMode | "40000"
+
+const TREE_ENTRY_MODES: ReadonlySet<string> = new Set<string>(["100644", "100755", "120000", "160000"])
+
+/**
+ * Narrow a mode Git reported to the listing vocabulary, refusing an entry outside it by name — mode, path and
+ * commit — before any entry is built. Git's vocabulary is finite; a mode gitomic does not understand must not flow
+ * through as data until something downstream assumes.
+ */
+export function assertTreeEntryMode(mode: string, path: string, commit: Oid): TreeEntryMode {
+  if (TREE_ENTRY_MODES.has(mode)) return mode as TreeEntryMode
+  throw new Error(
+    "Git tree " +
+      commit +
+      " has unsupported mode " +
+      mode +
+      " at " +
+      JSON.stringify(path) +
+      "; a listing carries only 100644, 100755, 120000 and 160000",
+  )
+}
+
 /** One regular blob of a tree listing: its object id and its mode. */
 export type TreeEntry = {
   readonly oid: Oid
   /**
-   * The mode Git reported for this entry. Widened from the two regular-blob modes (27226, @cto acb610e6): a listing
-   * now tells the truth about the tree it read, and whether a mode is ACCEPTABLE is a policy applied where an entry
-   * is EXPOSED — `assertRegularBlob` in path.ts, the one predicate — never by a backend dropping or rewriting it.
+   * The mode Git reported for this entry, drawn from the listing vocabulary above. Whether that mode is ACCEPTABLE
+   * is a policy applied where the entry is EXPOSED — `assertRegularBlob` in path.ts, the one predicate — never by a
+   * backend dropping or rewriting it (27226, @cto acb610e6 + 6c07a697).
    */
-  readonly mode: string
+  readonly mode: TreeEntryMode
 }
 
 /** A tree's regular blobs by path, with no value decoded: what a transaction is strict about. */
