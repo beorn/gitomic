@@ -37,8 +37,8 @@ import {
   TreePathCollision,
 } from "./errors.ts"
 import { cloneIdent, GITOMIC_IDENT, validateOid } from "./git-object.ts"
-import { assertTreeShape, isGitPrefixNotFoundError, normalizePath, normalizePrefix } from "./path.ts"
-import { createLazyBase, readLazyBase, type LazyBase } from "./lazy-base.ts"
+import { assertTreeShape, normalizePath, normalizePrefix } from "./path.ts"
+import { readLazyBase, type LazyBase } from "./lazy-base.ts"
 import { createShellBackend } from "./shell.ts"
 import type {
   Candidate,
@@ -798,44 +798,31 @@ function makeSnapshot(
   const pinned = (commit === undefined ? resolveCurrent().then(backendOid) : Promise.resolve(validateOid(commit))).then(
     (oid) => ({ oid, algorithm: oid.length === 64 ? ("sha256" as const) : ("sha1" as const) }),
   )
-  // One lazy base per prefix read: the listing is scoped through readTree(prefix), and a value is fetched by oid
-  // only when `get` asks for it — `oid`, `has` and `keys` answer from the listing alone.
-  const loads = new Map<string, Promise<LazyBase>>()
-  const load = (prefix: string): Promise<LazyBase> => {
-    for (const [loadedPrefix, base] of loads) {
-      if (prefix.startsWith(loadedPrefix)) return base
-    }
-    const base = pinned.then(async ({ oid }) => {
-      try {
-        return await readLazyBase(context.backend, context.repo, oid, prefix === "" ? undefined : prefix)
-      } catch (error) {
-        if (prefix !== "" && isGitPrefixNotFoundError(error)) {
-          return createLazyBase(context.backend, context.repo, oid, new Map())
-        }
-        throw error
-      }
-    })
-    loads.set(prefix, base)
-    return base
-  }
+  // ONE whole-tree listing for the snapshot's whole life, pinned at its one commit. `readTree` runs
+  // `ls-tree -r --full-tree` with no pathspec, so a prefix-scoped read listed the whole tree anyway and
+  // filtered it in JS — and because the old cache was keyed by prefix (a whole file path), a session that
+  // named n distinct paths paid n whole-tree listings. Loading the root base once makes n distinct-path
+  // reads one listing: `oid`, `has` and `keys(prefix)` answer from it, and a value is fetched by oid only
+  // when `get` asks. A path or prefix the listing does not hold is an empty view with no second read.
+  const base = pinned.then(({ oid }) => readLazyBase(context.backend, context.repo, oid))
   return {
     async get(path) {
       const normalized = normalizePath(path)
-      return (await load(normalized)).get(normalized)
+      return (await base).get(normalized)
     },
     async oid(path) {
       const normalized = normalizePath(path)
       // Straight from the listing — never through a decoded value — so it answers for a binary blob `get` would
       // refuse, and it is exactly the blob `apply`'s `expect` compares.
-      return (await load(normalized)).oid(normalized)
+      return (await base).oid(normalized)
     },
     async has(path) {
       const normalized = normalizePath(path)
-      return (await load(normalized)).has(normalized)
+      return (await base).has(normalized)
     },
     async keys(prefix = "") {
       const normalized = normalizePrefix(prefix)
-      return (await load(normalized))
+      return (await base)
         .publicPaths()
         .filter((path) => path.startsWith(normalized))
         .sort()

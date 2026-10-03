@@ -17,10 +17,12 @@ import { assertUtf8, decodeUtf8 } from "./utf8.ts"
  *
  * A transaction's LazyBase is created inside one attempt and never outlives
  * it: a CAS replay builds a new one on the new parent, so no memoised value
- * crosses parents. A Snapshot keeps one LazyBase per prefix it reads for the
- * Snapshot's whole life, pinned at its one commit, so a value it memoises can
- * never go stale; a read that failed is not memoised, so a later read of the
- * same path asks the backend again.
+ * crosses parents. A Snapshot keeps ONE LazyBase for its whole life, pinned at
+ * its one commit and read with no prefix — a prefix-scoped read listed the
+ * whole tree and filtered it in JS, so a per-prefix base only multiplied that
+ * one listing; `keys(prefix)` now filters this listing. A value the Snapshot
+ * memoises can never go stale; a read that failed is not memoised, so a later
+ * read of the same path asks the backend again.
  */
 export type LazyBase = {
   readonly listing: TreeListing
@@ -42,7 +44,11 @@ export type LazyBase = {
 
 type Waiter = { readonly path: string; resolve(value: BlobValue): void; reject(error: unknown): void }
 
-/** Read `commit`'s listing (whole, or one prefix's) and build the lazy base on it. */
+/**
+ * Read `commit`'s listing and build the lazy base on it. `prefix` is passed to the backend's `readTree`, which
+ * lists the WHOLE tree and filters in JS; a Snapshot passes none so its one listing answers every prefix, and the
+ * scoped form is kept for callers that want the filter pushed to the edges of the listing.
+ */
 export async function readLazyBase(
   backend: GitomicBackend,
   repo: string,

@@ -758,7 +758,11 @@ async function head(repo: string, ref: string, baseEnv?: NodeJS.ProcessEnv): Pro
   return text(await git(repo, ["rev-parse", "--verify", ref], { baseEnv }))
 }
 
-/** One `ls-tree -r`: every regular blob under the prefix, no value read. STATE's 19,670 entries list in ~20 ms. */
+/**
+ * One `ls-tree -r -z --full-tree` with NO pathspec: Git lists the WHOLE tree and the prefix is applied in JS below,
+ * so a prefix-scoped read still pays for every entry — this is a whole-tree cost per call, not a scoped one.
+ * Measured on the STATE rail's kept copy: 21.9-25.2 ms for 25,127 entries, no value read.
+ */
 async function readTree(repo: string, commit: Oid, prefix?: string, baseEnv?: NodeJS.ProcessEnv): Promise<TreeListing> {
   const normalizedPrefix = prefix === undefined ? "" : normalizePrefix(prefix)
   const listing = await git(repo, ["ls-tree", "-r", "-z", "--full-tree", commit], { baseEnv })
