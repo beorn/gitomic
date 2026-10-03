@@ -487,15 +487,26 @@ function lastStderrLine(stderr: Buffer): string {
 }
 
 /**
+ * Repository selectors that would otherwise override `-C <path>`. Git honors an ambient `GIT_DIR` or
+ * `GIT_COMMON_DIR` over the named path, so a caller with either in the environment was read another
+ * repository own config and answered with an authority it did not name (@dev/review2, 2026-10-03).
+ * An `undefined` env value removes the variable from the child environment.
+ */
+const REPOSITORY_SELECTOR_ENV = { GIT_DIR: undefined, GIT_COMMON_DIR: undefined } as const
+
+/**
  * Resolve the named repository OWN configured `origin` URL, or throw naming the missing, empty or invalid
  * resource. Git config search otherwise climbs past the named path: a plain directory under a repository
  * answers with the ANCESTOR repository origin, and a repository whose origin lives only in the global
  * config answers with the global one - each naming an authority the caller did not ask for (@dev/review2
  * HOLD, 2026-10-03). A ceiling at the named path parent stops the climb, so the path must itself be a
- * repository (or bare repository), and `--local` reads only that repository own config file.
+ * repository (or bare repository), ambient repository selectors are scrubbed so only the named path can
+ * answer, and `--local` reads only that repository own config file.
  */
 async function resolveOrigin(repo: string): Promise<string> {
-  const scoped = { env: { GIT_CEILING_DIRECTORIES: dirname(resolve(repo)) } }
+  const scoped = {
+    env: { ...REPOSITORY_SELECTOR_ENV, GIT_CEILING_DIRECTORIES: dirname(resolve(repo)) },
+  }
   const inside = await runGit(["-C", repo, "rev-parse", "--git-dir"], scoped)
   if (inside.code !== 0) {
     const detail = lastStderrLine(inside.stderr)
