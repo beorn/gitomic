@@ -527,3 +527,40 @@ describe("readTree and readBlobs agree across backends", () => {
     }
   })
 })
+
+describe("a snapshot reads its tree ONCE, however many paths it names (27226)", () => {
+  test("six distinct paths through get/oid/has/keys cost one whole-tree listing", async () => {
+    const recorded = recordReads(createMemBackend())
+    const store = await open({ repo: "one-listing", ref: "main", writer: "worker", backend: recorded.backend })
+    const parent = await seedNotes(store, 200)
+    recorded.reset()
+
+    const snapshot = store.at(parent)
+    // Every read verb, six distinct paths: before 27226 each distinct file path ran its own
+    // `ls-tree -r -z --full-tree` over the whole tree and filtered in JS.
+    expect(await snapshot.get(notePath(1))).toBe("note 1\n")
+    expect(await snapshot.oid(notePath(2))).toBeTypeOf("string")
+    expect(await snapshot.has(notePath(3))).toBe(true)
+    expect(await snapshot.get(notePath(77))).toBe("note 77\n")
+    expect(await snapshot.oid(notePath(198))).toBeTypeOf("string")
+    expect(await snapshot.keys("notes/00")).toHaveLength(200)
+
+    expect(recorded.treeCalls).toEqual([parent])
+  })
+
+  test("a missing path and a missing prefix keep their meaning as an empty view", async () => {
+    const recorded = recordReads(createMemBackend())
+    const store = await open({ repo: "one-listing-missing", ref: "main", writer: "worker", backend: recorded.backend })
+    const parent = await seedNotes(store, 3)
+    recorded.reset()
+
+    const snapshot = store.at(parent)
+    expect(await snapshot.get("notes/absent.md")).toBeUndefined()
+    expect(await snapshot.has("notes/absent.md")).toBe(false)
+    expect(await snapshot.oid("notes/absent.md")).toBeUndefined()
+    expect(await snapshot.keys("nothing/at/all")).toEqual([])
+
+    // The empty view is still answered from the one listing, never a second read.
+    expect(recorded.treeCalls).toEqual([parent])
+  })
+})
