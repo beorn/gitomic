@@ -1,0 +1,26 @@
+{
+  "schema": "vendor-kit/source-siblings/v1",
+  "siblings": [
+    {
+      "name": "@bearly/cli-process",
+      "repository": "beorn/bearly",
+      "commit": "6045a7f141dba812c4add6d7c52cafa5213ef537",
+      "directory": "packages/cli-process",
+      "pack": true
+    },
+    {
+      "name": "@bearly/flock",
+      "repository": "beorn/bearly",
+      "commit": "6045a7f141dba812c4add6d7c52cafa5213ef537",
+      "directory": "packages/flock",
+      "pack": true
+    },
+    {
+      "name": "@bearly/pacing",
+      "repository": "beorn/bearly",
+      "commit": "6045a7f141dba812c4add6d7c52cafa5213ef537",
+      "directory": "packages/pacing",
+      "pack": true
+    }
+  ]
+}

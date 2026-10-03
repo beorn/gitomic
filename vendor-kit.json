@@ -1,5 +1,5 @@
 {
-  "modules": ["publish-shebang", "release", "verify"],
+  "modules": ["publish-shebang", "release", "verify", "source-siblings"],
   "vars": {
     "testCommand": "bun run check",
     "bunVersion": "1.4.2"
