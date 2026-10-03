@@ -1,9 +1,9 @@
-// @failure The origin resolver could infer a repository from the current directory, select an alternate remote, fall back to a replica, print more than the URL and one newline, or report a missing, empty or invalid repository/origin as success, so a STATE write is addressed to the wrong authority.
+// @failure The origin resolver could infer a repository from the current directory, climb to an ancestor repository or the global config, select an alternate remote, fall back to a replica, print more than the URL and one newline, or report a missing, empty or invalid repository/origin as success, so a STATE write is addressed to the wrong authority.
 // @level l1
 // @consumer /commit STATE-write recipe and the km refusal messages that must name gitomic origin --repo; @cto ruling 24168 (STATE c90b9255)
 // @testonly none: real temporary repositories through the real CLI entry.
 
-import { mkdtemp, rm } from "node:fs/promises"
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -96,7 +96,37 @@ describe("origin", () => {
     const result = await run(["origin", "--repo", join(work, "absent")])
     expect(result.code).toBe(1)
     expect(result.stdout).toBe("")
-    expect(result.stderr).toContain("cannot resolve origin")
+    expect(result.stderr).toContain("not a Git repository")
+  })
+
+  test("refuses an existing directory that is not a repository, never an ancestor repository origin", async () => {
+    const repo = await checkout(URL)
+    const nested = join(repo, "nested-directory")
+    await mkdir(nested)
+    const result = await run(["origin", "--repo", nested])
+    expect(result.code).toBe(1)
+    expect(result.stdout).toBe("")
+    expect(result.stderr).toContain("not a Git repository")
+  })
+
+  test("refuses a repository whose only origin is in the global config, never another authority", async () => {
+    const repo = await checkout()
+    const globalConfig = join(work, "gitconfig-global")
+    await writeFile(globalConfig, `[remote "origin"]\n\turl = file:///srv/global-authority.git\n`)
+    const before = { global: process.env.GIT_CONFIG_GLOBAL, system: process.env.GIT_CONFIG_SYSTEM }
+    process.env.GIT_CONFIG_GLOBAL = globalConfig
+    process.env.GIT_CONFIG_SYSTEM = join(work, "absent-system-config")
+    try {
+      const result = await run(["origin", "--repo", repo])
+      expect(result.code).toBe(1)
+      expect(result.stdout).toBe("")
+      expect(result.stderr).toContain("remote.origin.url is unset")
+    } finally {
+      if (before.global === undefined) delete process.env.GIT_CONFIG_GLOBAL
+      else process.env.GIT_CONFIG_GLOBAL = before.global
+      if (before.system === undefined) delete process.env.GIT_CONFIG_SYSTEM
+      else process.env.GIT_CONFIG_SYSTEM = before.system
+    }
   })
 
   test("requires --repo and never infers the current directory", async () => {
