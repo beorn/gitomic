@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { spawnSync } from "node:child_process"
 import { readFile } from "node:fs/promises"
-import { isAbsolute, resolve } from "node:path"
+import { dirname, isAbsolute, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 
 import { routeConsoleToStreams, runCliProcess } from "@bearly/cli-process"
@@ -455,11 +455,14 @@ function compilePattern(pattern: string): RegExp {
 }
 
 /**
- * `origin --repo <path>`: print the named repository configured `origin` URL
- * and one newline, then exit. Read-only: one `git config --get remote.origin.url`
- * against the explicit path. No cwd inference, no alternate remote, no
- * GitHub-replica fallback, nothing written. A missing, empty, unreadable or
- * invalid repository/origin refuses with a diagnostic naming the problem.
+ * `origin --repo <path>`: print the named repository own configured `origin`
+ * URL and one newline, then exit. Read-only and scoped to the named path: the
+ * path must itself be a repository (`GIT_CEILING_DIRECTORIES` stops Git upward
+ * search at its parent) and only that repository local config is read, so
+ * neither an ancestor repository nor the global config can answer. No cwd
+ * inference, no alternate remote, no GitHub-replica fallback, nothing written.
+ * A missing, empty, unreadable or invalid repository/origin refuses with a
+ * diagnostic naming the problem.
  */
 async function runOrigin(args: string[], stdout: CliWriter): Promise<number> {
   const { positionals, flags } = extractFlags(args, { "--repo": "value" })
@@ -471,22 +474,45 @@ async function runOrigin(args: string[], stdout: CliWriter): Promise<number> {
   return OK
 }
 
-/** Resolve `repo` configured `origin` URL, or throw naming the missing, empty or invalid resource. */
+/** The last non-blank line of a command stderr, for a diagnostic that names Git own reason. */
+function lastStderrLine(stderr: Buffer): string {
+  return (
+    stderr
+      .toString("utf8")
+      .trim()
+      .split("\n")
+      .filter((line) => line !== "")
+      .at(-1) ?? ""
+  )
+}
+
+/**
+ * Resolve the named repository OWN configured `origin` URL, or throw naming the missing, empty or invalid
+ * resource. Git config search otherwise climbs past the named path: a plain directory under a repository
+ * answers with the ANCESTOR repository origin, and a repository whose origin lives only in the global
+ * config answers with the global one - each naming an authority the caller did not ask for (@dev/review2
+ * HOLD, 2026-10-03). A ceiling at the named path parent stops the climb, so the path must itself be a
+ * repository (or bare repository), and `--local` reads only that repository own config file.
+ */
 async function resolveOrigin(repo: string): Promise<string> {
-  const result = await runGit(["-C", repo, "config", "--get", "remote.origin.url"])
+  const scoped = { env: { GIT_CEILING_DIRECTORIES: dirname(resolve(repo)) } }
+  const inside = await runGit(["-C", repo, "rev-parse", "--git-dir"], scoped)
+  if (inside.code !== 0) {
+    const detail = lastStderrLine(inside.stderr)
+    throw new Error(
+      `${JSON.stringify(repo)}: not a Git repository (git rev-parse --git-dir exit ${inside.code})${detail === "" ? "" : `: ${detail}`}`,
+    )
+  }
+  const result = await runGit(["-C", repo, "config", "--local", "--get", "remote.origin.url"], scoped)
   if (result.code === 1 && result.stdout.length === 0) {
-    throw new Error(`${JSON.stringify(repo)}: remote.origin.url is unset; name a repository whose origin is configured`)
+    throw new Error(
+      `${JSON.stringify(repo)}: remote.origin.url is unset; name a repository whose own origin is configured`,
+    )
   }
   if (result.code !== 0) {
-    const detail =
-      result.stderr
-        .toString("utf8")
-        .trim()
-        .split("\n")
-        .filter((line) => line !== "")
-        .at(-1) ?? ""
+    const detail = lastStderrLine(result.stderr)
     throw new Error(
-      `${JSON.stringify(repo)}: cannot resolve origin (git config --get remote.origin.url exit ${result.code})${detail === "" ? "" : `: ${detail}`}`,
+      `${JSON.stringify(repo)}: cannot resolve origin (git config --local --get remote.origin.url exit ${result.code})${detail === "" ? "" : `: ${detail}`}`,
     )
   }
   const url = result.stdout.toString("utf8").replace(/\r?\n$/u, "")
