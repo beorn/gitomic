@@ -138,41 +138,45 @@ describe("repositoryCandidate — the gate the repository's trusted base declare
     { name: "empty edits", output: '{"put":{},"rm":[]}', perAttempt: 1 },
     { name: "put", output: '{"put":{"derived.md":"derived"}}', perAttempt: 2 },
     { name: "remove", output: '{"rm":["remove.md"]}', perAttempt: 2 },
-  ])("materializes once for $name derive, invalidates edits, and starts fresh after a CAS retry", async ({ output, perAttempt }) => {
-    await store.transact(async (map) => map.set("remove.md", "remove"), "seed removal")
-    const derive = await script("derive.sh", `printf '%s' '${output}'`)
-    const check = await script("check.sh", [
-      'git --git-dir="$GITOMIC_REPO" show "$GITOMIC_CANDIDATE:rival.md" 2>/dev/null || printf absent',
-    ].join("\n"))
-    await declare(`[candidate]\n\tderive = ${derive}\n\tcheck = ${check}\n`)
-    const rival = await open({ repo: fixture.repo, ref: "main", writer: "rival", backend: createShellBackend() })
-    const gate = repositoryCandidate({ repo: fixture.repo })
-    let attempts = 0
-    let materializations = 0
-    const committed = await store.transact(async (map) => map.set("own.md", "own"), "reuse candidate", {
-      candidate: async (context) => {
-        attempts++
-        const verdict = await gate({
-          ...context,
-          materialize: async () => {
-            materializations++
-            return context.materialize()
-          },
-        })
-        if (attempts === 1) await rival.transact(async (map) => map.set("rival.md", "rival"), "win the CAS")
-        return verdict
-      },
-    })
-    expect(attempts).toBe(2)
-    expect(committed.retries).toBe(1)
-    expect(materializations).toBe(perAttempt * attempts)
-    expect(committed.report).toEqual(["rival"])
-    const landed = store.at(committed.oid)
-    expect(await landed.get("own.md")).toBe("own")
-    expect(await landed.get("rival.md")).toBe("rival")
-    expect(await landed.get("derived.md")).toBe(output.includes('"derived.md"') ? "derived" : undefined)
-    expect(await landed.get("remove.md")).toBe(output.includes('"remove.md"') ? undefined : "remove")
-  })
+  ])(
+    "materializes once for $name derive, invalidates edits, and starts fresh after a CAS retry",
+    async ({ output, perAttempt }) => {
+      await store.transact(async (map) => map.set("remove.md", "remove"), "seed removal")
+      const derive = await script("derive.sh", `printf '%s' '${output}'`)
+      const check = await script(
+        "check.sh",
+        ['git --git-dir="$GITOMIC_REPO" show "$GITOMIC_CANDIDATE:rival.md" 2>/dev/null || printf absent'].join("\n"),
+      )
+      await declare(`[candidate]\n\tderive = ${derive}\n\tcheck = ${check}\n`)
+      const rival = await open({ repo: fixture.repo, ref: "main", writer: "rival", backend: createShellBackend() })
+      const gate = repositoryCandidate({ repo: fixture.repo })
+      let attempts = 0
+      let materializations = 0
+      const committed = await store.transact(async (map) => map.set("own.md", "own"), "reuse candidate", {
+        candidate: async (context) => {
+          attempts++
+          const verdict = await gate({
+            ...context,
+            materialize: async () => {
+              materializations++
+              return context.materialize()
+            },
+          })
+          if (attempts === 1) await rival.transact(async (map) => map.set("rival.md", "rival"), "win the CAS")
+          return verdict
+        },
+      })
+      expect(attempts).toBe(2)
+      expect(committed.retries).toBe(1)
+      expect(materializations).toBe(perAttempt * attempts)
+      expect(committed.report).toEqual(["rival"])
+      const landed = store.at(committed.oid)
+      expect(await landed.get("own.md")).toBe("own")
+      expect(await landed.get("rival.md")).toBe("rival")
+      expect(await landed.get("derived.md")).toBe(output.includes('"derived.md"') ? "derived" : undefined)
+      expect(await landed.get("remove.md")).toBe(output.includes('"remove.md"') ? undefined : "remove")
+    },
+  )
 
   test.each([
     {
