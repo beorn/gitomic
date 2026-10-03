@@ -154,7 +154,9 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
     const filename = parts.pop()
     if (filename === undefined) throw new TypeError(`invalid git tree path: ${JSON.stringify(path)}`)
     let node = root
+    const ancestors: { parent: TreeNode; name: string; child: TreeNode }[] = []
     for (const part of parts) {
+      const parent = node
       const existing = node.entries.get(part)
       if (existing === undefined) {
         const child: TreeNode = { kind: "tree", entries: new Map() }
@@ -165,9 +167,15 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
       } else {
         throw new TypeError(`path component is not a tree: ${part}`)
       }
+      ancestors.push({ parent, name: part, child: node })
     }
     if (content === undefined) {
       node.entries.delete(filename)
+      for (let index = ancestors.length - 1; index >= 0; index--) {
+        const ancestor = ancestors[index]!
+        if (ancestor.child.entries.size !== 0) break
+        ancestor.parent.entries.delete(ancestor.name)
+      }
       return
     }
     const existing = node.entries.get(filename)

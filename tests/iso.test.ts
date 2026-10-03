@@ -46,6 +46,51 @@ async function publishEverywhere(
 }
 
 describe("iso backend", () => {
+  test("prunes all emptied ancestors and permits replacing a deleted directory with a file in every backend", async () => {
+    const shellFixture = await createBareRepo()
+    const isoFixture = await createBareRepo()
+    try {
+      const targets = [
+        { repo: shellFixture.repo, backend: createShellBackend() },
+        { repo: isoFixture.repo, backend: createIsoBackend() },
+        { repo: "empty-ancestor-equivalence", backend: createMemBackend() },
+      ]
+      const input = {
+        writer: "empty-ancestor",
+        instance: "same-ancestor-instance",
+        time: 946684900,
+        message: "ancestor transition",
+        seq: 0,
+      }
+      const seeded = await publishEverywhere(targets, { ...input, changes: new Map([["a/b/file", "value"]]) })
+      expect(new Set(seeded)).toHaveLength(1)
+      const emptied = await publishEverywhere(targets, {
+        ...input,
+        seq: 1,
+        changes: new Map([["a/b/file", undefined]]),
+      })
+      expect(new Set(emptied)).toHaveLength(1)
+      const emptyTree = await gitWithInput(shellFixture.repo, "", "mktree")
+      for (const fixture of [shellFixture, isoFixture]) {
+        expect(await git(fixture.repo, "rev-parse", "main^{tree}")).toBe(emptyTree)
+      }
+      await publishEverywhere(targets, { ...input, seq: 2, changes: new Map([["a/b/file", "value"]]) })
+      const replaced = await publishEverywhere(targets, {
+        ...input,
+        seq: 3,
+        changes: new Map<string, string | undefined>([
+          ["a/b/file", undefined],
+          ["a", "replacement"],
+        ]),
+      })
+      expect(new Set(replaced)).toHaveLength(1)
+      for (const { repo, backend } of targets) {
+        expect([...(await backend.readTree(repo, replaced[0] as Oid))].map(([path]) => path)).toEqual(["a"])
+      }
+    } finally {
+      await Promise.all([shellFixture.cleanup(), isoFixture.cleanup()])
+    }
+  })
   test("serializes byte-identical commit objects in shell, iso, and mem", async () => {
     const shellFixture = await createBareRepo()
     const isoFixture = await createBareRepo()
