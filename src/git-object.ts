@@ -32,7 +32,12 @@ export type GitObject = {
 }
 
 export type GitTreeObjectEntry = {
-  mode: "100644" | "100755" | "40000"
+  /**
+   * The mode this entry carries. Widened to the reported mode (27226, @cto acb610e6): the ISO backend's canonical
+   * check must encode a foreign entry with the mode Git actually has to prove tree order and UTF-8, and the writer
+   * below reaches here only after assertRegularBlob admitted the mode, so only 100644/100755/40000 are ever written.
+   */
+  mode: string
   path: string
   oid: Oid
 }

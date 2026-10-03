@@ -184,7 +184,15 @@ export type CommitMeta = {
 export type Change = { path: string; from: Oid | null; to: Oid | null }
 
 /** One regular blob of a tree listing: its object id and its mode. */
-export type TreeEntry = { readonly oid: Oid; readonly mode: "100644" | "100755" }
+export type TreeEntry = {
+  readonly oid: Oid
+  /**
+   * The mode Git reported for this entry. Widened from the two regular-blob modes (27226, @cto acb610e6): a listing
+   * now tells the truth about the tree it read, and whether a mode is ACCEPTABLE is a policy applied where an entry
+   * is EXPOSED — `assertRegularBlob` in path.ts, the one predicate — never by a backend dropping or rewriting it.
+   */
+  readonly mode: string
+}
 
 /** A tree's regular blobs by path, with no value decoded: what a transaction is strict about. */
 export type TreeListing = ReadonlyMap<string, TreeEntry>

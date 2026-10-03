@@ -1,5 +1,5 @@
 import { objectOid } from "./git-object.ts"
-import { assertTreeShape, isPublicPath, normalizePath } from "./path.ts"
+import { assertRegularBlob, assertTreeShape, isPublicPath, normalizePath } from "./path.ts"
 import type { BlobValue, GitomicBackend, Oid, TreeListing } from "./types.js"
 import { assertUtf8, decodeUtf8 } from "./utf8.ts"
 
@@ -58,9 +58,43 @@ export async function readLazyBase(
   return createLazyBase(backend, repo, commit, await backend.readTree(repo, commit, prefix))
 }
 
-/** A lazy base over a listing already read: shape-validated here, values fetched by oid on demand. */
-export function createLazyBase(backend: GitomicBackend, repo: string, parent: Oid, listing: TreeListing): LazyBase {
-  assertTreeShape(listing.keys())
+/**
+ * THE policy site for a listing exposed WHOLE: every entry must be a regular blob and the paths must be a tree,
+ * refused by name before any value can be read. A transaction takes this exposure, so a base tree holding a
+ * symlink or a gitlink refuses the write whatever paths it names. A reader that validates only what each verb
+ * EXPOSES passes "caller" and calls this itself with the paths that verb exposes (see readLazyBaseExposed).
+ *
+ * One predicate decides a supported mode: assertRegularBlob in path.ts, called from here and from that verb site,
+ * never a second mode test (27226, @cto acb610e6).
+ */
+export function assertExposed(listing: TreeListing, paths: readonly string[]): void {
+  assertTreeShape(paths)
+  for (const path of paths) {
+    const entry = listing.get(path)
+    if (entry !== undefined) assertRegularBlob(path, entry.mode, "blob")
+  }
+}
+
+/**
+ * Read a commit's whole listing for a reader that validates only what it EXPOSES (27226). A Snapshot names one
+ * listing for its whole life and answers every verb from it, so the whole-tree refusal a transaction wants would
+ * charge every read for the whole tree and would refuse a tree wholesale where the refusal was always scoped to
+ * the paths a read exposes (tests/iso.test.ts "scopes reader blob validation to the requested path prefix").
+ * The caller validates each verb's scope with assertExposed.
+ */
+export async function readLazyBaseExposed(backend: GitomicBackend, repo: string, commit: Oid): Promise<LazyBase> {
+  return createLazyBase(backend, repo, commit, await backend.readTree(repo, commit), "caller")
+}
+
+/** A lazy base over a listing already read: values fetched by oid on demand. */
+export function createLazyBase(
+  backend: GitomicBackend,
+  repo: string,
+  parent: Oid,
+  listing: TreeListing,
+  exposure: "whole" | "caller" = "whole",
+): LazyBase {
+  if (exposure === "whole") assertExposed(listing, [...listing.keys()])
   const algorithm = parent.length === 64 ? "sha256" : "sha1"
   const memo = new Map<Oid, Promise<BlobValue>>()
   let pending: Map<Oid, Waiter[]> | undefined

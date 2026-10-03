@@ -1,6 +1,9 @@
 // @failure A transaction decodes every blob of the base tree before its update runs, so a write costs the whole vault (0.9 s and 175 MB on a 19,670-blob STATE root) instead of the handful of paths it names; the base is whole-tree strict on SHAPE but must be lazy on VALUES (25346).
 // @level l1
 // @consumer every gitomic writer on a large tree — km's STATE rail, the agent-rig's bead-id and receipt stores, the yrd queue
+/**
+ * @reach fs-walk <fixture-only: createBareRepo's mkdtempSync repo; the shell backend lists only that fixture>
+ */
 
 import { mkdtemp, readFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -562,5 +565,48 @@ describe("a snapshot reads its tree ONCE, however many paths it names (27226)", 
 
     // The empty view is still answered from the one listing, never a second read.
     expect(recorded.treeCalls).toEqual([parent])
+  })
+
+  test("a foreign entry refuses only where a verb EXPOSES it, by mode, and its blob is never read", async () => {
+    const fixture = await createBareRepo()
+    try {
+      const noteOid = await gitWithInput(fixture.repo, "# note\n", "hash-object", "-w", "--stdin")
+      const linkOid = await gitWithInput(fixture.repo, "target.md\n", "hash-object", "-w", "--stdin")
+      const tree = await gitWithInput(
+        fixture.repo,
+        "100644 blob " +
+          noteOid +
+          "\tone.md\0" +
+          "120000 blob " +
+          linkOid +
+          "\tunrelated-link\0" +
+          "160000 commit " +
+          "a".repeat(40) +
+          "\tvendor\0",
+        "mktree",
+        "-z",
+        "--missing",
+      )
+      const tip = await git(fixture.repo, "commit-tree", tree, "-p", fixture.initial, "-m", "foreign entries")
+      await git(fixture.repo, "update-ref", "refs/heads/main", tip, fixture.initial)
+      const recorded = recordReads(createShellBackend())
+      const store = await open({ repo: fixture.repo, ref: "main", writer: "worker", backend: recorded.backend })
+      const snapshot = store.at(tip)
+
+      // A read that does not expose the symlink or the gitlink is served from the one listing.
+      await expect(snapshot.get("one.md")).resolves.toBe("# note\n")
+      await expect(snapshot.has("one.md")).resolves.toBe(true)
+      await expect(snapshot.keys("one")).resolves.toEqual(["one.md"])
+      // A verb that exposes one refuses it BY NAME, and its value is never decoded as a blob.
+      await expect(snapshot.get("unrelated-link")).rejects.toThrow(/unsupported Git tree mode 120000/)
+      await expect(snapshot.oid("vendor")).rejects.toThrow(/unsupported Git tree mode 160000/)
+      // keys() with no prefix exposes the whole listing, so it refuses as it always did.
+      await expect(snapshot.keys()).rejects.toThrow(/unsupported Git tree mode 120000/)
+
+      expect(recorded.blobCalls.flat()).not.toContain(linkOid)
+      expect(recorded.treeCalls).toEqual([tip])
+    } finally {
+      await fixture.cleanup()
+    }
   })
 })

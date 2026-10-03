@@ -58,11 +58,10 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
     const result = await readTree({ fs, gitdir, oid, cache })
     if (readPrefix === "") {
       const canonicalEntries = result.tree.map((entry): GitTreeObjectEntry => {
-        const path = prefix === "" ? entry.path : `${prefix}/${entry.path}`
         if (entry.type === "tree") return { mode: "40000", path: entry.path, oid: entry.oid }
-        assertRegularBlob(path, entry.mode, entry.type)
-        const mode = entry.mode === "100755" ? "100755" : "100644"
-        return { mode, path: entry.path, oid: entry.oid }
+        // The real mode, so the canonical-order check below still proves UTF-8 and tree order for a foreign mode
+        // (27226): acceptability is decided where the entry is exposed, not by rewriting it here.
+        return { mode: entry.mode, path: entry.path, oid: entry.oid }
       })
       if (encodeTreeEntries(canonicalEntries).oid !== oid) {
         throw new Error(`Git tree ${oid} contains path bytes that are not valid UTF-8 or canonical Git tree order`)
@@ -80,7 +79,6 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
         if (entry.type === "tree") {
           entries.set(entry.path, await loadTree(gitdir, entry.oid, path, readPrefix))
         } else {
-          assertRegularBlob(path, entry.mode, entry.type)
           entries.set(entry.path, { kind: entry.type, mode: entry.mode, oid: entry.oid })
         }
       }),
@@ -99,8 +97,9 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
       for (const [name, entry] of node.entries) {
         const path = prefix === "" ? name : `${prefix}/${name}`
         if (entry.kind === "tree") visit(entry, path)
-        else if (entry.kind === "blob" && path.startsWith(normalizedPrefix)) {
-          listing.set(path, { oid: entry.oid, mode: entry.mode === "100755" ? "100755" : "100644" })
+        else if (path.startsWith(normalizedPrefix)) {
+          // Every non-tree entry, blob or commit (a gitlink), with the mode Git reported — see shell.ts readTree.
+          listing.set(path, { oid: entry.oid, mode: entry.mode })
         }
       }
     }
@@ -295,9 +294,7 @@ function encodeTreeNode(node: TreeNode, objects: Map<Oid, GitObject>): Oid {
       entries.push({ mode: "40000", path, oid: encodeTreeNode(entry, objects) })
       continue
     }
-    if (entry.mode !== "100644" && entry.mode !== "100755") {
-      throw new Error(`unsupported Git tree mode ${entry.mode} at ${JSON.stringify(path)}`)
-    }
+    assertRegularBlob(path, entry.mode, "blob")
     entries.push({ mode: entry.mode, path, oid: entry.oid })
   }
   const tree = encodeTreeEntries(entries)

@@ -33,7 +33,7 @@ import {
   transactionMatches,
   validateOid,
 } from "./git-object.ts"
-import { assertGitPrefixMatched, assertRegularBlob, normalizePrefix } from "./path.ts"
+import { assertGitPrefixMatched, normalizePrefix } from "./path.ts"
 import type {
   BlobValue,
   CommitInput,
@@ -762,6 +762,9 @@ async function head(repo: string, ref: string, baseEnv?: NodeJS.ProcessEnv): Pro
  * One `ls-tree -r -z --full-tree` with NO pathspec: Git lists the WHOLE tree and the prefix is applied in JS below,
  * so a prefix-scoped read still pays for every entry — this is a whole-tree cost per call, not a scoped one.
  * Measured on the STATE rail's kept copy: 21.9-25.2 ms for 25,127 entries, no value read.
+ *
+ * Every entry is returned with the mode Git reported, including a symlink or gitlink; whether that mode is
+ * acceptable is a policy applied where an entry is EXPOSED (`assertRegularBlob`, the one predicate), never here.
  */
 async function readTree(repo: string, commit: Oid, prefix?: string, baseEnv?: NodeJS.ProcessEnv): Promise<TreeListing> {
   const normalizedPrefix = prefix === undefined ? "" : normalizePrefix(prefix)
@@ -780,8 +783,7 @@ async function readTree(repo: string, commit: Oid, prefix?: string, baseEnv?: No
       throw new Error("git ls-tree returned malformed entry metadata")
     }
     if (!path.startsWith(normalizedPrefix)) continue
-    assertRegularBlob(path, mode, type)
-    entries.set(path, { oid, mode: mode === "100755" ? "100755" : "100644" })
+    entries.set(path, { oid, mode })
   }
   assertGitPrefixMatched(entries.size, repo, commit, normalizedPrefix)
   return entries

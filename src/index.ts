@@ -38,7 +38,7 @@ import {
 } from "./errors.ts"
 import { cloneIdent, GITOMIC_IDENT, validateOid } from "./git-object.ts"
 import { assertTreeShape, normalizePath, normalizePrefix } from "./path.ts"
-import { readLazyBase, type LazyBase } from "./lazy-base.ts"
+import { assertExposed, readLazyBase, readLazyBaseExposed, type LazyBase } from "./lazy-base.ts"
 import { createShellBackend } from "./shell.ts"
 import type {
   Candidate,
@@ -798,31 +798,44 @@ function makeSnapshot(
   const pinned = (commit === undefined ? resolveCurrent().then(backendOid) : Promise.resolve(validateOid(commit))).then(
     (oid) => ({ oid, algorithm: oid.length === 64 ? ("sha256" as const) : ("sha1" as const) }),
   )
-  // ONE whole-tree listing for the snapshot's whole life, pinned at its one commit. `readTree` runs
-  // `ls-tree -r --full-tree` with no pathspec, so a prefix-scoped read listed the whole tree anyway and
-  // filtered it in JS — and because the old cache was keyed by prefix (a whole file path), a session that
-  // named n distinct paths paid n whole-tree listings. Loading the root base once makes n distinct-path
-  // reads one listing: `oid`, `has` and `keys(prefix)` answer from it, and a value is fetched by oid only
-  // when `get` asks. A path or prefix the listing does not hold is an empty view with no second read.
-  const base = pinned.then(({ oid }) => readLazyBase(context.backend, context.repo, oid))
+  // ONE whole-tree listing for the snapshot's whole life, pinned at its one commit: readTree runs ls-tree with no
+  // pathspec, so a prefix-scoped read listed the whole tree anyway and filtered it in JS, and the old cache was
+  // keyed by prefix (a whole file path), so a session naming n distinct paths paid n whole-tree listings. The root
+  // listing answers oid, has and keys(prefix), and a value is fetched by oid only when get asks.
+  //
+  // The listing is read with the "caller" exposure and each verb validates only the paths it EXPOSES (27226): a
+  // whole-tree refusal here would charge every read for the whole tree (measured 15-20 ms of assertion on STATE's
+  // 25,138 entries) and would refuse a tree wholesale where the refusal was always scoped to what a read exposes
+  // (tests/iso.test.ts "scopes reader blob validation to the requested path prefix"). A path or prefix the listing
+  // does not hold stays an empty view, with no second read.
+  const root = pinned.then(({ oid }) => readLazyBaseExposed(context.backend, context.repo, oid))
+  const scope = async (paths: readonly string[]): Promise<LazyBase> => {
+    const base = await root
+    assertExposed(base.listing, paths)
+    return base
+  }
   return {
     async get(path) {
       const normalized = normalizePath(path)
-      return (await base).get(normalized)
+      return (await scope([normalized])).get(normalized)
     },
     async oid(path) {
       const normalized = normalizePath(path)
       // Straight from the listing — never through a decoded value — so it answers for a binary blob `get` would
       // refuse, and it is exactly the blob `apply`'s `expect` compares.
-      return (await base).oid(normalized)
+      return (await scope([normalized])).oid(normalized)
     },
     async has(path) {
       const normalized = normalizePath(path)
-      return (await base).has(normalized)
+      return (await scope([normalized])).has(normalized)
     },
     async keys(prefix = "") {
       const normalized = normalizePrefix(prefix)
-      return (await base)
+      const base = await root
+      // A JS string prefix, exactly as readTree filtered before it (the path-prefix question is 27226 part 2).
+      const exposed = [...base.listing.keys()].filter((path) => path.startsWith(normalized))
+      assertExposed(base.listing, exposed)
+      return base
         .publicPaths()
         .filter((path) => path.startsWith(normalized))
         .sort()
