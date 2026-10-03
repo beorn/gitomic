@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks"
-import childProcess, { type ChildProcess } from "node:child_process"
+import childProcess, { type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process"
 import { randomUUID } from "node:crypto"
 import fs from "node:fs"
 import { mkdtemp, rm, writeFile } from "node:fs/promises"
@@ -119,6 +119,127 @@ const GROUP_STOP_GRACE_MS = 2_000
 const DURABLE_GIT_CONFIG = ["-c", "core.fsync=loose-object,reference", "-c", "core.fsyncMethod=fsync"] as const
 const shellRuntime = new AsyncLocalStorage<{ executable: string; sigterm: "forward" | "drain" }>()
 const selectedGit = (): string => shellRuntime.getStore()?.executable ?? "git"
+
+type ShellOwnedProcess = {
+  stop(): void
+  stopNow(): void
+}
+
+/** One wall-clock budget for a candidate phase, including time spent waiting for its serial carrier. */
+export type ShellPhase = {
+  remainingMs(): number
+  run<T>(work: () => Promise<T>): Promise<T>
+  admit(process: ShellProcess): void
+  stop(): void
+}
+
+const shellPhase = new AsyncLocalStorage<PhaseOwner>()
+
+class PhaseOwner implements ShellPhase {
+  private readonly timeoutMs: number
+  private readonly deadline: number
+  private readonly helpers = new Set<ShellOwnedProcess>()
+  private readonly carriers = new Set<ShellProcess>()
+  private readonly limit: ReturnType<typeof setTimeout>
+  private rejectLimit: ((reason: Error) => void) | undefined
+  private stopped = false
+  private timedOut = false
+
+  constructor(timeoutMs: number) {
+    this.timeoutMs = timeoutMs
+    this.deadline = Date.now() + timeoutMs
+    this.limit = setTimeout(() => {
+      this.timedOut = true
+      this.stop()
+    }, timeoutMs)
+  }
+
+  private timeoutError(): GitTimeout {
+    return new GitTimeout("candidate phase", this.timeoutMs)
+  }
+
+  remainingMs(): number {
+    if (this.timedOut || Date.now() >= this.deadline) {
+      this.timedOut = true
+      this.stop()
+      throw this.timeoutError()
+    }
+    if (this.stopped) throw new Error("candidate phase has stopped")
+    return Math.max(1, this.deadline - Date.now())
+  }
+
+  own(process: ShellOwnedProcess): () => void {
+    try {
+      this.remainingMs()
+    } catch (error) {
+      process.stop()
+      throw error
+    }
+    this.helpers.add(process)
+    return () => this.helpers.delete(process)
+  }
+
+  admit(process: ShellProcess): void {
+    try {
+      this.remainingMs()
+    } catch (error) {
+      process.stop()
+      throw error
+    }
+    this.carriers.add(process)
+  }
+
+  stop(): void {
+    if (this.stopped) return
+    this.stopped = true
+    clearTimeout(this.limit)
+    for (const helper of this.helpers) helper.stop()
+    this.helpers.clear()
+    for (const carrier of this.carriers) carrier.stop()
+    this.carriers.clear()
+    this.rejectLimit?.(this.timedOut ? this.timeoutError() : new Error("candidate phase stopped"))
+  }
+
+  async run<T>(work: () => Promise<T>): Promise<T> {
+    this.remainingMs()
+    let succeeded = false
+    try {
+      const timeout = new Promise<never>((_resolve, reject) => {
+        this.rejectLimit = reject
+      })
+      const result = await Promise.race([shellPhase.run(this, work), timeout])
+      this.remainingMs()
+      succeeded = true
+      return result
+    } finally {
+      this.rejectLimit = undefined
+      if (succeeded) {
+        // A caller may have started a native helper without awaiting it. It
+        // cannot be allowed to produce output during the next carrier request.
+        for (const helper of this.helpers) helper.stopNow()
+        this.helpers.clear()
+        clearTimeout(this.limit)
+        this.stopped = true
+        this.carriers.clear()
+      } else {
+        this.stop()
+      }
+    }
+  }
+}
+
+export function createShellPhase(timeoutMs: number): ShellPhase {
+  return new PhaseOwner(normalizeTimeoutMs(timeoutMs, "timeoutMs"))
+}
+
+/** A warm child's streams and stop handle, launched by the same owner as runGit/runCommand. */
+export type ShellProcess = Readonly<{
+  stdin: ChildProcessWithoutNullStreams["stdin"]
+  stdout: ChildProcessWithoutNullStreams["stdout"]
+  stderr: ChildProcessWithoutNullStreams["stderr"]
+  exited: Promise<{ code: number | null; signal: NodeJS.Signals | null }>
+  stop(): void
+}>
 
 export function createShellBackend(options: ShellBackendOptions = {}): GitomicBackend {
   return createShellRuntime(options).backend
@@ -376,6 +497,91 @@ export async function runCommand(
   return run(command, args, options)
 }
 
+function launchShellProcess(
+  command: string,
+  args: readonly string[],
+  options: GitOptions,
+  group: boolean,
+  phaseOwned = true,
+): { child: ChildProcessWithoutNullStreams; stop(): void; stopNow(): void; finish(): void } {
+  const child = childProcess.spawn(command, args, {
+    env: { ...(options.baseEnv ?? process.env), ...options.env, GIT_TERMINAL_PROMPT: "0", LC_ALL: "C" },
+    stdio: ["pipe", "pipe", "pipe"],
+    detached: group,
+  })
+  const releaseGroup =
+    group && child.pid !== undefined ? holdGroup(child.pid, shellRuntime.getStore()?.sigterm ?? "forward") : () => {}
+  let escalation: ReturnType<typeof setTimeout> | undefined
+  let stopped = false
+  let finished = false
+  const handle = {
+    child,
+    stop(): void {
+      if (stopped) return
+      stopped = true
+      stopProcess(child, "SIGTERM", group)
+      child.stdin?.destroy()
+      child.stdout?.destroy()
+      child.stderr?.destroy()
+      escalation = setTimeout(() => stopProcess(child, "SIGKILL", group), GROUP_STOP_GRACE_MS)
+      escalation.unref()
+    },
+    stopNow(): void {
+      stopped = true
+      clearTimeout(escalation)
+      stopProcess(child, "SIGKILL", group)
+      child.stdin.destroy()
+      child.stdout.destroy()
+      child.stderr.destroy()
+    },
+    finish(): void {
+      if (finished) return
+      finished = true
+      // The leader may have exited successfully while a background helper
+      // closed the pipes. It still belongs to this invocation's group.
+      if (!stopped && group) stopProcess(child, "SIGKILL", true)
+      if (!stopped) clearTimeout(escalation)
+      releaseGroup()
+    },
+  }
+  const phase = phaseOwned ? shellPhase.getStore() : undefined
+  if (phase !== undefined) {
+    const releasePhase = phase.own(handle)
+    const finish = handle.finish
+    handle.finish = () => {
+      finish()
+      releasePhase()
+    }
+  }
+  return handle
+}
+
+/** Start one persistent child with Shell's group, signal and pipe lifecycle. */
+export function startShellProcess(command: string, args: readonly string[], options: RunGitOptions = {}): ShellProcess {
+  const launched = launchShellProcess(command, args, options, process.platform !== "win32", false)
+  const { child } = launched
+  const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolveExit, reject) => {
+    child.once("error", (error) => {
+      launched.finish()
+      reject(error)
+    })
+    child.once("exit", (code, signal) => {
+      // Preserve buffered protocol output until `close`, while stopping any
+      // descendants that outlived the carrier itself.
+      if (process.platform !== "win32") stopProcess(child, "SIGKILL", true)
+      resolveExit({ code, signal })
+    })
+    child.once("close", () => launched.finish())
+  })
+  return {
+    stdin: child.stdin,
+    stdout: child.stdout,
+    stderr: child.stderr,
+    exited,
+    stop: launched.stop,
+  }
+}
+
 /** Git's stable C-locale texts for a fetch stopped by a locally dangling ref. */
 export function isMissingObjectFetchError(detail: string): boolean {
   return /\bbad object refs\/|did not send all necessary objects/u.test(detail)
@@ -489,17 +695,16 @@ function commandFailure(repository: string, args: readonly string[], result: Git
 }
 
 async function run(command: string, args: readonly string[], options: GitOptions = {}): Promise<GitResult> {
-  const timeoutMs = options.timeoutMs === undefined ? undefined : normalizeTimeoutMs(options.timeoutMs, "timeoutMs")
+  const requested = options.timeoutMs === undefined ? undefined : normalizeTimeoutMs(options.timeoutMs, "timeoutMs")
+  const remaining = shellPhase.getStore()?.remainingMs()
+  const timeoutMs = remaining === undefined ? requested : Math.min(requested ?? remaining, remaining)
   // oxlint-disable-next-line promise/param-names -- resolveResult cannot shadow the imported path.resolve.
   return new Promise((resolveResult, reject) => {
     const bounded = timeoutMs !== undefined && process.platform !== "win32"
-    const child = childProcess.spawn(command, args, {
-      env: { ...(options.baseEnv ?? process.env), ...options.env, GIT_TERMINAL_PROMPT: "0", LC_ALL: "C" },
-      stdio: ["pipe", "pipe", "pipe"],
-      // A bounded command leads its own process group, so the limit reaches
-      // the helpers Git starts (ssh, index-pack) and not only Git itself.
-      detached: bounded,
-    })
+    // A bounded command leads its own process group, so the limit reaches
+    // the helpers Git starts (ssh, index-pack) and not only Git itself.
+    const launched = launchShellProcess(command, args, options, bounded)
+    const { child } = launched
     const stdout: Buffer[] = []
     const stderr: Buffer[] = []
     let settled = false
@@ -507,17 +712,11 @@ async function run(command: string, args: readonly string[], options: GitOptions
     let exitCode: number | null | undefined
     let exitSignal: NodeJS.Signals | null = null
     let limit: ReturnType<typeof setTimeout> | undefined
-    let escalation: ReturnType<typeof setTimeout> | undefined
-    const release =
-      bounded && child.pid !== undefined
-        ? holdGroup(child.pid, shellRuntime.getStore()?.sigterm ?? "forward")
-        : () => {}
     const settle = (finish: () => void): void => {
       if (settled) return
       settled = true
       clearTimeout(limit)
-      clearTimeout(escalation)
-      release()
+      launched.finish()
       finish()
     }
     const settleOutcome = (code: number | null, signal: NodeJS.Signals | null): void => {
@@ -536,8 +735,8 @@ async function run(command: string, args: readonly string[], options: GitOptions
     // helper that left the group could otherwise hold open indefinitely.
     const abandonHelpers = (): void => {
       stopProcess(child, "SIGKILL", bounded)
-      child.stdout.destroy()
-      child.stderr.destroy()
+      child.stdout?.destroy()
+      child.stderr?.destroy()
     }
     if (timeoutMs !== undefined) {
       limit = setTimeout(() => {
@@ -550,8 +749,7 @@ async function run(command: string, args: readonly string[], options: GitOptions
           return
         }
         timedOut = true
-        stopProcess(child, "SIGTERM", bounded)
-        escalation = setTimeout(() => stopProcess(child, "SIGKILL", bounded), GROUP_STOP_GRACE_MS)
+        launched.stop()
       }, timeoutMs)
     }
     child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk))

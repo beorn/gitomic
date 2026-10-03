@@ -17,10 +17,12 @@ import { fileURLToPath, pathToFileURL } from "node:url"
 import { afterEach, describe, expect, test, vi } from "vitest"
 import { tempTree } from "removely"
 
-import { createShellBackend, open, openRemoteRepository, runGit } from "../src/index.js"
+import { createShellBackend, open, openRemoteRepository, runCommand, runGit } from "../src/index.js"
+import { createShellPhase, startShellProcess } from "../src/shell.js"
 import { createBareRepo, createRemoteRepos, createWorktreeRepo, git, gitFrom } from "./helpers/git.js"
 
 const INDEX = fileURLToPath(new URL("../src/index.ts", import.meta.url))
+const SHELL = fileURLToPath(new URL("../src/shell.ts", import.meta.url))
 const STALLING_SOURCE = "git@stall.invalid:state.git"
 
 type StallingSsh = {
@@ -72,8 +74,8 @@ function alive(pid: number): boolean {
 }
 
 /** Every stalled process is gone, allowing a moment for the killed group to be reaped. */
-async function survivors(pids: readonly number[]): Promise<number[]> {
-  const deadline = Date.now() + 2_000
+async function survivors(pids: readonly number[], waitMs = 2_000): Promise<number[]> {
+  const deadline = Date.now() + waitMs
   let living = pids.filter(alive)
   while (living.length > 0 && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 50))
@@ -416,6 +418,244 @@ describe("a bounded command", () => {
     expect(result.code).toBe(0)
     expect(Date.now() - startedAt).toBeLessThan(4_500)
     expect(await survivors([Number(result.stdout.toString("utf8").trim())])).toEqual([])
+  }, 10_000)
+
+  // @failure A successful phase can hand a still-running detached native helper to its next request.
+  // @level l1
+  // @consumer the reusable repository-candidate carrier's parent-side native commands
+  // Existing held-pipe coverage stops only after the command limit; this helper closes its pipes first.
+  test("successful bounded command leaves no background helper with closed pipes", async () => {
+    const result = await runCommand("sh", ["-c", "sleep 3600 </dev/null >/dev/null 2>&1 & echo $!"], {
+      timeoutMs: 500,
+    })
+    expect(result.code).toBe(0)
+    const pid = Number(result.stdout.toString("utf8").trim())
+    try {
+      expect(pid).toBeGreaterThan(0)
+      expect(await survivors([pid])).toEqual([])
+    } finally {
+      if (alive(pid)) process.kill(pid, "SIGKILL")
+    }
+  }, 10_000)
+
+  // @failure Serial queue time is omitted from the request deadline, allowing a late request to launch native work.
+  // @level l1
+  // @consumer the warm repository-candidate carrier's queued derive/check requests
+  // Existing one-command deadlines start only when the command is launched.
+  test("phase deadline includes time before a queued request enters the carrier", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "gitomic-phase-queue-"))
+    const marker = join(directory, "late")
+    let releaseAdmission: (() => void) | undefined
+    const admission = new Promise<void>((resolve) => {
+      releaseAdmission = resolve
+    })
+    try {
+      const phase = createShellPhase(100)
+      await expect(
+        phase.run(async () => {
+          // This represents the serial carrier's admission queue. The phase
+          // must reject while still waiting here, before native work begins.
+          await admission
+          await runCommand("sh", ["-c", `echo late > ${JSON.stringify(marker)}`])
+        }),
+      ).rejects.toMatchObject({ name: "GitTimeout" })
+      releaseAdmission?.()
+      await new Promise((resolve) => setTimeout(resolve, 25))
+      expect(fs.existsSync(marker)).toBe(false)
+    } finally {
+      releaseAdmission?.()
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  // @failure A deadline stops the carrier but leaves a separately detached native helper alive.
+  // @level l1
+  // @consumer the warm repository-candidate carrier and parent-side Git/command helpers
+  // The prior timeout tests own only one child group and cannot see a second phase-owned group.
+  test("phase timeout stops its carrier and a separate TERM-ignoring helper", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "gitomic-phase-groups-"))
+    const carrierPidFile = join(directory, "carrier")
+    const helperPidFile = join(directory, "helper")
+    const carrier = startShellProcess(process.execPath, [
+      "-e",
+      `require("node:fs").writeFileSync(${JSON.stringify(carrierPidFile)}, String(process.pid)); process.on("SIGTERM", () => {}); setInterval(() => {}, 1000)`,
+    ])
+    try {
+      const phase = createShellPhase(250)
+      await expect(
+        phase.run(async () => {
+          phase.admit(carrier)
+          await runCommand("sh", ["-c", `echo $$ > ${JSON.stringify(helperPidFile)}; trap '' TERM; sleep 3600`], {
+            timeoutMs: 5_000,
+          })
+        }),
+      ).rejects.toMatchObject({ name: "GitTimeout" })
+      expect(fs.existsSync(carrierPidFile)).toBe(true)
+      expect(fs.existsSync(helperPidFile)).toBe(true)
+      const pids = [carrierPidFile, helperPidFile].map((path) => Number(fs.readFileSync(path, "utf8").trim()))
+      expect(await survivors(pids, 3_000)).toEqual([])
+    } finally {
+      carrier.stop()
+      for (const path of [carrierPidFile, helperPidFile]) {
+        if (fs.existsSync(path)) {
+          const pid = Number(fs.readFileSync(path, "utf8").trim())
+          if (alive(pid)) process.kill(pid, "SIGKILL")
+        }
+      }
+      await rm(directory, { recursive: true, force: true })
+    }
+  }, 10_000)
+
+  // @failure The first successful request kills its reusable child, or a later request inherits a helper from the first.
+  // @level l1
+  // @consumer the daemon's serial warm candidate carrier
+  // A one-shot command result cannot witness a second request on the same child.
+  test("success retains the carrier across requests but retires the first phase's helper", async () => {
+    const carrier = startShellProcess(process.execPath, [
+      "-e",
+      "process.stdin.on('data', chunk => process.stdout.write(chunk))",
+    ])
+    let helperPid = 0
+    const answer = async (input: string): Promise<string> => {
+      const reply = new Promise<string>((resolve) => {
+        carrier.stdout.once("data", (chunk: Buffer) => resolve(chunk.toString("utf8")))
+      })
+      carrier.stdin.write(input)
+      return reply
+    }
+    try {
+      const first = createShellPhase(2_000)
+      expect(
+        await first.run(async () => {
+          first.admit(carrier)
+          const helper = await runCommand("sh", ["-c", "sleep 3600 </dev/null >/dev/null 2>&1 & echo $!"])
+          helperPid = Number(helper.stdout.toString("utf8").trim())
+          return answer("first\n")
+        }),
+      ).toBe("first\n")
+      expect(await survivors([helperPid])).toEqual([])
+
+      const second = createShellPhase(2_000)
+      expect(
+        await second.run(async () => {
+          second.admit(carrier)
+          return answer("second\n")
+        }),
+      ).toBe("second\n")
+    } finally {
+      carrier.stop()
+      if (alive(helperPid)) process.kill(helperPid, "SIGKILL")
+    }
+  }, 10_000)
+
+  // @failure A phase returns success while an unawaited native command can keep running into the next request.
+  // @level l1
+  // @consumer the carrier phase's parent-side native helper ownership
+  // Awaited commands and completed background children do not expose the success cleanup window.
+  test("phase success ends an unfinished parent-side native helper before returning", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "gitomic-phase-finish-"))
+    const pidFile = join(directory, "helper")
+    let helperPid = 0
+    try {
+      const phase = createShellPhase(2_000)
+      await phase.run(async () => {
+        void runCommand("sh", ["-c", `echo $$ > ${JSON.stringify(pidFile)}; trap '' TERM; sleep 3600`], {
+          timeoutMs: 5_000,
+        }).catch(() => {})
+        for (let attempt = 0; attempt < 40 && !fs.existsSync(pidFile); attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 25))
+        }
+        expect(fs.existsSync(pidFile)).toBe(true)
+        helperPid = Number(fs.readFileSync(pidFile, "utf8").trim())
+      })
+      // A success boundary cannot leave a 2-second TERM grace window in which
+      // this process can write into another request.
+      expect(await survivors([helperPid], 400)).toEqual([])
+    } finally {
+      if (alive(helperPid)) process.kill(helperPid, "SIGKILL")
+      await rm(directory, { recursive: true, force: true })
+    }
+  }, 10_000)
+
+  // @failure Daemon shutdown leaves a pending request and its warm child alive until the request deadline.
+  // @level l1
+  // @consumer the daemon's carrier drain/shutdown path
+  // Deadline-only tests cannot prove the explicit stop path rejects a waiting phase.
+  test("explicit phase stop rejects pending work and stops its admitted carrier", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "gitomic-phase-stop-"))
+    const pidFile = join(directory, "carrier")
+    const carrier = startShellProcess(process.execPath, [
+      "-e",
+      `require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); process.on("SIGTERM", () => {}); setInterval(() => {}, 1000)`,
+    ])
+    const phase = createShellPhase(5_000)
+    let release: (() => void) | undefined
+    const waiting = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    try {
+      const work = phase.run(async () => {
+        phase.admit(carrier)
+        await waiting
+      })
+      for (let attempt = 0; attempt < 40 && !fs.existsSync(pidFile); attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 25))
+      }
+      expect(fs.existsSync(pidFile)).toBe(true)
+      phase.stop()
+      await expect(work).rejects.toThrow("candidate phase stopped")
+      const pid = Number(fs.readFileSync(pidFile, "utf8").trim())
+      expect(await survivors([pid], 3_000)).toEqual([])
+    } finally {
+      release?.()
+      carrier.stop()
+      if (fs.existsSync(pidFile)) {
+        const pid = Number(fs.readFileSync(pidFile, "utf8").trim())
+        if (alive(pid)) process.kill(pid, "SIGKILL")
+      }
+      await rm(directory, { recursive: true, force: true })
+    }
+  }, 10_000)
+
+  // @failure A synchronous policy hang lets the carrier's own detached native helper escape the parent deadline.
+  // @level l1
+  // @consumer the trusted bundle's Gitomic native calls inside a reusable carrier child
+  // Parent-side phase ownership cannot see a group detached by runCommand in another process.
+  test("phase deadline contains native groups started inside a synchronously hung carrier", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "gitomic-phase-nested-"))
+    const carrierPidFile = join(directory, "carrier")
+    const helperPidFile = join(directory, "helper")
+    const script = [
+      `const shell = await import(${JSON.stringify(SHELL)})`,
+      `require("node:fs").writeFileSync(${JSON.stringify(carrierPidFile)}, String(process.pid))`,
+      `void shell.runCommand("sh", ["-c", ${JSON.stringify(`echo $$ > ${JSON.stringify(helperPidFile)}; trap '' TERM; sleep 3600`)}], { timeoutMs: 5000 })`,
+      "while (true) {}",
+    ].join(";\n")
+    const carrier = startShellProcess(process.execPath, ["-e", script])
+    try {
+      const phase = createShellPhase(750)
+      await expect(
+        phase.run(async () => {
+          phase.admit(carrier)
+          for (let attempt = 0; attempt < 40 && !fs.existsSync(helperPidFile); attempt++) {
+            await new Promise((resolve) => setTimeout(resolve, 25))
+          }
+          expect(fs.existsSync(helperPidFile)).toBe(true)
+          await new Promise<void>(() => {})
+        }),
+      ).rejects.toMatchObject({ name: "GitTimeout" })
+      const pids = [carrierPidFile, helperPidFile].map((path) => Number(fs.readFileSync(path, "utf8").trim()))
+      expect(await survivors(pids, 3_000)).toEqual([])
+    } finally {
+      carrier.stop()
+      for (const path of [carrierPidFile, helperPidFile]) {
+        if (fs.existsSync(path)) {
+          const pid = Number(fs.readFileSync(path, "utf8").trim())
+          if (alive(pid)) process.kill(pid, "SIGKILL")
+        }
+      }
+      await rm(directory, { recursive: true, force: true })
+    }
   }, 10_000)
 })
 
