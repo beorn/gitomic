@@ -575,6 +575,8 @@ $ gitomic apply 'repo#main' -m batch  put new.md ./new.txt  rm old.md
 
 URL and scp-style addresses use `openRemoteRepository` for the command's lifetime. With `GITOMIC_CACHE_DIR` set, that open passes it as `cacheDir`, so each URL is cloned once into a kept bare repository there and every later command fetches only what changed; unset or empty, each command makes a temporary clone and removes it on exit. A temporary clone sets `gc.auto=0`, so one left behind by a killed process never starts a background gc. Explicit relative paths (`./` or `../`), absolute paths and drive paths stay local. A local-open failure never falls back to a remote. For example, `gitomic read 'file:///srv/state.git#main' note.md` needs no checkout in the current directory. Native Git handles the selected transport and its credentials. Cleanup failures produce a nonzero exit and diagnostics; a write may already have published, in which case its stdout receipt still identifies the landed commit.
 
+**Origin.** `gitomic origin --repo <path>` prints the repository configured `origin` URL and one newline, then exits. `--repo` is required and explicit: there is no current-directory inference, no alternate-remote selection, no GitHub-replica fallback, and nothing is written. A missing, empty, unreadable or invalid repository or origin exits nonzero with a diagnostic naming the problem. Callers append `#main` and use the result as the repo half of any other verb address.
+
 **Read verbs** open an immutable snapshot, pinned at `--at <oid>` or the tip:
 
 | verb                                                      | prints                                                               |

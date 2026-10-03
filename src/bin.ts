@@ -69,6 +69,12 @@ import { decodeUtf8 } from "./utf8.ts"
  *   identity changes, not text, rename or mode-only changes. `--at` defaults
  *   to one pinned tip. Both history commands buffer output until success.
  *
+ * - `origin --repo <path>`: print the repository configured `origin` URL and
+ *   one newline, then exit. `--repo` is required and explicit: no
+ *   current-directory inference, no alternate-remote selection, no
+ *   GitHub-replica fallback, nothing written. A missing, empty, unreadable or
+ *   invalid repository/origin refuses (exit 1) with a diagnostic.
+ *
  * Write verbs (open + apply, one commit per invocation). Every `--expect`
  * or clause anchor is the git BLOB oid `ls`/a prior write's own commit
  * reports, never a raw hash of the file's bytes:
@@ -223,6 +229,8 @@ export async function main(argv: string[], io: CliIo = {}): Promise<number> {
         return await runLog(args, stdout, stderr, source)
       case "diff":
         return await runDiff(args, stdout, source)
+      case "origin":
+        return await runOrigin(args, stdout)
       case "write":
         return await runWrite(args, stdin, stdout, stderr, source)
       case "rm":
@@ -255,7 +263,20 @@ export type CliIo = {
   env?: Readonly<Record<string, string | undefined>>
 }
 
-export const VERBS = ["read", "ls", "grep", "log", "diff", "write", "rm", "mv", "apply", "project", "trust"] as const
+export const VERBS = [
+  "read",
+  "ls",
+  "grep",
+  "log",
+  "diff",
+  "origin",
+  "write",
+  "rm",
+  "mv",
+  "apply",
+  "project",
+  "trust",
+] as const
 
 const OK = 0
 const RUNTIME_ERROR = 1
@@ -431,6 +452,46 @@ function compilePattern(pattern: string): RegExp {
   } catch (error) {
     throw new UsageError(`invalid grep pattern: ${error instanceof Error ? error.message : String(error)}`)
   }
+}
+
+/**
+ * `origin --repo <path>`: print the named repository configured `origin` URL
+ * and one newline, then exit. Read-only: one `git config --get remote.origin.url`
+ * against the explicit path. No cwd inference, no alternate remote, no
+ * GitHub-replica fallback, nothing written. A missing, empty, unreadable or
+ * invalid repository/origin refuses with a diagnostic naming the problem.
+ */
+async function runOrigin(args: string[], stdout: CliWriter): Promise<number> {
+  const { positionals, flags } = extractFlags(args, { "--repo": "value" })
+  const repo = requireStringFlag(flags, "--repo", "--repo <path>")
+  if (positionals.length > 0) {
+    throw new UsageError(`origin takes no positional arguments, got: ${positionals.join(" ")}`)
+  }
+  stdout.write(`${await resolveOrigin(repo)}\n`)
+  return OK
+}
+
+/** Resolve `repo` configured `origin` URL, or throw naming the missing, empty or invalid resource. */
+async function resolveOrigin(repo: string): Promise<string> {
+  const result = await runGit(["-C", repo, "config", "--get", "remote.origin.url"])
+  if (result.code === 1 && result.stdout.length === 0) {
+    throw new Error(`${JSON.stringify(repo)}: remote.origin.url is unset; name a repository whose origin is configured`)
+  }
+  if (result.code !== 0) {
+    const detail =
+      result.stderr
+        .toString("utf8")
+        .trim()
+        .split("\n")
+        .filter((line) => line !== "")
+        .at(-1) ?? ""
+    throw new Error(
+      `${JSON.stringify(repo)}: cannot resolve origin (git config --get remote.origin.url exit ${result.code})${detail === "" ? "" : `: ${detail}`}`,
+    )
+  }
+  const url = result.stdout.toString("utf8").replace(/\r?\n$/u, "")
+  if (url.trim() === "") throw new Error(`${JSON.stringify(repo)}: remote.origin.url is empty`)
+  return url
 }
 
 // --- write verbs ---------------------------------------------------------
