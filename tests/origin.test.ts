@@ -1,4 +1,4 @@
-// @failure The origin resolver could infer a repository from the current directory, climb to an ancestor repository or the global config, select an alternate remote, fall back to a replica, print more than the URL and one newline, or report a missing, empty or invalid repository/origin as success, so a STATE write is addressed to the wrong authority.
+// @failure The origin resolver could infer a repository from the current directory, climb to an ancestor repository or the global config, let an ambient repository selector (GIT_DIR, GIT_COMMON_DIR) override the explicit --repo, select an alternate remote, fall back to a replica, print more than the URL and one newline, or report a missing, empty or invalid repository/origin as success, so a STATE write is addressed to the wrong authority.
 // @level l1
 // @consumer /commit STATE-write recipe and the km refusal messages that must name gitomic origin --repo; @cto ruling 24168 (STATE c90b9255)
 // @testonly none: real temporary repositories through the real CLI entry.
@@ -44,6 +44,19 @@ async function checkout(origin?: string): Promise<string> {
   cleanups.push(made.cleanup)
   if (origin !== undefined) await gitFrom(made.repo, "remote", "add", "origin", origin)
   return made.repo
+}
+
+async function withEnv<T>(patch: Record<string, string>, body: () => Promise<T>): Promise<T> {
+  const before = new Map(Object.keys(patch).map((key) => [key, process.env[key]]))
+  for (const [key, value] of Object.entries(patch)) process.env[key] = value
+  try {
+    return await body()
+  } finally {
+    for (const [key, prior] of before) {
+      if (prior === undefined) delete process.env[key]
+      else process.env[key] = prior
+    }
+  }
 }
 
 describe("origin", () => {
@@ -127,6 +140,34 @@ describe("origin", () => {
       if (before.system === undefined) delete process.env.GIT_CONFIG_SYSTEM
       else process.env.GIT_CONFIG_SYSTEM = before.system
     }
+  })
+
+  test("keeps an ambient GIT_DIR from selecting another repository than --repo", async () => {
+    const named = await checkout("file:///srv/named.git")
+    const other = await checkout("file:///srv/other.git")
+    const result = await withEnv({ GIT_DIR: join(other, ".git") }, () => run(["origin", "--repo", named]))
+    expect(result.code).toBe(0)
+    expect(result.stdout).toBe("file:///srv/named.git\n")
+    expect(result.stderr).toBe("")
+  })
+
+  test("keeps an ambient GIT_COMMON_DIR from selecting another repository than --repo", async () => {
+    const named = await checkout("file:///srv/named.git")
+    const other = await checkout("file:///srv/other.git")
+    const result = await withEnv({ GIT_COMMON_DIR: join(other, ".git") }, () => run(["origin", "--repo", named]))
+    expect(result.code).toBe(0)
+    expect(result.stdout).toBe("file:///srv/named.git\n")
+    expect(result.stderr).toBe("")
+  })
+
+  test("refuses a directory that is not a repository even when an ambient GIT_DIR names one", async () => {
+    const other = await checkout(URL)
+    const plain = join(work, "plain-directory")
+    await mkdir(plain)
+    const result = await withEnv({ GIT_DIR: join(other, ".git") }, () => run(["origin", "--repo", plain]))
+    expect(result.code).toBe(1)
+    expect(result.stdout).toBe("")
+    expect(result.stderr).toContain("not a Git repository")
   })
 
   test("requires --repo and never infers the current directory", async () => {
