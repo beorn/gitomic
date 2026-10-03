@@ -102,6 +102,7 @@ export function createSnapshotBase(backend: GitomicBackend, repo: string, commit
   const entries = new Map<string, TreeEntry>()
   const base = createLazyBase(backend, repo, commit, entries, "caller")
   const resolved = new Set<string>()
+  const exact = new Map<string, Promise<void>>()
   let whole: Promise<void> | undefined
   const loadWhole = (): Promise<void> => {
     whole ??= (async () => {
@@ -109,21 +110,34 @@ export function createSnapshotBase(backend: GitomicBackend, repo: string, commit
     })()
     return whole
   }
+  // ONE in-flight scoped lookup per normalized path, held beside the answers it lands in. A path is marked
+  // resolved only when its read lands, so concurrent first asks for the same path share the pending read instead
+  // of each starting one (27226 part 2 re-review 4af05dc2). A rejected read leaves the map, so a later ask reads
+  // again: an error is not an answer, and it is not a resolved path either.
+  const loadExact = (normalized: string): Promise<void> => {
+    const pending = exact.get(normalized)
+    if (pending !== undefined) return pending
+    const read = (async () => {
+      const entry = await backend.readTreeExact(repo, commit, normalized)
+      if (entry !== undefined) entries.set(normalized, entry)
+      resolved.add(normalized)
+    })()
+    exact.set(normalized, read)
+    read.catch(() => {
+      if (exact.get(normalized) === read) exact.delete(normalized)
+    })
+    return read
+  }
   return {
     ...base,
     async wholeListing() {
       await loadWhole()
     },
     async resolveExact(path) {
-      if (whole !== undefined) {
-        await whole
-        return
-      }
+      if (whole !== undefined) return whole
       const normalized = normalizePath(path)
       if (resolved.has(normalized)) return
-      const entry = await backend.readTreeExact(repo, commit, normalized)
-      if (entry !== undefined) entries.set(normalized, entry)
-      resolved.add(normalized)
+      await loadExact(normalized)
     },
   }
 }

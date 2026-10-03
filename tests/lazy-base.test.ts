@@ -27,25 +27,34 @@ type Recorded = {
   blobCalls: Oid[][]
   /** Every `readTree` call: the commit it listed. */
   treeCalls: Oid[]
+  /** Every `readTreeExact` call: the path it looked up, in order (27226 part 2). */
+  exactCalls: string[]
   reset(): void
 }
 
-/** Record the two lazy-base primitives without changing what they answer. */
+/** Record the three lazy-base primitives without changing what they answer. */
 function recordReads(source: GitomicBackend): Recorded {
   const blobCalls: Oid[][] = []
   const treeCalls: Oid[] = []
+  const exactCalls: string[] = []
   return {
     blobCalls,
     treeCalls,
+    exactCalls,
     reset: () => {
       blobCalls.length = 0
       treeCalls.length = 0
+      exactCalls.length = 0
     },
     backend: {
       ...source,
       readTree: (repo, commit, prefix) => {
         treeCalls.push(commit)
         return source.readTree(repo, commit, prefix)
+      },
+      readTreeExact: (repo, commit, path) => {
+        exactCalls.push(path)
+        return source.readTreeExact(repo, commit, path)
       },
       readBlobs: (repo, oids) => {
         blobCalls.push([...oids])
@@ -549,6 +558,56 @@ describe("a snapshot reads its tree ONCE, however many paths it names (27226)", 
     expect(await snapshot.keys("notes/00")).toHaveLength(200)
 
     expect(recorded.treeCalls).toEqual([parent])
+  })
+
+  test("concurrent first get/oid/has for one path share the one exact lookup", async () => {
+    const recorded = recordReads(createMemBackend())
+    const store = await open({
+      repo: "one-exact-overlap",
+      ref: "main",
+      writer: "worker",
+      backend: recorded.backend,
+    })
+    const parent = await seedNotes(store, 200)
+    recorded.reset()
+
+    const snapshot = store.at(parent)
+    // The three verbs name the SAME path before any of them lands: each passed the completed-path check and issued
+    // its own scoped read (27226 part 2 re-review 4af05dc2).
+    const [value, oid, present] = await Promise.all([
+      snapshot.get(notePath(1)),
+      snapshot.oid(notePath(1)),
+      snapshot.has(notePath(1)),
+    ])
+    expect(value).toBe("note 1\n")
+    expect(oid).toBeTypeOf("string")
+    expect(present).toBe(true)
+    expect(recorded.exactCalls).toEqual([notePath(1)])
+  })
+
+  test("a rejected exact lookup is not kept: the same Snapshot asks again", async () => {
+    const recorded = recordReads(createMemBackend())
+    let failNext = true
+    const flaky = {
+      ...recorded.backend,
+      readTreeExact: async (repo: string, commit: Oid, path: string) => {
+        const answer = await recorded.backend.readTreeExact(repo, commit, path)
+        if (failNext) {
+          failNext = false
+          throw new Error("transient: the object store was busy")
+        }
+        return answer
+      },
+    }
+    const store = await open({ repo: "one-exact-retry", ref: "main", writer: "worker", backend: flaky })
+    const parent = await seedNotes(store, 3)
+    recorded.reset()
+
+    const snapshot = store.at(parent)
+    await expect(snapshot.get(notePath(1))).rejects.toThrow(/transient: the object store was busy/u)
+    // The rejection left the pending map, so the same Snapshot reads the same path again and answers.
+    expect(await snapshot.get(notePath(1))).toBe("note 1\n")
+    expect(recorded.exactCalls).toEqual([notePath(1), notePath(1)])
   })
 
   test("a missing path and a missing prefix keep their meaning as an empty view", async () => {
