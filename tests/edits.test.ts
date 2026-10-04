@@ -118,7 +118,7 @@ describe("apply — the four-edit door", () => {
     })
   })
 
-  test("append carries no precondition and concatenates onto whatever is there", async () => {
+  test("append concatenates onto an existing path but refuses an absent one by name", async () => {
     const store = await createStore("append")
     const base = await store.head()
     const created = await apply(
@@ -131,9 +131,22 @@ describe("apply — the four-edit door", () => {
     const appended = await apply(store, created.oid, [{ kind: "append", path: "log.md", content: "b\n" }], "append b")
     expect(await store.at(appended.oid).get("log.md")).toBe("a\nb\n")
 
-    // append onto an absent path starts it.
-    const fresh = await apply(store, appended.oid, [{ kind: "append", path: "new.md", content: "x\n" }], "append fresh")
-    expect(await store.at(fresh.oid).get("new.md")).toBe("x\n")
+    // append onto an ABSENT path must refuse by name, never silently create the file.
+    const refused = await apply(
+      store,
+      appended.oid,
+      [{ kind: "append", path: "@hh/tooling/mistyped.md", content: "x\n" }],
+      "append mistyped",
+    ).catch((e: unknown) => e)
+    expect(refused).toBeInstanceOf(EditDoesNotApply)
+    expect(refused).toMatchObject({
+      kind: "append",
+      preconditionType: "blob-present",
+      path: "@hh/tooling/mistyped.md",
+      expected: "present",
+      actual: null,
+    })
+    expect(await store.at(appended.oid).get("@hh/tooling/mistyped.md")).toBeUndefined()
   })
 
   test("rm removes when the source oid matches, refuses on a moved source", async () => {

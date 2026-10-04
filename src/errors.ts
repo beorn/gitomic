@@ -126,6 +126,7 @@ export type EditKind = "put" | "put-bytes" | "append" | "rm" | "mv" | "replace"
 export type PreconditionType =
   | "blob-identical"
   | "blob-absent"
+  | "blob-present"
   | "source-identical"
   | "destination-absent"
   | "text-unique"
@@ -154,7 +155,10 @@ export class EditDoesNotApply extends Error {
    * without changing it.
    */
   readonly anchor: string
-  /** The content the precondition names — the expected git blob oid, "1" for text-unique, or `null` for "absent". */
+  /**
+   * The content the precondition names — the expected git blob oid,
+   * "1" for text-unique, "present" for blob-present, or `null` for "absent".
+   */
   readonly expected: string | null
   /** What was actually there at the attempted tree — a git blob oid, decimal count for text-unique, or `null` for "absent". */
   readonly actual: string | null
@@ -179,7 +183,10 @@ export class EditDoesNotApply extends Error {
      * without changing it.
      */
     anchor: string,
-    /** The content the precondition names — the expected git blob oid, "1" for text-unique, or `null` for "absent". */
+    /**
+     * The content the precondition names — the expected git blob oid,
+     * "1" for text-unique, "present" for blob-present, or `null` for "absent".
+     */
     expected: string | null,
     /** What was actually there at the attempted tree — a git blob oid, decimal count for text-unique, or `null` for "absent". */
     actual: string | null,

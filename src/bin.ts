@@ -104,7 +104,7 @@ import { decodeUtf8 } from "./utf8.ts"
  *   apply). Each clause is introduced by its own kind keyword:
  *     - `put <path> <file> [--expect <oid> | --create]`
  *     - `put-bytes <path> <file> [--expect <oid> | --create]`
- *     - `append <path> <file>`
+ *     - `append <path> <file>` (the target must already exist)
  *     - `replace <path> <old-file> <new-file>`
  *     - `rm <path> [--expect <oid>]`
  *     - `mv <from> <to> [--expect <oid>]`
@@ -112,8 +112,9 @@ import { decodeUtf8 } from "./utf8.ts"
  *   `rm` and `mv` without `--expect` (and `put` without `--create`)
  *   auto-read their path's current oid at `--base` (default: the current
  *   head) — the same rule `write` uses above; `put --create` is a strict
- *   create; `append` carries no anchor at all, per the library's own `Edit`
- *   shape; `replace` replaces exactly one occurrence of `<old-file>`'s text
+ *   create; `append` carries no `--expect` anchor but requires its target to
+ *   already exist at the attempted tree — an absent path is refused, never
+ *   created; `replace` replaces exactly one occurrence of `<old-file>`'s text
  *   with `<new-file>`'s text. Clause ORDER is apply order against the SAME
  *   attempted tree, so a later clause can depend on an earlier one: `rm to.md`
  *   then `mv from.md to.md` frees `to.md` for the move inside one commit,

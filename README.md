@@ -356,13 +356,13 @@ if (oldNote === undefined) throw new Error("notes/old.md is gone")
 const edits: Edit[] = [
   { kind: "put", path: "notes/today.md", content: "buy milk", expect: null }, // create: must be ABSENT
   { kind: "put-bytes", path: "images/pixel.png", content: pngBytes, expect: null }, // raw bytes
-  { kind: "append", path: "log.md", content: "bought milk\n" }, // no precondition
+  { kind: "append", path: "log.md", content: "bought milk\n" }, // target must already exist
   { kind: "rm", path: "notes/old.md", expect: oldNote }, // remove exactly this blob
 ]
 const { oid } = await apply(store, base, edits, "sync notes")
 ```
 
-`apply(store, base, edits, message)` lands the whole list as ONE all-or-nothing commit. `base` is the commit the edits were read against; the natural anchor for each `expect` is `store.at(base).oid(path)` — the git blob oid there, or `undefined` when the path is absent. Each edit re-checks its own precondition against the tree the commit actually attempts, so when a concurrent writer has moved the ref `apply` replays against the new tip for free (the same contract `transact` gives a callback). The FIRST edit whose precondition fails throws `EditDoesNotApply` — naming the edit index, the path, the oid it expected and the one it found, and both commits — and lands nothing. A `put` or `put-bytes` with `expect: null` demands the path be ABSENT (a create); `append` carries no precondition and always re-applies. Edits apply in order against the same attempted tree, so a later one can depend on an earlier one — `rm dest` then `mv src dest` frees the destination inside a single commit.
+`apply(store, base, edits, message)` lands the whole list as ONE all-or-nothing commit. `base` is the commit the edits were read against; the natural anchor for each `expect` is `store.at(base).oid(path)` — the git blob oid there, or `undefined` when the path is absent. Each edit re-checks its own precondition against the tree the commit actually attempts, so when a concurrent writer has moved the ref `apply` replays against the new tip for free (the same contract `transact` gives a callback). The FIRST edit whose precondition fails throws `EditDoesNotApply` — naming the edit index, the path, the oid it expected and the one it found, and both commits — and lands nothing. A `put` or `put-bytes` with `expect: null` demands the path be ABSENT (a create); `append` carries no `--expect` anchor but still requires its target to be PRESENT at the attempted tree — an absent path is refused (`blob-present`) and never created, so a mistyped path cannot silently land a stray file. Edits apply in order against the same attempted tree, so a later one can depend on an earlier one — `rm dest` then `mv src dest` frees the destination inside a single commit.
 
 A file and its descendant cannot coexist in a Git tree. Before writing the candidate commit or publishing any ref, gitomic rejects that shape with `TreePathCollision` (`code: "tree-path-collision"`), naming the `file` and `descendant`. This shared check behaves identically across shell, iso and mem backends; remove one side in the same transaction.
 

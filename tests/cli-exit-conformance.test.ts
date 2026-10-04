@@ -180,6 +180,29 @@ describe.each(targets)("the CLI exit contract on $name", (target) => {
     expect(await tip()).toEqual(before)
   })
 
+  test("append onto an absent path exits 3 with facts only, prints no receipt, and the ref does not move", async () => {
+    const address = target.address(fixture.repo)
+    const before = await tip()
+
+    const refused = await cli(target, [
+      "apply",
+      address,
+      "-m",
+      "append mistyped path",
+      "append",
+      "@hh/tooling/mistyped.md",
+      await file("payload.md", "x\n"),
+    ])
+    expect(refused.code).toBe(3)
+    expect(refused.stdout).toBe("")
+    expect(refused.stderr).toContain("kind=append")
+    expect(refused.stderr).toContain("precondition=blob-present")
+    expect(refused.stderr).toContain("path=@hh/tooling/mistyped.md")
+    expect(refused.stderr).toContain("expected=present")
+    expect(refused.stderr).toContain("actual=absent")
+    expect(await tip()).toEqual(before)
+  })
+
   test("a put onto a relative-only path exits 2, prints no receipt, and the ref does not move", async () => {
     const declarer = await open({ repo: fixture.repo, ref: "main", writer: "declare", backend: createShellBackend() })
     const gate = await declarer.transact(async (map) => {

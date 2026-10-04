@@ -48,9 +48,11 @@ export function editPaths(edits: readonly Edit[]): readonly string[] {
  *
  * `expect` is the blob oid the author read at the base — the natural
  * `--base` per R46 ("the read's oid is the natural base"). `null` on a `put`
- * means the path must be ABSENT (a create). `append` carries no anchor: it is
- * the one edit with no precondition, so it always re-applies on the new tip.
- * `replace` checks that `oldText` occurs exactly once in the path's content (`text-unique`).
+ * means the path must be ABSENT (a create). `append` carries no `--expect`
+ * anchor but still requires its target to be PRESENT at the attempted tree:
+ * an absent path is refused (`blob-present`) and never created, so a mistyped
+ * path cannot silently land a stray file. `replace` checks that `oldText`
+ * occurs exactly once in the path's content (`text-unique`).
  */
 export type Edit =
   | { readonly kind: "put"; readonly path: string; readonly content: string; readonly expect: Oid | null }
@@ -165,7 +167,10 @@ export async function applyEdits(map: GitMap, base: Oid, head: Oid, edits: reado
     switch (edit.kind) {
       case "append": {
         const current = await map.get(edit.path)
-        map.set(edit.path, (current ?? "") + edit.content)
+        if (current === undefined) {
+          throw new EditDoesNotApply(index, "append", "blob-present", edit.path, edit.path, "present", null, base, head)
+        }
+        map.set(edit.path, current + edit.content)
         break
       }
       case "put": {
