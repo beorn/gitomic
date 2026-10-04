@@ -1,8 +1,10 @@
-// @failure A cold write-log ancestry walk would rebuild the whole kept DAG in memory; the bounded all-parent edge stream is the missing lower capability.
-// @level l1
-// @consumer km-storage's one bounded cold ancestry owner (#27349)
 /**
+ * @failure A cold write-log ancestry walk would rebuild the whole kept DAG in memory; the bounded all-parent
+ *          edge stream is the missing lower capability.
+ * @level l1
+ * @consumer km-storage's one bounded cold ancestry owner (#27349)
  * @reach fs-walk <fixture-only: the shell backend runs against temporary Git repositories>
+ * @testonly none: shell + mem backends against temporary Git repositories; no production symbol exists for tests.
  */
 
 import { describe, expect, test } from "vitest"
