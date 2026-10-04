@@ -323,3 +323,30 @@ export class CandidateRefused extends Error {
     this.base = base
   }
 }
+
+/**
+ * A streamed all-parent history-edge walk exceeded a hard producer cap and was
+ * stopped. Raised before any record past the cap is yielded, and after the
+ * child process group is stopped, so a bounded walk can never quietly return a
+ * partial graph. Callers treat it as a resource refusal, never a short history.
+ */
+export class HistoryEdgesOverflow extends Error {
+  override readonly name = "HistoryEdgesOverflow"
+  /** Stable machine key; the same string across every backend and release. */
+  readonly code = "history-edges-overflow" as const
+
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options)
+  }
+}
+
+/** A streamed history-edge walk could not prove its child process group had exited after cancellation. */
+export class HistoryEdgesTeardown extends Error {
+  override readonly name = "HistoryEdgesTeardown"
+  /** Stable machine key; the same string across every backend and release. */
+  readonly code = "history-edges-teardown" as const
+
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options)
+  }
+}

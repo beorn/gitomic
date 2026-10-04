@@ -25,6 +25,7 @@ import type {
   CommitInput,
   CommitMeta,
   GitomicBackend,
+  HistoryEdgeEvent,
   Oid,
   PublishResult,
   RefSwap,
@@ -34,6 +35,14 @@ import type {
 } from "./types.js"
 import { rejectLegacyProvenance, validateRefNames } from "./options.ts"
 import { assertGitPrefixMatched, normalizePath, normalizePrefix } from "./path.ts"
+import {
+  historyEdgeParentBytes,
+  historyEdgeRecordStartBytes,
+  historyEdgesByteOverflow,
+  historyEdgesRecordOverflow,
+  normalizeHistoryEdgeByteCap,
+  normalizeHistoryEdgeRecordCap,
+} from "./history-edges.ts"
 
 type MemCommit = {
   oid: Oid
@@ -306,6 +315,46 @@ export function createMemBackend(): GitomicBackend {
     return read
   }
 
+  const readHistoryEdges = async function* (
+    name: string,
+    tips: readonly Oid[],
+    options: { readonly exclude?: readonly Oid[]; readonly maxBytes?: number; readonly maxRecords?: number } = {},
+  ): AsyncIterable<HistoryEdgeEvent> {
+    const maxBytes = options.maxBytes === undefined ? undefined : normalizeHistoryEdgeByteCap(options.maxBytes)
+    const maxRecords = options.maxRecords === undefined ? undefined : normalizeHistoryEdgeRecordCap(options.maxRecords)
+    const commits = getRepo(name).commits
+    const exclude = new Set(options.exclude ?? [])
+    const seen = new Set<Oid>()
+    const stack: Oid[] = [...tips]
+    let records = 0
+    let bytes = 0
+    // Charge the ONE canonical record (OID, each ` <parent>`, a newline) the SAME way the shell backend does, so the
+    // same cap is the same wall on both. Each accepted token is charged BEFORE its event, mirroring the shell parser.
+    const chargeBytes = (cost: number): void => {
+      bytes += cost
+      if (maxBytes !== undefined && bytes > maxBytes) throw historyEdgesByteOverflow(name, maxBytes, bytes)
+    }
+    while (stack.length > 0) {
+      const oid = stack.pop()
+      if (oid === undefined) break
+      if (exclude.has(oid) || seen.has(oid)) continue
+      const commit = commits.get(oid)
+      if (commit === undefined) throw new Error("unknown commit: " + oid)
+      seen.add(oid)
+      records += 1
+      chargeBytes(historyEdgeRecordStartBytes(oid))
+      yield { kind: "commit", oid }
+      for (const parent of commit.parents) {
+        stack.push(parent)
+        chargeBytes(historyEdgeParentBytes(parent))
+        yield { kind: "parent", oid: parent }
+      }
+      // maxRecords counts COMPLETED commits, so it refuses before this record is closed by its end event.
+      if (maxRecords !== undefined && records > maxRecords) throw historyEdgesRecordOverflow(name, maxRecords)
+      yield { kind: "end" }
+    }
+  }
+
   const backend: GitomicBackend = {
     objectFormat: async () => "sha1",
     head,
@@ -325,6 +374,7 @@ export function createMemBackend(): GitomicBackend {
     isAncestor,
     listRefs,
     readHistory,
+    readHistoryEdges,
     publish,
     fetchRefs: async () => {
       throw new TypeError("the mem backend has no remotes; fetchRefs needs a remote")
