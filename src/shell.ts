@@ -47,7 +47,7 @@ import type {
   CommitInput,
   CommitMeta,
   GitomicBackend,
-  HistoryEdge,
+  HistoryEdgeEvent,
   Ident,
   Oid,
   PublishResult,
@@ -1214,6 +1214,11 @@ async function readHistory(
 
 /** Cap on the stderr tail kept for a stream-failure message: always drained, reported bounded. */
 const HISTORY_EDGES_STDERR_LIMIT_BYTES = 8 * 1024
+// One OID token is at most 64 hex characters; allow slack for the record's leading newline and any CR. A longer
+// delimiter-free run is malformed output and is REFUSED before the carry buffer grows with it. That bound, not
+// maxBytes, is what makes this reader's heap Theta(1) rather than Theta(bytes until the next delimiter):
+// maxBytes bounds the WHOLE walk, and a single unterminated token could otherwise sit just under it.
+const HISTORY_EDGES_MAX_TOKEN_CHARS = 128
 
 /**
  * Stream every parent of every commit reachable from `tips`, as `{ oid, parents }`
@@ -1236,7 +1241,7 @@ async function* readHistoryEdges(
   tips: readonly Oid[],
   options: { readonly exclude?: readonly Oid[]; readonly maxBytes?: number; readonly maxRecords?: number } = {},
   baseEnv?: NodeJS.ProcessEnv,
-): AsyncIterable<HistoryEdge> {
+): AsyncIterable<HistoryEdgeEvent> {
   if (tips.length === 0) return
   for (const tip of tips) validateOid(tip, "invalid history tip")
   const gitdir = await resolveGitDir(repo)
@@ -1320,8 +1325,22 @@ async function* readHistoryEdges(
   let bytes = 0
   let records = 0
   let carry = ""
-  let parents: string[] = []
   let pendingOid: string | undefined
+  // Refuse a delimiter-free run before it becomes the carry buffer's size. `length` is always the whole
+  // undelimited remainder, because the parser consumes each token up to its delimiter before looping.
+  const refuseUndelimitedToken = (length: number): void => {
+    if (length <= HISTORY_EDGES_MAX_TOKEN_CHARS) return
+    kill()
+    throw new Error(
+      "git rev-list edges in " +
+        repo +
+        " returned an undelimited token of " +
+        length +
+        " characters (limit " +
+        HISTORY_EDGES_MAX_TOKEN_CHARS +
+        "); refusing rather than accumulating",
+    )
+  }
   let primaryFailure: unknown = undefined
   let hasPrimaryFailure = false
   try {
@@ -1337,37 +1356,48 @@ async function* readHistoryEdges(
         }
         carry += decodeUtf8(chunk, "git rev-list edges")
         // Consume complete units. In the oid phase a unit ends at NUL; in the parents phase a unit ends at SPACE
-        // or NUL, so a very wide merge is built token by token and the carry never holds a whole parent field.
-        // There is deliberately no fixed per-edge ceiling here: the TOTAL maxBytes budget is the only byte bound.
+        // or NUL, so a very wide merge is emitted token by token and the carry never holds a whole parent field.
+        // There is deliberately no per-EDGE refusal (the ruled R3 limit is withdrawn): the TOTAL maxBytes budget
+        // bounds the walk, and HISTORY_EDGES_MAX_TOKEN_CHARS refuses an individual unterminated token.
         for (;;) {
           if (pendingOid === undefined) {
             const end = carry.indexOf("\0")
-            if (end === -1) break
-            pendingOid = validateOid(
+            if (end === -1) {
+              refuseUndelimitedToken(carry.length)
+              break
+            }
+            const oid = validateOid(
               stripLeadingNewlines(carry.slice(0, end)),
               "git rev-list returned a malformed history id",
             )
             carry = carry.slice(end + 1)
-            parents = []
+            pendingOid = oid
+            yield { kind: "commit", oid }
             continue
           }
           const space = carry.indexOf(" ")
           const nul = carry.indexOf("\0")
           const end = nul === -1 ? space : space === -1 ? nul : Math.min(space, nul)
-          if (end === -1) break
+          if (end === -1) {
+            refuseUndelimitedToken(carry.length)
+            break
+          }
           const delimiter = carry[end]
           const token = carry.slice(0, end)
           carry = carry.slice(end + 1)
-          if (token !== "") parents.push(validateOid(token, "git rev-list returned a malformed parent id"))
+          if (token !== "") {
+            yield { kind: "parent", oid: validateOid(token, "git rev-list returned a malformed parent id") }
+          }
           if (delimiter === " ") continue
           records += 1
           if (maxRecords !== undefined && records > maxRecords) {
             kill()
-            throw new HistoryEdgesOverflow("git rev-list edges in " + repo + " exceeded maxRecords " + maxRecords)
+            throw new HistoryEdgesOverflow(
+              "git rev-list edges in " + repo + " exceeded maxRecords " + maxRecords + " commits",
+            )
           }
-          const edge: HistoryEdge = { oid: pendingOid, parents }
+          yield { kind: "end" }
           pendingOid = undefined
-          yield edge
         }
       }
     } catch (cause) {

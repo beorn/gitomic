@@ -15,14 +15,41 @@ import { join } from "node:path"
 import { describe, expect, test, vi } from "vitest"
 
 import { createShellBackend, open } from "../src/index.js"
-import type { GitomicBackend, HistoryEdge } from "../src/index.js"
+import type { GitomicBackend, HistoryEdgeEvent } from "../src/index.js"
 import { createMemBackend } from "../src/mem.js"
 import { createShellRuntime } from "../src/shell.js"
 import { appendEmptyHistory, createBareRepo, git, gitWithInput } from "./helpers/git.js"
 
-async function edges(iterable: AsyncIterable<HistoryEdge>): Promise<HistoryEdge[]> {
-  const collected: HistoryEdge[] = []
-  for await (const edge of iterable) collected.push(edge)
+/** A commit folded back from the event stream - the test's own array, built only where a test needs one. */
+type FoldedEdge = { oid: string; parents: string[] }
+
+/**
+ * Folds commit|parent|end into per-commit edges AND asserts the stream contract while it does: one commit open
+ * at a time, parent events only inside a record, every record closed by its own end, no record left open.
+ */
+async function edges(iterable: AsyncIterable<HistoryEdgeEvent>): Promise<FoldedEdge[]> {
+  const collected: FoldedEdge[] = []
+  let open: FoldedEdge | undefined
+  for await (const event of iterable) {
+    if (event.kind === "commit") {
+      if (open !== undefined) throw new Error("commit event arrived while a record was open")
+      open = { oid: event.oid, parents: [] }
+    } else if (event.kind === "parent") {
+      if (open === undefined) throw new Error("parent event arrived outside a record")
+      open.parents.push(event.oid)
+    } else {
+      if (open === undefined) throw new Error("end event arrived with no open record")
+      collected.push(open)
+      open = undefined
+    }
+  }
+  if (open !== undefined) throw new Error("stream ended with an open record")
+  return collected
+}
+
+async function rawEvents(iterable: AsyncIterable<HistoryEdgeEvent>): Promise<HistoryEdgeEvent[]> {
+  const collected: HistoryEdgeEvent[] = []
+  for await (const event of iterable) collected.push(event)
   return collected
 }
 
@@ -79,6 +106,60 @@ describe("readHistoryEdges", () => {
       expect(oids).not.toContain(fixture.initial)
     } finally {
       await fixture.cleanup()
+    }
+  })
+
+  test("the stream is commit, then its parents in Git order, then end", async () => {
+    const fixture = await mergeFixture()
+    try {
+      const backend = createShellBackend()
+      const list = await rawEvents(backend.readHistoryEdges!(fixture.repo, [fixture.merge]))
+      const at = list.findIndex((event) => event.kind === "commit" && event.oid === fixture.merge)
+      expect(at).toBeGreaterThanOrEqual(0)
+      expect(list.slice(at, at + 4)).toEqual([
+        { kind: "commit", oid: fixture.merge },
+        { kind: "parent", oid: fixture.first },
+        { kind: "parent", oid: fixture.side },
+        { kind: "end" },
+      ])
+      expect(list.filter((event) => event.kind === "commit")).toHaveLength(4)
+      expect(list.filter((event) => event.kind === "end")).toHaveLength(4)
+      // At most one commit is open at a time, and nothing follows an end except the next commit.
+      let open = false
+      for (const event of list) {
+        if (event.kind === "commit") {
+          expect(open).toBe(false)
+          open = true
+        } else if (event.kind === "parent") {
+          expect(open).toBe(true)
+        } else {
+          expect(open).toBe(true)
+          open = false
+        }
+      }
+      expect(open).toBe(false)
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  test("an unterminated token past the OID bound is refused before it is accumulated", async () => {
+    const fixture = await createBareRepo()
+    const dir = mkdtempSync(join(tmpdir(), "gitomic-edges-"))
+    try {
+      // Delimiter-free output: no NUL and no space, so the only bound that can stop the carry buffer growing is
+      // the per-token limit. maxBytes is left undefined to prove the refusal does not depend on it.
+      const fakeGit = writeFakeGit(dir, ['process.stdout.write("a".repeat(4096))', "process.exit(0)"])
+      const backend = createShellBackend({ gitExecutable: fakeGit })
+      const failure = await rawEvents(backend.readHistoryEdges!(fixture.repo, [fixture.initial])).then(
+        () => undefined,
+        (error: unknown) => error as Error,
+      )
+      expect(failure).toBeInstanceOf(Error)
+      expect(failure!.message).toMatch(/undelimited token/i)
+    } finally {
+      await fixture.cleanup()
+      rmSync(dir, { recursive: true, force: true })
     }
   })
 
@@ -408,6 +489,12 @@ describe("readHistoryEdges", () => {
     const store = await open({ repo: "edges-mem", ref: "main", backend })
     await store.transact(async (map) => map.set("a.txt", "one\n"), "first")
     const head = await backend.head("edges-mem", "refs/heads/main")
+    const raw = await rawEvents(backend.readHistoryEdges!("edges-mem", [head]))
+    expect(raw[0]).toEqual({ kind: "commit", oid: head })
+    expect(raw.at(-1)).toEqual({ kind: "end" })
+    expect(raw.filter((event) => event.kind === "commit")).toHaveLength(
+      raw.filter((event) => event.kind === "end").length,
+    )
     const list = await edges(backend.readHistoryEdges!("edges-mem", [head]))
     expect(list[0]?.oid).toBe(head)
     expect(list.length).toBeGreaterThanOrEqual(2)

@@ -25,7 +25,7 @@ import type {
   CommitInput,
   CommitMeta,
   GitomicBackend,
-  HistoryEdge,
+  HistoryEdgeEvent,
   Oid,
   PublishResult,
   RefSwap,
@@ -312,7 +312,7 @@ export function createMemBackend(): GitomicBackend {
     name: string,
     tips: readonly Oid[],
     options: { readonly exclude?: readonly Oid[]; readonly maxBytes?: number; readonly maxRecords?: number } = {},
-  ): AsyncIterable<HistoryEdge> {
+  ): AsyncIterable<HistoryEdgeEvent> {
     const commits = getRepo(name).commits
     const exclude = new Set(options.exclude ?? [])
     const maxRecords = options.maxRecords ?? Number.POSITIVE_INFINITY
@@ -330,14 +330,21 @@ export function createMemBackend(): GitomicBackend {
       seen.add(oid)
       records += 1
       bytes += oid.length + commit.parents.join(" ").length
-      if (records > maxRecords) {
-        throw new HistoryEdgesOverflow("mem history edges in " + name + " exceeded maxRecords " + maxRecords)
-      }
       if (bytes > maxBytes) {
         throw new HistoryEdgesOverflow("mem history edges in " + name + " exceeded maxBytes " + maxBytes)
       }
-      for (const parent of commit.parents) stack.push(parent)
-      yield { oid, parents: commit.parents }
+      yield { kind: "commit", oid }
+      for (const parent of commit.parents) {
+        stack.push(parent)
+        yield { kind: "parent", oid: parent }
+      }
+      // maxRecords counts COMPLETED commits, so it refuses before this record is closed by its end event.
+      if (records > maxRecords) {
+        throw new HistoryEdgesOverflow(
+          "mem history edges in " + name + " exceeded maxRecords " + maxRecords + " commits",
+        )
+      }
+      yield { kind: "end" }
     }
   }
 

@@ -181,14 +181,20 @@ export type CommitMeta = {
 }
 
 /**
- * One commit's oid and every parent, with NO message body, author, committer or
- * timestamp. This is the byte-bounded shape a write-log ancestry walk needs: the
+ * One event of an all-parent history-edge walk, with NO message body, author, committer or timestamp: the
  * edges of the kept content DAG, nothing that grows with the message.
+ *
+ * Per visited commit, in the walk's commit order: exactly one `commit`, then one `parent` per parent in Git
+ * parent order, then exactly one `end`. A root commit emits `commit` + `end` with no parents. A record is OPEN
+ * from its `commit` until its `end`: a byte/record refusal or a consumer cancel stops the stream mid-record, and
+ * an unterminated record is NOT admissible to any caller. At most one OID is carried at a time, so the reader's
+ * heap is Theta(1) in the parent count and in the history size. A consumer that wants a per-commit array builds
+ * and owns that array itself.
  */
-export type HistoryEdge = {
-  readonly oid: Oid
-  readonly parents: readonly Oid[]
-}
+export type HistoryEdgeEvent =
+  | { readonly kind: "commit"; readonly oid: Oid }
+  | { readonly kind: "parent"; readonly oid: Oid }
+  | { readonly kind: "end" }
 
 /** A changed projected blob identity; mode-only changes are not represented. */
 export type Change = { path: string; from: Oid | null; to: Oid | null }
@@ -348,7 +354,7 @@ export type GitomicBackend = {
     repo: string,
     tips: readonly Oid[],
     options?: { readonly exclude?: readonly Oid[]; readonly maxBytes?: number; readonly maxRecords?: number },
-  ): AsyncIterable<HistoryEdge>
+  ): AsyncIterable<HistoryEdgeEvent>
   /**
    * A leased push of `next` to `remote`: `landed: false` is a lease origin refused. A landed push also moves the
    * local ref, a cache of origin, and `kept` says how that went: "swapped" to `next`; "moved", left alone because it

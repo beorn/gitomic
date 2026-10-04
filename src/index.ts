@@ -158,7 +158,7 @@ export type {
   Change,
   CommitProvenance,
   CommitMeta,
-  HistoryEdge,
+  HistoryEdgeEvent,
   Committed,
   CommitInput,
   GitMap,
