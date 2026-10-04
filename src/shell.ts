@@ -1254,6 +1254,15 @@ async function* readHistoryEdges(
     },
   )
   const release = child.pid === undefined ? noRelease : holdGroup(child.pid, "forward")
+  // Custody is released EXACTLY ONCE — and, for a walk that cannot PROVE teardown, only when the group
+  // actually closes. Without this a child that exits after our bound stays in `heldGroups` forever, and the
+  // next forwarded SIGTERM can target a process group id the OS has since REUSED.
+  let released = false
+  const releaseOnce = (): void => {
+    if (released) return
+    released = true
+    release()
+  }
   // stderr is always drained so a chatty child cannot block on a full pipe, but only a bounded tail is kept:
   // an unbounded Buffer[] would make this stream's memory grow with a runaway child's diagnostics.
   let stderrTail = Buffer.alloc(0)
@@ -1287,6 +1296,9 @@ async function* readHistoryEdges(
         escalation = undefined
       }
       settle(value)
+      // Actual close is the ONLY moment custody may be dropped. In the unproven-teardown branch the walk throws
+      // with the hold retained; this late-close finalizer is what releases it once the group really goes away.
+      releaseOnce()
     }
     child.once("close", (code, signal) => finish({ code, signal }))
     child.once("error", (error: Error) => {
@@ -1389,7 +1401,7 @@ async function* readHistoryEdges(
     throw cause
   } finally {
     if (teardownProven) {
-      release()
+      releaseOnce()
     } else {
       // Custody must not outlive the walk: stop the group, then require `closed` — process AND pipes — as proof.
       kill()
@@ -1399,7 +1411,7 @@ async function* readHistoryEdges(
         settled = await settlesWithin(closed, 1_000)
       }
       if (settled) {
-        release()
+        releaseOnce()
       } else {
         // Do NOT release: the group may still be running, and dropping the hold would orphan it silently.
         // The teardown refusal CHAINS any in-flight failure as its cause rather than discarding it.

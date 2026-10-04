@@ -315,6 +315,57 @@ describe("readHistoryEdges", () => {
     }
   })
 
+  test("custody kept for an unproven teardown is released once the group finally closes", async () => {
+    const fixture = await createBareRepo()
+    const dir = mkdtempSync(join(tmpdir(), "gitomic-edges-"))
+    const pidFile = join(dir, "helper.pid")
+    const baseline = process.listenerCount("SIGTERM")
+    let helperPid: number | undefined
+    try {
+      // The helper is DETACHED into its own process group, so the SIGKILL aimed at Git's group cannot reach it,
+      // and it inherits Git's stdout/stderr, so `closed` cannot settle until it exits. It exits AFTER the
+      // teardown bound, so cancellation refuses with custody retained — and that hold must still be released at
+      // the real close, or the stale pid outlives the group for a later forwarded SIGTERM to hit a reused PGID.
+      const fakeGit = writeFakeGit(dir, [
+        'const { spawn } = require("node:child_process")',
+        'const fs = require("node:fs")',
+        'const helper = spawn(process.execPath, ["-e", "setTimeout(() => process.exit(0), 8000)"], { stdio: ["ignore", "inherit", "inherit"], detached: true })',
+        "helper.unref()",
+        "fs.writeFileSync(process.env.FAKE_HELPER_PID_FILE, String(helper.pid))",
+        'process.stdout.write("\\n" + "a".repeat(40) + "\\0" + "b".repeat(40) + "\\0")',
+        "process.exit(0)",
+      ])
+      const runtime = createShellRuntime({
+        gitExecutable: fakeGit,
+        baseEnv: { ...process.env, FAKE_HELPER_PID_FILE: pidFile },
+      })
+      const iterator = runtime.backend.readHistoryEdges!(fixture.repo, [fixture.initial])[Symbol.asyncIterator]()
+      const first = await iterator.next()
+      expect(first.done).toBe(false)
+      helperPid = Number(readFileSync(pidFile, "utf8").trim())
+      expect(process.listenerCount("SIGTERM")).toBeGreaterThan(baseline)
+      await expect(iterator.return?.()).rejects.toThrow(/unproven|custody/i)
+      // Still alive at refusal time: the hold preserved the group rather than orphaning it silently.
+      beAlive(helperPid)
+      await waitForDeath(helperPid)
+      // Late close is release: the forwarders come off and no stale group pid remains held.
+      for (let attempt = 0; attempt < 200 && process.listenerCount("SIGTERM") !== baseline; attempt += 1) {
+        await new Promise((settle) => setTimeout(settle, 25))
+      }
+      expect(process.listenerCount("SIGTERM")).toBe(baseline)
+    } finally {
+      if (helperPid !== undefined) {
+        try {
+          process.kill(helperPid, "SIGKILL")
+        } catch {
+          // already gone
+        }
+      }
+      await fixture.cleanup()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }, 30_000)
+
   test("an executable that disappears rejects loudly instead of raising an unhandled spawn error", async () => {
     const fixture = await createBareRepo()
     const dir = mkdtempSync(join(tmpdir(), "gitomic-edges-"))
