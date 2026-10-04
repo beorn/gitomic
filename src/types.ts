@@ -180,6 +180,22 @@ export type CommitMeta = {
   timestamp: number
 }
 
+/**
+ * One event of an all-parent history-edge walk, with NO message body, author, committer or timestamp: the
+ * edges of the kept content DAG, nothing that grows with the message.
+ *
+ * Per visited commit, in the walk's commit order: exactly one `commit`, then one `parent` per parent in Git
+ * parent order, then exactly one `end`. A root commit emits `commit` + `end` with no parents. A record is OPEN
+ * from its `commit` until its `end`: a byte/record refusal or a consumer cancel stops the stream mid-record, and
+ * an unterminated record is NOT admissible to any caller. At most one OID is carried at a time, so the reader's
+ * heap is Theta(1) in the parent count and in the history size. A consumer that wants a per-commit array builds
+ * and owns that array itself.
+ */
+export type HistoryEdgeEvent =
+  | { readonly kind: "commit"; readonly oid: Oid }
+  | { readonly kind: "parent"; readonly oid: Oid }
+  | { readonly kind: "end" }
+
 /** A changed projected blob identity; mode-only changes are not represented. */
 export type Change = { path: string; from: Oid | null; to: Oid | null }
 
@@ -321,6 +337,24 @@ export type GitomicBackend = {
     tips: readonly Oid[],
     options?: { readonly exclude?: readonly Oid[]; readonly limit?: number },
   ): Promise<CommitMeta[]>
+  /**
+   * Every parent of every commit reachable from `tips`, streamed as
+   * `{ oid, parents }` edges in ONE process, with NO commit bodies read. This
+   * is the bounded lower capability a cold write-log ancestry walk uses so a
+   * large kept history never materialises as one in-memory graph.
+   *
+   * All parents are followed (never first-parent only), so a merge carries its
+   * side parent. The stream is byte-bounded by the producer: `maxBytes` and
+   * `maxRecords` are hard caps that REFUSE with a typed error before yielding
+   * past them, and an unparsed carry buffer above its bound kills the child. A
+   * consumer that stops early cancels the child. A backend that cannot stream
+   * edges omits this method; callers that require it refuse loudly by name.
+   */
+  readHistoryEdges?(
+    repo: string,
+    tips: readonly Oid[],
+    options?: { readonly exclude?: readonly Oid[]; readonly maxBytes?: number; readonly maxRecords?: number },
+  ): AsyncIterable<HistoryEdgeEvent>
   /**
    * A leased push of `next` to `remote`: `landed: false` is a lease origin refused. A landed push also moves the
    * local ref, a cache of origin, and `kept` says how that went: "swapped" to `next`; "moved", left alone because it
