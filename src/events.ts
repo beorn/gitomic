@@ -107,6 +107,12 @@ export type EventsRead = {
    */
   at?: Oid
   limit?: number
+  /**
+   * Read the whole chain to its root, paging in bounded `limit`-sized waves, instead of
+   * stopping at `limit`. A chain that cannot reach its root is refused by name, never
+   * returned short.
+   */
+  complete?: boolean
   /** Chronological (oldest first) by default. */
   order?: "oldest-first" | "newest-first"
 }
@@ -189,6 +195,12 @@ export type ListRefsOptions = {
 export type ChainsUnderOptions = ListRefsOptions & {
   /** Events read per chain; default 50, refused above 1024 like `Reader.log`. */
   limit?: number
+  /**
+   * Continue every chain the shared walk did not reach its root on, in bounded waves,
+   * instead of refusing it. Without it a chain that did not reach its root — including
+   * one that filled `limit` — is refused by ref, never returned short.
+   */
+  complete?: boolean
 }
 
 /** The one trailer key gitomic/events names: the envelope's `type`. Its value is opaque. */
@@ -463,14 +475,14 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
   }
 
   /** Assemble one attempt's complete history before a transaction decides. */
-  const readComplete = async (at: Oid, from?: Oid): Promise<Event[]> => {
+  const readComplete = async (at: Oid, from?: Oid, wave: number = MAX_LIMIT): Promise<Event[]> => {
     const pages: Event[][] = []
     const seen = new Set<Oid>()
     let cursor = at
     for (;;) {
       if (seen.has(cursor)) throw new Error(`${ref} at ${at}: event paging did not advance at ${cursor}`)
       seen.add(cursor)
-      const { events } = await readChain(cursor, { ...(from === undefined ? {} : { from }), limit: MAX_LIMIT })
+      const { events } = await readChain(cursor, { ...(from === undefined ? {} : { from }), limit: wave })
       if (events.length === 0) {
         if (cursor === from) return pages.flat().reverse()
         throw new Error(`${ref} at ${at} does not reach event ${from ?? "its genesis"}; refusing a partial read`)
@@ -558,7 +570,11 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
       const from = read.from === undefined ? undefined : validateOid(read.from, "events from must be an event id")
       const at = read.at === undefined ? await tip() : validateOid(read.at, "events at must be an event id")
       if (at === null) return []
-      const { events } = await readChain(at, { ...(from === undefined ? {} : { from }), limit })
+      // `complete` pages to the root in bounded waves; without it one read stops at `limit`.
+      const events =
+        read.complete === true
+          ? [...(await readComplete(at, from, limit))].reverse()
+          : (await readChain(at, { ...(from === undefined ? {} : { from }), limit })).events
       // The walk is newest-first.
       return read.order === "newest-first" ? events : events.reverse()
     },
@@ -720,11 +736,13 @@ export async function listRefs(prefix: string, options: ListRefsOptions): Promis
 /**
  * Every chain under `prefix`, read in one walk: the tips from `listRefs`, then
  * ONE `readHistory` over all of them, with each chain rebuilt from its commits'
- * first parents. A chain the shared read budget did not reach its root on, and
- * did not fill to `limit`, is refused loudly rather than returned short.
+ * first parents. A chain the shared walk did not reach its root on is refused
+ * loudly rather than returned short; `complete: true` continues those chains in
+ * bounded waves, per ref, until each reaches its root.
  */
 export async function chainsUnder(prefix: string, options: ChainsUnderOptions): Promise<ReadonlyMap<string, Event[]>> {
   const limit = normalizeLimit(options.limit)
+  const complete = options.complete === true
   const backend = requireEvents(options.backend ?? createShellBackend())
   let refs: ReadonlyMap<string, Oid>
   if (options.remote === undefined) {
@@ -740,27 +758,51 @@ export async function chainsUnder(prefix: string, options: ChainsUnderOptions): 
   const tips = [...new Set(refs.values())]
   if (tips.length === 0) return new Map()
   const history = await backend.readHistory(options.repo, tips, { limit: (limit + 1) * tips.length })
-  const byId = new Map(history.map((meta) => [meta.oid, meta]))
-  const chains = new Map<string, Event[]>()
-  for (const [ref, tip] of refs) {
+  const held = new Map(history.map((meta) => [meta.oid, meta]))
+  /** One more bounded wave, per ref, from a commit the shared walk did not hold. */
+  const readWave = async (ref: string, cursor: Oid): Promise<void> => {
+    let page: CommitMeta[]
+    try {
+      page = await backend.readHistory(options.repo, [cursor], { limit: limit + 1 })
+    } catch (error) {
+      const why = error instanceof Error ? error.message : String(error)
+      throw new Error(`${ref}: cannot read event ${cursor} to reach its root (${why})`, { cause: error })
+    }
+    for (const meta of page) held.set(meta.oid, meta)
+  }
+  /**
+   * Walk one tip to its root through `held`. Without `complete` the shared read is
+   * the whole budget, so reaching its bound stops the walk for the caller to refuse.
+   */
+  const walkChain = async (ref: string, tip: Oid): Promise<{ walk: CommitMeta[]; reachedRoot: boolean }> => {
     const walk: CommitMeta[] = []
+    const seen = new Set<Oid>()
     let oid: Oid | undefined = tip
-    let reachedRoot = false
-    while (oid !== undefined && walk.length < limit + 1) {
-      const meta = byId.get(oid)
-      if (meta === undefined) break
-      walk.push(meta)
-      if (meta.parents.length === 0) {
-        reachedRoot = true
-        break
+    while (oid !== undefined) {
+      if (!complete && walk.length >= limit + 1) return { walk, reachedRoot: false }
+      let meta = held.get(oid)
+      if (meta === undefined) {
+        if (!complete) return { walk, reachedRoot: false }
+        await readWave(ref, oid)
+        meta = held.get(oid)
+        if (meta === undefined) throw new Error(`${ref}: event ${oid} names a parent this repository does not hold`)
       }
+      if (seen.has(oid)) throw new Error(`${ref}: event paging did not advance at ${oid}`)
+      seen.add(oid)
+      walk.push(meta)
+      if (meta.parents.length === 0) return { walk, reachedRoot: true }
       oid = meta.parents[0]
     }
-    const eventsRead = walk.filter((meta) => meta.parents.length > 0).length
-    if (!reachedRoot && eventsRead < limit) {
+    return { walk, reachedRoot: false }
+  }
+  const chains = new Map<string, Event[]>()
+  for (const [ref, tip] of refs) {
+    const { walk, reachedRoot } = await walkChain(ref, tip)
+    if (!reachedRoot) {
       throw new Error(`chainsUnder read budget ran out before ${ref} reached its root; read it with openEvents instead`)
     }
-    chains.set(ref, toEvents(walk, ref).events.slice(0, limit).reverse())
+    const events = toEvents(walk, ref).events
+    chains.set(ref, complete ? [...events].reverse() : events.slice(0, limit).reverse())
   }
   return chains
 }

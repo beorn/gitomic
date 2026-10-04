@@ -12,6 +12,15 @@
   fails at its first array call. The external custom-backend population is unknown.
   This backend migration belongs in the next minor release on 0.x.
 
+- `chainsUnder` refuses every chain it did not read to its root, not only one that
+  ran out of budget below `limit` (27354). A chain that filled `limit` used to come
+  back truncated with its oldest event still parented, so a caller could read it as
+  complete and miss the oldest events; now `limit` bounds a chain that reached its
+  root, and one that did not refuses by ref. `complete: true` — on `chainsUnder` and
+  on `events({ at, complete: true })` — pages a chain of any length to its root in
+  bounded `limit`-sized waves instead. A caller that wants one bounded page keeps it
+  with `events({ at, limit })`.
+
 - `GitomicBackend.readTreeExact(repo, commit, path)` is required (27226 part 2):
   the second tree entry point a Snapshot reads through. `get`, `oid` and `has`
   resolve one exact path with one scoped read — `git ls-tree -z --full-tree

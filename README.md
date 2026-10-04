@@ -419,13 +419,13 @@ Git metadata. For attribution, pass the native `author` and caller trailers
 | ----------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `openEvents({ repo, ref, writer?, remote?, backend?, retryBudgetMs? })` | Open one chain.                                                                                                                                                                                                                                                             |
 | `head()`                                                                | The tip, or `null` when the chain does not exist.                                                                                                                                                                                                                           |
-| `events({ from?, limit?, order? })`                                     | Events after `from`, oldest first by default; `limit` defaults to 50, at most 1024.                                                                                                                                                                                         |
+| `events({ from?, at?, limit?, complete?, order? })`                     | Events after `from`, oldest first by default; `limit` defaults to 50, at most 1024. `complete: true` pages to the root in `limit`-sized waves and returns the whole chain instead of one bounded page.                                                                       |
 | `transact(decide, message, { also?, from? })`                           | Page every event after `from` (or from genesis) at one selected tip before deciding, then write by compare-and-swap; on a race, re-read the complete winner history and re-run `decide`. An unreachable boundary refuses before `decide`; no partial chain is passed to it. |
 | `append(inputs, { expect, also? })`                                     | Write at exactly `expect`; a moved tip throws `Conflict`.                                                                                                                                                                                                                   |
 | `stage(inputs, { expect, author? })`                                    | Write event commits locally without moving a ref; return their `head`, events and a single-use `publish({ also? })` handle.                                                                                                                                                 |
 | `watch({ signal, pollIntervalMs? })`                                    | Yield each batch of new events; a jump of over 1024 throws.                                                                                                                                                                                                                 |
 | `listRefs(prefix, { repo, remote? })`                                   | Every ref under a prefix and its tip: `for-each-ref`, or `ls-remote --refs` against a remote.                                                                                                                                                                               |
-| `chainsUnder(prefix, { repo, remote?, limit? })`                        | Every chain under a prefix, read in one walk; with `remote`, one fetch first.                                                                                                                                                                                               |
+| `chainsUnder(prefix, { repo, remote?, limit?, complete? })`             | Every chain under a prefix, read in one walk; with `remote`, one fetch first. A chain the walk did not read to its root is refused by ref; `complete: true` continues those chains in bounded `limit`-sized waves instead.                                                  |
 | `fetchRefs(prefixOrRefs, { repo, remote })`                             | Every ref under a prefix, or the named refs, with their objects, in one `git fetch`.                                                                                                                                                                                        |
 
 `stage` lets a caller use a new event's OID while preparing other chains. Its
@@ -438,7 +438,9 @@ does not read a remote or publish any ref.
 two git processes, every chain under a prefix takes two with exactly one
 walk, and an append takes three: read the parent, write the commit, swap the
 ref. Tests count these. A publish is one process, local or remote; `fetchRefs`
-is one; `chainsUnder` against a remote is two, a fetch and a walk.
+is one; `chainsUnder` against a remote is two, a fetch and a walk. A chain
+longer than the walk's wave is the only one that adds a process per wave, and
+only for `complete: true`.
 
 **MULTI: many refs, all or none.** `append` and `transact` take
 `also: [{ ref, expect, oid }]`: more refs that land in the SAME atomic publish

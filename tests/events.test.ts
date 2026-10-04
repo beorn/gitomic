@@ -22,7 +22,7 @@ import { createIsoBackend } from "../src/iso.js"
 import { createMemBackend } from "../src/mem.js"
 import { createShellBackend } from "../src/shell.js"
 import type { GitomicBackend, Oid } from "../src/types.js"
-import { createBareRepo, git } from "./helpers/git.js"
+import { createBareRepo, git, gitWithInput } from "./helpers/git.js"
 
 const CHAIN = "refs/events/demo"
 
@@ -1162,6 +1162,72 @@ describe("the README events example runs as written", () => {
         "again",
       )
       expect((await chain.events()).map((event) => event.type)).toEqual(["opened", "paid"])
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+})
+
+describe("complete traversal past the read budget (#27354)", () => {
+  const many = (count: number, prefix: string): EventInput[] =>
+    Array.from({ length: count }, (_, index) => ({ type: `${prefix}${index}` }))
+
+  test("chainsUnder refuses a chain that filled the limit, and completes it only when asked", async () => {
+    const backend = createMemBackend()
+    const repo = "events-complete-prefix"
+    const short = await openEvents({ repo, ref: "refs/events/complete/short", backend })
+    await short.append(many(3, "s"), { expect: null })
+    const long = await openEvents({ repo, ref: "refs/events/complete/long", backend })
+    await long.append(many(1_030, "l"), { expect: null })
+
+    // A cap-filled chain comes back truncated with its oldest event still parented, so the
+    // default must refuse it by name rather than return a chain that looks complete.
+    await expect(chainsUnder("refs/events/complete/", { repo, backend })).rejects.toThrow(
+      /refs\/events\/complete\/long.*reached its root/,
+    )
+
+    const chains = await chainsUnder("refs/events/complete/", { repo, backend, complete: true })
+    expect(chains.get("refs/events/complete/short")?.map((event) => event.type)).toEqual(["s0", "s1", "s2"])
+    const whole = chains.get("refs/events/complete/long") ?? []
+    expect(whole).toHaveLength(1_030)
+    expect(whole[0]?.parent).toBeNull()
+    expect(whole.at(-1)?.type).toBe("l1029")
+  })
+
+  test("events at a fixed tip completes the chain only when asked", async () => {
+    const backend = createMemBackend()
+    const repo = "events-complete-tip"
+    const chain = await openEvents({ repo, ref: CHAIN, backend })
+    await chain.append(many(1_030, "e"), { expect: null })
+    const tip = await chain.head()
+    if (tip === null) throw new Error("long event chain has no tip")
+
+    expect(await chain.events({ at: tip })).toHaveLength(50)
+
+    const whole = await chain.events({ at: tip, complete: true })
+    expect(whole).toHaveLength(1_030)
+    expect(whole[0]?.parent).toBeNull()
+    expect(whole.at(-1)?.id).toBe(tip)
+
+    const newestFirst = await chain.events({ at: tip, complete: true, order: "newest-first" })
+    expect(newestFirst[0]?.id).toBe(tip)
+    expect(newestFirst.at(-1)?.parent).toBeNull()
+  })
+
+  test("a chain whose named parent is absent refuses instead of returning short", async () => {
+    const fixture = await createBareRepo()
+    try {
+      const backend = createShellBackend()
+      const tree = await gitWithInput(fixture.repo, "", "mktree")
+      const body =
+        `tree ${tree}\nparent ${"f".repeat(40)}\nauthor t <t@t> 1000000000 +0000\n` +
+        `committer t <t@t> 1000000000 +0000\n\nEvent: opened\n`
+      const tip = await gitWithInput(fixture.repo, body, "hash-object", "-t", "commit", "-w", "--stdin")
+      await git(fixture.repo, "update-ref", "refs/events/missing/chain", tip)
+      await expect(
+        chainsUnder("refs/events/missing/", { repo: fixture.repo, backend, complete: true }),
+      ).rejects.toThrow(/ffffffff|not reach|cannot read|unknown commit/iu)
+      await expect(chainsUnder("refs/events/missing/", { repo: fixture.repo, backend })).rejects.toThrow()
     } finally {
       await fixture.cleanup()
     }
