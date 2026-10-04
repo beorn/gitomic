@@ -130,6 +130,19 @@ export type StagedEvents = {
   publish(options?: { also?: readonly AlsoRef[] }): Promise<Appended>
 }
 
+/**
+ * The staged run an `Events.transact` `afterStage` hook sees: the commit that would be published, the tip it was
+ * built on, and the events written for it. The hook runs after staging and before the single publish, once per CAS
+ * attempt, and is a LOCAL-ONLY side effect in the caller's repository (a candidate marker, say). It must not publish
+ * a ref of its own: refs that ride the atomic publish belong in `also`. A hook that throws aborts the attempt before
+ * anything is published, so a failed side effect fails the whole transaction closed.
+ */
+export type StagedAttempt = {
+  readonly next: Oid
+  readonly base: Oid
+  readonly events: readonly Event[]
+}
+
 type EventWriteOptions = { readonly trailers?: readonly Trailer[] }
 
 export type Events = {
@@ -145,7 +158,12 @@ export type Events = {
   transact(
     decide: Decide,
     message: string,
-    options?: { also?: readonly AlsoRef[]; author?: Ident; from?: Oid } & EventWriteOptions,
+    options?: {
+      also?: readonly AlsoRef[]
+      author?: Ident
+      from?: Oid
+      afterStage?: (staged: StagedAttempt) => Promise<void>
+    } & EventWriteOptions,
   ): Promise<Appended>
   /** Append at exactly `expect` (null = the chain must not exist); throws Conflict on a moved tip. */
   append(
@@ -550,6 +568,7 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
       const callerTrailers = captureEventTrailers(transactOptions.trailers)
       const author = cloneIdent(transactOptions.author, "author") ?? committer
       const publish = publishWith(shapeAlso(transactOptions.also))
+      const afterStage = transactOptions.afterStage
       const from =
         transactOptions.from === undefined
           ? undefined
@@ -574,6 +593,9 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
           const shaped = shapeEventInputs(inputs, author, committer, callerTrailers, capturedAttributions)
           const base = at ?? (await genesisOf())
           const { next, written, lastSeq } = await writeRun(base, at === null, shaped, reserved)
+          // The caller's local-only side effect rides the attempt, not the publish: it runs after staging and before
+          // the single publish, once per CAS attempt, and a throw here fails the attempt before anything lands.
+          if (afterStage !== undefined) await afterStage({ next, base, events: written })
           return {
             kind: "write",
             next,
