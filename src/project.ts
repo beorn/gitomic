@@ -1627,6 +1627,19 @@ function clearCapturedPaths(repoRoot: string, localTip: string, captures: readon
   }
 }
 
+/**
+ * `clearCapturedPaths` puts a captured path back with a rename plus create-if-absent, which leaves the bytes equal
+ * to the index entry but the inode and timestamps new. The index still caches the pre-clear stat, so the next
+ * `read-tree -m -u` reads every cleared path as locally modified and refuses a move it should take. Refresh the
+ * cleared paths' stat cache so the index and the restored bytes agree. Whether a path genuinely still differs is
+ * the following read-tree's call: it weighs the refreshed index and refuses loudly on its own, so this refresh's
+ * own status is not consulted.
+ */
+function refreshClearedPaths(repoRoot: string, captures: readonly CapturedPath[]): void {
+  if (captures.length === 0) return
+  git(repoRoot, ["update-index", "--refresh", "--", ...captures.map((capture) => capture.path)])
+}
+
 function selectOldBlockingPaths(
   repoRoot: string,
   changedPaths: ReadonlySet<string>,
@@ -1727,6 +1740,7 @@ export async function projectCheckoutWithSetAside(
       )
     }
     request.afterWorktreeClear?.()
+    refreshClearedPaths(repoRoot, [capture])
     const verified = await projectCheckout({ repoRoot, remote, ref: branchRef, sourceRef })
     if (!verified.ok) {
       return refused(
@@ -1786,6 +1800,7 @@ export async function projectCheckoutWithSetAside(
       )
     }
     request.afterWorktreeClear?.()
+    refreshClearedPaths(repoRoot, captures)
     const caughtUp = await projectCheckout({ repoRoot, remote, ref: branchRef, sourceRef })
     if (!caughtUp.ok) {
       return refused(
@@ -1881,12 +1896,19 @@ export async function projectCheckoutWithSetAside(
       )
     }
     request.afterWorktreeClear?.()
+    refreshClearedPaths(repoRoot, combinedCaptures)
   }
 
   if (!indexAtBase) {
     const reverted = git(repoRoot, ["read-tree", "-m", "-u", localTip, base])
     if (reverted.status !== 0) {
-      return refused(`two-way movement to ${base} refused (${gitDetail(reverted)})`, preserveRef)
+      const cleared = combinedCaptures.filter((capture) => capture.kind !== "absent").map((capture) => capture.path)
+      const worktreeNote =
+        cleared.length === 0
+          ? "The working tree was not changed"
+          : `The working tree was already changed: [${cleared.join(", ")}] now hold ${localTip}'s committed bytes, and ` +
+            `the captured edits are preserved in ${preserveRef}`
+      return refused(`two-way movement to ${base} refused (${gitDetail(reverted)}); ${worktreeNote}`, preserveRef)
     }
   }
   const advanced = git(repoRoot, ["update-ref", branchRef, base, localTip])

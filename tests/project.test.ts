@@ -577,6 +577,56 @@ describe("gitomic project and checkout synchronization", () => {
       expect(git(checkout, "rev-parse", "HEAD")).toBe(remoteTip)
       expect(worktreeDirtyPaths(checkout)).toEqual([])
     })
+
+    // @failure A dirty path the local-only commits also changed is captured and restored, but the clear's new inode
+    // leaves a stale index stat, so the two-way move back to the common base refuses a set-aside it should finish.
+    // @level l1 @consumer gitomic project --checkout set-aside repair @testonly none
+    test("#27393: a captured path the local commits also changed still set-asides and projects", async () => {
+      const { checkout, landAtOrigin } = remoteFixture(true)
+      writeFileSync(join(checkout, "tracked.md"), "# local commit edit\n")
+      git(checkout, "add", "tracked.md")
+      git(checkout, "commit", "-qm", "local commit edits tracked.md")
+      const localTip = git(checkout, "rev-parse", "HEAD")
+      writeFileSync(join(checkout, "tracked.md"), "# direct local edit\n")
+      const remoteTip = landAtOrigin("tracked.md", "# remote edit\n")
+      advancePastQuietPeriod()
+
+      const result = await projectCheckoutWithSetAside({ repoRoot: checkout })
+
+      expect(result).toMatchObject({ ok: true, kind: "set-aside", to: remoteTip, localTip })
+      if (!result.ok || result.kind !== "set-aside") {
+        throw new Error(`expected set-aside outcome: ${JSON.stringify(result)}`)
+      }
+      expect(git(checkout, "show", `${result.preserveRef}:tracked.md`)).toBe("# direct local edit")
+      expect(git(checkout, "rev-parse", "HEAD")).toBe(remoteTip)
+      expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# remote edit\n")
+      expect(worktreeDirtyPaths(checkout)).toEqual([])
+    })
+
+    // @failure A refusal after the captured paths were already cleared still claims nothing happened, hiding that
+    // the working tree holds the committed baseline and the local edits live only in the preservation ref.
+    // @level l1 @consumer gitomic project --checkout set-aside refusal wording @testonly none
+    test("#27393: a refusal after the clear names the worktree change instead of claiming nothing happened", async () => {
+      const { checkout, landAtOrigin } = remoteFixture(true)
+      writeFileSync(join(checkout, "tracked.md"), "# local commit edit\n")
+      git(checkout, "add", "tracked.md")
+      git(checkout, "commit", "-qm", "local commit edits tracked.md")
+      const localTip = git(checkout, "rev-parse", "HEAD")
+      writeFileSync(join(checkout, "tracked.md"), "# direct local edit\n")
+      landAtOrigin("tracked.md", "# remote edit\n")
+      advancePastQuietPeriod()
+
+      const result = await projectCheckoutWithSetAside({
+        repoRoot: checkout,
+        // A concurrent writer dirties the cleared path again between the clear and the two-way move.
+        afterWorktreeClear: () => writeFileSync(join(checkout, "tracked.md"), "# concurrent edit\n"),
+      })
+
+      expect(result).toMatchObject({ ok: false, kind: "set-aside-refused", localTip })
+      if (result.ok) throw new Error("expected a refusal")
+      expect(result.error).toContain("The working tree was already changed: [tracked.md] now hold")
+      expect(result.error).toContain("the captured edits are preserved in")
+    })
   })
 
   describe("library routines", () => {
