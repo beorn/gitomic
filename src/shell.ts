@@ -9,7 +9,7 @@ import { dirname, join, resolve } from "node:path"
 import { fullJitter, type RandomUnit } from "@bearly/pacing"
 
 import { syncDirectory } from "./durable.ts"
-import { Conflict, GitSignaled, GitTimeout, PublicationRejected } from "./errors.ts"
+import { Conflict, GitSignaled, GitTimeout, HistoryEdgesOverflow, PublicationRejected } from "./errors.ts"
 import { journalLeaseRejection } from "./lease-journal.ts"
 import { rejectLegacyProvenance, validateRefNames } from "./options.ts"
 import {
@@ -40,6 +40,7 @@ import type {
   CommitInput,
   CommitMeta,
   GitomicBackend,
+  HistoryEdge,
   Ident,
   Oid,
   PublishResult,
@@ -307,7 +308,17 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
       const invoke = (operation as (...args: unknown[]) => Promise<unknown>).bind(backend)
       return [name, (...args: unknown[]) => inRuntime(() => invoke(...args))]
     }),
-  ) as GitomicBackend
+    // The wrapped bag is structurally heterogeneous now that one member streams:
+    // every other member returns a Promise, `readHistoryEdges` returns an
+    // AsyncIterable. Widen through `unknown` for the deliberate re-type; the
+    // runtime shape is asserted by the backend conformance tests.
+  ) as unknown as GitomicBackend
+  // `readHistoryEdges` is the one STREAMING operation: it returns an AsyncIterable
+  // synchronously, so the Promise wrapper above would break its contract. It is
+  // attached unwrapped, carrying the selected executable explicitly and resolving
+  // the git dir inside that runtime at iteration time.
+  selectedBackend.readHistoryEdges = (repo, tips, edgesOptions) =>
+    readHistoryEdges((target) => inRuntime(() => resolveGitDir(target)), executable, repo, tips, edgesOptions, baseEnv)
   return {
     backend: selectedBackend,
     resolveGitDir: (repo) => inRuntime(() => resolveGitDir(repo)),
@@ -1192,6 +1203,136 @@ async function readHistory(
     commits.push(commitMeta(oid, parents, timestamp, fields[index + 7] ?? "", { author, committer }))
   }
   return commits
+}
+
+/** Cap on the unparsed carry buffer of a streamed history-edge walk: one incomplete record. */
+const HISTORY_EDGES_CARRY_LIMIT_BYTES = 1024 * 1024
+
+/**
+ * Stream every parent of every commit reachable from `tips`, as `{ oid, parents }`
+ * edges from ONE `git rev-list` child. No commit body is read, so the stream does
+ * not grow with message size. The unparsed carry buffer, the producer maxBytes and
+ * maxRecords caps, and consumer cancellation are all bounded: a cap overflow stops
+ * the child process group and throws BEFORE the over-cap record is yielded, and a
+ * consumer that stops early cancels the child in the generator finally block. The
+ * child leads its own process group so a cancel reaches any helper Git started.
+ */
+async function* readHistoryEdges(
+  resolveGitDir: (repo: string) => Promise<string>,
+  executable: string,
+  repo: string,
+  tips: readonly Oid[],
+  options: { readonly exclude?: readonly Oid[]; readonly maxBytes?: number; readonly maxRecords?: number } = {},
+  baseEnv?: NodeJS.ProcessEnv,
+): AsyncIterable<HistoryEdge> {
+  if (tips.length === 0) return
+  for (const tip of tips) validateOid(tip, "invalid history tip")
+  const gitdir = await resolveGitDir(repo)
+  const exclude = (options.exclude ?? []).map((oid) => "^" + validateOid(oid, "invalid history exclusion"))
+  const input = [...tips, ...exclude].join("\n") + "\n"
+  const maxBytes = options.maxBytes === undefined ? undefined : normalizeByteCap(options.maxBytes)
+  const maxRecords = options.maxRecords === undefined ? undefined : normalizeRecordCap(options.maxRecords)
+  const child = childProcess.spawn(
+    executable,
+    gitArgs(gitdir, ["rev-list", "--no-commit-header", "--format=%H%x00%P%x00", "--stdin"]),
+    {
+      env: { ...(baseEnv ?? process.env), GIT_TERMINAL_PROMPT: "0", LC_ALL: "C" },
+      stdio: ["pipe", "pipe", "pipe"],
+      detached: true,
+    },
+  )
+  const release = child.pid === undefined ? noRelease : holdGroup(child.pid, "forward")
+  const stderr: Buffer[] = []
+  child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk))
+  child.stdin.on("error", ignoreChildStdinError)
+  const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((settle) => {
+    child.once("close", (code, signal) => settle({ code, signal }))
+  })
+  const kill = (): void => {
+    stopProcess(child, "SIGTERM", true)
+    const escalate = setTimeout(() => stopProcess(child, "SIGKILL", true), GROUP_STOP_GRACE_MS)
+    escalate.unref?.()
+  }
+  let bytes = 0
+  let records = 0
+  let carry = ""
+  let pendingOid: string | undefined
+  try {
+    child.stdin.end(input)
+    for await (const chunk of child.stdout) {
+      bytes += chunk.length
+      if (maxBytes !== undefined && bytes > maxBytes) {
+        kill()
+        throw new HistoryEdgesOverflow(
+          "git rev-list edges in " + repo + " exceeded maxBytes " + maxBytes + " after " + bytes + " bytes read",
+        )
+      }
+      carry += decodeUtf8(chunk, "git rev-list edges")
+      let index = carry.indexOf("\0")
+      while (index !== -1) {
+        const field = carry.slice(0, index)
+        carry = carry.slice(index + 1)
+        if (pendingOid === undefined) {
+          pendingOid = validateOid(stripLeadingNewlines(field), "git rev-list returned a malformed history id")
+        } else {
+          const parents = field === "" ? [] : field.split(" ").map((parent) => validateOid(parent))
+          records += 1
+          if (maxRecords !== undefined && records > maxRecords) {
+            kill()
+            throw new HistoryEdgesOverflow("git rev-list edges in " + repo + " exceeded maxRecords " + maxRecords)
+          }
+          const edge: HistoryEdge = { oid: pendingOid, parents }
+          pendingOid = undefined
+          yield edge
+        }
+        index = carry.indexOf("\0")
+      }
+      if (carry.length > HISTORY_EDGES_CARRY_LIMIT_BYTES) {
+        kill()
+        throw new HistoryEdgesOverflow(
+          "git rev-list edges in " + repo + " exceeded the " + HISTORY_EDGES_CARRY_LIMIT_BYTES + "-byte carry limit",
+        )
+      }
+    }
+    const { code, signal } = await closed
+    if (carry.trim() !== "" || pendingOid !== undefined) {
+      throw new Error("git rev-list returned trailing history-edge data in " + repo)
+    }
+    if (code !== 0) {
+      const detail = Buffer.concat(stderr).toString("utf8").trim()
+      throw new Error(
+        "git rev-list edges failed (" + (code ?? signal ?? "no exit") + ") in " + repo + (detail ? ": " + detail : ""),
+      )
+    }
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) kill()
+    release()
+  }
+}
+
+/** Strip the newline(s) `git rev-list --format` writes between NUL-separated records. */
+function stripLeadingNewlines(value: string): string {
+  let start = 0
+  while (start < value.length && value.charCodeAt(start) === 10) start += 1
+  return value.slice(start)
+}
+
+function noRelease(): void {
+  return undefined
+}
+
+function ignoreChildStdinError(): void {
+  return undefined
+}
+
+function normalizeByteCap(value: number): number {
+  if (!Number.isSafeInteger(value) || value <= 0) throw new TypeError("maxBytes must be a positive integer")
+  return value
+}
+
+function normalizeRecordCap(value: number): number {
+  if (!Number.isSafeInteger(value) || value <= 0) throw new TypeError("maxRecords must be a positive integer")
+  return value
 }
 
 async function compareAndSwap(

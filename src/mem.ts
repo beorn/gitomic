@@ -25,6 +25,7 @@ import type {
   CommitInput,
   CommitMeta,
   GitomicBackend,
+  HistoryEdge,
   Oid,
   PublishResult,
   RefSwap,
@@ -34,6 +35,7 @@ import type {
 } from "./types.js"
 import { rejectLegacyProvenance, validateRefNames } from "./options.ts"
 import { assertGitPrefixMatched, normalizePath, normalizePrefix } from "./path.ts"
+import { HistoryEdgesOverflow } from "./errors.ts"
 
 type MemCommit = {
   oid: Oid
@@ -306,6 +308,39 @@ export function createMemBackend(): GitomicBackend {
     return read
   }
 
+  const readHistoryEdges = async function* (
+    name: string,
+    tips: readonly Oid[],
+    options: { readonly exclude?: readonly Oid[]; readonly maxBytes?: number; readonly maxRecords?: number } = {},
+  ): AsyncIterable<HistoryEdge> {
+    const commits = getRepo(name).commits
+    const exclude = new Set(options.exclude ?? [])
+    const maxRecords = options.maxRecords ?? Number.POSITIVE_INFINITY
+    const maxBytes = options.maxBytes ?? Number.POSITIVE_INFINITY
+    const seen = new Set<Oid>()
+    const stack: Oid[] = [...tips]
+    let records = 0
+    let bytes = 0
+    while (stack.length > 0) {
+      const oid = stack.pop()
+      if (oid === undefined) break
+      if (exclude.has(oid) || seen.has(oid)) continue
+      const commit = commits.get(oid)
+      if (commit === undefined) throw new Error("unknown commit: " + oid)
+      seen.add(oid)
+      records += 1
+      bytes += oid.length + commit.parents.join(" ").length
+      if (records > maxRecords) {
+        throw new HistoryEdgesOverflow("mem history edges in " + name + " exceeded maxRecords " + maxRecords)
+      }
+      if (bytes > maxBytes) {
+        throw new HistoryEdgesOverflow("mem history edges in " + name + " exceeded maxBytes " + maxBytes)
+      }
+      for (const parent of commit.parents) stack.push(parent)
+      yield { oid, parents: commit.parents }
+    }
+  }
+
   const backend: GitomicBackend = {
     objectFormat: async () => "sha1",
     head,
@@ -325,6 +360,7 @@ export function createMemBackend(): GitomicBackend {
     isAncestor,
     listRefs,
     readHistory,
+    readHistoryEdges,
     publish,
     fetchRefs: async () => {
       throw new TypeError("the mem backend has no remotes; fetchRefs needs a remote")
