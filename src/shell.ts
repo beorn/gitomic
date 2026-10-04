@@ -9,14 +9,15 @@ import { dirname, join, resolve } from "node:path"
 import { fullJitter, type RandomUnit } from "@bearly/pacing"
 
 import { syncDirectory } from "./durable.ts"
+import { Conflict, GitSignaled, GitTimeout, HistoryEdgesTeardown, PublicationRejected } from "./errors.ts"
 import {
-  Conflict,
-  GitSignaled,
-  GitTimeout,
-  HistoryEdgesOverflow,
-  HistoryEdgesTeardown,
-  PublicationRejected,
-} from "./errors.ts"
+  historyEdgeParentBytes,
+  historyEdgeRecordStartBytes,
+  historyEdgesByteOverflow,
+  historyEdgesRecordOverflow,
+  normalizeHistoryEdgeByteCap,
+  normalizeHistoryEdgeRecordCap,
+} from "./history-edges.ts"
 import { journalLeaseRejection } from "./lease-journal.ts"
 import { rejectLegacyProvenance, validateRefNames } from "./options.ts"
 import {
@@ -1221,8 +1222,8 @@ const HISTORY_EDGES_STDERR_LIMIT_BYTES = 8 * 1024
 const HISTORY_EDGES_MAX_TOKEN_CHARS = 128
 
 /**
- * Stream every parent of every commit reachable from `tips`, as `{ oid, parents }`
- * edges from ONE `git rev-list` child. No commit body is read, so the stream does
+ * Stream every parent of every commit reachable from `tips`, as `commit`/`parent`/`end`
+ * events from ONE `git rev-list` child. No commit body is read, so the stream does
  * not grow with message size. Parent ids are tokenised as they arrive, so no fixed
  * per-edge ceiling exists: the carry holds at most one partial id and the TOTAL
  * maxBytes/maxRecords budget is the only bound (an unbounded request is
@@ -1233,6 +1234,10 @@ const HISTORY_EDGES_MAX_TOKEN_CHARS = 128
  * is not proof, because a helper it started can still hold the pipes. stderr is
  * always drained but only a bounded tail is kept. The child leads its own process
  * group so a cancel reaches any helper Git started.
+ *
+ * Bytes are charged as the ONE canonical record (the OID, each ` <parent>`, a terminating
+ * newline) — the SAME contract the mem backend charges, so a given cap is one wall on both
+ * backends. The raw rev-list framing (the leading newline, the NUL separators) is NOT counted.
  */
 async function* readHistoryEdges(
   resolveGitDir: (repo: string) => Promise<string>,
@@ -1242,13 +1247,13 @@ async function* readHistoryEdges(
   options: { readonly exclude?: readonly Oid[]; readonly maxBytes?: number; readonly maxRecords?: number } = {},
   baseEnv?: NodeJS.ProcessEnv,
 ): AsyncIterable<HistoryEdgeEvent> {
+  const maxBytes = options.maxBytes === undefined ? undefined : normalizeHistoryEdgeByteCap(options.maxBytes)
+  const maxRecords = options.maxRecords === undefined ? undefined : normalizeHistoryEdgeRecordCap(options.maxRecords)
   if (tips.length === 0) return
   for (const tip of tips) validateOid(tip, "invalid history tip")
   const gitdir = await resolveGitDir(repo)
   const exclude = (options.exclude ?? []).map((oid) => "^" + validateOid(oid, "invalid history exclusion"))
   const input = [...tips, ...exclude].join("\n") + "\n"
-  const maxBytes = options.maxBytes === undefined ? undefined : normalizeByteCap(options.maxBytes)
-  const maxRecords = options.maxRecords === undefined ? undefined : normalizeRecordCap(options.maxRecords)
   const child = childProcess.spawn(
     executable,
     gitArgs(gitdir, ["rev-list", "--no-commit-header", "--format=%H%x00%P%x00", "--stdin"]),
@@ -1326,6 +1331,16 @@ async function* readHistoryEdges(
   let records = 0
   let carry = ""
   let pendingOid: string | undefined
+  // Charge the ONE canonical record (the OID, each ` <parent>`, a newline) — the SAME unit the mem backend
+  // charges — so a cap is one wall on both backends. Each accepted token is charged BEFORE its event is yielded;
+  // the raw rev-list framing is not part of the contract.
+  const chargeBytes = (cost: number): void => {
+    bytes += cost
+    if (maxBytes !== undefined && bytes > maxBytes) {
+      kill()
+      throw historyEdgesByteOverflow(repo, maxBytes, bytes)
+    }
+  }
   // Refuse a delimiter-free run before it becomes the carry buffer's size. `length` is always the whole
   // undelimited remainder, because the parser consumes each token up to its delimiter before looping.
   const refuseUndelimitedToken = (length: number): void => {
@@ -1347,18 +1362,12 @@ async function* readHistoryEdges(
     child.stdin.end(input)
     try {
       for await (const chunk of child.stdout) {
-        bytes += chunk.length
-        if (maxBytes !== undefined && bytes > maxBytes) {
-          kill()
-          throw new HistoryEdgesOverflow(
-            "git rev-list edges in " + repo + " exceeded maxBytes " + maxBytes + " after " + bytes + " bytes read",
-          )
-        }
         carry += decodeUtf8(chunk, "git rev-list edges")
         // Consume complete units. In the oid phase a unit ends at NUL; in the parents phase a unit ends at SPACE
         // or NUL, so a very wide merge is emitted token by token and the carry never holds a whole parent field.
-        // There is deliberately no per-EDGE refusal (the ruled R3 limit is withdrawn): the TOTAL maxBytes budget
-        // bounds the walk, and HISTORY_EDGES_MAX_TOKEN_CHARS refuses an individual unterminated token.
+        // There is deliberately no per-EDGE refusal (the ruled R3 limit is withdrawn): the TOTAL maxBytes budget,
+        // charged per accepted record token, bounds the walk, and HISTORY_EDGES_MAX_TOKEN_CHARS refuses an
+        // individual unterminated token.
         for (;;) {
           if (pendingOid === undefined) {
             const end = carry.indexOf("\0")
@@ -1372,6 +1381,7 @@ async function* readHistoryEdges(
             )
             carry = carry.slice(end + 1)
             pendingOid = oid
+            chargeBytes(historyEdgeRecordStartBytes(oid))
             yield { kind: "commit", oid }
             continue
           }
@@ -1386,15 +1396,15 @@ async function* readHistoryEdges(
           const token = carry.slice(0, end)
           carry = carry.slice(end + 1)
           if (token !== "") {
-            yield { kind: "parent", oid: validateOid(token, "git rev-list returned a malformed parent id") }
+            const parent = validateOid(token, "git rev-list returned a malformed parent id")
+            chargeBytes(historyEdgeParentBytes(parent))
+            yield { kind: "parent", oid: parent }
           }
           if (delimiter === " ") continue
           records += 1
           if (maxRecords !== undefined && records > maxRecords) {
             kill()
-            throw new HistoryEdgesOverflow(
-              "git rev-list edges in " + repo + " exceeded maxRecords " + maxRecords + " commits",
-            )
+            throw historyEdgesRecordOverflow(repo, maxRecords)
           }
           yield { kind: "end" }
           pendingOid = undefined
@@ -1494,16 +1504,6 @@ function noRelease(): void {
 
 function ignoreChildStdinError(): void {
   return undefined
-}
-
-function normalizeByteCap(value: number): number {
-  if (!Number.isSafeInteger(value) || value <= 0) throw new TypeError("maxBytes must be a positive integer")
-  return value
-}
-
-function normalizeRecordCap(value: number): number {
-  if (!Number.isSafeInteger(value) || value <= 0) throw new TypeError("maxRecords must be a positive integer")
-  return value
 }
 
 async function compareAndSwap(

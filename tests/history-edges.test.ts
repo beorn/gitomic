@@ -14,7 +14,7 @@ import { join } from "node:path"
 
 import { describe, expect, test, vi } from "vitest"
 
-import { createShellBackend, open } from "../src/index.js"
+import { createShellBackend, HistoryEdgesOverflow, open } from "../src/index.js"
 import type { GitomicBackend, HistoryEdgeEvent } from "../src/index.js"
 import { createMemBackend } from "../src/mem.js"
 import { createShellRuntime } from "../src/shell.js"
@@ -499,5 +499,123 @@ describe("readHistoryEdges", () => {
     expect(list[0]?.oid).toBe(head)
     expect(list.length).toBeGreaterThanOrEqual(2)
     for (const edge of list) expect(Object.keys(edge).sort()).toEqual(["oid", "parents"])
+  })
+
+  /**
+   * The ONE budget contract, checked against an INDEPENDENT oracle (not the production helper): a kept record costs
+   * OID + ` <parent>` per parent + a terminating newline (@cto 9eeab5bd). Both backends must charge the SAME number,
+   * so the same cap is the same wall whichever backend a caller happens to hold.
+   */
+  describe("budget parity across backends", () => {
+    function canonicalBytes(list: readonly FoldedEdge[]): number {
+      return list.reduce(
+        (total, edge) => total + edge.oid.length + 1 + edge.parents.reduce((sum, parent) => sum + 1 + parent.length, 0),
+        0,
+      )
+    }
+
+    async function attempt(
+      iterable: AsyncIterable<HistoryEdgeEvent>,
+    ): Promise<{ events: HistoryEdgeEvent[]; error: unknown }> {
+      const events: HistoryEdgeEvent[] = []
+      try {
+        for await (const event of iterable) events.push(event)
+        return { events, error: undefined }
+      } catch (error) {
+        return { events, error }
+      }
+    }
+
+    test("an invalid cap is refused by name, before any event, in both backends", async () => {
+      const fixture = await createBareRepo()
+      const mem = createMemBackend()
+      const store = await open({ repo: "edges-parity-invalid", ref: "main", backend: mem })
+      await store.transact(async (map) => map.set("a.txt", "one\n"), "first")
+      const memHead = await mem.head("edges-parity-invalid", "refs/heads/main")
+      try {
+        const shell = createShellBackend()
+        const invalid = [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]
+        for (const cap of invalid) {
+          const streams: Array<[string, AsyncIterable<HistoryEdgeEvent>]> = [
+            ["shell maxBytes", shell.readHistoryEdges!(fixture.repo, [fixture.initial], { maxBytes: cap })],
+            ["shell maxRecords", shell.readHistoryEdges!(fixture.repo, [fixture.initial], { maxRecords: cap })],
+            ["mem maxBytes", mem.readHistoryEdges!("edges-parity-invalid", [memHead], { maxBytes: cap })],
+            ["mem maxRecords", mem.readHistoryEdges!("edges-parity-invalid", [memHead], { maxRecords: cap })],
+          ]
+          for (const [label, iterable] of streams) {
+            const { events, error } = await attempt(iterable)
+            expect(error, label).toBeInstanceOf(TypeError)
+            expect(events, label).toEqual([])
+          }
+        }
+      } finally {
+        await fixture.cleanup()
+      }
+    })
+
+    test("a root refuses at maxBytes = OID length in both backends, and yields one byte above", async () => {
+      const fixture = await createBareRepo()
+      const mem = createMemBackend()
+      const store = await open({ repo: "edges-parity-root", ref: "main", backend: mem })
+      const memRoot = await store.head()
+      try {
+        expect(memRoot).toHaveLength(fixture.initial.length)
+        const shell = createShellBackend()
+        const roots: Array<[string, string, (cap: number) => AsyncIterable<HistoryEdgeEvent>]> = [
+          [
+            "shell",
+            fixture.initial,
+            (cap) => shell.readHistoryEdges!(fixture.repo, [fixture.initial], { maxBytes: cap }),
+          ],
+          ["mem", memRoot, (cap) => mem.readHistoryEdges!("edges-parity-root", [memRoot], { maxBytes: cap })],
+        ]
+        for (const [label, oid, stream] of roots) {
+          const refused = await attempt(stream(oid.length))
+          expect(refused.error, label).toBeInstanceOf(HistoryEdgesOverflow)
+          expect((refused.error as { code?: string }).code, label).toBe("history-edges-overflow")
+          expect(refused.events, label).toEqual([])
+          const admitted = await attempt(stream(oid.length + 1))
+          expect(admitted.error, label).toBeUndefined()
+          expect(admitted.events, label).toEqual([{ kind: "commit", oid }, { kind: "end" }])
+        }
+      } finally {
+        await fixture.cleanup()
+      }
+    })
+
+    test("both backends admit at exactly the canonical cost and refuse one byte below it", async () => {
+      const fixture = await mergeFixture()
+      const mem = createMemBackend()
+      const store = await open({ repo: "edges-parity-cost", ref: "main", backend: mem })
+      for (const name of ["b", "c", "d"]) {
+        await store.transact(async (map) => map.set(`${name}.txt`, "one\n"), `commit ${name}`)
+      }
+      const memHead = await mem.head("edges-parity-cost", "refs/heads/main")
+      try {
+        const shell = createShellBackend()
+        const targets: Array<[string, (cap?: number) => AsyncIterable<HistoryEdgeEvent>]> = [
+          [
+            "shell",
+            (cap) => shell.readHistoryEdges!(fixture.repo, [fixture.merge], cap === undefined ? {} : { maxBytes: cap }),
+          ],
+          [
+            "mem",
+            (cap) => mem.readHistoryEdges!("edges-parity-cost", [memHead], cap === undefined ? {} : { maxBytes: cap }),
+          ],
+        ]
+        for (const [label, stream] of targets) {
+          const full = await edges(stream())
+          expect(full.length, label).toBeGreaterThanOrEqual(3)
+          const cost = canonicalBytes(full)
+          const exact = await attempt(stream(cost))
+          expect(exact.error, label).toBeUndefined()
+          expect(exact.events, label).toEqual(await rawEvents(stream()))
+          const under = await attempt(stream(cost - 1))
+          expect(under.error, label).toBeInstanceOf(HistoryEdgesOverflow)
+        }
+      } finally {
+        await fixture.cleanup()
+      }
+    })
   })
 })

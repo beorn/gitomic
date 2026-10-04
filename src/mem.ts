@@ -35,7 +35,14 @@ import type {
 } from "./types.js"
 import { rejectLegacyProvenance, validateRefNames } from "./options.ts"
 import { assertGitPrefixMatched, normalizePath, normalizePrefix } from "./path.ts"
-import { HistoryEdgesOverflow } from "./errors.ts"
+import {
+  historyEdgeParentBytes,
+  historyEdgeRecordStartBytes,
+  historyEdgesByteOverflow,
+  historyEdgesRecordOverflow,
+  normalizeHistoryEdgeByteCap,
+  normalizeHistoryEdgeRecordCap,
+} from "./history-edges.ts"
 
 type MemCommit = {
   oid: Oid
@@ -313,14 +320,20 @@ export function createMemBackend(): GitomicBackend {
     tips: readonly Oid[],
     options: { readonly exclude?: readonly Oid[]; readonly maxBytes?: number; readonly maxRecords?: number } = {},
   ): AsyncIterable<HistoryEdgeEvent> {
+    const maxBytes = options.maxBytes === undefined ? undefined : normalizeHistoryEdgeByteCap(options.maxBytes)
+    const maxRecords = options.maxRecords === undefined ? undefined : normalizeHistoryEdgeRecordCap(options.maxRecords)
     const commits = getRepo(name).commits
     const exclude = new Set(options.exclude ?? [])
-    const maxRecords = options.maxRecords ?? Number.POSITIVE_INFINITY
-    const maxBytes = options.maxBytes ?? Number.POSITIVE_INFINITY
     const seen = new Set<Oid>()
     const stack: Oid[] = [...tips]
     let records = 0
     let bytes = 0
+    // Charge the ONE canonical record (OID, each ` <parent>`, a newline) the SAME way the shell backend does, so the
+    // same cap is the same wall on both. Each accepted token is charged BEFORE its event, mirroring the shell parser.
+    const chargeBytes = (cost: number): void => {
+      bytes += cost
+      if (maxBytes !== undefined && bytes > maxBytes) throw historyEdgesByteOverflow(name, maxBytes, bytes)
+    }
     while (stack.length > 0) {
       const oid = stack.pop()
       if (oid === undefined) break
@@ -329,21 +342,15 @@ export function createMemBackend(): GitomicBackend {
       if (commit === undefined) throw new Error("unknown commit: " + oid)
       seen.add(oid)
       records += 1
-      bytes += oid.length + commit.parents.join(" ").length
-      if (bytes > maxBytes) {
-        throw new HistoryEdgesOverflow("mem history edges in " + name + " exceeded maxBytes " + maxBytes)
-      }
+      chargeBytes(historyEdgeRecordStartBytes(oid))
       yield { kind: "commit", oid }
       for (const parent of commit.parents) {
         stack.push(parent)
+        chargeBytes(historyEdgeParentBytes(parent))
         yield { kind: "parent", oid: parent }
       }
       // maxRecords counts COMPLETED commits, so it refuses before this record is closed by its end event.
-      if (records > maxRecords) {
-        throw new HistoryEdgesOverflow(
-          "mem history edges in " + name + " exceeded maxRecords " + maxRecords + " commits",
-        )
-      }
+      if (maxRecords !== undefined && records > maxRecords) throw historyEdgesRecordOverflow(name, maxRecords)
       yield { kind: "end" }
     }
   }
