@@ -1212,22 +1212,22 @@ async function readHistory(
   return commits
 }
 
-/** Cap on the unparsed carry buffer of a streamed history-edge walk: one incomplete record. */
-const HISTORY_EDGES_CARRY_LIMIT_BYTES = 1024 * 1024
 /** Cap on the stderr tail kept for a stream-failure message: always drained, reported bounded. */
 const HISTORY_EDGES_STDERR_LIMIT_BYTES = 8 * 1024
 
 /**
  * Stream every parent of every commit reachable from `tips`, as `{ oid, parents }`
  * edges from ONE `git rev-list` child. No commit body is read, so the stream does
- * not grow with message size. The unparsed carry buffer, the producer maxBytes and
- * maxRecords caps, and consumer cancellation are all bounded: a cap overflow stops
- * the child process group and throws BEFORE the over-cap record is yielded, and a
- * consumer that stops early cancels the child in the generator finally block, which
- * stops the group and does not release custody until the child is proven gone (or
- * refuses, bounded and loud). stderr is always drained but only a bounded tail is
- * kept. The child leads its own process group so a cancel reaches any helper Git
- * started.
+ * not grow with message size. Parent ids are tokenised as they arrive, so no fixed
+ * per-edge ceiling exists: the carry holds at most one partial id and the TOTAL
+ * maxBytes/maxRecords budget is the only bound (an unbounded request is
+ * deliberately unbounded). A budget overflow stops the child process group and
+ * throws BEFORE the over-budget record is yielded, and a consumer that stops early
+ * cancels the child in the generator finally block, which stops the group and does
+ * not release custody until the child's group has settled — an exited child alone
+ * is not proof, because a helper it started can still hold the pipes. stderr is
+ * always drained but only a bounded tail is kept. The child leads its own process
+ * group so a cancel reaches any helper Git started.
  */
 async function* readHistoryEdges(
   resolveGitDir: (repo: string) => Promise<string>,
@@ -1270,11 +1270,22 @@ async function* readHistoryEdges(
   // A spawn failure (missing or non-executable Git) emits 'error' and may never emit 'close'; without this
   // listener Node raises it as an unhandled exception instead of a rejection the caller can act on.
   let spawnError: Error | undefined
+  // `closed` (process AND its pipes) is the ONLY teardown proof. An exited child is not enough: a helper Git
+  // started can inherit the pipes and keep the group alive after the child itself is gone.
+  let teardownProven = false
+  let escalation: ReturnType<typeof setTimeout> | undefined
   const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((settle) => {
     let settled = false
     const finish = (value: { code: number | null; signal: NodeJS.Signals | null }): void => {
       if (settled) return
       settled = true
+      teardownProven = true
+      // Clear the SIGKILL escalation: a timer left armed would signal -pid ~2 s later, and that pid may be gone
+      // or REUSED by then, killing an unrelated process group.
+      if (escalation !== undefined) {
+        clearTimeout(escalation)
+        escalation = undefined
+      }
       settle(value)
     }
     child.once("close", (code, signal) => finish({ code, signal }))
@@ -1287,12 +1298,17 @@ async function* readHistoryEdges(
   })
   const kill = (): void => {
     stopProcess(child, "SIGTERM", true)
-    const escalate = setTimeout(() => stopProcess(child, "SIGKILL", true), GROUP_STOP_GRACE_MS)
-    escalate.unref?.()
+    if (escalation !== undefined) return
+    escalation = setTimeout(() => {
+      escalation = undefined
+      stopProcess(child, "SIGKILL", true)
+    }, GROUP_STOP_GRACE_MS)
+    escalation.unref?.()
   }
   let bytes = 0
   let records = 0
   let carry = ""
+  let parents: string[] = []
   let pendingOid: string | undefined
   let primaryFailure: unknown = undefined
   let hasPrimaryFailure = false
@@ -1308,30 +1324,38 @@ async function* readHistoryEdges(
           )
         }
         carry += decodeUtf8(chunk, "git rev-list edges")
-        let index = carry.indexOf("\0")
-        while (index !== -1) {
-          const field = carry.slice(0, index)
-          carry = carry.slice(index + 1)
+        // Consume complete units. In the oid phase a unit ends at NUL; in the parents phase a unit ends at SPACE
+        // or NUL, so a very wide merge is built token by token and the carry never holds a whole parent field.
+        // There is deliberately no fixed per-edge ceiling here: the TOTAL maxBytes budget is the only byte bound.
+        for (;;) {
           if (pendingOid === undefined) {
-            pendingOid = validateOid(stripLeadingNewlines(field), "git rev-list returned a malformed history id")
-          } else {
-            const parents = field === "" ? [] : field.split(" ").map((parent) => validateOid(parent))
-            records += 1
-            if (maxRecords !== undefined && records > maxRecords) {
-              kill()
-              throw new HistoryEdgesOverflow("git rev-list edges in " + repo + " exceeded maxRecords " + maxRecords)
-            }
-            const edge: HistoryEdge = { oid: pendingOid, parents }
-            pendingOid = undefined
-            yield edge
+            const end = carry.indexOf("\0")
+            if (end === -1) break
+            pendingOid = validateOid(
+              stripLeadingNewlines(carry.slice(0, end)),
+              "git rev-list returned a malformed history id",
+            )
+            carry = carry.slice(end + 1)
+            parents = []
+            continue
           }
-          index = carry.indexOf("\0")
-        }
-        if (carry.length > HISTORY_EDGES_CARRY_LIMIT_BYTES) {
-          kill()
-          throw new HistoryEdgesOverflow(
-            "git rev-list edges in " + repo + " exceeded the " + HISTORY_EDGES_CARRY_LIMIT_BYTES + "-byte carry limit",
-          )
+          const space = carry.indexOf(" ")
+          const nul = carry.indexOf("\0")
+          const end = nul === -1 ? space : space === -1 ? nul : Math.min(space, nul)
+          if (end === -1) break
+          const delimiter = carry[end]
+          const token = carry.slice(0, end)
+          carry = carry.slice(end + 1)
+          if (token !== "") parents.push(validateOid(token, "git rev-list returned a malformed parent id"))
+          if (delimiter === " ") continue
+          records += 1
+          if (maxRecords !== undefined && records > maxRecords) {
+            kill()
+            throw new HistoryEdgesOverflow("git rev-list edges in " + repo + " exceeded maxRecords " + maxRecords)
+          }
+          const edge: HistoryEdge = { oid: pendingOid, parents }
+          pendingOid = undefined
+          yield edge
         }
       }
     } catch (cause) {
@@ -1364,27 +1388,30 @@ async function* readHistoryEdges(
     primaryFailure = cause
     throw cause
   } finally {
-    if (child.exitCode !== null || child.signalCode !== null) {
+    if (teardownProven) {
       release()
     } else {
-      // Custody must not outlive the walk: stop the group, then prove teardown before releasing the hold.
+      // Custody must not outlive the walk: stop the group, then require `closed` — process AND pipes — as proof.
       kill()
       let settled = await settlesWithin(closed, GROUP_STOP_GRACE_MS + 1_000)
       if (!settled) {
         stopProcess(child, "SIGKILL", true)
         settled = await settlesWithin(closed, 1_000)
       }
-      release()
-      if (!settled) {
-        // The teardown refusal is the loud outcome, and it CHAINS any in-flight failure as its cause rather
-        // than silently discarding it.
-        // oxlint-disable-next-line no-unsafe-finally -- see the line above; the cause is preserved.
+      if (settled) {
+        release()
+      } else {
+        // Do NOT release: the group may still be running, and dropping the hold would orphan it silently.
+        // The teardown refusal CHAINS any in-flight failure as its cause rather than discarding it.
+        // oxlint-disable-next-line no-unsafe-finally -- the cause is preserved; see the line above.
         throw new HistoryEdgesTeardown(
           "git rev-list edges in " +
             repo +
-            " did not settle " +
+            " left process group " +
+            (child.pid ?? "?") +
+            " unproven " +
             (GROUP_STOP_GRACE_MS + 2_000) +
-            "ms after SIGKILL; the child process group may still be running",
+            "ms after SIGKILL; custody retained (orphan escalation)",
           hasPrimaryFailure ? { cause: primaryFailure } : undefined,
         )
       }

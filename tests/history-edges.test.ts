@@ -8,7 +8,7 @@
  */
 
 import childProcess, { type ChildProcess } from "node:child_process"
-import { chmodSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs"
+import { chmodSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -18,7 +18,7 @@ import { createShellBackend, open } from "../src/index.js"
 import type { GitomicBackend, HistoryEdge } from "../src/index.js"
 import { createMemBackend } from "../src/mem.js"
 import { createShellRuntime } from "../src/shell.js"
-import { appendEmptyHistory, createBareRepo, git } from "./helpers/git.js"
+import { appendEmptyHistory, createBareRepo, git, gitWithInput } from "./helpers/git.js"
 
 async function edges(iterable: AsyncIterable<HistoryEdge>): Promise<HistoryEdge[]> {
   const collected: HistoryEdge[] = []
@@ -119,6 +119,66 @@ describe("readHistoryEdges", () => {
     }
   })
 
+  const GROUP_STOP_GRACE_MS = 2_000
+
+  function beAlive(pid: number): void {
+    expect(() => process.kill(pid, 0)).not.toThrow()
+  }
+
+  function beDead(pid: number): void {
+    expect(() => process.kill(pid, 0)).toThrow(/ESRCH/u)
+  }
+
+  async function waitForDeath(pid: number): Promise<void> {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      try {
+        process.kill(pid, 0)
+      } catch {
+        return
+      }
+      await new Promise((settle) => setTimeout(settle, 20))
+    }
+  }
+
+  /** A native octopus merge with `parentCount` parents, built by fast-import (no second Git implementation). */
+  async function appendWideMerge(repo: string, base: string, parentCount: number): Promise<string> {
+    const stream: string[] = []
+    for (let index = 1; index <= parentCount; index += 1) {
+      const message = "wide " + index + "\n"
+      const from = index === 1 ? base : ":" + (index - 1)
+      stream.push(
+        "commit refs/heads/wide\nmark :" +
+          index +
+          "\ncommitter gitomic <gitomic@localhost> " +
+          (946_684_801 + index) +
+          " +0000\ndata " +
+          Buffer.byteLength(message) +
+          "\n" +
+          message +
+          "from " +
+          from +
+          "\n\n",
+      )
+    }
+    const mergeMessage = "wide merge\n"
+    const merges: string[] = []
+    for (let index = 2; index <= parentCount; index += 1) merges.push("merge :" + index)
+    stream.push(
+      "commit refs/heads/wide\nmark :merge\ncommitter gitomic <gitomic@localhost> " +
+        (946_684_801 + parentCount + 1) +
+        " +0000\ndata " +
+        Buffer.byteLength(mergeMessage) +
+        "\n" +
+        mergeMessage +
+        "from :1\n" +
+        merges.join("\n") +
+        "\n\n",
+    )
+    stream.push("done\n")
+    await gitWithInput(repo, stream.join(""), "fast-import", "--quiet")
+    return await git(repo, "rev-parse", "refs/heads/wide")
+  }
+
   /**
    * A fake git executable: every Git query delegates to the real git, and a rev-list call runs `revListBody`
    * instead. Lets a test own the child's stderr and lifetime without a second Git implementation.
@@ -159,6 +219,97 @@ describe("readHistoryEdges", () => {
       // The generator must not report cancellation complete while the child still runs.
       expect(child!.exitCode !== null || child!.signalCode !== null).toBe(true)
     } finally {
+      spawnSpy.mockRestore()
+      await fixture.cleanup()
+    }
+  })
+
+  test("a merge wider than a megabyte of parent ids is yielded, not refused", async () => {
+    const fixture = await createBareRepo()
+    try {
+      const parentCount = 40_000
+      const wide = await appendWideMerge(fixture.repo, fixture.initial, parentCount)
+      const backend = createShellBackend()
+      const list = await edges(backend.readHistoryEdges!(fixture.repo, [wide]))
+      const merge = list.find((edge) => edge.oid === wide)
+      expect(merge).toBeTruthy()
+      expect(merge!.parents).toHaveLength(parentCount)
+      const parentBytes = merge!.parents.reduce((total, oid) => total + oid.length + 1, 0)
+      expect(parentBytes).toBeGreaterThan(1024 * 1024)
+      // The TOTAL budget is still the bound: a walk that cannot fit it refuses.
+      await expect(edges(backend.readHistoryEdges!(fixture.repo, [wide], { maxBytes: 4_096 }))).rejects.toThrow(
+        /maxBytes|byte/i,
+      )
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  test("an exited Git that leaves a helper holding the group is not teardown proof", async () => {
+    const fixture = await createBareRepo()
+    const dir = mkdtempSync(join(tmpdir(), "gitomic-edges-"))
+    const pidFile = join(dir, "helper.pid")
+    let helperPid: number | undefined
+    try {
+      const fakeGit = writeFakeGit(dir, [
+        'const { spawn } = require("node:child_process")',
+        'const fs = require("node:fs")',
+        'const helper = spawn("sleep", ["30"], { stdio: ["ignore", "inherit", "inherit"] })',
+        "fs.writeFileSync(process.env.FAKE_HELPER_PID_FILE, String(helper.pid))",
+        'process.stdout.write("\\n" + "a".repeat(40) + "\\0" + "b".repeat(40) + "\\0")',
+        "process.exit(0)",
+      ])
+      const runtime = createShellRuntime({
+        gitExecutable: fakeGit,
+        baseEnv: { ...process.env, FAKE_HELPER_PID_FILE: pidFile },
+      })
+      const iterator = runtime.backend.readHistoryEdges!(fixture.repo, [fixture.initial])[Symbol.asyncIterator]()
+      const first = await iterator.next()
+      expect(first.done).toBe(false)
+      helperPid = Number(readFileSync(pidFile, "utf8").trim())
+      beAlive(helperPid)
+      // Let the Git parent's own 'exit' land before cancelling: an exited parent is NOT teardown proof while
+      // its helper still holds the group and the pipe.
+      await new Promise((settle) => setTimeout(settle, 50))
+      await iterator.return?.()
+      // The Git parent exited immediately, but its helper still held the group and the pipe: teardown must
+      // wait for the helper, so it is gone by the time cancellation resolves.
+      await waitForDeath(helperPid)
+      beDead(helperPid)
+    } finally {
+      if (helperPid !== undefined) {
+        try {
+          process.kill(helperPid, "SIGKILL")
+        } catch {
+          // already gone
+        }
+      }
+      await fixture.cleanup()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("a prompt cancel clears the SIGKILL escalation; no stray group kill fires", async () => {
+    const fixture = await createBareRepo()
+    const spawnSpy = vi.spyOn(childProcess, "spawn")
+    const killSpy = vi.spyOn(process, "kill")
+    try {
+      await appendEmptyHistory(fixture.repo, fixture.initial, 20_000)
+      const head = await git(fixture.repo, "rev-parse", "refs/heads/main")
+      const backend = createShellBackend()
+      const iterator = backend.readHistoryEdges!(fixture.repo, [head])[Symbol.asyncIterator]()
+      await iterator.next()
+      const child = spawnSpy.mock.results.at(-1)?.value as ChildProcess
+      const groupPid = child.pid
+      await iterator.return?.()
+      killSpy.mockClear()
+      await new Promise((settle) => setTimeout(settle, GROUP_STOP_GRACE_MS + 500))
+      const stray = killSpy.mock.calls.filter(
+        ([target, signal]) => signal === "SIGKILL" && groupPid !== undefined && target === -groupPid,
+      )
+      expect(stray).toEqual([])
+    } finally {
+      killSpy.mockRestore()
       spawnSpy.mockRestore()
       await fixture.cleanup()
     }
