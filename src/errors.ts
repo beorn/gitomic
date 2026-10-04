@@ -121,7 +121,8 @@ export type EditKind = "put" | "put-bytes" | "append" | "rm" | "mv" | "replace"
  * identical to the base's (`blob-identical`, or `blob-absent` for a create);
  * `mv` checks the source is identical (`source-identical`) AND the destination
  * is absent (`destination-absent`); `replace` checks the old text occurs exactly
- * once (`text-unique`); `append` has no precondition and never fails this way.
+ * once (`text-unique`); `append` checks its target is present (`blob-present`)
+ * and refuses an absent path rather than creating one.
  */
 export type PreconditionType =
   | "blob-identical"
