@@ -7,12 +7,18 @@
  * @testonly none: shell + mem backends against temporary Git repositories; no production symbol exists for tests.
  */
 
-import { describe, expect, test } from "vitest"
+import childProcess, { type ChildProcess } from "node:child_process"
+import { chmodSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+
+import { describe, expect, test, vi } from "vitest"
 
 import { createShellBackend, open } from "../src/index.js"
 import type { GitomicBackend, HistoryEdge } from "../src/index.js"
 import { createMemBackend } from "../src/mem.js"
-import { createBareRepo, git } from "./helpers/git.js"
+import { createShellRuntime } from "../src/shell.js"
+import { appendEmptyHistory, createBareRepo, git } from "./helpers/git.js"
 
 async function edges(iterable: AsyncIterable<HistoryEdge>): Promise<HistoryEdge[]> {
   const collected: HistoryEdge[] = []
@@ -110,6 +116,87 @@ describe("readHistoryEdges", () => {
       await iterator.return?.()
     } finally {
       await fixture.cleanup()
+    }
+  })
+
+  /**
+   * A fake git executable: every Git query delegates to the real git, and a rev-list call runs `revListBody`
+   * instead. Lets a test own the child's stderr and lifetime without a second Git implementation.
+   */
+  function writeFakeGit(dir: string, revListBody: readonly string[]): string {
+    const path = join(dir, "fake-git.cjs")
+    const source = [
+      "#!/usr/bin/env node",
+      'const { spawnSync } = require("node:child_process")',
+      "const args = process.argv.slice(2)",
+      'if (args.includes("--version") || args.includes("--git-common-dir")) {',
+      '  const result = spawnSync("git", args, { stdio: "inherit", env: process.env })',
+      "  process.exit(result.status ?? 1)",
+      "}",
+      ...revListBody,
+      "",
+    ].join("\n")
+    writeFileSync(path, source)
+    chmodSync(path, 0o755)
+    return path
+  }
+
+  test("cancellation resolves only after the child process has exited", async () => {
+    const fixture = await createBareRepo()
+    const spawnSpy = vi.spyOn(childProcess, "spawn")
+    try {
+      // A history far larger than one pipe buffer keeps rev-list alive and blocked when the consumer stops.
+      await appendEmptyHistory(fixture.repo, fixture.initial, 20_000)
+      const head = await git(fixture.repo, "rev-parse", "refs/heads/main")
+      const backend = createShellBackend()
+      const iterator = backend.readHistoryEdges!(fixture.repo, [head])[Symbol.asyncIterator]()
+      const first = await iterator.next()
+      expect(first.done).toBe(false)
+      const child = spawnSpy.mock.results.at(-1)?.value as ChildProcess | undefined
+      expect(child).toBeTruthy()
+      expect(child!.exitCode === null && child!.signalCode === null).toBe(true)
+      await iterator.return?.()
+      // The generator must not report cancellation complete while the child still runs.
+      expect(child!.exitCode !== null || child!.signalCode !== null).toBe(true)
+    } finally {
+      spawnSpy.mockRestore()
+      await fixture.cleanup()
+    }
+  })
+
+  test("an executable that disappears rejects loudly instead of raising an unhandled spawn error", async () => {
+    const fixture = await createBareRepo()
+    const dir = mkdtempSync(join(tmpdir(), "gitomic-edges-"))
+    try {
+      const fakeGit = writeFakeGit(dir, ["process.exit(1)"])
+      const runtime = createShellRuntime({ gitExecutable: fakeGit })
+      await runtime.resolveGitDir(fixture.repo)
+      unlinkSync(fakeGit)
+      await expect(edges(runtime.backend.readHistoryEdges!(fixture.repo, [fixture.initial]))).rejects.toThrow(
+        /rev-list|cannot|could not|spawn|ENOENT/i,
+      )
+    } finally {
+      await fixture.cleanup()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("a large stderr is drained but only a bounded tail is reported", async () => {
+    const fixture = await createBareRepo()
+    const dir = mkdtempSync(join(tmpdir(), "gitomic-edges-"))
+    try {
+      const fakeGit = writeFakeGit(dir, ["process.stderr.write('x'.repeat(256 * 1024))", "process.exitCode = 1"])
+      const backend = createShellBackend({ gitExecutable: fakeGit })
+      const failure = await edges(backend.readHistoryEdges!(fixture.repo, [fixture.initial])).then(
+        () => undefined,
+        (error: unknown) => error as Error,
+      )
+      expect(failure).toBeInstanceOf(Error)
+      expect(failure!.message).toMatch(/rev-list edges failed/i)
+      expect(failure!.message.length).toBeLessThan(64 * 1024)
+    } finally {
+      await fixture.cleanup()
+      rmSync(dir, { recursive: true, force: true })
     }
   })
 

@@ -339,3 +339,14 @@ export class HistoryEdgesOverflow extends Error {
     super(message, options)
   }
 }
+
+/** A streamed history-edge walk could not prove its child process group had exited after cancellation. */
+export class HistoryEdgesTeardown extends Error {
+  override readonly name = "HistoryEdgesTeardown"
+  /** Stable machine key; the same string across every backend and release. */
+  readonly code = "history-edges-teardown" as const
+
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options)
+  }
+}

@@ -9,7 +9,14 @@ import { dirname, join, resolve } from "node:path"
 import { fullJitter, type RandomUnit } from "@bearly/pacing"
 
 import { syncDirectory } from "./durable.ts"
-import { Conflict, GitSignaled, GitTimeout, HistoryEdgesOverflow, PublicationRejected } from "./errors.ts"
+import {
+  Conflict,
+  GitSignaled,
+  GitTimeout,
+  HistoryEdgesOverflow,
+  HistoryEdgesTeardown,
+  PublicationRejected,
+} from "./errors.ts"
 import { journalLeaseRejection } from "./lease-journal.ts"
 import { rejectLegacyProvenance, validateRefNames } from "./options.ts"
 import {
@@ -1207,6 +1214,8 @@ async function readHistory(
 
 /** Cap on the unparsed carry buffer of a streamed history-edge walk: one incomplete record. */
 const HISTORY_EDGES_CARRY_LIMIT_BYTES = 1024 * 1024
+/** Cap on the stderr tail kept for a stream-failure message: always drained, reported bounded. */
+const HISTORY_EDGES_STDERR_LIMIT_BYTES = 8 * 1024
 
 /**
  * Stream every parent of every commit reachable from `tips`, as `{ oid, parents }`
@@ -1214,8 +1223,11 @@ const HISTORY_EDGES_CARRY_LIMIT_BYTES = 1024 * 1024
  * not grow with message size. The unparsed carry buffer, the producer maxBytes and
  * maxRecords caps, and consumer cancellation are all bounded: a cap overflow stops
  * the child process group and throws BEFORE the over-cap record is yielded, and a
- * consumer that stops early cancels the child in the generator finally block. The
- * child leads its own process group so a cancel reaches any helper Git started.
+ * consumer that stops early cancels the child in the generator finally block, which
+ * stops the group and does not release custody until the child is proven gone (or
+ * refuses, bounded and loud). stderr is always drained but only a bounded tail is
+ * kept. The child leads its own process group so a cancel reaches any helper Git
+ * started.
  */
 async function* readHistoryEdges(
   resolveGitDir: (repo: string) => Promise<string>,
@@ -1242,11 +1254,36 @@ async function* readHistoryEdges(
     },
   )
   const release = child.pid === undefined ? noRelease : holdGroup(child.pid, "forward")
-  const stderr: Buffer[] = []
-  child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk))
+  // stderr is always drained so a chatty child cannot block on a full pipe, but only a bounded tail is kept:
+  // an unbounded Buffer[] would make this stream's memory grow with a runaway child's diagnostics.
+  let stderrTail = Buffer.alloc(0)
+  let stderrDropped = false
+  child.stderr.on("data", (chunk: Buffer) => {
+    if (stderrTail.length + chunk.length <= HISTORY_EDGES_STDERR_LIMIT_BYTES) {
+      stderrTail = Buffer.concat([stderrTail, chunk])
+      return
+    }
+    stderrDropped = true
+    stderrTail = Buffer.from(chunk.subarray(Math.max(0, chunk.length - HISTORY_EDGES_STDERR_LIMIT_BYTES)))
+  })
   child.stdin.on("error", ignoreChildStdinError)
+  // A spawn failure (missing or non-executable Git) emits 'error' and may never emit 'close'; without this
+  // listener Node raises it as an unhandled exception instead of a rejection the caller can act on.
+  let spawnError: Error | undefined
   const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((settle) => {
-    child.once("close", (code, signal) => settle({ code, signal }))
+    let settled = false
+    const finish = (value: { code: number | null; signal: NodeJS.Signals | null }): void => {
+      if (settled) return
+      settled = true
+      settle(value)
+    }
+    child.once("close", (code, signal) => finish({ code, signal }))
+    child.once("error", (error: Error) => {
+      spawnError = error
+      child.stdout.destroy()
+      child.stderr.destroy()
+      finish({ code: null, signal: null })
+    })
   })
   const kill = (): void => {
     stopProcess(child, "SIGTERM", true)
@@ -1257,56 +1294,121 @@ async function* readHistoryEdges(
   let records = 0
   let carry = ""
   let pendingOid: string | undefined
+  let primaryFailure: unknown = undefined
+  let hasPrimaryFailure = false
   try {
     child.stdin.end(input)
-    for await (const chunk of child.stdout) {
-      bytes += chunk.length
-      if (maxBytes !== undefined && bytes > maxBytes) {
-        kill()
-        throw new HistoryEdgesOverflow(
-          "git rev-list edges in " + repo + " exceeded maxBytes " + maxBytes + " after " + bytes + " bytes read",
-        )
-      }
-      carry += decodeUtf8(chunk, "git rev-list edges")
-      let index = carry.indexOf("\0")
-      while (index !== -1) {
-        const field = carry.slice(0, index)
-        carry = carry.slice(index + 1)
-        if (pendingOid === undefined) {
-          pendingOid = validateOid(stripLeadingNewlines(field), "git rev-list returned a malformed history id")
-        } else {
-          const parents = field === "" ? [] : field.split(" ").map((parent) => validateOid(parent))
-          records += 1
-          if (maxRecords !== undefined && records > maxRecords) {
-            kill()
-            throw new HistoryEdgesOverflow("git rev-list edges in " + repo + " exceeded maxRecords " + maxRecords)
-          }
-          const edge: HistoryEdge = { oid: pendingOid, parents }
-          pendingOid = undefined
-          yield edge
+    try {
+      for await (const chunk of child.stdout) {
+        bytes += chunk.length
+        if (maxBytes !== undefined && bytes > maxBytes) {
+          kill()
+          throw new HistoryEdgesOverflow(
+            "git rev-list edges in " + repo + " exceeded maxBytes " + maxBytes + " after " + bytes + " bytes read",
+          )
         }
-        index = carry.indexOf("\0")
+        carry += decodeUtf8(chunk, "git rev-list edges")
+        let index = carry.indexOf("\0")
+        while (index !== -1) {
+          const field = carry.slice(0, index)
+          carry = carry.slice(index + 1)
+          if (pendingOid === undefined) {
+            pendingOid = validateOid(stripLeadingNewlines(field), "git rev-list returned a malformed history id")
+          } else {
+            const parents = field === "" ? [] : field.split(" ").map((parent) => validateOid(parent))
+            records += 1
+            if (maxRecords !== undefined && records > maxRecords) {
+              kill()
+              throw new HistoryEdgesOverflow("git rev-list edges in " + repo + " exceeded maxRecords " + maxRecords)
+            }
+            const edge: HistoryEdge = { oid: pendingOid, parents }
+            pendingOid = undefined
+            yield edge
+          }
+          index = carry.indexOf("\0")
+        }
+        if (carry.length > HISTORY_EDGES_CARRY_LIMIT_BYTES) {
+          kill()
+          throw new HistoryEdgesOverflow(
+            "git rev-list edges in " + repo + " exceeded the " + HISTORY_EDGES_CARRY_LIMIT_BYTES + "-byte carry limit",
+          )
+        }
       }
-      if (carry.length > HISTORY_EDGES_CARRY_LIMIT_BYTES) {
-        kill()
-        throw new HistoryEdgesOverflow(
-          "git rev-list edges in " + repo + " exceeded the " + HISTORY_EDGES_CARRY_LIMIT_BYTES + "-byte carry limit",
-        )
-      }
+    } catch (cause) {
+      // A failed spawn destroys the child's pipes; the stream error is not the story, the spawn error is.
+      if (spawnError === undefined) throw cause
     }
     const { code, signal } = await closed
+    if (spawnError !== undefined) {
+      throw new Error("git rev-list edges could not start (" + spawnError.message + ") in " + repo, {
+        cause: spawnError,
+      })
+    }
     if (carry.trim() !== "" || pendingOid !== undefined) {
       throw new Error("git rev-list returned trailing history-edge data in " + repo)
     }
     if (code !== 0) {
-      const detail = Buffer.concat(stderr).toString("utf8").trim()
+      const detail = stderrTail.toString("utf8").trim()
+      const truncated = stderrDropped ? " [stderr tail; earlier output dropped]" : ""
       throw new Error(
-        "git rev-list edges failed (" + (code ?? signal ?? "no exit") + ") in " + repo + (detail ? ": " + detail : ""),
+        "git rev-list edges failed (" +
+          (code ?? signal ?? "no exit") +
+          ") in " +
+          repo +
+          (detail ? ": " + detail + truncated : truncated),
       )
     }
+  } catch (cause) {
+    // Remember the in-flight failure so a teardown refusal can CHAIN it instead of discarding it.
+    hasPrimaryFailure = true
+    primaryFailure = cause
+    throw cause
   } finally {
-    if (child.exitCode === null && child.signalCode === null) kill()
-    release()
+    if (child.exitCode !== null || child.signalCode !== null) {
+      release()
+    } else {
+      // Custody must not outlive the walk: stop the group, then prove teardown before releasing the hold.
+      kill()
+      let settled = await settlesWithin(closed, GROUP_STOP_GRACE_MS + 1_000)
+      if (!settled) {
+        stopProcess(child, "SIGKILL", true)
+        settled = await settlesWithin(closed, 1_000)
+      }
+      release()
+      if (!settled) {
+        // The teardown refusal is the loud outcome, and it CHAINS any in-flight failure as its cause rather
+        // than silently discarding it.
+        // oxlint-disable-next-line no-unsafe-finally -- see the line above; the cause is preserved.
+        throw new HistoryEdgesTeardown(
+          "git rev-list edges in " +
+            repo +
+            " did not settle " +
+            (GROUP_STOP_GRACE_MS + 2_000) +
+            "ms after SIGKILL; the child process group may still be running",
+          hasPrimaryFailure ? { cause: primaryFailure } : undefined,
+        )
+      }
+    }
+  }
+}
+
+/** Resolves true when `closed` settles within `ms`; a bound that elapses resolves false. */
+async function settlesWithin(closed: Promise<unknown>, ms: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const expired = new Promise<boolean>((settle) => {
+    timer = setTimeout(() => settle(false), ms)
+    timer.unref?.()
+  })
+  try {
+    return await Promise.race([
+      closed.then(
+        () => true,
+        () => true,
+      ),
+      expired,
+    ])
+  } finally {
+    clearTimeout(timer)
   }
 }
 
