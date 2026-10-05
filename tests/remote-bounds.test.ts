@@ -9,7 +9,7 @@
 
 import { execFile, spawnSync } from "node:child_process"
 import { createHash } from "node:crypto"
-import { chmod, mkdir, mkdtemp, readdir, readFile, rename, rm, writeFile } from "node:fs/promises"
+import { appendFile, chmod, mkdir, mkdtemp, readdir, readFile, rename, rm, writeFile } from "node:fs/promises"
 import fs from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -603,6 +603,70 @@ describe("a kept remote repository", () => {
     } finally {
       if (lock !== undefined) await rm(lock, { force: true })
       await rm(join(cacheDir, ".."), { recursive: true, force: true })
+      await fixture.cleanup()
+    }
+  })
+
+  /**
+   * @failure hh 27525 REVISE (@cto): the CONTINUE half of the config.lock tolerance, forced deterministically. A
+   *          PATH shim logs and then delays every `config --local --list` by 0.4 s, so the test appends the guards
+   *          to the store's OWN config (another opener's completed write) AFTER the first read and far BEFORE the
+   *          re-read. With config.lock held by the test the write cannot succeed, so a passing open proves the
+   *          re-read-equal-continue branch ran — never a race the runner might miss.
+   */
+  test("a config.lock another opener already resolved is tolerated: the guarded open continues", async () => {
+    const fixture = await createBareRepo()
+    const cacheDir = join(await mkdtemp(join(tmpdir(), "gitomic-kept-guard-continue-")), "remotes")
+    const shimDir = await mkdtemp(join(tmpdir(), "gitomic-git-shim-"))
+    const shimLog = join(shimDir, "calls.log")
+    const realGit = spawnSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).stdout.trim()
+    const shim = join(shimDir, "git")
+    await writeFile(
+      shim,
+      `#!/bin/sh\nprintf '%s\\n' "$*" >> '${shimLog}'\ncase " $* " in *" config --local --list "*) sleep 0.4 ;; esac\nexec '${realGit}' "$@"\n`,
+    )
+    await chmod(shim, 0o755)
+    const savedPath = process.env.PATH
+    let lock: string | undefined
+    try {
+      const source = pathToFileURL(fixture.repo).href
+      const seed = await openRemoteRepository(source, { cacheDir })
+      seed[Symbol.dispose]()
+      process.env.PATH = `${shimDir}:${savedPath ?? ""}`
+      for (const key of ["gc.auto", "gc.pruneExpire", "maintenance.auto"]) {
+        await git(seed.repo, "config", "--unset", key)
+      }
+      lock = join(seed.repo, "config.lock")
+      await writeFile(lock, "")
+
+      const opening = openRemoteRepository(source, { cacheDir })
+      const deadline = Date.now() + 15_000
+      for (;;) {
+        const listed = await readFile(shimLog, "utf8")
+          .then((text) => text.split("\n").filter((line) => line.includes("config --local --list")).length)
+          .catch(() => 0)
+        if (listed >= 2) break
+        if (Date.now() > deadline) throw new Error("the guard never made its second config --local --list read")
+        await new Promise((resolve) => setTimeout(resolve, 5))
+      }
+      // Another opener's completed write, written straight into the store's own config: `git config` cannot, the
+      // lock is ours. The shim still sleeps 0.4 s before the re-read runs, so this lands first by construction.
+      await appendFile(
+        join(seed.repo, "config"),
+        "[gc]\n\tauto = 0\n\tpruneExpire = never\n[maintenance]\n\tauto = false\n",
+      )
+
+      const opened = await opening
+      opened[Symbol.dispose]()
+      expect(await git(seed.repo, "config", "--local", "--get", "gc.auto")).toBe("0")
+      expect(await git(seed.repo, "config", "--local", "--get", "gc.pruneExpire")).toBe("never")
+      expect(await git(seed.repo, "config", "--local", "--get", "maintenance.auto")).toBe("false")
+    } finally {
+      if (savedPath === undefined) delete process.env.PATH
+      else process.env.PATH = savedPath
+      if (lock !== undefined) await rm(lock, { force: true })
+      await rm(join(cacheDir, ".."), { recursive: true, force: true })
+      await rm(shimDir, { recursive: true, force: true })
       await fixture.cleanup()
     }
   })
