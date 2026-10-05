@@ -156,7 +156,8 @@ async function openKept(
  * stops `git maintenance` running on its own after a command. A kept remote is shared across live processes and
  * "outlives every owner by design", so it is exactly the storage these guards exist for — the temporary clone
  * beside it already set `gc.auto=0` (openTemporary), and only the kept one was left open (hh #27525). Reads the
- * config once and writes only a value that differs, so a guarded remote costs one git call on later opens.
+ * store's OWN config once and writes only a value that differs, so a guarded remote costs one git call on later
+ * opens.
  */
 const KEPT_STORE_GC_GUARDS = [
   ["gc.auto", "0"],
@@ -165,16 +166,35 @@ const KEPT_STORE_GC_GUARDS = [
 ] as const
 
 async function guardKeptStore(source: string, repo: string, timeoutMs: number): Promise<void> {
-  const listed = await gitOrThrow(source, ["--git-dir", repo, "config", "--list"], timeoutMs)
+  const current = await readKeptGuards(source, repo, timeoutMs)
+  for (const [key, value] of KEPT_STORE_GC_GUARDS) {
+    if (current.get(key.toLowerCase()) === value) continue
+    try {
+      await gitOrThrow(source, ["--git-dir", repo, "config", key, value], timeoutMs)
+    } catch (failure) {
+      // The kept remote is shared by live processes, so two first opens after deploy can race on config.lock and
+      // the loser's write exits non-zero for an operation another opener has already completed (hh #27525 REVISE,
+      // @cto). Re-read ONCE: if the store now carries the guard, the race was redundant, not a failure.
+      const reread = await readKeptGuards(source, repo, timeoutMs)
+      if (reread.get(key.toLowerCase()) === value) continue
+      throw failure
+    }
+  }
+}
+
+/**
+ * The store's OWN config, never the system or global files. `git config --list` merges all three scopes, so a
+ * `gc.auto=0` in ~/.gitconfig would satisfy the check and the kept store would never be written (hh #27525 REVISE,
+ * @cto) — a guard inherited by accident is not carried by the store and disappears when that file changes.
+ */
+async function readKeptGuards(source: string, repo: string, timeoutMs: number): Promise<Map<string, string>> {
+  const listed = await gitOrThrow(source, ["--git-dir", repo, "config", "--local", "--list"], timeoutMs)
   const current = new Map<string, string>()
   for (const line of listed.split("\n")) {
     const separator = line.indexOf("=")
     if (separator > 0) current.set(line.slice(0, separator).trim().toLowerCase(), line.slice(separator + 1))
   }
-  for (const [key, value] of KEPT_STORE_GC_GUARDS) {
-    if (current.get(key.toLowerCase()) === value) continue
-    await gitOrThrow(source, ["--git-dir", repo, "config", key, value], timeoutMs)
-  }
+  return current
 }
 
 async function build(source: string, repo: string, seed: string | undefined, timeoutMs: number): Promise<void> {

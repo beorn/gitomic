@@ -517,6 +517,96 @@ describe("a kept remote repository", () => {
     }
   })
 
+  /**
+   * @failure hh 27525 REVISE (@cto): `git config --list` merges the system, global and local scopes, so a
+   *          `gc.auto=0` in ~/.gitconfig satisfied the check and the kept store was never written — the guard was
+   *          inherited by accident, not carried by the store, and would vanish when that file changed. The guard
+   *          must be visible in the store's OWN config.
+   */
+  test("a global gc.auto never satisfies the guard: it is written to the kept repository's own config", async () => {
+    const fixture = await createBareRepo()
+    const cacheDir = join(await mkdtemp(join(tmpdir(), "gitomic-kept-guard-global-")), "remotes")
+    const globalDir = await mkdtemp(join(tmpdir(), "gitomic-global-config-"))
+    const globalConfig = join(globalDir, "gitconfig")
+    await writeFile(globalConfig, "[gc]\n\tauto = 0\n\tpruneExpire = never\n[maintenance]\n\tauto = false\n")
+    const savedGlobal = process.env.GIT_CONFIG_GLOBAL
+    process.env.GIT_CONFIG_GLOBAL = globalConfig
+    try {
+      const source = pathToFileURL(fixture.repo).href
+      const opened = await openRemoteRepository(source, { cacheDir })
+      opened[Symbol.dispose]()
+
+      // The global file already carries all three guards, so a `--list` read would have skipped every write.
+      expect(await git(opened.repo, "config", "--local", "--get", "gc.auto")).toBe("0")
+      expect(await git(opened.repo, "config", "--local", "--get", "gc.pruneExpire")).toBe("never")
+      expect(await git(opened.repo, "config", "--local", "--get", "maintenance.auto")).toBe("false")
+    } finally {
+      if (savedGlobal === undefined) delete process.env.GIT_CONFIG_GLOBAL
+      else process.env.GIT_CONFIG_GLOBAL = savedGlobal
+      await rm(join(cacheDir, ".."), { recursive: true, force: true })
+      await rm(globalDir, { recursive: true, force: true })
+      await fixture.cleanup()
+    }
+  })
+
+  /**
+   * @failure hh 27525 REVISE (@cto): the kept remote is shared by live processes, so the first opens after deploy
+   *          read it as unguarded and race on config.lock. The loser's `git config` exits non-zero for an
+   *          operation another opener already completed, and openKept threw where it would have succeeded.
+   */
+  test("concurrent first opens of an unguarded kept repository all succeed and all carry the guards", async () => {
+    const fixture = await createBareRepo()
+    const cacheDir = join(await mkdtemp(join(tmpdir(), "gitomic-kept-guard-race-")), "remotes")
+    try {
+      const source = pathToFileURL(fixture.repo).href
+      const seed = await openRemoteRepository(source, { cacheDir })
+      seed[Symbol.dispose]()
+      for (const key of ["gc.auto", "gc.pruneExpire", "maintenance.auto"]) {
+        await git(seed.repo, "config", "--unset", key)
+      }
+      await expect(git(seed.repo, "config", "--local", "--get", "gc.auto")).rejects.toThrow()
+
+      const opened = await Promise.all([
+        openRemoteRepository(source, { cacheDir }),
+        openRemoteRepository(source, { cacheDir }),
+      ])
+      for (const handle of opened) handle[Symbol.dispose]()
+      expect(await git(seed.repo, "config", "--local", "--get", "gc.auto")).toBe("0")
+      expect(await git(seed.repo, "config", "--local", "--get", "gc.pruneExpire")).toBe("never")
+      expect(await git(seed.repo, "config", "--local", "--get", "maintenance.auto")).toBe("false")
+    } finally {
+      await rm(join(cacheDir, ".."), { recursive: true, force: true })
+      await fixture.cleanup()
+    }
+  })
+
+  /**
+   * @failure hh 27525 REVISE (@cto): the config.lock tolerance must not become a silent swallow. When a held
+   *          config.lock is NOT the work of another opener — the store still lacks the guard after the re-read —
+   *          the open must still fail LOUDLY, naming the git error, never proceed unguarded.
+   */
+  test("a held config.lock no other opener resolved still refuses the open, naming the git error", async () => {
+    const fixture = await createBareRepo()
+    const cacheDir = join(await mkdtemp(join(tmpdir(), "gitomic-kept-guard-lock-")), "remotes")
+    let lock: string | undefined
+    try {
+      const source = pathToFileURL(fixture.repo).href
+      const seed = await openRemoteRepository(source, { cacheDir })
+      seed[Symbol.dispose]()
+      for (const key of ["gc.auto", "gc.pruneExpire", "maintenance.auto"]) {
+        await git(seed.repo, "config", "--unset", key)
+      }
+      lock = join(seed.repo, "config.lock")
+      await writeFile(lock, "")
+      await expect(openRemoteRepository(source, { cacheDir })).rejects.toThrow(/could not lock/u)
+      expect(await git(seed.repo, "config", "--local", "--list")).not.toContain("gc.auto")
+    } finally {
+      if (lock !== undefined) await rm(lock, { force: true })
+      await rm(join(cacheDir, ".."), { recursive: true, force: true })
+      await fixture.cleanup()
+    }
+  })
+
   test("the first build seeds from a local checkout without contacting the source", async () => {
     const stall = await createStallingSsh()
     const checkout = await createWorktreeRepo()
