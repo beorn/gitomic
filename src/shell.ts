@@ -73,6 +73,8 @@ type GitOptions = {
   input?: string | Buffer
   /** Stop the command, and every process it started, after this many milliseconds. */
   timeoutMs?: number
+  /** Bound combined stdout/stderr bytes; overflow stops the command group before rejecting. */
+  maxBytes?: number
 }
 
 /** Options for {@link runGit}. */
@@ -206,21 +208,9 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
         baseEnv,
         input: `${oid}\n`,
       })
-      const newline = output.indexOf(0x0a)
-      const header = output.toString("utf8", 0, newline < 0 ? output.length : newline)
-      const match = /^([0-9a-f]+) commit (\d+)$/.exec(header)
-      const size = match === null ? NaN : Number(match[2])
-      if (
-        match?.[1] !== oid ||
-        !Number.isSafeInteger(size) ||
-        output.length !== newline + size + 2 ||
-        output.at(-1) !== 0x0a
-      ) {
-        throw new Error(
-          `cannot read commit ${oid} in ${JSON.stringify(repo)}: unexpected cat-file result ${JSON.stringify(header)}`,
-        )
-      }
-      return parseCommit(oid, output.subarray(newline + 1, newline + 1 + size))
+      const raw = parseBatch([oid], output, "commit").get(oid)
+      if (raw === undefined) throw new Error(`git cat-file --batch omitted commit ${oid}`)
+      return parseCommit(oid, raw)
     },
     readTree: async (repo, commit, prefix) => readTree(await resolveGitDir(repo), commit, prefix, baseEnv),
     readTreeExact: async (repo, commit, path) => readTreeExact(await resolveGitDir(repo), commit, path, baseEnv),
@@ -511,7 +501,8 @@ async function run(command: string, args: readonly string[], options: GitOptions
   const timeoutMs = options.timeoutMs === undefined ? undefined : normalizeTimeoutMs(options.timeoutMs, "timeoutMs")
   // oxlint-disable-next-line promise/param-names -- resolveResult cannot shadow the imported path.resolve.
   return new Promise((resolveResult, reject) => {
-    const bounded = timeoutMs !== undefined && process.platform !== "win32"
+    const maxBytes = options.maxBytes === undefined ? undefined : normalizeHistoryEdgeByteCap(options.maxBytes)
+    const bounded = (timeoutMs !== undefined || maxBytes !== undefined) && process.platform !== "win32"
     const child = childProcess.spawn(command, args, {
       env: { ...(options.baseEnv ?? process.env), ...options.env, GIT_TERMINAL_PROMPT: "0", LC_ALL: "C" },
       stdio: ["pipe", "pipe", "pipe"],
@@ -523,6 +514,8 @@ async function run(command: string, args: readonly string[], options: GitOptions
     const stderr: Buffer[] = []
     let settled = false
     let timedOut = false
+    let outputOverflow: Error | undefined
+    let outputBytes = 0
     let exitCode: number | null | undefined
     let exitSignal: NodeJS.Signals | null = null
     let limit: ReturnType<typeof setTimeout> | undefined
@@ -542,7 +535,9 @@ async function run(command: string, args: readonly string[], options: GitOptions
     const settleOutcome = (code: number | null, signal: NodeJS.Signals | null): void => {
       settle(() => {
         const capturedStderr = Buffer.concat(stderr)
-        if (signal !== null) {
+        if (outputOverflow !== undefined) {
+          reject(outputOverflow)
+        } else if (signal !== null) {
           reject(new GitSignaled(describeGitCommand(command, args), signal, capturedStderr.toString("utf8")))
         } else if (code === null) {
           reject(new Error(`${describeGitCommand(command, args)} ended without an exit code or signal`))
@@ -573,13 +568,31 @@ async function run(command: string, args: readonly string[], options: GitOptions
         escalation = setTimeout(() => stopProcess(child, "SIGKILL", bounded), GROUP_STOP_GRACE_MS)
       }, timeoutMs)
     }
-    child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk))
-    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk))
+    const collect = (chunks: Buffer[], chunk: Buffer): void => {
+      if (outputOverflow !== undefined) return
+      outputBytes += chunk.length
+      if (maxBytes !== undefined && outputBytes > maxBytes) {
+        outputOverflow = new Error(
+          `${describeGitCommand(command, args)} exceeded maxBytes ${maxBytes} after ${outputBytes} bytes`,
+        )
+        stopProcess(child, "SIGTERM", bounded)
+        escalation = setTimeout(() => stopProcess(child, "SIGKILL", bounded), GROUP_STOP_GRACE_MS)
+        return
+      }
+      chunks.push(chunk)
+    }
+    child.stdout.on("data", (chunk: Buffer) => collect(stdout, chunk))
+    child.stderr.on("data", (chunk: Buffer) => collect(stderr, chunk))
     child.once("error", (error) => settle(() => reject(error)))
     // A stopped command settles when its own process exits, not when its pipes close.
     child.once("exit", (code, signal) => {
       exitCode = code
       exitSignal = signal
+      if (outputOverflow !== undefined) {
+        abandonHelpers()
+        settle(() => reject(outputOverflow))
+        return
+      }
       if (!timedOut) return
       abandonHelpers()
       settle(() => reject(new GitTimeout(describeGitCommand(command, args), timeoutMs ?? 0)))
@@ -593,7 +606,7 @@ async function run(command: string, args: readonly string[], options: GitOptions
       // limit is then the reported outcome. A command that exits (or closes
       // stdin) without reading all of its input breaks the pipe: its exit code
       // is the result, never the EPIPE. Any other stdin failure is the result.
-      if (timedOut || error.code === "EPIPE") return
+      if (timedOut || outputOverflow !== undefined || error.code === "EPIPE") return
       settle(() => reject(error))
     })
     child.stdin.end(options.input)
@@ -874,34 +887,105 @@ async function readBlobs(
   if (distinct.length === 0) return new Map()
   for (const oid of distinct) validateOid(oid, "readBlobs needs valid Git object ids")
   const output = await git(repo, ["cat-file", "--batch"], { baseEnv, input: `${distinct.join("\n")}\n` })
-  return parseBatch(distinct, output)
+  return new Map([...parseBatch(distinct, output, "blob")].map(([oid, raw]) => [oid, decodeBlob(raw)]))
 }
 
-function parseBatch(oids: readonly Oid[], output: Buffer): ReadonlyMap<Oid, BlobValue> {
-  const blobs = new Map<Oid, BlobValue>()
+function parseBatch(oids: readonly Oid[], output: Buffer, type: "commit" | "blob"): ReadonlyMap<Oid, Buffer> {
+  const blobs = new Map<Oid, Buffer>()
   let offset = 0
   for (const oid of oids) {
     const newline = output.indexOf(0x0a, offset)
-    if (newline < 0) throw new Error("git cat-file --batch returned a truncated header")
+    if (newline < 0) throw new Error(`git cat-file --batch returned a truncated header for ${oid}`)
     const header = output.toString("utf8", offset, newline)
     if (header === `${oid} missing`) {
       throw new Error(`git cat-file --batch: object ${oid} is missing from the repository`)
     }
-    const match = /^([0-9a-f]+) blob ([0-9]+)$/.exec(header)
-    if (match === null || match[1] !== oid) {
+    const match = /^([0-9a-f]+) (blob|commit) ([0-9]+)$/.exec(header)
+    if (match === null || match[1] !== oid || match[2] !== type) {
       throw new Error(`git cat-file --batch returned an unexpected object for ${oid}: ${header}`)
     }
-    const size = Number(match[2])
+    const size = Number(match[3])
     const start = newline + 1
     const end = start + size
     if (!Number.isSafeInteger(size) || size < 0 || end >= output.length || output[end] !== 0x0a) {
-      throw new Error(`git cat-file --batch returned a malformed blob for ${oid}`)
+      throw new Error(`git cat-file --batch returned a malformed ${type} for ${oid}`)
     }
-    blobs.set(oid, decodeBlob(output.subarray(start, end)))
+    blobs.set(oid, output.subarray(start, end))
     offset = end + 1
   }
-  if (offset !== output.length) throw new Error("git cat-file --batch returned trailing data")
+  if (offset !== output.length) throw new Error(`git cat-file --batch returned trailing data after ${oids.at(-1)}`)
   return blobs
+}
+
+/** Required cumulative raw payload budget and per-command deadline for exact commit reads. */
+export type ReadRawCommitsOptions = Readonly<{
+  maxBytes: number
+  timeoutMs: number
+  run?: (args: readonly string[], options?: RunGitOptions) => Promise<GitResult>
+}>
+
+/** Read distinct commits as exact bytes, with at most 500 OIDs and 8 MiB per native batch. */
+export async function readRawCommits(
+  repo: string,
+  oids: readonly Oid[],
+  options: ReadRawCommitsOptions,
+): Promise<ReadonlyMap<Oid, Buffer>> {
+  const maxBytes = normalizeHistoryEdgeByteCap(options.maxBytes)
+  const timeoutMs = normalizeTimeoutMs(options.timeoutMs, "timeoutMs")
+  const distinct = [...new Set(oids)]
+  for (const oid of distinct) validateOid(oid, "readRawCommits needs valid Git object ids")
+  const invoke = options.run ?? runGit
+  const at = ["-C", resolve(repo)]
+  const nativeMaxBytes = 8 * 1024 * 1024
+  const result = new Map<Oid, Buffer>()
+  let totalBytes = 0
+  for (let offset = 0; offset < distinct.length; offset += 500) {
+    const candidates = distinct.slice(offset, offset + 500)
+    const args = [...at, "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"]
+    const checked = await invoke(args, { input: candidates.join("\n") + "\n", timeoutMs, maxBytes: nativeMaxBytes })
+    if (checked.code !== 0) throw commandFailure(repo, args, checked)
+    const answers = checked.stdout.toString("ascii").split("\n")
+    if (answers.pop() !== "" || answers.length !== candidates.length) {
+      throw new Error(`git cat-file metadata cardinality differs for ${candidates[0]} in ${repo}`)
+    }
+    let chunk: Oid[] = []
+    let chunkBytes = 0
+    const sizes = new Map<Oid, number>()
+    const readChunk = async (): Promise<void> => {
+      if (chunk.length === 0) return
+      const readArgs = [...at, "cat-file", "--batch"]
+      const read = await invoke(readArgs, { input: chunk.join("\n") + "\n", timeoutMs, maxBytes: nativeMaxBytes })
+      if (read.code !== 0) throw commandFailure(repo, readArgs, read)
+      for (const [oid, raw] of parseBatch(chunk, read.stdout, "commit")) {
+        if (raw.length !== sizes.get(oid)) throw new Error(`git cat-file commit length differs for ${oid}`)
+        result.set(oid, raw)
+      }
+      chunk = []
+      chunkBytes = 0
+    }
+    for (const [index, oid] of candidates.entries()) {
+      const answer = answers[index]
+      const match = /^([0-9a-f]+) commit ([0-9]+)$/.exec(answer ?? "")
+      const bytes = match === null ? NaN : Number(match[2])
+      if (match?.[1] !== oid || !Number.isSafeInteger(bytes) || bytes < 0) {
+        throw new Error(`git cat-file metadata missing or invalid commit ${oid} in ${repo}: ${answer}`)
+      }
+      totalBytes += bytes
+      if (totalBytes > maxBytes) {
+        throw new Error(`raw commits in ${repo} exceeded maxBytes ${maxBytes} after ${totalBytes} bytes at ${oid}`)
+      }
+      const framedBytes = bytes + Buffer.byteLength(`${oid} commit ${bytes}\n`) + 1
+      if (framedBytes > nativeMaxBytes) {
+        throw new Error(`git cat-file commit ${oid} exceeded maxBytes ${nativeMaxBytes} after ${framedBytes} bytes`)
+      }
+      if (chunkBytes + framedBytes > nativeMaxBytes) await readChunk()
+      chunk.push(oid)
+      sizes.set(oid, bytes)
+      chunkBytes += framedBytes
+    }
+    await readChunk()
+  }
+  return result
 }
 
 async function writeCommit(
