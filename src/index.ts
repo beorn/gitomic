@@ -122,6 +122,8 @@ export {
   resolveGitAuthor,
   runCommand,
   runGit,
+  readRawCommits,
+  type ReadRawCommitsOptions,
   type DanglingRef,
   type DanglingRefsOptions,
   type BatchCheckOptions,
