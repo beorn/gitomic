@@ -661,6 +661,8 @@ function removeSignalForwarders(): void {
 
 function forwardSignal(signal: NodeJS.Signals): void {
   const firstTermination = signal === "SIGTERM" && !deferredTermination
+  const exitsByDefault =
+    process.listenerCount(signal) === 1 && !(firstTermination && [...heldGroups.values()].includes("drain"))
   let deferred = false
   for (const [pid, policy] of heldGroups) {
     if (firstTermination && policy === "drain") {
@@ -669,6 +671,9 @@ function forwardSignal(signal: NodeJS.Signals): void {
     }
     try {
       process.kill(-pid, signal)
+      // A default host exit loses its escalation timers. Finish stopping its
+      // owned groups before exiting, as a timed-out command does for helpers.
+      if (exitsByDefault) process.kill(-pid, "SIGKILL")
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error
     }

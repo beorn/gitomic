@@ -17,7 +17,7 @@ import { fileURLToPath, pathToFileURL } from "node:url"
 import { afterEach, describe, expect, test, vi } from "vitest"
 import { tempTree } from "removely"
 
-import { createShellBackend, open, openRemoteRepository, runGit } from "../src/index.js"
+import { createShellBackend, open, openRemoteRepository, runCommand, runGit } from "../src/index.js"
 import { createBareRepo, createRemoteRepos, createWorktreeRepo, git, gitFrom } from "./helpers/git.js"
 
 const INDEX = fileURLToPath(new URL("../src/index.ts", import.meta.url))
@@ -232,6 +232,34 @@ describe("a remote that stalls", () => {
 })
 
 describe("a bounded command", () => {
+  // @failure An outer timeout returns while a nested bounded runner's TERM-ignoring group remains alive.
+  // @level l1
+  // @consumer gitomic#runCommand whole-stage bounds in STATE replica restoration (#27465/#27385)
+  // Direct timeout and host-policy cases do not nest two independently bounded groups.
+  test("an outer timeout stops a TERM-ignoring nested process group before rejecting", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "gitomic-nested-bound-"))
+    const pidFile = join(directory, "nested.pid")
+    const child = [
+      `const { runCommand } = await import(${JSON.stringify(INDEX)})`,
+      `await runCommand("sh", ["-c", "trap '' TERM; echo $$ > \\\"$GITOMIC_TEST_NESTED_PID\\\"; exec sleep 5"], { timeoutMs: 60000 })`,
+    ].join("\n")
+    try {
+      await expect(
+        runCommand("bun", ["-e", child], {
+          timeoutMs: 1500,
+          env: { GITOMIC_TEST_NESTED_PID: pidFile },
+        }),
+      ).rejects.toBeInstanceOf((await import("../src/index.js")).GitTimeout)
+      expect(fs.existsSync(pidFile)).toBe(true)
+      const pid = Number((await readFile(pidFile, "utf8")).trim())
+      expect(Number.isSafeInteger(pid) && pid > 0).toBe(true)
+      expect(alive(pid)).toBe(false)
+    } finally {
+      // The finite child exits naturally even on RED; no manual signal can fake cleanup proof.
+      await rm(directory, { recursive: true, force: true })
+    }
+  }, 15000)
+
   // #26689: signalling Git itself does not cover TERM sent to its graceful host.
   test.each([
     {
