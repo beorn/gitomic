@@ -335,7 +335,17 @@ export type GitomicBackend = {
   readHistory?(
     repo: string,
     tips: readonly Oid[],
-    options?: { readonly exclude?: readonly Oid[]; readonly limit?: number },
+    options?: {
+      readonly exclude?: readonly Oid[]
+      readonly limit?: number
+      /**
+       * Walk ALL parents (the full ancestor closure) instead of the first-parent chain. The cold write-log
+       * ancestry route reads exactly the commits its disk DAG already knows, in ONE process, so the metadata
+       * pass costs one read instead of a chain of per-round reads (#27099 step 2 slice 1, @cto 68b1ca87).
+       * Defaults to false: every existing caller keeps first-parent semantics.
+       */
+      readonly allParents?: boolean
+    },
   ): Promise<CommitMeta[]>
   /**
    * Every parent of every commit reachable from `tips`, streamed as

@@ -295,23 +295,29 @@ export function createMemBackend(): GitomicBackend {
   const readHistory = async (
     name: string,
     tips: readonly Oid[],
-    options: { readonly exclude?: readonly Oid[]; readonly limit?: number } = {},
+    options: { readonly exclude?: readonly Oid[]; readonly limit?: number; readonly allParents?: boolean } = {},
   ): Promise<CommitMeta[]> => {
     const commits = getRepo(name).commits
     const exclude = new Set(options.exclude ?? [])
     const limit = options.limit ?? Number.POSITIVE_INFINITY
     const seen = new Set<Oid>()
     const read: CommitMeta[] = []
-    for (const tip of tips) {
-      let oid: Oid | undefined = tip
-      while (oid !== undefined && !exclude.has(oid) && !seen.has(oid) && read.length < limit) {
+    // An explicit stack (never recursion): with `allParents` the whole ancestor closure is walked, otherwise the
+    // first-parent chain is — the same order the previous single-parent loop emitted (#27099 slice 1).
+    const walk = (start: Oid): void => {
+      const stack: Oid[] = [start]
+      while (stack.length > 0) {
+        const oid = stack.pop() as Oid
+        if (exclude.has(oid) || seen.has(oid) || read.length >= limit) continue
         const commit = commits.get(oid)
         if (commit === undefined) throw new Error(`unknown commit: ${oid}`)
         seen.add(oid)
         read.push(parseCommit(oid, commit.content))
-        oid = commit.parents[0]
+        if (options.allParents === true) for (const parent of commit.parents) stack.push(parent)
+        else if (commit.parents[0] !== undefined) stack.push(commit.parents[0])
       }
     }
+    for (const tip of tips) walk(tip)
     return read
   }
 

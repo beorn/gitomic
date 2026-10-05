@@ -1180,7 +1180,7 @@ const HISTORY_FIELDS = 8
 async function readHistory(
   repo: string,
   tips: readonly Oid[],
-  options: { readonly exclude?: readonly Oid[]; readonly limit?: number } = {},
+  options: { readonly exclude?: readonly Oid[]; readonly limit?: number; readonly allParents?: boolean } = {},
   baseEnv?: NodeJS.ProcessEnv,
 ): Promise<CommitMeta[]> {
   if (tips.length === 0) return []
@@ -1192,7 +1192,9 @@ async function readHistory(
     repo,
     [
       "rev-list",
-      "--first-parent",
+      // #27099 step 2 slice 1 (@cto 68b1ca87): the cold ancestry route asks for the WHOLE ancestor closure in
+      // one process; the first-parent chain stays the default for every existing caller.
+      ...(options.allParents === true ? [] : ["--first-parent"]),
       ...limit,
       "--no-commit-header",
       "--format=%H%x00%P%x00%ct%x00%an%x00%ae%x00%cn%x00%ce%x00%B%x00",
