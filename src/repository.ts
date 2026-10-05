@@ -140,12 +140,40 @@ async function openKept(
     }
   }
   await assertKeptOrigin(source, repo, timeoutMs)
+  await guardKeptStore(source, repo, timeoutMs)
   return {
     repo,
     remote: "origin",
     [Symbol.dispose]() {
       // The kept repository outlives every owner by design.
     },
+  }
+}
+
+/**
+ * The guards every shared object store carries (hh #25050, #27167): `gc.auto=0` stops any git command starting an
+ * automatic gc, `gc.pruneExpire=never` keeps an object only another ref might reach, and `maintenance.auto=false`
+ * stops `git maintenance` running on its own after a command. A kept remote is shared across live processes and
+ * "outlives every owner by design", so it is exactly the storage these guards exist for — the temporary clone
+ * beside it already set `gc.auto=0` (openTemporary), and only the kept one was left open (hh #27525). Reads the
+ * config once and writes only a value that differs, so a guarded remote costs one git call on later opens.
+ */
+const KEPT_STORE_GC_GUARDS = [
+  ["gc.auto", "0"],
+  ["gc.pruneExpire", "never"],
+  ["maintenance.auto", "false"],
+] as const
+
+async function guardKeptStore(source: string, repo: string, timeoutMs: number): Promise<void> {
+  const listed = await gitOrThrow(source, ["--git-dir", repo, "config", "--list"], timeoutMs)
+  const current = new Map<string, string>()
+  for (const line of listed.split("\n")) {
+    const separator = line.indexOf("=")
+    if (separator > 0) current.set(line.slice(0, separator).trim().toLowerCase(), line.slice(separator + 1))
+  }
+  for (const [key, value] of KEPT_STORE_GC_GUARDS) {
+    if (current.get(key.toLowerCase()) === value) continue
+    await gitOrThrow(source, ["--git-dir", repo, "config", key, value], timeoutMs)
   }
 }
 

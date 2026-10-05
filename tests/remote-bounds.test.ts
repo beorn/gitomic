@@ -480,6 +480,43 @@ describe("a kept remote repository", () => {
     }
   })
 
+  /**
+   * @failure hh 27525: the KEPT remote is shared across live processes and "outlives every owner by design", but
+   *          only the TEMPORARY clone was guarded (repository.ts openTemporary set gc.auto=0). git's own
+   *          maintenance therefore rewrote the kept store on hh's host: a 4-layer commit-graph chain, a rewritten
+   *          multi-pack-index, 352 loose objects and a leaked tmp_pack. A kept remote is exactly the storage the
+   *          shared-store guards exist for (#25050 /hh/dev, #27167 state authority).
+   */
+  test("a kept repository carries the shared-store gc guards, on its first build AND when reopened", async () => {
+    const fixture = await createBareRepo()
+    const cacheDir = join(await mkdtemp(join(tmpdir(), "gitomic-kept-guard-")), "remotes")
+    try {
+      const source = pathToFileURL(fixture.repo).href
+      const first = await openRemoteRepository(source, { cacheDir })
+      first[Symbol.dispose]()
+
+      // The exact guards tools/lib/store-gc.ts STORE_GC_GUARDS and the state authority (#27167) carry, copied.
+      expect(await git(first.repo, "config", "--get", "gc.auto")).toBe("0")
+      expect(await git(first.repo, "config", "--get", "gc.pruneExpire")).toBe("never")
+      expect(await git(first.repo, "config", "--get", "maintenance.auto")).toBe("false")
+
+      // An EXISTING kept remote whose guards were removed is re-guarded on its NEXT open, not only a new one.
+      for (const key of ["gc.auto", "gc.pruneExpire", "maintenance.auto"]) {
+        await git(first.repo, "config", "--unset", key)
+      }
+      await expect(git(first.repo, "config", "--get", "gc.auto")).rejects.toThrow()
+      const second = await openRemoteRepository(source, { cacheDir })
+      second[Symbol.dispose]()
+      expect(second.repo).toBe(first.repo)
+      expect(await git(second.repo, "config", "--get", "gc.auto")).toBe("0")
+      expect(await git(second.repo, "config", "--get", "gc.pruneExpire")).toBe("never")
+      expect(await git(second.repo, "config", "--get", "maintenance.auto")).toBe("false")
+    } finally {
+      await rm(join(cacheDir, ".."), { recursive: true, force: true })
+      await fixture.cleanup()
+    }
+  })
+
   test("the first build seeds from a local checkout without contacting the source", async () => {
     const stall = await createStallingSsh()
     const checkout = await createWorktreeRepo()
