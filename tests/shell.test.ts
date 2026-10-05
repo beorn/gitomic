@@ -1341,3 +1341,143 @@ describe.sequential("shell backend failure boundaries", () => {
     ).toBe(false)
   })
 })
+
+// @failure Raw proof reads lose binary commit bytes or accept malformed/missing object framing.
+// @level l1
+// @consumer STATE historical rewrite proof through Gitomic's native commit-only reader
+// Existing structured readers decode metadata; they do not expose exact commit bytes or bounded batches.
+test("raw commit batches preserve native bytes and refuse invalid framing", async () => {
+  const { repo, initial, cleanup } = await createBareRepo()
+  try {
+    const tree = (await git(repo, "rev-parse", `${initial}^{tree}`)).trim()
+    const raw = Buffer.concat([
+      Buffer.from(
+        `tree ${tree}\nparent ${initial}\nparent ${initial}\nauthor A <a@a> 1 +0000\ncommitter C <c@c> 2 +0000\n\n`,
+      ),
+      Buffer.from([0xff, 0, 0x80, 10]),
+    ])
+    const stored = await gitomic.runGit(["-C", repo, "hash-object", "-t", "commit", "-w", "--literally", "--stdin"], {
+      input: raw,
+    })
+    expect(stored.code).toBe(0)
+    const oid = stored.stdout.toString().trim()
+    const found = await gitomic.readRawCommits(repo, [oid, oid], { maxBytes: 1024, timeoutMs: 5000 })
+    expect(found.size).toBe(1)
+    expect(found.get(oid)).toEqual(raw)
+    const frame = Buffer.concat([Buffer.from(`${oid} commit 3\n`), Buffer.from([0xff, 0, 0x80]), Buffer.from("\n")])
+    const invalid = [
+      Buffer.from(`${oid} missing\n`),
+      Buffer.from(`${initial} commit 3\nabc\n`),
+      Buffer.from(`${oid} blob 3\nabc\n`),
+      Buffer.from(`${oid} commit 4\nabc\n`),
+      Buffer.from(`${oid} commit 3\nab`),
+      Buffer.concat([frame, Buffer.from("extra")]),
+    ]
+    for (const stdout of invalid) {
+      await expect(
+        gitomic.readRawCommits(repo, [oid], {
+          maxBytes: 1024,
+          timeoutMs: 5000,
+          run: async (args) => ({
+            code: 0,
+            stderr: Buffer.alloc(0),
+            stdout: args.some((arg) => arg.startsWith("--batch-check")) ? Buffer.from(`${oid} commit 3\n`) : stdout,
+          }),
+        }),
+      ).rejects.toThrow(oid)
+    }
+    const corruptedMetadata = Buffer.from(`${oid} commit 3\n`)
+    corruptedMetadata[0] = corruptedMetadata[0]! | 0x80
+    await expect(
+      gitomic.readRawCommits(repo, [oid], {
+        maxBytes: 1024,
+        timeoutMs: 5000,
+        run: async (args) => ({
+          code: 0,
+          stderr: Buffer.alloc(0),
+          stdout: args.some((arg) => arg.startsWith("--batch-check")) ? corruptedMetadata : frame,
+        }),
+      }),
+    ).rejects.toThrow(oid)
+    await expect(gitomic.readRawCommits(repo, [oid], { maxBytes: raw.length - 1, timeoutMs: 5000 })).rejects.toThrow(
+      /maxBytes/,
+    )
+    for (const maxBytes of [0, -1, 1.5, Number.NaN]) {
+      await expect(gitomic.readRawCommits(repo, [], { maxBytes, timeoutMs: 5000 })).rejects.toThrow(
+        "maxBytes must be a positive integer",
+      )
+    }
+  } finally {
+    await cleanup()
+  }
+})
+
+// @failure Bounded native output grows without limit or returns before the emitting process completes.
+// @level l1
+// @consumer bounded raw commit transport, using the existing public native runner
+// Existing timeout tests cover deadlines, not byte-triggered termination.
+test("native output byte limit stops the emitter and preserves unlimited callers", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "gitomic-output-"))
+  const pidFile = join(dir, "pid")
+  try {
+    await expect(
+      gitomic.runCommand(
+        process.execPath,
+        [
+          "-e",
+          `require('node:fs').writeFileSync(${JSON.stringify(pidFile)},String(process.pid));setInterval(()=>process.stdout.write(Buffer.alloc(4096)),1)`,
+        ],
+        { maxBytes: 1024, timeoutMs: 5000 },
+      ),
+    ).rejects.toThrow(/exceeded maxBytes 1024/)
+    const pid = Number(await readFile(pidFile, "utf8"))
+    expect(() => process.kill(pid, 0)).toThrow()
+    await expect(
+      gitomic.runCommand(process.execPath, ["-e", "process.stderr.write(Buffer.alloc(4096))"], { maxBytes: 1024 }),
+    ).rejects.toThrow(/exceeded maxBytes 1024/)
+    const free = await gitomic.runCommand(process.execPath, ["-e", "process.stdout.write(Buffer.alloc(4096))"], {
+      timeoutMs: 5000,
+    })
+    expect(free.code).toBe(0)
+    expect(free.stdout.length).toBe(4096)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+// @failure Many or large commits exceed native batch bounds or lose objects while splitting a raw-byte request.
+// @level l1
+// @consumer public raw commit reader; the default-runner fidelity case above cannot exercise chunk boundaries cheaply
+// Existing raw-byte parity tests cover one distinct commit, not cumulative or per-native limits.
+test("raw commit batch bounds split large and many objects without changing exact bytes", async () => {
+  const oids = Array.from({ length: 501 }, (_, i) => (i + 1).toString(16).padStart(40, "0"))
+  const payloads = new Map(oids.map((oid, i) => [oid, Buffer.alloc(i < 2 ? 5 * 1024 * 1024 : 3, i % 256)]))
+  const maxBytes = [...payloads.values()].reduce((n, b) => n + b.length, 0)
+  const run: NonNullable<gitomic.ReadRawCommitsOptions["run"]> = async (args, options) => {
+    const requested = options?.input?.toString().trim().split("\n") ?? []
+    expect(requested.length).toBeLessThanOrEqual(500)
+    expect(options?.timeoutMs).toBe(5000)
+    expect(options?.maxBytes).toBe(8 * 1024 * 1024)
+    const stdout = Buffer.concat(
+      requested.map((oid) => {
+        const bytes = payloads.get(oid)
+        if (bytes === undefined) throw Error(`unexpected test object ${oid}`)
+        return args.some((arg) => arg.startsWith("--batch-check"))
+          ? Buffer.from(`${oid} commit ${bytes.length}\n`)
+          : Buffer.concat([Buffer.from(`${oid} commit ${bytes.length}\n`), bytes, Buffer.from("\n")])
+      }),
+    )
+    if (stdout.length > 8 * 1024 * 1024) throw Error("native transport output bound exceeded")
+    return { code: 0, stderr: Buffer.alloc(0), stdout }
+  }
+  const found = await gitomic.readRawCommits("/tmp/raw-commit-bound-fixture", [...oids, oids[0]!], {
+    run,
+    maxBytes,
+    timeoutMs: 5000,
+  })
+  expect(found.size).toBe(501)
+  for (const [oid, bytes] of payloads) expect(found.get(oid)?.equals(bytes)).toBe(true)
+  await expect(
+    gitomic.readRawCommits("/tmp/raw-commit-bound-fixture", oids, { run, maxBytes: maxBytes - 1, timeoutMs: 5000 }),
+  ).rejects.toThrow(/exceeded maxBytes/)
+})
