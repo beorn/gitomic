@@ -361,8 +361,9 @@ describe("readHistoryEdges", () => {
       if (helperPid !== undefined) {
         try {
           process.kill(helperPid, "SIGKILL")
-        } catch {
-          // already gone
+        } catch (error) {
+          // Cancellation already reaped the helper; other cleanup failures must surface.
+          if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error
         }
       }
       await fixture.cleanup()
@@ -438,8 +439,9 @@ describe("readHistoryEdges", () => {
       if (helperPid !== undefined) {
         try {
           process.kill(helperPid, "SIGKILL")
-        } catch {
-          // already gone
+        } catch (error) {
+          // Cancellation already reaped the helper; other cleanup failures must surface.
+          if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error
         }
       }
       await fixture.cleanup()
