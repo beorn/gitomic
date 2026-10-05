@@ -944,7 +944,7 @@ export async function readRawCommits(
     const args = [...at, "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"]
     const checked = await invoke(args, { input: candidates.join("\n") + "\n", timeoutMs, maxBytes: nativeMaxBytes })
     if (checked.code !== 0) throw commandFailure(repo, args, checked)
-    const answers = checked.stdout.toString("ascii").split("\n")
+    const answers = checked.stdout.toString("utf8").split("\n")
     if (answers.pop() !== "" || answers.length !== candidates.length) {
       throw new Error(`git cat-file metadata cardinality differs for ${candidates[0]} in ${repo}`)
     }
