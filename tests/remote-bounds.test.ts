@@ -17,7 +17,7 @@ import { fileURLToPath, pathToFileURL } from "node:url"
 import { afterEach, describe, expect, test, vi } from "vitest"
 import { tempTree } from "removely"
 
-import { createShellBackend, open, openRemoteRepository, runCommand, runGit } from "../src/index.js"
+import { createShellBackend, GitTimeout, open, openRemoteRepository, runCommand, runGit } from "../src/index.js"
 import { createBareRepo, createRemoteRepos, createWorktreeRepo, git, gitFrom } from "./helpers/git.js"
 
 const INDEX = fileURLToPath(new URL("../src/index.ts", import.meta.url))
@@ -239,17 +239,22 @@ describe("a bounded command", () => {
   test("an outer timeout stops a TERM-ignoring nested process group before rejecting", async () => {
     const directory = await mkdtemp(join(tmpdir(), "gitomic-nested-bound-"))
     const pidFile = join(directory, "nested.pid")
+    const shell = `trap '' TERM; echo $$ > "$GITOMIC_TEST_NESTED_PID"; exec sleep 5`
     const child = [
       `const { runCommand } = await import(${JSON.stringify(INDEX)})`,
-      `await runCommand("sh", ["-c", "trap '' TERM; echo $$ > \\\"$GITOMIC_TEST_NESTED_PID\\\"; exec sleep 5"], { timeoutMs: 60000 })`,
+      `await runCommand("sh", ["-c", ${JSON.stringify(shell)}], { timeoutMs: 60000 })`,
     ].join("\n")
     try {
+      const startedAt = Date.now()
       await expect(
         runCommand("bun", ["-e", child], {
           timeoutMs: 1500,
           env: { GITOMIC_TEST_NESTED_PID: pidFile },
         }),
-      ).rejects.toBeInstanceOf((await import("../src/index.js")).GitTimeout)
+      ).rejects.toBeInstanceOf(GitTimeout)
+      // 1500 ms bound + 2000 ms stop grace + 1000 ms allowance stays below
+      // natural sleep completion, so an orphan that merely finishes cannot pass.
+      expect(Date.now() - startedAt).toBeLessThan(4500)
       expect(fs.existsSync(pidFile)).toBe(true)
       const pid = Number((await readFile(pidFile, "utf8")).trim())
       expect(Number.isSafeInteger(pid) && pid > 0).toBe(true)
