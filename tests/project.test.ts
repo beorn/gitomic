@@ -1245,24 +1245,86 @@ describe("gitomic project and checkout synchronization", () => {
 
       // @failure The projector mistakes its own legitimate authored staging for an external index race.
       // @level l1 @consumer normalized projection with explicit or inferred authored paths @testonly none
-      test.each(["explicit", "matching"] as const)("%s authored landing composes with normalized HEAD index", async (mode) => {
-        const { checkout, bare, landAtOrigin } = fixture()
-        const authored = "# authored local landing\n"
-        const to = landAtOrigin("bystander.md", authored)
-        writeFileSync(join(checkout, "bystander.md"), authored)
-        const result = mode === "matching"
-          ? await projectCheckout({ repoRoot: checkout })
-          : await projectRemoteFirstFastForward({
-            repoRoot: checkout, remote: bare, ref: "refs/heads/main", to,
-            expectedDirtyPaths: worktreeDirtyPaths(checkout), authoredPaths: ["bystander.md"],
+      test.each(["explicit", "matching"] as const)(
+        "%s authored landing composes with normalized HEAD index",
+        async (mode) => {
+          const { checkout, bare, landAtOrigin } = fixture()
+          const authored = "# authored local landing\n"
+          const to = landAtOrigin("bystander.md", authored)
+          writeFileSync(join(checkout, "bystander.md"), authored)
+          const result =
+            mode === "matching"
+              ? await projectCheckout({ repoRoot: checkout })
+              : await projectRemoteFirstFastForward({
+                  repoRoot: checkout,
+                  remote: bare,
+                  ref: "refs/heads/main",
+                  to,
+                  expectedDirtyPaths: worktreeDirtyPaths(checkout),
+                  authoredPaths: ["bystander.md"],
+                })
+          expect(result, JSON.stringify(result)).toMatchObject({ ok: true, kind: "synchronized" })
+          expect(git(checkout, "rev-parse", "HEAD")).toBe(to)
+          expect(git(checkout, "write-tree")).toBe(git(checkout, "rev-parse", `${to}^{tree}`))
+          expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# successor\n")
+          expect(readFileSync(join(checkout, "bystander.md"), "utf8")).toBe(authored)
+          expect(worktreeDirtyPaths(checkout)).toEqual([])
+        },
+      )
+
+      // @failure Accepting our stage hides a foreign delta, or rollback erases another writer's staged entry.
+      // @level l1 @consumer normalized projection authored staging @testonly none
+      test.each(["unrelated", "authored"] as const)(
+        "%s foreign staging is refused and preserved after our stage",
+        async (change) => {
+          const { checkout, head, raw, landAtOrigin } = fixture()
+          const authored = "# authored local landing\n"
+          landAtOrigin("bystander.md", authored)
+          writeFileSync(join(checkout, "bystander.md"), authored)
+          const originalAuthored = git(checkout, "rev-parse", ":bystander.md")
+          const normalized = git(checkout, "rev-parse", ":tracked.md")
+          const foreignPath = change === "authored" ? "bystander.md" : "foreign.md"
+          let foreignOid = ""
+          let fired = false
+          const native = await vi.importActual<typeof import("node:child_process")>("node:child_process")
+          const mocked = vi.mocked(spawnSync)
+          mocked.mockImplementation((command, args, options) => {
+            const argv = args ?? []
+            const result = native.spawnSync(command, args, options)
+            if (
+              !fired &&
+              command === "git" &&
+              argv[1] === checkout &&
+              argv.includes("update-index") &&
+              argv.includes("--add")
+            ) {
+              fired = true
+              writeFileSync(join(checkout, foreignPath), "# foreign staged work\n")
+              git(checkout, "add", foreignPath)
+              foreignOid = git(checkout, "rev-parse", `:${foreignPath}`)
+              if (change === "authored") writeFileSync(join(checkout, foreignPath), authored)
+            }
+            return result
           })
-        expect(result, JSON.stringify(result)).toMatchObject({ ok: true, kind: "synchronized" })
-        expect(git(checkout, "rev-parse", "HEAD")).toBe(to)
-        expect(git(checkout, "write-tree")).toBe(git(checkout, "rev-parse", `${to}^{tree}`))
-        expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# successor\n")
-        expect(readFileSync(join(checkout, "bystander.md"), "utf8")).toBe(authored)
-        expect(worktreeDirtyPaths(checkout)).toEqual([])
-      })
+          try {
+            const result = await projectCheckout({ repoRoot: checkout })
+            expect(fired).toBe(true)
+            expect(result).toMatchObject({ ok: false, kind: "dirt-unverifiable" })
+            if (result.ok) throw new Error("expected foreign staging refusal")
+            expect(result.error).toContain("foreign index delta")
+            expect(git(checkout, "rev-parse", "HEAD")).toBe(head)
+            expect(git(checkout, "rev-parse", `:${foreignPath}`)).toBe(foreignOid)
+            expect(git(checkout, "rev-parse", ":bystander.md")).toBe(
+              change === "authored" ? foreignOid : originalAuthored,
+            )
+            expect(git(checkout, "rev-parse", ":tracked.md")).toBe(normalized)
+            expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe(raw)
+            expect(readFileSync(join(checkout, "bystander.md"), "utf8")).toBe(authored)
+          } finally {
+            mocked.mockImplementation(native.spawnSync)
+          }
+        },
+      )
 
       test.each(["index", "content", "residual-eol"] as const)(
         "%s mutation around the proof preserves the approved race contract",

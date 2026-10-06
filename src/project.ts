@@ -686,7 +686,7 @@ export function isBareRepository(repoRoot: string, baseEnv?: NodeJS.ProcessEnv):
 type DirtRead = { readonly ok: true; readonly paths: string[] } | { readonly ok: false; readonly detail: string }
 
 type AuthoredStage =
-  | { readonly ok: true; readonly expectedDirtyPaths: string[] }
+  | { readonly ok: true; readonly expectedDirtyPaths: string[]; readonly normalized?: NormalizedIndexProof }
   | { readonly ok: false; readonly outcome: Extract<CheckoutSyncOutcome, { readonly ok: false }> }
 
 /** Compare checkout bytes in the same clean-filtered representation that Git stages. */
@@ -782,6 +782,7 @@ function stageAuthoredPaths(
   authoredPaths: readonly string[],
   expectedDirtyPaths: readonly string[],
   baseEnv?: NodeJS.ProcessEnv,
+  normalized?: NormalizedIndexProof,
 ): AuthoredStage {
   if (authoredPaths.length === 0) return { ok: true, expectedDirtyPaths: [...expectedDirtyPaths] }
   const mismatch = (
@@ -865,10 +866,70 @@ function stageAuthoredPaths(
     }
   }
 
+  const refusal = (detail: string, rollback: boolean): AuthoredStage => {
+    const unstaged = rollback ? unstageAuthoredPaths(topLevel, from, authoredPaths, baseEnv, normalized, to) : undefined
+    return {
+      ok: false,
+      outcome: {
+        ok: false,
+        kind: "dirt-unverifiable",
+        error:
+          `${ref} in ${repoRoot}: ${detail}. Authored staging was refused; no projection ref write ran.` +
+          (unstaged === undefined ? "" : ` Authored rollback failed: ${unstaged}.`),
+      },
+    }
+  }
+  if (normalized !== undefined) {
+    try {
+      reverifyNormalizedIndex(topLevel, normalized)
+    } catch (error) {
+      return refusal(String(error), false)
+    }
+  }
   const staged = git(topLevel, ["update-index", "--add", "--remove", "--", ...authoredPaths], undefined, baseEnv)
-  if (staged.status !== 0) return unreadable("staging the authored paths", staged)
+  if (staged.status !== 0) {
+    return normalized === undefined
+      ? unreadable("staging the authored paths", staged)
+      : refusal(gitDetail(staged), true)
+  }
   const authored = new Set(authoredPaths)
-  return { ok: true, expectedDirtyPaths: expectedDirtyPaths.filter((path) => !authored.has(path)) }
+  let updated = normalized
+  if (normalized !== undefined) {
+    try {
+      const after = indexTreeFromCopy(topLevel, baseEnv)
+      if (!after.ok) throw new Error(`cannot read authored index: ${after.detail}`)
+      const delta = git(
+        topLevel,
+        readonlyArgs(["diff", "--name-only", "-z", "--no-renames", normalized.tree, after.tree, "--"]),
+        undefined,
+        baseEnv,
+      )
+      if (delta.status !== 0) throw new Error(`cannot compare authored index: ${gitDetail(delta)}`)
+      for (const path of nulPaths(delta.stdout)) {
+        if (
+          !authored.has(path) ||
+          !capturesEqual(baselinePath(topLevel, after.tree, path, baseEnv), baselinePath(topLevel, to, path, baseEnv))
+        ) {
+          throw new Error(`foreign index delta at ${path} after authored staging`)
+        }
+      }
+      const fingerprint = indexHash(normalized.indexPath)
+      if (fingerprint !== after.indexHash) throw new Error("index changed during authored content proof")
+      updated = {
+        ...normalized,
+        indexHash: fingerprint,
+        preserved: normalized.preserved.filter((capture) => !authored.has(capture.path)),
+      }
+      reverifyNormalizedIndex(topLevel, updated)
+    } catch (error) {
+      return refusal(String(error), true)
+    }
+  }
+  return {
+    ok: true,
+    expectedDirtyPaths: expectedDirtyPaths.filter((path) => !authored.has(path)),
+    ...(updated === undefined ? {} : { normalized: updated }),
+  }
 }
 
 /** Put the authored paths' index entries back to `tip`'s; the working tree is untouched. Returns the failure, if any. */
@@ -877,14 +938,29 @@ function unstageAuthoredPaths(
   tip: string,
   authoredPaths: readonly string[],
   baseEnv?: NodeJS.ProcessEnv,
+  normalized?: NormalizedIndexProof,
+  to?: string,
 ): string | undefined {
   if (authoredPaths.length === 0) return undefined
-  const reset = git(
-    repoRoot,
-    ["reset", "-q", tip, "--", ...authoredPaths.map((path) => `:(top)${path}`)],
-    undefined,
-    baseEnv,
-  )
+  let paths = authoredPaths
+  if (normalized !== undefined) {
+    try {
+      if (to === undefined) throw new Error("authored rollback requires the target tree")
+      const current = indexTreeFromCopy(repoRoot, baseEnv)
+      if (!current.ok) throw new Error(`cannot read index for authored rollback: ${current.detail}`)
+      // Entries replaced by another writer are foreign work, even on our paths.
+      paths = authoredPaths.filter((path) =>
+        capturesEqual(baselinePath(repoRoot, current.tree, path, baseEnv), baselinePath(repoRoot, to, path, baseEnv)),
+      )
+      if (indexHash(current.indexPath) !== current.indexHash)
+        throw new Error("index changed during authored rollback proof")
+      tip = normalized.tree
+    } catch (error) {
+      return String(error)
+    }
+  }
+  if (paths.length === 0) return undefined
+  const reset = git(repoRoot, ["reset", "-q", tip, "--", ...paths.map((path) => `:(top)${path}`)], undefined, baseEnv)
   return reset.status === 0 ? undefined : gitDetail(reset)
 }
 
@@ -947,10 +1023,20 @@ export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): Check
     }
   }
   const stagedPaths = [...new Set([...(request.authoredPaths ?? []), ...matching.paths])]
-  const authored = stageAuthoredPaths(repoRoot, ref, from, to, stagedPaths, carried.expectedDirtyPaths, baseEnv)
+  const authored = stageAuthoredPaths(
+    repoRoot,
+    ref,
+    from,
+    to,
+    stagedPaths,
+    carried.expectedDirtyPaths,
+    baseEnv,
+    carried.normalized,
+  )
   if (!authored.ok) return authored.outcome
+  const normalized = authored.normalized ?? carried.normalized
   if (matching.blockers.length > 0) {
-    const unstage = unstageAuthoredPaths(repoRoot, from, stagedPaths, baseEnv)
+    const unstage = unstageAuthoredPaths(repoRoot, from, stagedPaths, baseEnv, normalized, to)
     return {
       ok: false,
       kind: "worktree-update-refused",
@@ -1010,20 +1096,21 @@ export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): Check
     return { ok: true, kind: "already-current", dirtyPaths: current.paths }
   }
 
-  if (carried.normalized !== undefined) {
+  if (normalized !== undefined) {
     try {
-      reverifyNormalizedIndex(repoRoot, carried.normalized)
+      reverifyNormalizedIndex(repoRoot, normalized)
     } catch (error) {
+      const rollback = unstageAuthoredPaths(repoRoot, normalized.tree, stagedPaths, baseEnv, normalized, to)
       return {
         ok: false,
         kind: "dirt-unverifiable",
-        error: `${ref} in ${repoRoot}: ${String(error)}. Merge did not run.`,
+        error: `${ref} in ${repoRoot}: ${String(error)}${rollback === undefined ? "" : `; authored rollback failed: ${rollback}`}. Merge did not run.`,
       }
     }
   }
-  const merged = git(repoRoot, ["read-tree", "-m", "-u", carried.normalized?.tree ?? from, to], undefined, baseEnv)
+  const merged = git(repoRoot, ["read-tree", "-m", "-u", normalized?.tree ?? from, to], undefined, baseEnv)
   if (merged.status !== 0) {
-    const unstaged = unstageAuthoredPaths(repoRoot, from, stagedPaths, baseEnv)
+    const unstaged = unstageAuthoredPaths(repoRoot, from, stagedPaths, baseEnv, normalized, to)
     const unstageNote =
       unstaged === undefined
         ? ""
@@ -1045,14 +1132,15 @@ export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): Check
     })
   }
 
-  if (carried.normalized !== undefined) {
+  if (normalized !== undefined) {
     try {
-      verifyNormalizedMerge(repoRoot, to, carried.normalized, baseEnv)
+      verifyNormalizedMerge(repoRoot, to, normalized, baseEnv)
     } catch (error) {
+      const rollback = unstageAuthoredPaths(repoRoot, normalized.tree, stagedPaths, baseEnv, normalized, to)
       return {
         ok: false,
         kind: "dirt-unverifiable",
-        error: `${ref} in ${repoRoot}: ${String(error)}. Checkout merge ran.`,
+        error: `${ref} in ${repoRoot}: ${String(error)}${rollback === undefined ? "" : `; authored rollback failed: ${rollback}`}. Checkout merge ran.`,
       }
     }
   }
@@ -1355,10 +1443,20 @@ function projectFetchedCommit(request: RemoteFirstProjectionRequest, sourceOid: 
     }
   }
   const stagedPaths = [...new Set([...authoredPaths, ...matching.paths])]
-  const authored = stageAuthoredPaths(repoRoot, ref, localTip, to, stagedPaths, expectedDirtyPaths)
+  const authored = stageAuthoredPaths(
+    repoRoot,
+    ref,
+    localTip,
+    to,
+    stagedPaths,
+    expectedDirtyPaths,
+    undefined,
+    carried.normalized,
+  )
   if (!authored.ok) return authored.outcome
+  const normalized = authored.normalized ?? carried.normalized
   if (matching.blockers.length > 0) {
-    const unstage = unstageAuthoredPaths(repoRoot, localTip, stagedPaths)
+    const unstage = unstageAuthoredPaths(repoRoot, localTip, stagedPaths, undefined, normalized, to)
     return {
       ok: false,
       kind: "worktree-update-refused",
@@ -1371,20 +1469,21 @@ function projectFetchedCommit(request: RemoteFirstProjectionRequest, sourceOid: 
         (unstage === undefined ? "" : ` Could not unstage matching paths: ${unstage}.`),
     }
   }
-  if (carried.normalized !== undefined) {
+  if (normalized !== undefined) {
     try {
-      reverifyNormalizedIndex(repoRoot, carried.normalized)
+      reverifyNormalizedIndex(repoRoot, normalized)
     } catch (error) {
+      const rollback = unstageAuthoredPaths(repoRoot, normalized.tree, stagedPaths, undefined, normalized, to)
       return {
         ok: false,
         kind: "dirt-unverifiable",
-        error: `${ref} in ${repoRoot}: ${String(error)}. Ref was not advanced.`,
+        error: `${ref} in ${repoRoot}: ${String(error)}${rollback === undefined ? "" : `; authored rollback failed: ${rollback}`}. Ref was not advanced.`,
       }
     }
   }
-  const probed = git(repoRoot, ["read-tree", "-m", "-u", carried.normalized?.tree ?? localTip, to])
+  const probed = git(repoRoot, ["read-tree", "-m", "-u", normalized?.tree ?? localTip, to])
   if (probed.status !== 0) {
-    const unstaged = unstageAuthoredPaths(repoRoot, localTip, stagedPaths)
+    const unstaged = unstageAuthoredPaths(repoRoot, localTip, stagedPaths, undefined, normalized, to)
     const expected = [...expectedDirtyPaths].sort()
     const unstageNote =
       unstaged === undefined
@@ -1405,14 +1504,15 @@ function projectFetchedCommit(request: RemoteFirstProjectionRequest, sourceOid: 
     })
   }
 
-  if (carried.normalized !== undefined) {
+  if (normalized !== undefined) {
     try {
-      verifyNormalizedMerge(repoRoot, to, carried.normalized)
+      verifyNormalizedMerge(repoRoot, to, normalized)
     } catch (error) {
+      const rollback = unstageAuthoredPaths(repoRoot, normalized.tree, stagedPaths, undefined, normalized, to)
       return {
         ok: false,
         kind: "dirt-unverifiable",
-        error: `${ref} in ${repoRoot}: ${String(error)}. Ref was not advanced.`,
+        error: `${ref} in ${repoRoot}: ${String(error)}${rollback === undefined ? "" : `; authored rollback failed: ${rollback}`}. Ref was not advanced.`,
       }
     }
   }
