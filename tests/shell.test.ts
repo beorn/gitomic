@@ -118,6 +118,20 @@ test("configured commit signing signs the exact batch and refuses an unavailable
     const explicitSigning = createShellBackend({ localTimeoutMs: 1000, signing: { timeoutMs: 5000 } })
     const delayedSigned = await explicitSigning.writeCommit(repo, input)
     expect(await git(repo, "cat-file", "commit", delayedSigned)).toContain("-----BEGIN SSH SIGNATURE-----")
+    // @failure The explicit signing limit overrides the original absolute ceiling.
+    // @level l2
+    // @consumer WINDOW backend absoluteDeadlineMs (27385); ordinary local precedence cannot observe this cap.
+    const absoluteSigning = createShellBackend({
+      localTimeoutMs: 1000,
+      signing: { timeoutMs: 5000 },
+      absoluteDeadlineMs: performance.now() + 2800,
+    })
+    const signingOutcome = await absoluteSigning.writeCommit(repo, input).then(
+      () => undefined,
+      (error: unknown) => error,
+    )
+    expect(signingOutcome).toBeInstanceOf(Error)
+    expect((signingOutcome as Error).cause).toBeInstanceOf(gitomic.GitTimeout)
     await git(repo, "config", "gpg.ssh.program", "ssh-keygen")
     await git(repo, "verify-commit", delayedSigned)
     expect(await git(repo, "rev-parse", "refs/heads/main")).toBe(initial)
@@ -180,11 +194,13 @@ async function createGitWrapper(): Promise<{
       "#!/usr/bin/env node",
       'const { appendFileSync } = require("node:fs")',
       "const args = process.argv.slice(2)",
+      "const commands = process.env.GITOMIC_COMMAND_LOG",
+      'if (commands) appendFileSync(commands, JSON.stringify(args) + "\\n")',
       "const log = process.env.GITOMIC_GIT_ENV_LOG",
       'if (log) appendFileSync(log, `${process.env.LC_ALL ?? "<unset>"}\\n`)',
       "const fullLog = process.env.GITOMIC_GIT_FULL_ENV_LOG",
       "if (fullLog) appendFileSync(fullLog, `${JSON.stringify({ GIT_DIR: process.env.GIT_DIR, GIT_TERMINAL_PROMPT: process.env.GIT_TERMINAL_PROMPT, LC_ALL: process.env.LC_ALL })}\\n`)",
-      'const stage = args[0] === "--version" ? "version" : args.includes("--git-common-dir") ? "resolve" : args.includes("for-each-ref") ? "refs" : undefined',
+      'const stage = args[0] === "--version" ? "version" : args.includes("--git-common-dir") ? "resolve" : args.includes("for-each-ref") ? "refs" : args.includes("fetch") ? "fetch" : undefined',
       "if (stage !== undefined && process.env.GITOMIC_DELAY_STAGE === stage) {",
       '  appendFileSync(process.env.GITOMIC_DELAY_LOG, JSON.stringify({ stage, pid: process.pid }) + "\\n")',
       '  process.on("SIGTERM", () => {})',
@@ -196,6 +212,7 @@ async function createGitWrapper(): Promise<{
       "  return",
       "}",
       'if (args.includes("fetch") && process.env.GITOMIC_FAKE_FETCH_ERROR !== undefined) {',
+      '  if (process.env.GITOMIC_FETCH_LOG) appendFileSync(process.env.GITOMIC_FETCH_LOG, "fetch\\n")',
       "  process.stderr.write(process.env.GITOMIC_FAKE_FETCH_ERROR)",
       "  process.exit(128)",
       "}",
@@ -757,6 +774,210 @@ describe.sequential("shell backend failure boundaries", () => {
     },
   )
 
+  /** @failure A per-command limit refreshes a retained WINDOW's original deadline.
+   * @level l2
+   * @consumer The approved absoluteDeadlineMs ceiling (27385, CTO deffc362).
+   * Existing local limits do not refuse a later command before spawn or cap an explicit remote limit.
+   */
+  test.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY, "3000", null])(
+    "rejects an invalid absolute deadline %j at construction",
+    (absoluteDeadlineMs) => {
+      expect(() => Reflect.apply(createShellBackend, undefined, [{ absoluteDeadlineMs }])).toThrow(
+        /absoluteDeadlineMs/u,
+      )
+    },
+  )
+
+  test("refuses an expired absolute deadline before the first native spawn", async () => {
+    const wrapper = await createGitWrapper()
+    try {
+      const backend: GitomicBackend = Reflect.apply(createShellBackend, undefined, [
+        {
+          gitExecutable: join(wrapper.bin, "git"),
+          baseEnv: { PATH: process.env.PATH, GITOMIC_GIT_ENV_LOG: wrapper.log },
+          absoluteDeadlineMs: Math.max(1, performance.now() - 1),
+        },
+      ])
+      await expect(backend.listRefs!("ignored", "refs/heads/")).rejects.toMatchObject({
+        name: "AbsoluteDeadlineExpired",
+        message: expect.stringMatching(/deadline=.*now=.*command=/u),
+      })
+      expect(fs.existsSync(wrapper.log)).toBe(false)
+    } finally {
+      await wrapper.cleanup()
+    }
+  })
+
+  test("surfaces a later fetch deadline refusal unchanged without retry or diagnosis", async () => {
+    const wrapper = await createGitWrapper()
+    const absoluteDeadlineMs = performance.now() + 10_000
+    try {
+      const backend: GitomicBackend = Reflect.apply(createShellBackend, undefined, [
+        {
+          gitExecutable: join(wrapper.bin, "git"),
+          baseEnv: {
+            PATH: process.env.PATH,
+            GITOMIC_GIT_ENV_LOG: wrapper.log,
+            GITOMIC_FAKE_GITDIR: "/tmp/gitomic-absolute-deadline.git",
+            GITOMIC_FAKE_LOCAL_REFS: `${"1".repeat(40)} refs/heads/main\n`,
+            GITOMIC_FAKE_FETCH_ERROR: "fatal: bad object refs/km/lost",
+          },
+          absoluteDeadlineMs,
+        },
+      ])
+      await backend.listRefs!("ignored", "refs/heads/")
+      const before = await readFile(wrapper.log, "utf8")
+      const clock = vi.spyOn(performance, "now").mockReturnValue(absoluteDeadlineMs)
+      try {
+        await expect(backend.fetchRefs!("ignored", ["refs/heads/main"], "origin")).rejects.toMatchObject({
+          name: "AbsoluteDeadlineExpired",
+          message: expect.stringMatching(/deadline=.*now=.*command=.*fetch/u),
+        })
+        expect(await readFile(wrapper.log, "utf8")).toBe(before)
+      } finally {
+        clock.mockRestore()
+      }
+    } finally {
+      await wrapper.cleanup()
+    }
+  })
+
+  /** @failure A later internal resolver command starts after the original deadline or retries its cached refusal.
+   * @level l2
+   * @consumer WINDOW absoluteDeadlineMs; the expired-first-spawn and later-public-fetch cases never cross an internal await.
+   * Native version completes; its journal advances the parent's test clock before native resolution can spawn.
+   */
+  test("refuses a late internal command and preserves the cached resolver refusal", async () => {
+    const wrapper = await createGitWrapper()
+    const absoluteDeadlineMs = performance.now() + 10_000
+    const originalNow = performance.now.bind(performance)
+    const clock = vi
+      .spyOn(performance, "now")
+      .mockImplementation(() => (fs.existsSync(wrapper.log) ? absoluteDeadlineMs : originalNow()))
+    try {
+      const backend = createShellBackend({
+        gitExecutable: join(wrapper.bin, "git"),
+        baseEnv: {
+          PATH: process.env.PATH,
+          GITOMIC_COMMAND_LOG: wrapper.log,
+          GITOMIC_FAKE_GITDIR: "/tmp/gitomic-late-internal.git",
+          GITOMIC_FAKE_LOCAL_REFS: `${"1".repeat(40)} refs/heads/main\n`,
+        },
+        absoluteDeadlineMs,
+      })
+      const capture = () =>
+        backend.listRefs!("ignored", "refs/heads/").then(
+          () => undefined,
+          (error: unknown) => error,
+        )
+      const first = await capture()
+      expect(first).toMatchObject({
+        name: "AbsoluteDeadlineExpired",
+        message: expect.stringMatching(/command=.*--git-common-dir/u),
+      })
+      expect(await capture()).toBe(first)
+      expect(
+        (await readFile(wrapper.log, "utf8"))
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line)),
+      ).toEqual([["--version"]])
+    } finally {
+      clock.mockRestore()
+      await wrapper.cleanup()
+    }
+  })
+
+  /** @failure Missing-object diagnosis wraps an absolute refusal after the initial native fetch fails.
+   * @level l2
+   * @consumer WINDOW absoluteDeadlineMs; rejecting fetch before spawn never reaches the diagnosis catch.
+   */
+  test("preserves an absolute deadline refusal reached inside fetch diagnosis", async () => {
+    const wrapper = await createGitWrapper()
+    const fetched = `${wrapper.log}.fetch`
+    const absoluteDeadlineMs = performance.now() + 10_000
+    const originalNow = performance.now.bind(performance)
+    const clock = vi
+      .spyOn(performance, "now")
+      .mockImplementation(() => (fs.existsSync(fetched) ? absoluteDeadlineMs : originalNow()))
+    try {
+      const backend = createShellBackend({
+        gitExecutable: join(wrapper.bin, "git"),
+        baseEnv: {
+          PATH: process.env.PATH,
+          GITOMIC_COMMAND_LOG: wrapper.log,
+          GITOMIC_FETCH_LOG: fetched,
+          GITOMIC_FAKE_GITDIR: "/tmp/gitomic-absolute-diagnosis.git",
+          GITOMIC_FAKE_LOCAL_REFS: `${"1".repeat(40)} refs/km/lost\n`,
+          GITOMIC_FAKE_FETCH_ERROR: "fatal: bad object refs/km/lost",
+        },
+        absoluteDeadlineMs,
+      })
+      await expect(backend.fetchRefs!("ignored", ["refs/heads/main"], "origin")).rejects.toMatchObject({
+        name: "AbsoluteDeadlineExpired",
+        message: expect.stringMatching(/command=.*for-each-ref/u),
+      })
+      const commands = (await readFile(wrapper.log, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as string[])
+      expect(commands.filter((args) => args.includes("fetch"))).toHaveLength(1)
+      expect(commands.at(-1)).toContain("fetch")
+      expect(
+        commands.some(
+          (args) => args.includes("for-each-ref") || args.includes("cat-file") || args.includes("ls-remote"),
+        ),
+      ).toBe(false)
+    } finally {
+      clock.mockRestore()
+      await wrapper.cleanup()
+    }
+  })
+
+  test.skipIf(process.platform !== "linux").each(["refs", "fetch"])(
+    "caps a TERM-resistant %s command with the original absolute deadline",
+    async (stage) => {
+      const wrapper = await createGitWrapper()
+      try {
+        const backend: GitomicBackend = Reflect.apply(createShellBackend, undefined, [
+          {
+            gitExecutable: join(wrapper.bin, "git"),
+            baseEnv: {
+              PATH: process.env.PATH,
+              GITOMIC_FAKE_GITDIR: "/tmp/gitomic-absolute-deadline.git",
+              GITOMIC_FAKE_LOCAL_REFS: `${"1".repeat(40)} refs/heads/main\n`,
+              GITOMIC_DELAY_STAGE: stage,
+              GITOMIC_DELAY_LOG: wrapper.log,
+            },
+            localTimeoutMs: 10_000,
+            remoteTimeoutMs: 10_000,
+            absoluteDeadlineMs: performance.now() + 3500,
+          },
+        ])
+        const started = performance.now()
+        const outcome = await (
+          stage === "refs"
+            ? backend.listRefs!("ignored", "refs/heads/")
+            : backend.fetchRefs!("ignored", ["refs/heads/main"], "origin")
+        ).then(
+          () => undefined,
+          (error: unknown) => error,
+        )
+        expect(outcome).toBeInstanceOf(gitomic.GitTimeout)
+        expect(performance.now() - started).toBeLessThan(4500)
+        const events = (await readFile(wrapper.log, "utf8"))
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line) as LocalCommandEvent)
+        expect(events).toHaveLength(1)
+        expect(events[0]?.stage).toBe(stage)
+      } finally {
+        await wrapper.cleanup()
+      }
+    },
+    12_000,
+  )
+
   /** @failure Local version, repository resolution and ref reads outlive the WINDOW child budget.
    * @level l2
    * @consumer createShellBackend localTimeoutMs (27385); existing remote-write coverage cannot reach these reads.
@@ -909,12 +1130,12 @@ describe.sequential("shell backend failure boundaries", () => {
 
   /** @failure Concurrent PREP and WINDOW backends share a deadline, or mutation after construction changes WINDOW policy.
    * @level l2
-   * @consumer Snapshotted localTimeoutMs in the existing shell runtime (27385).
+   * @consumer Snapshotted localTimeoutMs and absoluteDeadlineMs in the existing shell runtime (27385).
    * The existing concurrent-executable row does not vary timeout policy or delay actual reads.
    */
-  test.skipIf(process.platform !== "linux")(
-    "snapshots and isolates local deadlines across concurrent runtimes",
-    async () => {
+  test.skipIf(process.platform !== "linux").each(["local", "absolute"])(
+    "snapshots and isolates %s deadlines across concurrent runtimes",
+    async (policy) => {
       const wrapper = await createGitWrapper()
       const first = "1".repeat(40),
         second = "2".repeat(40)
@@ -924,13 +1145,15 @@ describe.sequential("shell backend failure boundaries", () => {
         GITOMIC_DELAY_STAGE: "refs",
         GITOMIC_DELAY_LOG: wrapper.log,
       }
-      const mutableOptions = {
+      const mutableOptions: gitomic.ShellBackendOptions = {
         gitExecutable: join(wrapper.bin, "git"),
         baseEnv: { ...baseEnv, GITOMIC_FAKE_LOCAL_REFS: `${first} refs/heads/main\n` },
-        localTimeoutMs: 1000,
+        localTimeoutMs: policy === "local" ? 1000 : 10_000,
+        ...(policy === "absolute" ? { absoluteDeadlineMs: performance.now() + 3500 } : {}),
       }
       const bounded = createShellBackend(mutableOptions)
       mutableOptions.localTimeoutMs = 10000
+      mutableOptions.absoluteDeadlineMs = performance.now() + 10_000
       const omitted = createShellBackend({
         gitExecutable: join(wrapper.bin, "git"),
         baseEnv: { ...baseEnv, GITOMIC_FAKE_LOCAL_REFS: `${second} refs/heads/main\n` },
@@ -955,9 +1178,10 @@ describe.sequential("shell backend failure boundaries", () => {
           evidence,
         ).toEqual(["refs", "refs"])
         if (window.outcome.status !== "rejected" || !(window.outcome.error instanceof Error)) {
-          throw new Error(`${evidence}; WINDOW lost its snapshotted1000ms deadline`)
+          throw new Error(`${evidence}; WINDOW lost its snapshotted ${policy} deadline`)
         }
-        expect(window.outcome.error.message, evidence).toMatch(/1000 ms limit/u)
+        if (policy === "local") expect(window.outcome.error.message, evidence).toMatch(/1000 ms limit/u)
+        else expect(window.outcome.error, evidence).toBeInstanceOf(gitomic.GitTimeout)
         expect(window.elapsedMs, evidence).toBeLessThan(5000)
         if (prep.outcome.status !== "fulfilled") throw new Error(`${evidence}; WINDOW policy leaked into PREP`)
         expect(prep.outcome.value, evidence).toEqual(new Map([["refs/heads/main", second]]))
