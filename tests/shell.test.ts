@@ -96,6 +96,31 @@ test("configured commit signing signs the exact batch and refuses an unavailable
     const unsigned = await createShellBackend().writeCommit(repo, input)
     expect(await git(repo, "cat-file", "commit", unsigned)).not.toContain("-----BEGIN SSH SIGNATURE-----")
     await git(repo, "config", "user.signingkey", key)
+    // @failure A local default overrides the caller's explicit longer signing deadline (27385).
+    // Existing signer refusal coverage has no local default or slower successful signer.
+    const delayedSigner = join(directory, "delayed-signer")
+    await writeFile(
+      delayedSigner,
+      [
+        "#!/usr/bin/env node",
+        'const { spawnSync } = require("node:child_process")',
+        "setTimeout(() => {",
+        '  const result = spawnSync("ssh-keygen", process.argv.slice(2), { stdio: "inherit" })',
+        "  if (result.error) throw result.error",
+        "  if (result.signal) { process.kill(process.pid, result.signal); return }",
+        '  if (result.status === null) throw new Error("delayed signer has no exit status")',
+        "  process.exit(result.status)",
+        "}, 1500)",
+      ].join("\n"),
+    )
+    await chmod(delayedSigner, 0o755)
+    await git(repo, "config", "gpg.ssh.program", delayedSigner)
+    const explicitSigning = createShellBackend({ localTimeoutMs: 1000, signing: { timeoutMs: 5000 } })
+    const delayedSigned = await explicitSigning.writeCommit(repo, input)
+    expect(await git(repo, "cat-file", "commit", delayedSigned)).toContain("-----BEGIN SSH SIGNATURE-----")
+    await git(repo, "config", "gpg.ssh.program", "ssh-keygen")
+    await git(repo, "verify-commit", delayedSigned)
+    expect(await git(repo, "rev-parse", "refs/heads/main")).toBe(initial)
     const blockedSigner = join(directory, "blocked-signer")
     await writeFile(blockedSigner, "#!/usr/bin/env node\nsetInterval(() => {}, 1000)\n")
     await chmod(blockedSigner, 0o755)
@@ -154,6 +179,25 @@ async function createGitWrapper(): Promise<{
       'if (log) appendFileSync(log, `${process.env.LC_ALL ?? "<unset>"}\\n`)',
       "const fullLog = process.env.GITOMIC_GIT_FULL_ENV_LOG",
       "if (fullLog) appendFileSync(fullLog, `${JSON.stringify({ GIT_DIR: process.env.GIT_DIR, GIT_TERMINAL_PROMPT: process.env.GIT_TERMINAL_PROMPT, LC_ALL: process.env.LC_ALL })}\\n`)",
+      'const stage = args[0] === "--version" ? "version" : args.includes("--git-common-dir") ? "resolve" : args.includes("for-each-ref") ? "refs" : undefined',
+      "if (stage !== undefined && process.env.GITOMIC_DELAY_STAGE === stage) {",
+      '  appendFileSync(process.env.GITOMIC_DELAY_LOG, JSON.stringify({ stage, pid: process.pid }) + "\\n")',
+      '  process.on("SIGTERM", () => {})',
+      "  setTimeout(() => {",
+      '    const output = stage === "version" ? "git version 2.39.0\\n" : stage === "resolve" ? process.env.GITOMIC_FAKE_GITDIR + "\\n" : process.env.GITOMIC_FAKE_LOCAL_REFS',
+      "    process.stdout.write(output)",
+      "    process.exit(0)",
+      "  }, 8000)",
+      "  return",
+      "}",
+      'if (args.includes("fetch") && process.env.GITOMIC_FAKE_FETCH_ERROR !== undefined) {',
+      "  process.stderr.write(process.env.GITOMIC_FAKE_FETCH_ERROR)",
+      "  process.exit(128)",
+      "}",
+      'if (args.includes("cat-file") && args.some((arg) => arg.startsWith("--batch-check=")) && process.env.GITOMIC_FAKE_BATCH_CHECK !== undefined) {',
+      "  process.stdout.write(process.env.GITOMIC_FAKE_BATCH_CHECK)",
+      "  process.exit(0)",
+      "}",
       'if (args[0] === "--version") {',
       '  process.stdout.write(`git version ${process.env.GITOMIC_FAKE_GIT_VERSION ?? "2.39.0"}\\n`)',
       "  process.exit(0)",
@@ -165,6 +209,10 @@ async function createGitWrapper(): Promise<{
       'if (args.includes("ls-remote") && process.env.GITOMIC_FAKE_LS_REMOTE !== undefined) {',
       "  process.stdout.write(process.env.GITOMIC_FAKE_LS_REMOTE)",
       "  process.exit(0)",
+      "}",
+      'if (args.includes("push") && process.env.GITOMIC_FAKE_PUSH_REPORT !== undefined) {',
+      "  setTimeout(() => { process.stdout.write(process.env.GITOMIC_FAKE_PUSH_REPORT); process.exit(0) }, 1500)",
+      "  return",
       "}",
       'if (args.includes("push") && process.env.GITOMIC_HANG_PUSH === "true") {',
       "  setInterval(() => {}, 1000)",
@@ -178,6 +226,10 @@ async function createGitWrapper(): Promise<{
       'if (updateRef >= 0 && process.env.GITOMIC_FAIL_UPDATE_REF === "true") {',
       '  process.stderr.write("fatal: simulated persistent update-ref failure\\n")',
       "  process.exit(1)",
+      "}",
+      'if (args.includes("for-each-ref") && process.env.GITOMIC_FAKE_LOCAL_REFS !== undefined) {',
+      "  process.stdout.write(process.env.GITOMIC_FAKE_LOCAL_REFS)",
+      "  process.exit(0)",
       "}",
       'if (args.includes("rev-parse")) {',
       "  process.stdout.write(`${process.env.GITOMIC_FAKE_HEAD}\\n`)",
@@ -688,6 +740,228 @@ describe.sequential("shell backend failure boundaries", () => {
     }
   }, 30_000)
 
+  /** @failure Invalid local command deadlines silently produce unbounded Git subprocesses.
+   * @level l0
+   * @consumer createShellBackend localTimeoutMs for the retained WINDOW owner (27385).
+   * Existing SIGTERM policy/remote timeout tests do not validate the local default.
+   */
+  test.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY, "3000", null])(
+    "rejects an invalid local command timeout %j at construction",
+    (localTimeoutMs) => {
+      expect(() => Reflect.apply(createShellBackend, undefined, [{ localTimeoutMs }])).toThrow(/localTimeoutMs/u)
+    },
+  )
+
+  /** @failure Local version, repository resolution and ref reads outlive the WINDOW child budget.
+   * @level l2
+   * @consumer createShellBackend localTimeoutMs (27385); existing remote-write coverage cannot reach these reads.
+   * Real selected executable ignores TERM and exits naturally at8s; the existing runner must stop its group first.
+   */
+  test.skipIf(process.platform !== "linux").each(["version", "resolve", "refs"])(
+    "bounds a TERM-resistant local %s command before its natural exit",
+    async (stage) => {
+      const wrapper = await createGitWrapper()
+      const expected = "1".repeat(40)
+      try {
+        const backend = createShellBackend({
+          gitExecutable: join(wrapper.bin, "git"),
+          baseEnv: {
+            PATH: process.env.PATH,
+            GITOMIC_FAKE_GITDIR: "/tmp/gitomic-local-deadline.git",
+            GITOMIC_FAKE_LOCAL_REFS: `${expected} refs/heads/main\n`,
+            GITOMIC_DELAY_STAGE: stage,
+            GITOMIC_DELAY_LOG: wrapper.log,
+          },
+          localTimeoutMs: 1000,
+        })
+        const started = performance.now()
+        const outcome = await backend.listRefs!("ignored", "refs/heads/").then(
+          (value) => ({ status: "fulfilled" as const, value }),
+          (error: unknown) => ({ status: "rejected" as const, error }),
+        )
+        const elapsedMs = performance.now() - started
+        const events = (await readFile(wrapper.log, "utf8"))
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line))
+        expect(events).toHaveLength(1)
+        expect(events[0].stage).toBe(stage)
+        const pid = events[0].pid as number
+        expect(Number.isSafeInteger(pid) && pid > 0).toBe(true)
+        let state: string
+        try {
+          state = (await readFile(`/proc/${pid}/stat`, "utf8")).split(") ")[1]?.split(" ")[0] ?? "malformed"
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+          state = "absent"
+        }
+        expect(["absent", "Z"]).toContain(state)
+        const evidence = `stage=${stage} events=${JSON.stringify(events)} elapsedMs=${elapsedMs} outcome=${outcome.status}`
+        if (outcome.status === "fulfilled") {
+          expect(outcome.value, evidence).toEqual(new Map([["refs/heads/main", expected]]))
+          throw new Error(`${evidence}; local deadline did not stop the native command before natural completion`)
+        }
+        expect(outcome.error, evidence).toBeInstanceOf(Error)
+        expect((outcome.error as Error).message, evidence).toMatch(/1000 ms limit/u)
+        expect(elapsedMs, evidence).toBeLessThan(5000)
+      } finally {
+        await wrapper.cleanup()
+      }
+    },
+    12000,
+  )
+
+  /** @failure A missing-object fetch hides an unbounded30s diagnosis, or leaks the WINDOW deadline into later PREP reads.
+   * @level l2
+   * @consumer Backend-internal diagnostic timeout clamp (27385, CTO9c14b2ed).
+   * Existing ordinary local/remote timeout rows never enter the missing-object diagnostic invoke seam.
+   */
+  test.skipIf(process.platform !== "linux")(
+    "caps internal fetch diagnostics with opt-in then restores omitted policy",
+    async () => {
+      const wrapper = await createGitWrapper()
+      const lost = "1".repeat(40)
+      const ref = "refs/km/lost"
+      const baseEnv = {
+        PATH: process.env.PATH,
+        GITOMIC_FAKE_GITDIR: "/tmp/gitomic-diagnostic-deadline.git",
+        GITOMIC_FAKE_LOCAL_REFS: `${lost} ${ref}\n`,
+        GITOMIC_FAKE_FETCH_ERROR: `fatal: bad object ${ref}\nerror: origin did not send all necessary objects\n`,
+        GITOMIC_FAKE_BATCH_CHECK: `${lost} missing\n`,
+        GITOMIC_FAKE_LS_REMOTE: "",
+        GITOMIC_DELAY_STAGE: "refs",
+        GITOMIC_DELAY_LOG: wrapper.log,
+      }
+      const capture = async (backend: GitomicBackend) => {
+        const started = performance.now()
+        const outcome = await backend.fetchRefs!("ignored", ["refs/heads/main"], "origin").then(
+          (value) => ({ status: "fulfilled" as const, value }),
+          (error: unknown) => ({ status: "rejected" as const, error }),
+        )
+        return { outcome, elapsedMs: performance.now() - started }
+      }
+      try {
+        // Omission runs AFTER opt-in in the same process; ambient runtime leakage
+        // would time out this row too. Keep both outcomes before RED assertions.
+        const bounded = await capture(
+          createShellBackend({
+            gitExecutable: join(wrapper.bin, "git"),
+            baseEnv,
+            localTimeoutMs: 1000,
+          }),
+        )
+        const omitted = await capture(createShellBackend({ gitExecutable: join(wrapper.bin, "git"), baseEnv }))
+        const events = (await readFile(wrapper.log, "utf8"))
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line))
+        const evidence = `events=${JSON.stringify(events)} boundedMs=${bounded.elapsedMs} omittedMs=${omitted.elapsedMs}`
+        expect(
+          events.map(({ stage }) => stage),
+          evidence,
+        ).toEqual(["refs", "refs"])
+        for (const { pid } of events) {
+          expect(Number.isSafeInteger(pid) && pid > 0, evidence).toBe(true)
+          let state: string
+          try {
+            state = (await readFile(`/proc/${pid}/stat`, "utf8")).split(") ")[1]?.split(" ")[0] ?? "malformed"
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+            state = "absent"
+          }
+          expect(["absent", "Z"], evidence).toContain(state)
+        }
+        if (bounded.outcome.status !== "rejected" || !(bounded.outcome.error instanceof AggregateError)) {
+          throw new Error(`${evidence}; opt-in did not preserve original fetch failure plus bounded diagnosis timeout`)
+        }
+        const aggregate = bounded.outcome.error
+        expect(aggregate.errors, evidence).toHaveLength(2)
+        expect(aggregate.errors[0], evidence).toBeInstanceOf(Error)
+        expect(aggregate.cause, evidence).toBe(aggregate.errors[0])
+        expect((aggregate.errors[0] as Error).message, evidence).toContain(`bad object ${ref}`)
+        expect(aggregate.message, evidence).toMatch(/dangling-ref diagnosis failed.*1000 ms limit/u)
+        expect(bounded.elapsedMs, evidence).toBeLessThan(5000)
+        if (omitted.outcome.status !== "rejected" || !(omitted.outcome.error instanceof Error)) {
+          throw new Error(`${evidence}; omitted diagnostic did not complete with the original missing-object cure`)
+        }
+        expect(omitted.outcome.error, evidence).not.toBeInstanceOf(AggregateError)
+        expect(omitted.outcome.error.message, evidence).toContain(
+          `${ref} local=${lost} origin=absent object missing locally`,
+        )
+        expect(omitted.outcome.error.message, evidence).toContain(`git update-ref -d ${ref} ${lost}`)
+        expect(omitted.outcome.error.cause, evidence).toBeInstanceOf(Error)
+        expect((omitted.outcome.error.cause as Error).message, evidence).toContain(`bad object ${ref}`)
+        expect(omitted.elapsedMs, evidence).toBeGreaterThan(5000)
+        expect(omitted.elapsedMs, evidence).toBeLessThan(30000)
+      } finally {
+        await wrapper.cleanup()
+      }
+    },
+    30000,
+  )
+
+  /** @failure Concurrent PREP and WINDOW backends share a deadline, or mutation after construction changes WINDOW policy.
+   * @level l2
+   * @consumer Snapshotted localTimeoutMs in the existing shell runtime (27385).
+   * The existing concurrent-executable row does not vary timeout policy or delay actual reads.
+   */
+  test.skipIf(process.platform !== "linux")(
+    "snapshots and isolates local deadlines across concurrent runtimes",
+    async () => {
+      const wrapper = await createGitWrapper()
+      const first = "1".repeat(40),
+        second = "2".repeat(40)
+      const baseEnv = {
+        PATH: process.env.PATH,
+        GITOMIC_FAKE_GITDIR: "/tmp/gitomic-concurrent-deadline.git",
+        GITOMIC_DELAY_STAGE: "refs",
+        GITOMIC_DELAY_LOG: wrapper.log,
+      }
+      const mutableOptions = {
+        gitExecutable: join(wrapper.bin, "git"),
+        baseEnv: { ...baseEnv, GITOMIC_FAKE_LOCAL_REFS: `${first} refs/heads/main\n` },
+        localTimeoutMs: 1000,
+      }
+      const bounded = createShellBackend(mutableOptions)
+      mutableOptions.localTimeoutMs = 10000
+      const omitted = createShellBackend({
+        gitExecutable: join(wrapper.bin, "git"),
+        baseEnv: { ...baseEnv, GITOMIC_FAKE_LOCAL_REFS: `${second} refs/heads/main\n` },
+      })
+      const capture = async (backend: GitomicBackend) => {
+        const started = performance.now()
+        const outcome = await backend.listRefs!("ignored", "refs/heads/").then(
+          (value) => ({ status: "fulfilled" as const, value }),
+          (error: unknown) => ({ status: "rejected" as const, error }),
+        )
+        return { outcome, elapsedMs: performance.now() - started }
+      }
+      try {
+        const [window, prep] = await Promise.all([capture(bounded), capture(omitted)])
+        const events = (await readFile(wrapper.log, "utf8"))
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line))
+        const evidence = `events=${JSON.stringify(events)} windowMs=${window.elapsedMs} prepMs=${prep.elapsedMs}`
+        expect(
+          events.map(({ stage }) => stage),
+          evidence,
+        ).toEqual(["refs", "refs"])
+        if (window.outcome.status !== "rejected" || !(window.outcome.error instanceof Error)) {
+          throw new Error(`${evidence}; WINDOW lost its snapshotted1000ms deadline`)
+        }
+        expect(window.outcome.error.message, evidence).toMatch(/1000 ms limit/u)
+        expect(window.elapsedMs, evidence).toBeLessThan(5000)
+        if (prep.outcome.status !== "fulfilled") throw new Error(`${evidence}; WINDOW policy leaked into PREP`)
+        expect(prep.outcome.value, evidence).toEqual(new Map([["refs/heads/main", second]]))
+        expect(prep.elapsedMs, evidence).toBeGreaterThan(5000)
+      } finally {
+        await wrapper.cleanup()
+      }
+    },
+    20000,
+  )
+
   // #26689: runtime callers must not silently receive forwarding for an invalid host policy.
   test.each(["", "ignore", null, 0, false])("rejects an invalid SIGTERM policy %j at construction", (sigterm) => {
     expect(() => Reflect.apply(createShellBackend, undefined, [{ sigterm }])).toThrow(
@@ -850,22 +1124,44 @@ describe.sequential("shell backend failure boundaries", () => {
     }
   })
 
-  test("reports a timed-out remote write as unknown with every lease", async () => {
+  /** @failure A local default overrides an explicit remote limit, or a timed-out write loses unknown outcome/lease custody.
+   * @level l2
+   * @consumer Explicit remoteTimeoutMs and localTimeoutMs shell callers (27385).
+   * The existing timed-out-write row supplied no local default and never exceeded one successfully.
+   */
+  test("keeps explicit remote deadlines and reports a timed-out write as unknown with every lease", async () => {
     const wrapper = await createGitWrapper()
     const ref = "refs/yrd/main/task/one"
     const expected = "1".repeat(40)
+    const next = "2".repeat(40)
     try {
-      const backend = createShellBackend({
-        baseEnv: {
-          GITOMIC_FAKE_GITDIR: "/tmp/gitomic-fake.git",
-          GITOMIC_HANG_PUSH: "true",
-          PATH: `${wrapper.bin}${delimiter}${process.env.PATH ?? ""}`,
-        },
+      const baseEnv = {
+        GITOMIC_FAKE_GITDIR: "/tmp/gitomic-fake.git",
+        PATH: `${wrapper.bin}${delimiter}${process.env.PATH ?? ""}`,
+      }
+      const longer = createShellBackend({
+        baseEnv: { ...baseEnv, GITOMIC_FAKE_PUSH_REPORT: `To origin\n+\t${next}:${ref}\tforced update\nDone\n` },
+        localTimeoutMs: 1000,
+        remoteTimeoutMs: 5000,
+      })
+      await expect(longer.publish!("ignored", [{ ref, expect: expected, oid: next }], "origin")).resolves.toEqual({
+        outcomes: [{ ref, outcome: "updated" }],
+      })
+      const shorter = createShellBackend({
+        baseEnv: { ...baseEnv, GITOMIC_HANG_PUSH: "true" },
+        localTimeoutMs: 1000,
         remoteTimeoutMs: 10,
       })
-      await expect(
-        backend.publish?.("ignored", [{ ref, expect: expected, oid: "2".repeat(40) }], "origin"),
-      ).rejects.toThrow(`remote write outcome is unknown for ${ref} expected ${expected}`)
+      const failure = await shorter.publish!("ignored", [{ ref, expect: expected, oid: next }], "origin").then(
+        () => undefined,
+        (error: unknown) => error,
+      )
+      expect(failure).toBeInstanceOf(Error)
+      if (!(failure instanceof Error)) throw new Error("timed-out remote write unexpectedly succeeded")
+      expect(failure.message).toContain(`remote write outcome is unknown for ${ref} expected ${expected}`)
+      expect(failure.cause).toBeInstanceOf(gitomic.GitTimeout)
+      if (!(failure.cause instanceof gitomic.GitTimeout)) throw new Error("remote write lost timeout cause")
+      expect(failure.cause.message).toContain("10 ms limit")
     } finally {
       await wrapper.cleanup()
     }

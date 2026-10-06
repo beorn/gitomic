@@ -103,6 +103,8 @@ export type BatchCheckOptions = Readonly<{
 export type ShellBackendOptions = {
   /** Opt into standard Git commit signing through the configured signer, under this required deadline. Unsigned by default. */
   signing?: { timeoutMs: number }
+  /** Default positive finite per-command limit for native Git commands without an explicit deadline. Snapshotted at construction; omitted by default. */
+  localTimeoutMs?: number
   /** Git executable used for every shell-backend command. A bare name resolves through `baseEnv`'s PATH. Defaults to `git`. */
   gitExecutable?: string
   /**
@@ -128,7 +130,11 @@ const DANGLING_REF_SCAN_TIMEOUT_MS = 30_000
 const GROUP_STOP_GRACE_MS = 2_000
 
 const DURABLE_GIT_CONFIG = ["-c", "core.fsync=loose-object,reference", "-c", "core.fsyncMethod=fsync"] as const
-const shellRuntime = new AsyncLocalStorage<{ executable: string; sigterm: "forward" | "drain" }>()
+const shellRuntime = new AsyncLocalStorage<{
+  executable: string
+  sigterm: "forward" | "drain"
+  localTimeoutMs: number | undefined
+}>()
 const selectedGit = (): string => shellRuntime.getStore()?.executable ?? "git"
 
 export function createShellBackend(options: ShellBackendOptions = {}): GitomicBackend {
@@ -150,6 +156,8 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
     options.signing === undefined
       ? undefined
       : { timeoutMs: normalizeTimeoutMs(options.signing.timeoutMs, "signing.timeoutMs") }
+  const localTimeoutMs =
+    options.localTimeoutMs === undefined ? undefined : normalizeTimeoutMs(options.localTimeoutMs, "localTimeoutMs")
   const baseEnv = snapshotEnvironment(options.baseEnv)
   const resolveGitDir = createGitDirResolver(baseEnv)
   const refStorages = new Map<string, Promise<"files" | "native">>()
@@ -300,7 +308,8 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
   // Each backend owns its executable even when two backends run concurrently.
   // Keeping the selection in the async call chain lets the Git plumbing below
   // use one runner without adding an executable argument to every operation.
-  const inRuntime = <T>(work: () => Promise<T>): Promise<T> => shellRuntime.run({ executable, sigterm }, work)
+  const inRuntime = <T>(work: () => Promise<T>): Promise<T> =>
+    shellRuntime.run({ executable, sigterm, localTimeoutMs }, work)
   const selectedBackend = Object.fromEntries(
     Object.entries(backend).map(([name, operation]) => {
       const invoke = (operation as (...args: unknown[]) => Promise<unknown>).bind(backend)
@@ -498,7 +507,9 @@ function commandFailure(repository: string, args: readonly string[], result: Git
 }
 
 async function run(command: string, args: readonly string[], options: GitOptions = {}): Promise<GitResult> {
-  const timeoutMs = options.timeoutMs === undefined ? undefined : normalizeTimeoutMs(options.timeoutMs, "timeoutMs")
+  const selectedTimeoutMs =
+    options.timeoutMs === undefined ? shellRuntime.getStore()?.localTimeoutMs : options.timeoutMs
+  const timeoutMs = selectedTimeoutMs === undefined ? undefined : normalizeTimeoutMs(selectedTimeoutMs, "timeoutMs")
   // oxlint-disable-next-line promise/param-names -- resolveResult cannot shadow the imported path.resolve.
   return new Promise((resolveResult, reject) => {
     const maxBytes = options.maxBytes === undefined ? undefined : normalizeHistoryEdgeByteCap(options.maxBytes)
@@ -2181,8 +2192,18 @@ async function diagnoseMissingObjectFetch(
 ): Promise<never> {
   const message = original instanceof Error ? original.message : String(original)
   if (!isMissingObjectFetchError(message)) throw original
-  const invoke = (args: readonly string[], options: RunGitOptions = {}) =>
-    run(selectedGit(), args, { ...options, baseEnv })
+  const invoke = (args: readonly string[], options: RunGitOptions = {}) => {
+    const localTimeoutMs = shellRuntime.getStore()?.localTimeoutMs
+    return run(selectedGit(), args, {
+      ...options,
+      baseEnv,
+      ...(localTimeoutMs === undefined
+        ? {}
+        : {
+            timeoutMs: Math.min(options.timeoutMs ?? DANGLING_REF_SCAN_TIMEOUT_MS, localTimeoutMs),
+          }),
+    })
+  }
   let dangling: readonly DanglingRef[]
   try {
     dangling = await danglingRefs(repo, { run: invoke })
