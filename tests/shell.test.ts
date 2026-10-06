@@ -145,6 +145,11 @@ type TraceEvent = {
   argv?: string[]
 }
 
+type LocalCommandEvent = {
+  stage: string
+  pid: number
+}
+
 function replaceEnvironment(values: Record<string, string | undefined>): () => void {
   const previous = new Map(Object.keys(values).map((key) => [key, process.env[key]]))
   for (const [key, value] of Object.entries(values)) {
@@ -783,10 +788,12 @@ describe.sequential("shell backend failure boundaries", () => {
         const events = (await readFile(wrapper.log, "utf8"))
           .trim()
           .split("\n")
-          .map((line) => JSON.parse(line))
+          .map((line) => JSON.parse(line) as LocalCommandEvent)
         expect(events).toHaveLength(1)
-        expect(events[0].stage).toBe(stage)
-        const pid = events[0].pid as number
+        const event = events[0]
+        if (event === undefined) throw new Error(`missing native command journal event for ${stage}`)
+        expect(event.stage).toBe(stage)
+        const pid = event.pid
         expect(Number.isSafeInteger(pid) && pid > 0).toBe(true)
         let state: string
         try {
@@ -854,7 +861,7 @@ describe.sequential("shell backend failure boundaries", () => {
         const events = (await readFile(wrapper.log, "utf8"))
           .trim()
           .split("\n")
-          .map((line) => JSON.parse(line))
+          .map((line) => JSON.parse(line) as LocalCommandEvent)
         const evidence = `events=${JSON.stringify(events)} boundedMs=${bounded.elapsedMs} omittedMs=${omitted.elapsedMs}`
         expect(
           events.map(({ stage }) => stage),
@@ -941,7 +948,7 @@ describe.sequential("shell backend failure boundaries", () => {
         const events = (await readFile(wrapper.log, "utf8"))
           .trim()
           .split("\n")
-          .map((line) => JSON.parse(line))
+          .map((line) => JSON.parse(line) as LocalCommandEvent)
         const evidence = `events=${JSON.stringify(events)} windowMs=${window.elapsedMs} prepMs=${prep.elapsedMs}`
         expect(
           events.map(({ stage }) => stage),
