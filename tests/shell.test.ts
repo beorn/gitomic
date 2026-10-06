@@ -184,7 +184,7 @@ async function createGitWrapper(): Promise<{
       'if (log) appendFileSync(log, `${process.env.LC_ALL ?? "<unset>"}\\n`)',
       "const fullLog = process.env.GITOMIC_GIT_FULL_ENV_LOG",
       "if (fullLog) appendFileSync(fullLog, `${JSON.stringify({ GIT_DIR: process.env.GIT_DIR, GIT_TERMINAL_PROMPT: process.env.GIT_TERMINAL_PROMPT, LC_ALL: process.env.LC_ALL })}\\n`)",
-      'const stage = args[0] === "--version" ? "version" : args.includes("--git-common-dir") ? "resolve" : args.includes("for-each-ref") ? "refs" : undefined',
+      'const stage = args[0] === "--version" ? "version" : args.includes("--git-common-dir") ? "resolve" : args.includes("for-each-ref") ? "refs" : args.includes("fetch") ? "fetch" : undefined',
       "if (stage !== undefined && process.env.GITOMIC_DELAY_STAGE === stage) {",
       '  appendFileSync(process.env.GITOMIC_DELAY_LOG, JSON.stringify({ stage, pid: process.pid }) + "\\n")',
       '  process.on("SIGTERM", () => {})',
@@ -755,6 +755,118 @@ describe.sequential("shell backend failure boundaries", () => {
     (localTimeoutMs) => {
       expect(() => Reflect.apply(createShellBackend, undefined, [{ localTimeoutMs }])).toThrow(/localTimeoutMs/u)
     },
+  )
+
+  /** @failure A per-command limit refreshes a retained WINDOW's original deadline.
+   * @level l2
+   * @consumer The approved absoluteDeadlineMs ceiling (27385, CTO deffc362).
+   * Existing local limits do not refuse a later command before spawn or cap an explicit remote limit.
+   */
+  test.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY, "3000", null])(
+    "rejects an invalid absolute deadline %j at construction",
+    (absoluteDeadlineMs) => {
+      expect(() => Reflect.apply(createShellBackend, undefined, [{ absoluteDeadlineMs }])).toThrow(
+        /absoluteDeadlineMs/u,
+      )
+    },
+  )
+
+  test("refuses an expired absolute deadline before the first native spawn", async () => {
+    const wrapper = await createGitWrapper()
+    try {
+      const backend: GitomicBackend = Reflect.apply(createShellBackend, undefined, [
+        {
+          gitExecutable: join(wrapper.bin, "git"),
+          baseEnv: { PATH: process.env.PATH, GITOMIC_GIT_ENV_LOG: wrapper.log },
+          absoluteDeadlineMs: Math.max(1, performance.now() - 1),
+        },
+      ])
+      await expect(backend.listRefs!("ignored", "refs/heads/")).rejects.toMatchObject({
+        name: "AbsoluteDeadlineExpired",
+        message: expect.stringMatching(/deadline=.*now=.*command=/u),
+      })
+      expect(fs.existsSync(wrapper.log)).toBe(false)
+    } finally {
+      await wrapper.cleanup()
+    }
+  })
+
+  test("surfaces a later fetch deadline refusal unchanged without retry or diagnosis", async () => {
+    const wrapper = await createGitWrapper()
+    const absoluteDeadlineMs = performance.now() + 10_000
+    try {
+      const backend: GitomicBackend = Reflect.apply(createShellBackend, undefined, [
+        {
+          gitExecutable: join(wrapper.bin, "git"),
+          baseEnv: {
+            PATH: process.env.PATH,
+            GITOMIC_GIT_ENV_LOG: wrapper.log,
+            GITOMIC_FAKE_GITDIR: "/tmp/gitomic-absolute-deadline.git",
+            GITOMIC_FAKE_LOCAL_REFS: `${"1".repeat(40)} refs/heads/main\n`,
+            GITOMIC_FAKE_FETCH_ERROR: "fatal: bad object refs/km/lost",
+          },
+          absoluteDeadlineMs,
+        },
+      ])
+      await backend.listRefs!("ignored", "refs/heads/")
+      const before = await readFile(wrapper.log, "utf8")
+      const clock = vi.spyOn(performance, "now").mockReturnValue(absoluteDeadlineMs)
+      try {
+        await expect(backend.fetchRefs!("ignored", ["refs/heads/main"], "origin")).rejects.toMatchObject({
+          name: "AbsoluteDeadlineExpired",
+          message: expect.stringMatching(/deadline=.*now=.*command=.*fetch/u),
+        })
+        expect(await readFile(wrapper.log, "utf8")).toBe(before)
+      } finally {
+        clock.mockRestore()
+      }
+    } finally {
+      await wrapper.cleanup()
+    }
+  })
+
+  test.skipIf(process.platform !== "linux").each(["refs", "fetch"])(
+    "caps a TERM-resistant %s command with the original absolute deadline",
+    async (stage) => {
+      const wrapper = await createGitWrapper()
+      try {
+        const backend: GitomicBackend = Reflect.apply(createShellBackend, undefined, [
+          {
+            gitExecutable: join(wrapper.bin, "git"),
+            baseEnv: {
+              PATH: process.env.PATH,
+              GITOMIC_FAKE_GITDIR: "/tmp/gitomic-absolute-deadline.git",
+              GITOMIC_FAKE_LOCAL_REFS: `${"1".repeat(40)} refs/heads/main\n`,
+              GITOMIC_DELAY_STAGE: stage,
+              GITOMIC_DELAY_LOG: wrapper.log,
+            },
+            localTimeoutMs: 10_000,
+            remoteTimeoutMs: 10_000,
+            absoluteDeadlineMs: performance.now() + 3500,
+          },
+        ])
+        const started = performance.now()
+        const outcome = await (
+          stage === "refs"
+            ? backend.listRefs!("ignored", "refs/heads/")
+            : backend.fetchRefs!("ignored", ["refs/heads/main"], "origin")
+        ).then(
+          () => undefined,
+          (error: unknown) => error,
+        )
+        expect(outcome).toBeInstanceOf(gitomic.GitTimeout)
+        expect(performance.now() - started).toBeLessThan(4500)
+        const events = (await readFile(wrapper.log, "utf8"))
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line) as LocalCommandEvent)
+        expect(events).toHaveLength(1)
+        expect(events[0]?.stage).toBe(stage)
+      } finally {
+        await wrapper.cleanup()
+      }
+    },
+    12_000,
   )
 
   /** @failure Local version, repository resolution and ref reads outlive the WINDOW child budget.

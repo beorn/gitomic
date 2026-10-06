@@ -105,6 +105,8 @@ export type ShellBackendOptions = {
   signing?: { timeoutMs: number }
   /** Default positive finite per-command limit for native Git commands without an explicit deadline. Snapshotted at construction; omitted by default. */
   localTimeoutMs?: number
+  /** Positive finite performance.now() deadline in this process; caps every non-streaming command, reserving group teardown. */
+  absoluteDeadlineMs?: number
   /** Git executable used for every shell-backend command. A bare name resolves through `baseEnv`'s PATH. Defaults to `git`. */
   gitExecutable?: string
   /**
@@ -134,6 +136,7 @@ const shellRuntime = new AsyncLocalStorage<{
   executable: string
   sigterm: "forward" | "drain"
   localTimeoutMs: number | undefined
+  absoluteDeadlineMs: number | undefined
 }>()
 const selectedGit = (): string => shellRuntime.getStore()?.executable ?? "git"
 
@@ -158,6 +161,10 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
       : { timeoutMs: normalizeTimeoutMs(options.signing.timeoutMs, "signing.timeoutMs") }
   const localTimeoutMs =
     options.localTimeoutMs === undefined ? undefined : normalizeTimeoutMs(options.localTimeoutMs, "localTimeoutMs")
+  const absoluteDeadlineMs =
+    options.absoluteDeadlineMs === undefined
+      ? undefined
+      : normalizeTimeoutMs(options.absoluteDeadlineMs, "absoluteDeadlineMs")
   const baseEnv = snapshotEnvironment(options.baseEnv)
   const resolveGitDir = createGitDirResolver(baseEnv)
   const refStorages = new Map<string, Promise<"files" | "native">>()
@@ -309,7 +316,7 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
   // Keeping the selection in the async call chain lets the Git plumbing below
   // use one runner without adding an executable argument to every operation.
   const inRuntime = <T>(work: () => Promise<T>): Promise<T> =>
-    shellRuntime.run({ executable, sigterm, localTimeoutMs }, work)
+    shellRuntime.run({ executable, sigterm, localTimeoutMs, absoluteDeadlineMs }, work)
   const selectedBackend = Object.fromEntries(
     Object.entries(backend).map(([name, operation]) => {
       const invoke = (operation as (...args: unknown[]) => Promise<unknown>).bind(backend)
@@ -506,10 +513,25 @@ function commandFailure(repository: string, args: readonly string[], result: Git
   return new Error(`git ${shown.join(" ")} failed (${result.code}) in ${repository}${detail ? `: ${detail}` : ""}`)
 }
 
+class AbsoluteDeadlineExpired extends Error {
+  constructor(deadline: number, now: number, command: string, args: readonly string[]) {
+    super(
+      `absolute Git deadline expired before spawn: deadline=${deadline} now=${now} command=${command} ${args.join(" ")}`,
+    )
+    this.name = "AbsoluteDeadlineExpired"
+  }
+}
+
 async function run(command: string, args: readonly string[], options: GitOptions = {}): Promise<GitResult> {
-  const selectedTimeoutMs =
-    options.timeoutMs === undefined ? shellRuntime.getStore()?.localTimeoutMs : options.timeoutMs
-  const timeoutMs = selectedTimeoutMs === undefined ? undefined : normalizeTimeoutMs(selectedTimeoutMs, "timeoutMs")
+  const runtime = shellRuntime.getStore()
+  const selectedTimeoutMs = options.timeoutMs === undefined ? runtime?.localTimeoutMs : options.timeoutMs
+  let timeoutMs = selectedTimeoutMs === undefined ? undefined : normalizeTimeoutMs(selectedTimeoutMs, "timeoutMs")
+  if (runtime?.absoluteDeadlineMs !== undefined) {
+    const now = performance.now()
+    const remaining = runtime.absoluteDeadlineMs - now - GROUP_STOP_GRACE_MS
+    if (remaining <= 0) throw new AbsoluteDeadlineExpired(runtime.absoluteDeadlineMs, now, command, args)
+    timeoutMs = timeoutMs === undefined ? remaining : Math.min(timeoutMs, remaining)
+  }
   // oxlint-disable-next-line promise/param-names -- resolveResult cannot shadow the imported path.resolve.
   return new Promise((resolveResult, reject) => {
     const maxBytes = options.maxBytes === undefined ? undefined : normalizeHistoryEdgeByteCap(options.maxBytes)
@@ -531,10 +553,7 @@ async function run(command: string, args: readonly string[], options: GitOptions
     let exitSignal: NodeJS.Signals | null = null
     let limit: ReturnType<typeof setTimeout> | undefined
     let escalation: ReturnType<typeof setTimeout> | undefined
-    const release =
-      bounded && child.pid !== undefined
-        ? holdGroup(child.pid, shellRuntime.getStore()?.sigterm ?? "forward")
-        : () => {}
+    const release = bounded && child.pid !== undefined ? holdGroup(child.pid, runtime?.sigterm ?? "forward") : () => {}
     const settle = (finish: () => void): void => {
       if (settled) return
       settled = true
@@ -768,6 +787,7 @@ async function requireSupportedGit(baseEnv?: NodeJS.ProcessEnv): Promise<void> {
   try {
     result = await run(executable, ["--version"], { baseEnv })
   } catch (error) {
+    if (error instanceof AbsoluteDeadlineExpired) throw error
     throw new Error(`Git executable ${JSON.stringify(executable)} cannot run: ${String(error)}`, { cause: error })
   }
   const output = result.stdout.toString("utf8").trim()
@@ -2190,6 +2210,7 @@ async function diagnoseMissingObjectFetch(
   original: unknown,
   baseEnv?: NodeJS.ProcessEnv,
 ): Promise<never> {
+  if (original instanceof AbsoluteDeadlineExpired) throw original
   const message = original instanceof Error ? original.message : String(original)
   if (!isMissingObjectFetchError(message)) throw original
   const invoke = (args: readonly string[], options: RunGitOptions = {}) => {
@@ -2208,6 +2229,7 @@ async function diagnoseMissingObjectFetch(
   try {
     dangling = await danglingRefs(repo, { run: invoke })
   } catch (diagnosis) {
+    if (diagnosis instanceof AbsoluteDeadlineExpired) throw diagnosis
     throw new AggregateError(
       [original, diagnosis],
       `${message}; dangling-ref diagnosis failed: ${diagnosis instanceof Error ? diagnosis.message : String(diagnosis)}`,
@@ -2226,6 +2248,7 @@ async function diagnoseMissingObjectFetch(
       throw commandFailure(repo, ["ls-remote", "--refs", remote, ...refs], advertised)
     }
   } catch (diagnosis) {
+    if (diagnosis instanceof AbsoluteDeadlineExpired) throw diagnosis
     throw new AggregateError(
       [original, diagnosis],
       `${message}; dangling-ref remote diagnosis failed: ${diagnosis instanceof Error ? diagnosis.message : String(diagnosis)}`,
@@ -2359,6 +2382,7 @@ async function fetchRefs(
     try {
       output = await git(repo, fetchArgs, { baseEnv, timeoutMs })
     } catch (error) {
+      if (error instanceof AbsoluteDeadlineExpired) throw error
       // Another fetch in this repository moved or held one of our private
       // fetched refs between this fetch's read and its lock. The namespace is
       // only a cache of remote tips, so fetching again reads them afresh.
