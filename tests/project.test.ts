@@ -1243,6 +1243,27 @@ describe("gitomic project and checkout synchronization", () => {
         expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe(raw)
       })
 
+      // @failure The projector mistakes its own legitimate authored staging for an external index race.
+      // @level l1 @consumer normalized projection with explicit or inferred authored paths @testonly none
+      test.each(["explicit", "matching"] as const)("%s authored landing composes with normalized HEAD index", async (mode) => {
+        const { checkout, bare, landAtOrigin } = fixture()
+        const authored = "# authored local landing\n"
+        const to = landAtOrigin("bystander.md", authored)
+        writeFileSync(join(checkout, "bystander.md"), authored)
+        const result = mode === "matching"
+          ? await projectCheckout({ repoRoot: checkout })
+          : await projectRemoteFirstFastForward({
+            repoRoot: checkout, remote: bare, ref: "refs/heads/main", to,
+            expectedDirtyPaths: worktreeDirtyPaths(checkout), authoredPaths: ["bystander.md"],
+          })
+        expect(result, JSON.stringify(result)).toMatchObject({ ok: true, kind: "synchronized" })
+        expect(git(checkout, "rev-parse", "HEAD")).toBe(to)
+        expect(git(checkout, "write-tree")).toBe(git(checkout, "rev-parse", `${to}^{tree}`))
+        expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# successor\n")
+        expect(readFileSync(join(checkout, "bystander.md"), "utf8")).toBe(authored)
+        expect(worktreeDirtyPaths(checkout)).toEqual([])
+      })
+
       test.each(["index", "content", "residual-eol"] as const)(
         "%s mutation around the proof preserves the approved race contract",
         async (mutation) => {
