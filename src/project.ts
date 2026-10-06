@@ -952,8 +952,9 @@ function unstageAuthoredPaths(
       paths = authoredPaths.filter((path) =>
         capturesEqual(baselinePath(repoRoot, current.tree, path, baseEnv), baselinePath(repoRoot, to, path, baseEnv)),
       )
-      if (indexHash(current.indexPath) !== current.indexHash)
+      if (indexHash(current.indexPath) !== current.indexHash) {
         throw new Error("index changed during authored rollback proof")
+      }
       tip = normalized.tree
     } catch (error) {
       return String(error)
