@@ -1150,6 +1150,155 @@ describe("gitomic project and checkout synchronization", () => {
       expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# staged by hand\n")
     })
 
+    // @failure Git-normalized staged HEAD bytes brick projection, or their admission overwrites unique local work.
+    // @level l1 @consumer projectCheckout fast-forward callers @testonly none
+    describe("normalized HEAD index", () => {
+      function fixture(advances = true, landingPath = "tracked.md") {
+        const original = remoteFixture()
+        const { checkout } = original
+        git(checkout, "config", "core.autocrlf", "false")
+        writeFileSync(join(checkout, ".gitattributes"), "* text=auto\n")
+        git(checkout, "add", ".gitattributes")
+        const raw = "# raw HEAD\r\nretained bytes\r\n"
+        writeFileSync(join(checkout, "tracked.md"), raw)
+        const input = join(original.root, "raw-blob")
+        writeFileSync(input, raw)
+        const rawOid = git(checkout, "hash-object", "-w", "--no-filters", input)
+        git(checkout, "update-index", "--cacheinfo", `100644,${rawOid},tracked.md`)
+        git(checkout, "commit", "-qm", "raw object-side HEAD")
+        git(checkout, "push", "-q", "origin", "main")
+        const head = git(checkout, "rev-parse", "HEAD")
+        // text=auto preserves existing CRLF blobs on ordinary add; reapply the
+        // declared clean conversion to manufacture the measured staged class.
+        git(checkout, "add", "--renormalize", "tracked.md")
+        expect(git(checkout, "rev-parse", ":tracked.md")).not.toBe(rawOid)
+        expect(git(checkout, "rev-parse", ":tracked.md")).toBe(git(checkout, "hash-object", "--path=tracked.md", input))
+        expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe(raw)
+        const to = advances ? original.landAtOrigin(landingPath, "# successor\n") : head
+        return { ...original, raw, head, to }
+      }
+
+      test.each(["tracked.md", "other.md"])(
+        "fast-forward to %s admits only Git's normalization and preserves unrelated raw dirt",
+        async (landingPath) => {
+          const { checkout, to, raw } = fixture(true, landingPath)
+          const dirt = "# unrelated raw work\r\n"
+          writeFileSync(join(checkout, "bystander.md"), dirt)
+
+          const result = await projectCheckout({ repoRoot: checkout })
+
+          expect(result, JSON.stringify(result)).toMatchObject({ ok: true, kind: "synchronized" })
+          expect(git(checkout, "rev-parse", "HEAD")).toBe(to)
+          expect(git(checkout, "write-tree")).toBe(git(checkout, "rev-parse", `${to}^{tree}`))
+          expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe(
+            landingPath === "tracked.md" ? "# successor\n" : raw,
+          )
+          expect(readFileSync(join(checkout, "bystander.md"), "utf8")).toBe(dirt)
+          expect(worktreeDirtyPaths(checkout)).toEqual(["bystander.md"])
+        },
+      )
+
+      test.each(["staged", "worktree-eol", "mixed", "mode", "unmerged"] as const)(
+        "%s differences retain index, ref and raw worktree",
+        async (change) => {
+          const { checkout, raw, head } = fixture()
+          if (change === "staged") {
+            writeFileSync(join(checkout, "tracked.md"), "# unique staged work\n")
+            git(checkout, "add", "tracked.md")
+            writeFileSync(join(checkout, "tracked.md"), raw)
+          } else if (change === "worktree-eol") {
+            writeFileSync(join(checkout, "tracked.md"), raw.replaceAll("\r\n", "\n"))
+          } else if (change === "mixed") {
+            writeFileSync(join(checkout, "bystander.md"), "# unique staged work\n")
+            git(checkout, "add", "bystander.md")
+          } else if (change === "mode") {
+            git(checkout, "update-index", "--chmod=+x", "tracked.md")
+          } else {
+            const blob = git(checkout, "rev-parse", ":tracked.md")
+            const conflict = spawnSync("git", ["-C", checkout, "update-index", "--index-info"], {
+              input: `0 ${"0".repeat(40)}\ttracked.md\n100644 ${blob} 1\ttracked.md\n100644 ${blob} 2\ttracked.md\n`,
+              encoding: "utf8",
+            })
+            expect(conflict.status).toBe(0)
+          }
+          const index = readFileSync(join(git(checkout, "rev-parse", "--absolute-git-dir"), "index"))
+          const bytes = readFileSync(join(checkout, "tracked.md"))
+
+          const result = await projectCheckout({ repoRoot: checkout })
+
+          expect(result).toMatchObject({ ok: false, kind: "dirt-unverifiable" })
+          expect(git(checkout, "rev-parse", "HEAD")).toBe(head)
+          expect(readFileSync(join(git(checkout, "rev-parse", "--absolute-git-dir"), "index"))).toEqual(index)
+          expect(readFileSync(join(checkout, "tracked.md"))).toEqual(bytes)
+        },
+      )
+
+      test("already-current normalization does not claim a clean checkout", async () => {
+        const { checkout, head, raw } = fixture(false)
+        const index = readFileSync(join(git(checkout, "rev-parse", "--absolute-git-dir"), "index"))
+        const result = await projectCheckout({ repoRoot: checkout })
+        expect(result).toMatchObject({ ok: false, kind: "dirt-unverifiable" })
+        expect(git(checkout, "rev-parse", "HEAD")).toBe(head)
+        expect(readFileSync(join(git(checkout, "rev-parse", "--absolute-git-dir"), "index"))).toEqual(index)
+        expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe(raw)
+      })
+
+      test.each(["index", "content", "residual-eol"] as const)(
+        "%s mutation around the proof preserves the approved race contract",
+        async (mutation) => {
+          const { checkout, head, raw, to } = fixture()
+          const native = await vi.importActual<typeof import("node:child_process")>("node:child_process")
+          let fired = false
+          let capturedIndex: Buffer | undefined
+          let capturedBytes: Buffer | undefined
+          const mocked = vi.mocked(spawnSync)
+          mocked.mockImplementation((command, args, options) => {
+            const argv = args ?? []
+            const isCheckout = command === "git" && argv[1] === checkout
+            const trigger =
+              mutation === "residual-eol"
+                ? argv.includes("read-tree") && argv.includes("-m") && argv.includes("-u")
+                : argv.includes("hash-object") && argv.includes("--no-filters") && argv.includes("--stdin")
+            if (isCheckout && trigger && !fired) {
+              // The input hash/capture is already fixed. An actual external Git
+              // writer (or raw byte writer) now changes the checkout.
+              fired = true
+              if (mutation === "index") {
+                writeFileSync(join(checkout, "tracked.md"), "# concurrent staged work\n")
+                git(checkout, "add", "tracked.md")
+                writeFileSync(join(checkout, "tracked.md"), raw)
+              } else {
+                writeFileSync(
+                  join(checkout, "tracked.md"),
+                  mutation === "content" ? "# concurrent raw work\n" : raw.replaceAll("\r\n", "\n"),
+                )
+              }
+              capturedIndex = readFileSync(join(git(checkout, "rev-parse", "--absolute-git-dir"), "index"))
+              capturedBytes = readFileSync(join(checkout, "tracked.md"))
+            }
+            return native.spawnSync(command, args, options)
+          })
+          try {
+            const result = await projectCheckout({ repoRoot: checkout })
+            expect(fired).toBe(true)
+            expect(result).toMatchObject({
+              ok: false,
+              kind: mutation === "residual-eol" ? "worktree-update-refused" : "dirt-unverifiable",
+            })
+            if (result.ok) throw new Error("expected race refusal")
+            expect(result.error).toContain(
+              mutation === "residual-eol" ? "not uptodate" : "changed after normalization proof",
+            )
+            expect(git(checkout, "rev-parse", "HEAD")).toBe(head)
+            expect(readFileSync(join(git(checkout, "rev-parse", "--absolute-git-dir"), "index"))).toEqual(capturedIndex)
+            expect(readFileSync(join(checkout, "tracked.md"))).toEqual(capturedBytes)
+          } finally {
+            mocked.mockImplementation(native.spawnSync)
+          }
+        },
+      )
+    })
+
     test("an index 70 commits behind is repaired: the search has no depth cliff", async () => {
       const { checkout } = remoteFixture()
       const { parent } = commitThenLeaveIndexAtParent(checkout)

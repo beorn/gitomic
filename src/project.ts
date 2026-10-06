@@ -38,7 +38,7 @@ import type {
   SpawnSyncOptionsWithStringEncoding,
   SpawnSyncReturns,
 } from "node:child_process"
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import {
   chmodSync,
   copyFileSync,
@@ -399,8 +399,89 @@ export function worktreeDirtyPaths(repoRoot: string, baseEnv?: NodeJS.ProcessEnv
 }
 
 type IndexCarry =
-  | { readonly ok: true; readonly expectedDirtyPaths: string[]; readonly repairedIndexFrom?: string }
+  | {
+      readonly ok: true
+      readonly expectedDirtyPaths: string[]
+      readonly repairedIndexFrom?: string
+      readonly normalized?: NormalizedIndexProof
+    }
   | { readonly ok: false; readonly outcome: Extract<CheckoutSyncOutcome, { readonly ok: false }> }
+
+interface NormalizedIndexProof {
+  readonly tree: string
+  readonly indexPath: string
+  readonly indexHash: string
+  readonly paths: readonly CapturedPath[]
+  readonly preserved: readonly CapturedPath[]
+}
+
+function indexHash(path: string): string {
+  return createHash("sha256").update(readFileSync(path)).digest("hex")
+}
+
+/** Only Git-derived index differences with byte-identical raw working copies carry no unique work. */
+function proveNormalizedIndex(
+  repoRoot: string,
+  tip: string,
+  index: { tree: string; indexPath: string; indexHash: string },
+  expected: readonly string[],
+  baseEnv?: NodeJS.ProcessEnv,
+): NormalizedIndexProof | undefined {
+  const delta = git(repoRoot, readonlyArgs(["diff", "--name-only", "-z", tip, index.tree, "--"]), undefined, baseEnv)
+  if (delta.status !== 0) throw new Error(`cannot read normalized index differences: ${gitDetail(delta)}`)
+  const paths: CapturedPath[] = []
+  for (const path of nulPaths(delta.stdout)) {
+    const baseline = baselinePath(repoRoot, tip, path, baseEnv)
+    const staged = baselinePath(repoRoot, index.tree, path, baseEnv)
+    if (baseline.kind !== "regular" || staged.kind !== "regular" || baseline.mode !== staged.mode) return undefined
+    const raw = readCapturedPath(repoRoot, path)
+    if (!capturesEqual(raw, baseline)) return undefined
+    const normalized = gitWithInput(
+      repoRoot,
+      ["hash-object", `--path=${path}`, "--stdin"],
+      baseline.bytes,
+      undefined,
+      baseEnv,
+    )
+    const indexed = gitWithInput(repoRoot, ["hash-object", "--no-filters", "--stdin"], staged.bytes, undefined, baseEnv)
+    if (normalized.status !== 0 || indexed.status !== 0) {
+      throw new Error(`cannot hash normalized index path ${path}: ${gitDetail(normalized)}; ${gitDetail(indexed)}`)
+    }
+    if (normalized.stdout === "" || normalized.stdout !== indexed.stdout) return undefined
+    paths.push(raw)
+  }
+  if (paths.length === 0) return undefined
+  const resolved = new Set(paths.map((capture) => capture.path))
+  return {
+    ...index,
+    paths,
+    preserved: expected.filter((path) => !resolved.has(path)).map((path) => readCapturedPath(repoRoot, path)),
+  }
+}
+
+function reverifyNormalizedIndex(repoRoot: string, proof: NormalizedIndexProof): void {
+  if (indexHash(proof.indexPath) !== proof.indexHash) throw new Error("index changed after normalization proof")
+  for (const capture of [...proof.paths, ...proof.preserved]) {
+    if (!capturesEqual(capture, readCapturedPath(repoRoot, capture.path))) {
+      throw new Error(`raw checkout path ${capture.path} changed after normalization proof`)
+    }
+  }
+}
+
+function verifyNormalizedMerge(
+  repoRoot: string,
+  to: string,
+  proof: NormalizedIndexProof,
+  baseEnv?: NodeJS.ProcessEnv,
+): void {
+  const indexed = git(repoRoot, readonlyArgs(["diff-index", "--cached", "--quiet", to, "--"]), undefined, baseEnv)
+  if (indexed.status !== 0) throw new Error(`target index differs after normalized merge: ${gitDetail(indexed)}`)
+  for (const capture of proof.preserved) {
+    if (!capturesEqual(capture, readCapturedPath(repoRoot, capture.path))) {
+      throw new Error(`preserved checkout path ${capture.path} changed during normalized merge`)
+    }
+  }
+}
 
 /**
  * Bring an index that still holds an ANCESTOR's tree forward to `tip`, before any projection judges the ref.
@@ -411,8 +492,10 @@ type IndexCarry =
  * ONE walk, with no depth cliff; the first match is carried forward by the conditional two-way merge every projection
  * uses, so unrelated dirt survives and an edit to a path the skipped commits wrote refuses. An index already at
  * `tip`, or at `alreadyAt` (a projection re-running after its probe merge), needs nothing. An index that holds no
- * ancestor's tree carries staged changes no projection may overwrite, and refuses. `expectedDirtyPaths` comes back
- * without the paths the repair resolved.
+ * ancestor's tree normally carries staged changes no projection may overwrite. On a fast-forward only, an index
+ * proved to contain solely Git's normalization of raw HEAD bytes supplies the old merge tree without a preliminary
+ * index rewrite. The raw paths and index file are reverified immediately before that merge. `expectedDirtyPaths`
+ * comes back without the paths the repair resolved.
  *
  * Reading the index never takes `.git/index.lock`: another git may hold it at any moment (a hook commit), and a
  * projector that took it would both refuse while that git runs and collide with it, which is how an index is left
@@ -448,6 +531,18 @@ function carryIndexTo(
       `${ref} in the checkout ${repoRoot}: the index's tree could not be read (${indexTree.detail}). ` +
         "Nothing was changed.",
     )
+  }
+  // Already-current needs its own proof; this class only enables an actual fast-forward.
+  if (alreadyAt !== undefined && alreadyAt !== tip) {
+    try {
+      const normalized = proveNormalizedIndex(repoRoot, tip, indexTree, expected, baseEnv)
+      if (normalized !== undefined) {
+        const resolved = new Set(normalized.paths.map((capture) => capture.path))
+        return { ok: true, expectedDirtyPaths: expected.filter((path) => !resolved.has(path)), normalized }
+      }
+    } catch (error) {
+      return refuse(`${ref} in ${repoRoot}: normalization proof failed (${String(error)}). Nothing was changed.`)
+    }
   }
   let scanned = 0
   let match: string | undefined
@@ -539,7 +634,7 @@ const WALK_LINE_BYTES_MAX = 160
 function indexTreeFromCopy(
   repoRoot: string,
   baseEnv?: NodeJS.ProcessEnv,
-): { ok: true; tree: string } | { ok: false; detail: string } {
+): { ok: true; tree: string; indexPath: string; indexHash: string } | { ok: false; detail: string } {
   const located = git(
     repoRoot,
     readonlyArgs(["rev-parse", "--path-format=absolute", "--git-path", "index"]),
@@ -554,6 +649,7 @@ function indexTreeFromCopy(
     return { ok: false, detail: `copying ${located.stdout}: ${error instanceof Error ? error.message : String(error)}` }
   }
   try {
+    const capturedHash = indexHash(copy)
     const written = spawnProjectionGit(
       repoRoot,
       ["write-tree"],
@@ -570,7 +666,7 @@ function indexTreeFromCopy(
         detail: gitDetail({ status: written.status ?? 1, stdout: tree, stderr: (written.stderr ?? "").trim() }),
       }
     }
-    return { ok: true, tree }
+    return { ok: true, tree, indexPath: located.stdout, indexHash: capturedHash }
   } finally {
     rmSync(copy, { force: true })
   }
@@ -914,7 +1010,18 @@ export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): Check
     return { ok: true, kind: "already-current", dirtyPaths: current.paths }
   }
 
-  const merged = git(repoRoot, ["read-tree", "-m", "-u", from, to], undefined, baseEnv)
+  if (carried.normalized !== undefined) {
+    try {
+      reverifyNormalizedIndex(repoRoot, carried.normalized)
+    } catch (error) {
+      return {
+        ok: false,
+        kind: "dirt-unverifiable",
+        error: `${ref} in ${repoRoot}: ${String(error)}. Merge did not run.`,
+      }
+    }
+  }
+  const merged = git(repoRoot, ["read-tree", "-m", "-u", carried.normalized?.tree ?? from, to], undefined, baseEnv)
   if (merged.status !== 0) {
     const unstaged = unstageAuthoredPaths(repoRoot, from, stagedPaths, baseEnv)
     const unstageNote =
@@ -938,6 +1045,17 @@ export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): Check
     })
   }
 
+  if (carried.normalized !== undefined) {
+    try {
+      verifyNormalizedMerge(repoRoot, to, carried.normalized, baseEnv)
+    } catch (error) {
+      return {
+        ok: false,
+        kind: "dirt-unverifiable",
+        error: `${ref} in ${repoRoot}: ${String(error)}. Checkout merge ran.`,
+      }
+    }
+  }
   const remaining = readDirt(repoRoot, baseEnv)
   if (!remaining.ok) {
     return {
@@ -1253,7 +1371,18 @@ function projectFetchedCommit(request: RemoteFirstProjectionRequest, sourceOid: 
         (unstage === undefined ? "" : ` Could not unstage matching paths: ${unstage}.`),
     }
   }
-  const probed = git(repoRoot, ["read-tree", "-m", "-u", localTip, to])
+  if (carried.normalized !== undefined) {
+    try {
+      reverifyNormalizedIndex(repoRoot, carried.normalized)
+    } catch (error) {
+      return {
+        ok: false,
+        kind: "dirt-unverifiable",
+        error: `${ref} in ${repoRoot}: ${String(error)}. Ref was not advanced.`,
+      }
+    }
+  }
+  const probed = git(repoRoot, ["read-tree", "-m", "-u", carried.normalized?.tree ?? localTip, to])
   if (probed.status !== 0) {
     const unstaged = unstageAuthoredPaths(repoRoot, localTip, stagedPaths)
     const expected = [...expectedDirtyPaths].sort()
@@ -1276,6 +1405,17 @@ function projectFetchedCommit(request: RemoteFirstProjectionRequest, sourceOid: 
     })
   }
 
+  if (carried.normalized !== undefined) {
+    try {
+      verifyNormalizedMerge(repoRoot, to, carried.normalized)
+    } catch (error) {
+      return {
+        ok: false,
+        kind: "dirt-unverifiable",
+        error: `${ref} in ${repoRoot}: ${String(error)}. Ref was not advanced.`,
+      }
+    }
+  }
   request.beforeRefAdvance?.()
   const advanced = git(repoRoot, ["update-ref", ref, to, localTip])
   if (advanced.status !== 0) {
@@ -1490,20 +1630,25 @@ function gitWithIndex(repoRoot: string, index: string, args: readonly string[]):
   return gitWithInput(repoRoot, args, Buffer.alloc(0), { GIT_INDEX_FILE: index })
 }
 
-function readGitBlob(repoRoot: string, oid: string): Buffer {
-  const result = spawnProjectionGit(repoRoot, ["cat-file", "blob", oid], {
-    encoding: null,
-    maxBuffer: 64 * 1024 * 1024,
-    env: { LC_ALL: "C" },
-  })
+function readGitBlob(repoRoot: string, oid: string, baseEnv?: NodeJS.ProcessEnv): Buffer {
+  const result = spawnProjectionGit(
+    repoRoot,
+    ["cat-file", "blob", oid],
+    {
+      encoding: null,
+      maxBuffer: 64 * 1024 * 1024,
+      env: { LC_ALL: "C" },
+    },
+    baseEnv,
+  )
   if (result.status !== 0 || result.error !== undefined) {
     throw new Error(`cannot read baseline blob ${oid}: ${result.stderr?.toString("utf8") ?? String(result.error)}`)
   }
   return result.stdout
 }
 
-function baselinePath(repoRoot: string, tip: string, path: string): CapturedPath {
-  const listed = git(repoRoot, readonlyArgs(["ls-tree", "-z", tip, "--", path]))
+function baselinePath(repoRoot: string, tip: string, path: string, baseEnv?: NodeJS.ProcessEnv): CapturedPath {
+  const listed = git(repoRoot, readonlyArgs(["ls-tree", "-z", tip, "--", path]), undefined, baseEnv)
   if (listed.status !== 0) throw new Error(`cannot read ${path} at ${tip}: ${gitDetail(listed)}`)
   if (listed.stdout === "") return { path, kind: "absent" }
   const tab = listed.stdout.indexOf("\t")
@@ -1513,8 +1658,10 @@ function baselinePath(repoRoot: string, tip: string, path: string): CapturedPath
   if (tab < 0 || oid === undefined || listed.stdout.slice(tab + 1).replace(/\0$/u, "") !== path) {
     throw new Error(`cannot parse exact baseline entry for ${path} at ${tip}`)
   }
-  if (mode === "120000") return { path, kind: "symlink", mode, bytes: readGitBlob(repoRoot, oid) }
-  if (mode === "100644" || mode === "100755") return { path, kind: "regular", mode, bytes: readGitBlob(repoRoot, oid) }
+  if (mode === "120000") return { path, kind: "symlink", mode, bytes: readGitBlob(repoRoot, oid, baseEnv) }
+  if (mode === "100644" || mode === "100755") {
+    return { path, kind: "regular", mode, bytes: readGitBlob(repoRoot, oid, baseEnv) }
+  }
   throw new Error(`${path} at ${tip} has unsupported baseline mode ${mode}`)
 }
 
