@@ -13,6 +13,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   utimesSync,
   writeFileSync,
 } from "node:fs"
@@ -32,6 +33,7 @@ import {
   projectRemoteFirstFastForward,
   synchronizeCheckoutToCommit,
   worktreeDirtyPaths,
+  worktreeByteDifferences,
 } from "../src/index.js"
 import { gitOutcomeForTest } from "../src/project.js"
 import { checkoutLockPath, holdCheckoutLock } from "../src/checkout-lock.ts"
@@ -660,6 +662,103 @@ describe("gitomic project and checkout synchronization", () => {
       expect(worktreeDirtyPaths(checkout)).toEqual([" leading.md", ".gitignore", "new-untracked.md", "tracked.md"])
       git(checkout, "add", " leading.md")
       expect(worktreeDirtyPaths(checkout)).toEqual([" leading.md", ".gitignore", "new-untracked.md", "tracked.md"])
+    })
+
+    // Raw observations have a distinct contract from projection's index custody.
+    test.each([
+      "raw equal",
+      "filtered equal",
+      "edit",
+      "ignored",
+      "unborn",
+      "mode true",
+      "mode false",
+      "deletion",
+      "symlink",
+      "gitlink directory",
+      "gitlink absent",
+      "gitlink file",
+      "sha256",
+    ])("raw checkout evidence: %s", (scenario) => {
+      const checkout = mkdtempSync(join(tmpdir(), "gitomic-byte-evidence-"))
+      roots.push(checkout)
+      git(
+        checkout,
+        "init",
+        "-q",
+        "--initial-branch=main",
+        `--object-format=${scenario === "sha256" ? "sha256" : "sha1"}`,
+      )
+      writeFileSync(join(checkout, ".gitattributes"), "*.md text eol=lf\n")
+      writeFileSync(join(checkout, ".gitignore"), "ignored.txt\n")
+      writeFileSync(join(checkout, "tracked.md"), "initial\n")
+      git(checkout, "add", "-A")
+      if (scenario === "unborn") {
+        writeFileSync(join(checkout, "ignored.txt"), "ignored\n")
+        const rows = worktreeByteDifferences(checkout)
+        expect(rows.map((row) => row.path)).toEqual([".gitattributes", ".gitignore", "tracked.md"])
+        expect(rows.every((row) => row.head === "absent" && typeof row.worktree === "object")).toBe(true)
+        return
+      }
+      git(checkout, "commit", "-qm", "seed")
+      if (scenario === "raw equal" || scenario === "sha256") {
+        writeFileSync(join(checkout, "tracked.md"), "initial\r\n")
+        const oid = git(checkout, "hash-object", "-w", "--no-filters", "tracked.md")
+        git(checkout, "update-index", "--cacheinfo", `100644,${oid},tracked.md`)
+        const tip = git(
+          checkout,
+          "commit-tree",
+          git(checkout, "write-tree"),
+          "-p",
+          git(checkout, "rev-parse", "HEAD"),
+          "-m",
+          "raw",
+        )
+        git(checkout, "update-ref", "refs/heads/main", tip)
+      } else if (scenario === "filtered equal") {
+        writeFileSync(join(checkout, "tracked.md"), "initial\r\n")
+        expect(worktreeDirtyPaths(checkout)).toEqual([])
+      } else if (scenario === "edit") writeFileSync(join(checkout, "tracked.md"), "changed\n")
+      else if (scenario === "ignored") writeFileSync(join(checkout, "ignored.txt"), "ignored\n")
+      else if (scenario.startsWith("mode")) {
+        git(checkout, "config", "core.fileMode", scenario.endsWith("false") ? "false" : "true")
+        chmodSync(join(checkout, "tracked.md"), 0o755)
+      } else if (scenario === "deletion") rmSync(join(checkout, "tracked.md"))
+      else if (scenario === "symlink") {
+        symlinkSync("first", join(checkout, "link"))
+        git(checkout, "add", "link")
+        git(checkout, "commit", "-qm", "symlink")
+        rmSync(join(checkout, "link"))
+        symlinkSync("second", join(checkout, "link"))
+      } else if (scenario.startsWith("gitlink")) {
+        git(checkout, "update-index", "--add", "--cacheinfo", `160000,${git(checkout, "rev-parse", "HEAD")},module`)
+        const tip = git(
+          checkout,
+          "commit-tree",
+          git(checkout, "write-tree"),
+          "-p",
+          git(checkout, "rev-parse", "HEAD"),
+          "-m",
+          "gitlink",
+        )
+        git(checkout, "update-ref", "refs/heads/main", tip)
+        if (scenario.endsWith("directory")) mkdirSync(join(checkout, "module"))
+        if (scenario.endsWith("file")) writeFileSync(join(checkout, "module"), "wrong type")
+      }
+      const rows = worktreeByteDifferences(checkout)
+      const clean = ["raw equal", "ignored", "mode false", "gitlink directory", "sha256"].includes(scenario)
+      expect(rows.map((row) => row.path)).toEqual(
+        clean ? [] : [scenario === "symlink" ? "link" : scenario.startsWith("gitlink") ? "module" : "tracked.md"],
+      )
+      if (scenario === "deletion") expect(rows[0]?.worktree).toBe("absent")
+      if (scenario.startsWith("gitlink") && !clean) expect(rows[0]?.worktree).toBe("type-mismatch")
+      if (scenario === "filtered equal" || scenario === "edit") {
+        expect(rows[0]?.head).toMatchObject({ oid: git(checkout, "rev-parse", "HEAD:tracked.md"), mode: "100644" })
+        expect(rows[0]?.worktree).toMatchObject({
+          oid: git(checkout, "hash-object", "--no-filters", "tracked.md"),
+          mode: "100644",
+        })
+      }
     })
 
     test("synchronizeCheckoutToCommit reports bare for a bare repository", () => {

@@ -143,6 +143,8 @@ export {
   projectRemoteFirstFastForward,
   synchronizeCheckoutToCommit,
   worktreeDirtyPaths,
+  worktreeByteDifferences,
+  type WorktreeByteDifference,
   type CheckoutSyncOutcome,
   type CheckoutSyncRequest,
   type ProjectCheckoutOutcome,

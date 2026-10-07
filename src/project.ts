@@ -58,6 +58,8 @@ import { dirname, join } from "node:path"
 
 import { readStateCheckoutDeclaration } from "./candidate.ts"
 import { DEFAULT_REMOTE_TIMEOUT_MS, runGit } from "./shell.ts"
+import { objectOid } from "./git-object.ts"
+import type { TreeEntry } from "./types.js"
 
 /**
  * Front read-only git invocations with `--no-optional-locks` so a repeated
@@ -368,9 +370,9 @@ function nulPaths(output: string): string[] {
  * This is the pathset reconciliation must preserve exactly, so it must see the
  * same things the guards that refuse on dirt see.
  */
-export function worktreeDirtyPaths(repoRoot: string, baseEnv?: NodeJS.ProcessEnv): string[] {
+function worktreeSourcePaths(repoRoot: string, baseEnv?: NodeJS.ProcessEnv) {
   const head = git(repoRoot, readonlyArgs(["rev-parse", "--verify", "--quiet", "HEAD"]), undefined, baseEnv)
-  let trackedArgs = ["diff", "--name-only", "-z", "HEAD", "--"]
+  let cached: string[] = []
   if (head.status !== 0) {
     const branch = git(repoRoot, readonlyArgs(["symbolic-ref", "--quiet", "HEAD"]), undefined, baseEnv)
     if (head.status !== 1 || branch.status !== 0) {
@@ -384,10 +386,10 @@ export function worktreeDirtyPaths(repoRoot: string, baseEnv?: NodeJS.ProcessEnv
     )
     if (tip.status !== 1) throw new Error(`read unborn worktree branch failed: ${gitDetail(tip)}`)
     // A proven unborn branch has no base: every index entry is pending source.
-    trackedArgs = ["ls-files", "--cached", "-z"]
+    const tracked = git(repoRoot, readonlyArgs(["ls-files", "--cached", "-z"]), undefined, baseEnv)
+    if (tracked.status !== 0) throw new Error(`read tracked worktree dirt failed: ${gitDetail(tracked)}`)
+    cached = nulPaths(tracked.stdout)
   }
-  const tracked = git(repoRoot, readonlyArgs(trackedArgs), undefined, baseEnv)
-  if (tracked.status !== 0) throw new Error(`read tracked worktree dirt failed: ${gitDetail(tracked)}`)
   const untracked = git(
     repoRoot,
     readonlyArgs(["ls-files", "--others", "--exclude-standard", "-z"]),
@@ -395,7 +397,110 @@ export function worktreeDirtyPaths(repoRoot: string, baseEnv?: NodeJS.ProcessEnv
     baseEnv,
   )
   if (untracked.status !== 0) throw new Error(`read untracked worktree dirt failed: ${gitDetail(untracked)}`)
-  return [...new Set([...nulPaths(tracked.stdout), ...nulPaths(untracked.stdout)])].sort()
+  return { head: head.status === 0 ? head.stdout.trim() : undefined, cached, untracked: nulPaths(untracked.stdout) }
+}
+
+export function worktreeDirtyPaths(repoRoot: string, baseEnv?: NodeJS.ProcessEnv): string[] {
+  const source = worktreeSourcePaths(repoRoot, baseEnv)
+  let tracked = source.cached
+  if (source.head !== undefined) {
+    const result = git(repoRoot, readonlyArgs(["diff", "--name-only", "-z", "HEAD", "--"]), undefined, baseEnv)
+    if (result.status !== 0) throw new Error(`read tracked worktree dirt failed: ${gitDetail(result)}`)
+    tracked = nulPaths(result.stdout)
+  }
+  return [...new Set([...tracked, ...source.untracked])].sort()
+}
+
+export interface WorktreeByteDifference {
+  readonly path: string
+  readonly head: TreeEntry | "absent"
+  readonly worktree: TreeEntry | "absent" | "type-mismatch"
+}
+
+/** Raw checkout evidence against HEAD. Index custody belongs to worktreeDirtyPaths. */
+export function worktreeByteDifferences(repoRoot: string, baseEnv?: NodeJS.ProcessEnv): WorktreeByteDifference[] {
+  const source = worktreeSourcePaths(repoRoot, baseEnv)
+  const top = git(repoRoot, readonlyArgs(["rev-parse", "--show-toplevel"]), undefined, baseEnv)
+  if (top.status !== 0 || top.stdout === "") {
+    throw new Error(`${repoRoot}: read checkout root failed: ${gitDetail(top)}`)
+  }
+  const format = git(repoRoot, readonlyArgs(["rev-parse", "--show-object-format"]), undefined, baseEnv)
+  const algorithm = format.stdout.trim()
+  if (format.status !== 0 || (algorithm !== "sha1" && algorithm !== "sha256")) {
+    throw new Error(`${repoRoot}: read object format failed: ${gitDetail(format)}`)
+  }
+  const mode = git(repoRoot, readonlyArgs(["config", "--bool", "--get", "core.fileMode"]), undefined, baseEnv)
+  if (mode.status !== 0 && mode.status !== 1) {
+    throw new Error(`${repoRoot}: read core.fileMode failed: ${gitDetail(mode)}`)
+  }
+  const fileMode = mode.status === 1 || mode.stdout.trim() === "true"
+  const entries = new Map<string, TreeEntry>()
+  if (source.head !== undefined) {
+    const tree = git(repoRoot, readonlyArgs(["ls-tree", "--full-tree", "-r", "-z", source.head]), undefined, baseEnv)
+    if (tree.status !== 0) throw new Error(`${repoRoot}: read HEAD tree failed: ${gitDetail(tree)}`)
+    for (const record of nulPaths(tree.stdout)) {
+      const match = /^(100644|100755|120000|160000) (blob|commit) ([a-f0-9]+)\t([\s\S]+)$/.exec(record)
+      const [, modeText, kind, oid, path] = match ?? []
+      if (
+        modeText === undefined ||
+        kind === undefined ||
+        oid === undefined ||
+        path === undefined ||
+        oid.length !== (algorithm === "sha256" ? 64 : 40)
+      ) {
+        throw new Error(`${repoRoot}: cannot parse HEAD entry ${JSON.stringify(record)}`)
+      }
+      const entryMode = modeText as TreeEntry["mode"]
+      if ((entryMode === "160000") !== (kind === "commit")) {
+        throw new Error(`${repoRoot}: invalid HEAD type for ${JSON.stringify(path)}`)
+      }
+      entries.set(path, { oid, mode: entryMode })
+    }
+  }
+  const differences: WorktreeByteDifference[] = []
+  const paths = [...new Set([...entries.keys(), ...source.cached, ...source.untracked])].sort()
+  for (const path of paths) {
+    const head = entries.get(path) ?? "absent"
+    try {
+      let stat: ReturnType<typeof lstatSync> | undefined
+      try {
+        stat = lstatSync(join(top.stdout.trim(), path))
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT" && (error as NodeJS.ErrnoException).code !== "ENOTDIR") {
+          throw error
+        }
+      }
+      if (head !== "absent" && head.mode === "160000") {
+        // A gitlink's commit identifies another repository, not checkout file bytes.
+        if (!stat?.isDirectory()) differences.push({ path, head, worktree: "type-mismatch" })
+        continue
+      }
+      if (stat !== undefined && !stat.isFile() && !stat.isSymbolicLink()) {
+        differences.push({ path, head, worktree: "type-mismatch" })
+        continue
+      }
+      const captured = readCapturedPath(top.stdout.trim(), path)
+      if (captured.kind === "absent") {
+        differences.push({ path, head, worktree: "absent" })
+        continue
+      }
+      const worktree = { oid: objectOid("blob", captured.bytes, algorithm), mode: captured.mode }
+      const sameMode =
+        head !== "absent" &&
+        (head.mode === worktree.mode ||
+          (!fileMode && (head.mode === "100644" || head.mode === "100755") && captured.kind === "regular"))
+      if (head === "absent" || head.oid !== worktree.oid || !sameMode) differences.push({ path, head, worktree })
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT" || (error as NodeJS.ErrnoException).code === "ENOTDIR") {
+        differences.push({ path, head, worktree: "absent" })
+      } else {
+        throw new Error(`${repoRoot}: read raw checkout path ${JSON.stringify(path)} failed: ${String(error)}`, {
+          cause: error,
+        })
+      }
+    }
+  }
+  return differences
 }
 
 type IndexCarry =
