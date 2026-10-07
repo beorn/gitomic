@@ -100,7 +100,12 @@ export type EventsOptions = {
 export type EventsRead = {
   /** Read only events newer than this event id (exclusive). */
   from?: Oid
-  /** Read events at or after this integer unix-second commit time (inclusive). */
+  /**
+   * Stop the walk at the first event older than this integer unix-second commit
+   * time (inclusive bound). Every backend clamps commit time to at least its
+   * parent's time plus one, so this returns every event at or after `since`.
+   * Genesis is not an event and never ends the walk at this time bound.
+   */
   since?: number
   /**
    * Read the chain whose tip is this event instead of the ref's current tip: a tip another read already
