@@ -693,6 +693,10 @@ describe("gitomic project and checkout synchronization", () => {
       "edit",
       "staged add",
       "staged add absent",
+      "staged delete",
+      "untracked",
+      "file to symlink",
+      "file to directory",
       "ignored",
       "unborn",
       "mode true",
@@ -748,6 +752,14 @@ describe("gitomic project and checkout synchronization", () => {
         git(checkout, "add", "new.md")
         expect(worktreeDirtyPaths(checkout)).toEqual(["new.md"])
         if (scenario === "staged add absent") rmSync(join(checkout, "new.md"))
+      } else if (scenario === "staged delete") {
+        git(checkout, "rm", "--cached", "tracked.md")
+        expect(worktreeDirtyPaths(checkout)).toEqual(["tracked.md"])
+      } else if (scenario === "untracked") writeFileSync(join(checkout, "new.md"), "new source\n")
+      else if (scenario.startsWith("file to")) {
+        rmSync(join(checkout, "tracked.md"))
+        if (scenario === "file to symlink") symlinkSync("target", join(checkout, "tracked.md"))
+        else mkdirSync(join(checkout, "tracked.md"))
       } else if (scenario === "ignored") writeFileSync(join(checkout, "ignored.txt"), "ignored\n")
       else if (scenario.startsWith("mode")) {
         git(checkout, "config", "core.fileMode", scenario.endsWith("false") ? "false" : "true")
@@ -775,14 +787,20 @@ describe("gitomic project and checkout synchronization", () => {
         if (scenario.endsWith("file")) writeFileSync(join(checkout, "module"), "wrong type")
       }
       const rows = worktreeByteDifferences(checkout)
-      const clean = ["raw equal", "ignored", "mode false", "gitlink directory", "sha256", "staged add absent"].includes(
-        scenario,
-      )
+      const clean = [
+        "raw equal",
+        "ignored",
+        "mode false",
+        "gitlink directory",
+        "sha256",
+        "staged add absent",
+        "staged delete",
+      ].includes(scenario)
       expect(rows.map((row) => row.path)).toEqual(
         clean
           ? []
           : [
-              scenario === "staged add"
+              scenario === "staged add" || scenario === "untracked"
                 ? "new.md"
                 : scenario === "symlink"
                   ? "link"
@@ -793,6 +811,8 @@ describe("gitomic project and checkout synchronization", () => {
       )
       if (scenario === "deletion") expect(rows[0]?.worktree).toBe("absent")
       if (scenario === "staged add") expect(rows[0]?.head).toBe("absent")
+      if (scenario === "file to directory") expect(rows[0]?.worktree).toBe("type-mismatch")
+      if (scenario === "file to symlink") expect(rows[0]?.worktree).toMatchObject({ mode: "120000" })
       if (scenario.startsWith("gitlink") && !clean) expect(rows[0]?.worktree).toBe("type-mismatch")
       if (scenario === "filtered equal" || scenario === "edit") {
         expect(rows[0]?.head).toMatchObject({ oid: git(checkout, "rev-parse", "HEAD:tracked.md"), mode: "100644" })
