@@ -436,7 +436,12 @@ export function worktreeByteDifferences(repoRoot: string, baseEnv?: NodeJS.Proce
   const fileMode = mode.status === 1 || mode.stdout.trim() === "true"
   const entries = new Map<string, TreeEntry>()
   if (source.head !== undefined) {
-    const tree = git(repoRoot, readonlyArgs(["ls-tree", "--full-tree", "-r", "-z", source.head]), undefined, baseEnv)
+    const tree = git(
+      repoRoot,
+      readonlyArgs(["ls-tree", "--full-tree", "-r", "-z", source.head]),
+      64 * 1024 * 1024,
+      baseEnv,
+    )
     if (tree.status !== 0) throw new Error(`${repoRoot}: read HEAD tree failed: ${gitDetail(tree)}`)
     for (const record of nulPaths(tree.stdout)) {
       const match = /^(100644|100755|120000|160000) (blob|commit) ([a-f0-9]+)\t([\s\S]+)$/.exec(record)

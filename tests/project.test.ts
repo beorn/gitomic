@@ -664,6 +664,28 @@ describe("gitomic project and checkout synchronization", () => {
       expect(worktreeDirtyPaths(checkout)).toEqual([" leading.md", ".gitignore", "new-untracked.md", "tracked.md"])
     })
 
+    test("raw checkout evidence enumerates a HEAD listing larger than one MiB", () => {
+      const { checkout } = remoteFixture()
+      const blob = git(checkout, "rev-parse", "HEAD:tracked.md")
+      const names = Array.from({ length: 6000 }, (_, index) => `${String(index).padStart(5, "0")}-${"x".repeat(160)}`)
+      const input = names.map((name) => `100644 blob ${blob}\t${name}\n`).join("")
+      expect(Buffer.byteLength(input)).toBeGreaterThan(1024 * 1024)
+      const tree = spawnSync("git", ["-C", checkout, "mktree"], { encoding: "utf8", input })
+      expect(tree.status).toBe(0)
+      const tip = git(
+        checkout,
+        "commit-tree",
+        tree.stdout.trim(),
+        "-p",
+        git(checkout, "rev-parse", "HEAD"),
+        "-m",
+        "large tree",
+      )
+      git(checkout, "update-ref", "refs/heads/main", tip)
+      const rows = worktreeByteDifferences(checkout)
+      expect(rows.filter((row) => row.worktree === "absent").map((row) => row.path)).toEqual(names)
+    })
+
     // Raw observations have a distinct contract from projection's index custody.
     test.each([
       "raw equal",
