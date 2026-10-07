@@ -1168,6 +1168,115 @@ describe("the README events example runs as written", () => {
   })
 })
 
+// @failure a bounded import-membership read could omit a retained event, return a partial
+// suffix as complete, or change the first event's parent while discarding older metadata.
+// @level l1
+// @consumer km's retained import membership at an attempt-pinned item-event tip (#26488)
+describe("inclusive event-clock lower bound (#26488)", () => {
+  const start = 1_000_000_000
+
+  test("returns the exact suffix across waves, preserving order and parent edges on every backend", async () => {
+    await withTargets(async (target) => {
+      const chain = await openEvents({ repo: target.repo, ref: CHAIN, backend: target.backend, clock: () => start })
+      const written = await chain.append(
+        Array.from({ length: 6 }, (_, index) => ({ type: `e${index}` })),
+        {
+          expect: null,
+        },
+      )
+      const tip = written.head
+      if (tip === null) throw new Error("fixture event chain has no tip")
+      const ids = written.events.map((event) => event.id)
+      const suffix = { at: tip, since: start + 3, limit: 2, complete: true }
+      const events = await chain.events(suffix)
+      expect(
+        events.map((event) => event.id),
+        target.name,
+      ).toEqual(ids.slice(3))
+      expect(events[0]?.parent, target.name).toBe(ids[2])
+      expect(
+        (await chain.events({ ...suffix, order: "newest-first" })).map((event) => event.id),
+        target.name,
+      ).toEqual(ids.slice(3).reverse())
+      // Two retained events fill the wave exactly; its lookahead proves the cut.
+      expect(
+        (await chain.events({ ...suffix, since: start + 4 })).map((event) => event.id),
+        target.name,
+      ).toEqual(ids.slice(4))
+      expect(
+        (await chain.events({ at: tip, since: start + 3, limit: 2 })).map((event) => event.id),
+        target.name,
+      ).toEqual(ids.slice(4))
+      for (const complete of [false, true]) {
+        expect(await chain.events({ at: tip, since: start + 6, complete }), target.name).toEqual([])
+        // Genesis is older than the realistic bound, but still identifies the first event's parent.
+        for (const since of [0, start]) {
+          const all = await chain.events({ at: tip, since, limit: 8, complete })
+          expect(
+            all.map((event) => event.id),
+            target.name,
+          ).toEqual(ids)
+          expect(all[0]?.parent, target.name).toBeNull()
+        }
+      }
+    })
+  })
+
+  test("completes at whichever from or time endpoint comes first without hiding an unreachable endpoint", async () => {
+    await withTargets(async (target) => {
+      const chain = await openEvents({ repo: target.repo, ref: CHAIN, backend: target.backend, clock: () => start })
+      const written = await chain.append(
+        Array.from({ length: 6 }, (_, index) => ({ type: `e${index}` })),
+        {
+          expect: null,
+        },
+      )
+      const tip = written.head
+      if (tip === null) throw new Error("fixture event chain has no tip")
+      const ids = written.events.map((event) => event.id)
+      for (const [index, expected] of [
+        [1, ids.slice(3)],
+        [2, ids.slice(3)],
+        [4, ids.slice(5)],
+        [5, []],
+      ] as const) {
+        const from = ids[index]
+        if (from === undefined) throw new Error("fixture event boundary is absent")
+        expect(
+          (await chain.events({ at: tip, from, since: start + 3, limit: 2, complete: true })).map((event) => event.id),
+          target.name,
+        ).toEqual(expected)
+      }
+      const unrelated = await workCommit(target, "unrelated-time-bound.txt")
+      expect(
+        (await chain.events({ from: unrelated, since: start + 3, limit: 2, complete: true })).map((event) => event.id),
+        target.name,
+      ).toEqual(ids.slice(3))
+      await expect(chain.events({ from: unrelated, since: 0, limit: 2, complete: true }), target.name).rejects.toThrow(
+        "refusing a partial read",
+      )
+    })
+  })
+
+  test("refuses a non-integer time before reading even an absent chain on every backend", async () => {
+    await withTargets(async (target) => {
+      const chain = await openEvents({ repo: target.repo, ref: CHAIN, backend: target.backend })
+      for (const since of [0.5, NaN, Infinity, -Infinity]) {
+        await expect(chain.events({ since }), target.name).rejects.toThrow(/since.*integer.*unix seconds/iu)
+      }
+      expect(await chain.events({ since: 0, complete: true }), target.name).toEqual([])
+      const written = await chain.append([{ type: "opened" }], { expect: null })
+      const tip = written.head
+      if (tip === null) throw new Error("fixture event chain has no tip")
+      for (const since of [0.5, NaN, Infinity, -Infinity]) {
+        await expect(chain.events({ at: tip, since, complete: true }), target.name).rejects.toThrow(
+          /since.*integer.*unix seconds/iu,
+        )
+      }
+    })
+  })
+})
+
 describe("complete traversal past the read budget (#27354)", () => {
   const many = (count: number, prefix: string): EventInput[] =>
     Array.from({ length: count }, (_, index) => ({ type: `${prefix}${index}` }))

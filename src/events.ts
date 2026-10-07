@@ -100,6 +100,8 @@ export type EventsOptions = {
 export type EventsRead = {
   /** Read only events newer than this event id (exclusive). */
   from?: Oid
+  /** Read events at or after this integer unix-second commit time (inclusive). */
+  since?: number
   /**
    * Read the chain whose tip is this event instead of the ref's current tip: a tip another read already
    * fetched (a store's per-attempt `fetch` list), so the read costs no remote round trip and sees exactly
@@ -108,9 +110,9 @@ export type EventsRead = {
   at?: Oid
   limit?: number
   /**
-   * Read the whole chain to its root, paging in bounded `limit`-sized waves, instead of
-   * stopping at `limit`. A chain that cannot reach its root is refused by name, never
-   * returned short.
+   * Read to the first of the root, `from`, or an observed event older than `since`,
+   * paging in bounded `limit`-sized waves instead of stopping at `limit`. A chain
+   * that cannot reach its boundary is refused by name, never returned short.
    */
   complete?: boolean
   /** Chronological (oldest first) by default. */
@@ -442,14 +444,19 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
     }
   const shapeAlso = (also: readonly AlsoRef[] | undefined): RefUpdate[] => shapeRefUpdates(ref, also, "also")
 
-  const readChain = async (at: Oid, options: { from?: Oid; limit: number }) => {
+  const readChain = async (at: Oid, options: { from?: Oid; since?: number; limit: number }) => {
     const history = await backend.readHistory(repo, [at], {
       ...(options.from === undefined ? {} : { exclude: [options.from] }),
       // One more than asked for, so the genesis fits when the chain is short.
       limit: options.limit + 1,
     })
-    const read = toEvents(history, ref)
-    return { ...read, events: read.events.slice(0, options.limit) }
+    // Gitomic commit clocks increase along the first-parent chain. Stop at the
+    // first older event; keep a reached genesis for validation and parent=null.
+    const since = options.since
+    const boundary =
+      since === undefined ? -1 : history.findIndex((meta) => meta.parents.length > 0 && meta.timestamp < since)
+    const read = toEvents(boundary < 0 ? history : history.slice(0, boundary), ref)
+    return { ...read, events: read.events.slice(0, options.limit), reachedSince: boundary >= 0 }
   }
 
   /** Watch keeps its bounded jump refusal; a partial batch is never yielded. */
@@ -475,16 +482,20 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
   }
 
   /** Assemble one attempt's complete history before a transaction decides. */
-  const readComplete = async (at: Oid, from?: Oid, wave: number = MAX_LIMIT): Promise<Event[]> => {
+  const readComplete = async (at: Oid, from?: Oid, wave: number = MAX_LIMIT, since?: number): Promise<Event[]> => {
     const pages: Event[][] = []
     const seen = new Set<Oid>()
     let cursor = at
     for (;;) {
       if (seen.has(cursor)) throw new Error(`${ref} at ${at}: event paging did not advance at ${cursor}`)
       seen.add(cursor)
-      const { events } = await readChain(cursor, { ...(from === undefined ? {} : { from }), limit: wave })
+      const { events, reachedSince } = await readChain(cursor, {
+        ...(from === undefined ? {} : { from }),
+        ...(since === undefined ? {} : { since }),
+        limit: wave,
+      })
       if (events.length === 0) {
-        if (cursor === from) return pages.flat().reverse()
+        if (cursor === from || reachedSince) return pages.flat().reverse()
         throw new Error(`${ref} at ${at} does not reach event ${from ?? "its genesis"}; refusing a partial read`)
       }
       if (events[0]?.id !== cursor) {
@@ -496,6 +507,7 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
         }
       }
       pages.push(events)
+      if (reachedSince) return pages.flat().reverse()
       const parent = events.at(-1)?.parent
       if (from === undefined ? parent === null : parent === from) return pages.flat().reverse()
       if (parent === null || parent === undefined) {
@@ -568,13 +580,23 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
     async events(read = {}) {
       const limit = normalizeLimit(read.limit)
       const from = read.from === undefined ? undefined : validateOid(read.from, "events from must be an event id")
+      const since = read.since
+      if (since !== undefined && !Number.isInteger(since)) {
+        throw new TypeError(`events since must be an integer of unix seconds; received ${String(since)}`)
+      }
       const at = read.at === undefined ? await tip() : validateOid(read.at, "events at must be an event id")
       if (at === null) return []
-      // `complete` pages to the root in bounded waves; without it one read stops at `limit`.
+      // `complete` pages to the first observed boundary; otherwise one read stops at `limit`.
       const events =
         read.complete === true
-          ? [...(await readComplete(at, from, limit))].reverse()
-          : (await readChain(at, { ...(from === undefined ? {} : { from }), limit })).events
+          ? [...(await readComplete(at, from, limit, since))].reverse()
+          : (
+              await readChain(at, {
+                ...(from === undefined ? {} : { from }),
+                ...(since === undefined ? {} : { since }),
+                limit,
+              })
+            ).events
       // The walk is newest-first.
       return read.order === "newest-first" ? events : events.reverse()
     },
