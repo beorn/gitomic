@@ -370,7 +370,7 @@ function nulPaths(output: string): string[] {
  * This is the pathset reconciliation must preserve exactly, so it must see the
  * same things the guards that refuse on dirt see.
  */
-function worktreeSourcePaths(repoRoot: string, baseEnv?: NodeJS.ProcessEnv) {
+function worktreeSourcePaths(repoRoot: string, baseEnv?: NodeJS.ProcessEnv, includeCached = false) {
   const head = git(repoRoot, readonlyArgs(["rev-parse", "--verify", "--quiet", "HEAD"]), undefined, baseEnv)
   let cached: string[] = []
   if (head.status !== 0) {
@@ -385,8 +385,15 @@ function worktreeSourcePaths(repoRoot: string, baseEnv?: NodeJS.ProcessEnv) {
       baseEnv,
     )
     if (tip.status !== 1) throw new Error(`read unborn worktree branch failed: ${gitDetail(tip)}`)
-    // A proven unborn branch has no base: every index entry is pending source.
-    const tracked = git(repoRoot, readonlyArgs(["ls-files", "--cached", "-z"]), undefined, baseEnv)
+  }
+  if (head.status !== 0 || includeCached) {
+    // Raw observation also needs staged additions, which are absent from HEAD and the untracked list.
+    const tracked = git(
+      repoRoot,
+      readonlyArgs(["ls-files", "--cached", "-z"]),
+      includeCached ? 64 * 1024 * 1024 : undefined,
+      baseEnv,
+    )
     if (tracked.status !== 0) throw new Error(`read tracked worktree dirt failed: ${gitDetail(tracked)}`)
     cached = nulPaths(tracked.stdout)
   }
@@ -419,7 +426,7 @@ export interface WorktreeByteDifference {
 
 /** Raw checkout evidence against HEAD. Index custody belongs to worktreeDirtyPaths. */
 export function worktreeByteDifferences(repoRoot: string, baseEnv?: NodeJS.ProcessEnv): WorktreeByteDifference[] {
-  const source = worktreeSourcePaths(repoRoot, baseEnv)
+  const source = worktreeSourcePaths(repoRoot, baseEnv, true)
   const top = git(repoRoot, readonlyArgs(["rev-parse", "--show-toplevel"]), undefined, baseEnv)
   if (top.status !== 0 || top.stdout === "") {
     throw new Error(`${repoRoot}: read checkout root failed: ${gitDetail(top)}`)
@@ -463,7 +470,8 @@ export function worktreeByteDifferences(repoRoot: string, baseEnv?: NodeJS.Proce
     }
   }
   const differences: WorktreeByteDifference[] = []
-  const paths = [...new Set([...entries.keys(), ...source.cached, ...source.untracked])].sort()
+  const untracked = new Set(source.untracked)
+  const paths = [...new Set([...entries.keys(), ...source.cached, ...untracked])].sort()
   for (const path of paths) {
     const head = entries.get(path) ?? "absent"
     try {
@@ -484,6 +492,9 @@ export function worktreeByteDifferences(repoRoot: string, baseEnv?: NodeJS.Proce
         differences.push({ path, head, worktree: "type-mismatch" })
         continue
       }
+      // An index-only addition whose checkout path is already absent has no raw difference.
+      // Untracked enumeration or a successful lstat establishes presence before a later disappearance.
+      if (stat === undefined && head === "absent" && !untracked.has(path)) continue
       const captured = readCapturedPath(top.stdout.trim(), path)
       if (captured.kind === "absent") {
         differences.push({ path, head, worktree: "absent" })

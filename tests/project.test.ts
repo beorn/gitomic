@@ -691,6 +691,8 @@ describe("gitomic project and checkout synchronization", () => {
       "raw equal",
       "filtered equal",
       "edit",
+      "staged add",
+      "staged add absent",
       "ignored",
       "unborn",
       "mode true",
@@ -741,7 +743,12 @@ describe("gitomic project and checkout synchronization", () => {
         writeFileSync(join(checkout, "tracked.md"), "initial\r\n")
         expect(worktreeDirtyPaths(checkout)).toEqual([])
       } else if (scenario === "edit") writeFileSync(join(checkout, "tracked.md"), "changed\n")
-      else if (scenario === "ignored") writeFileSync(join(checkout, "ignored.txt"), "ignored\n")
+      else if (scenario.startsWith("staged add")) {
+        writeFileSync(join(checkout, "new.md"), "new source\n")
+        git(checkout, "add", "new.md")
+        expect(worktreeDirtyPaths(checkout)).toEqual(["new.md"])
+        if (scenario === "staged add absent") rmSync(join(checkout, "new.md"))
+      } else if (scenario === "ignored") writeFileSync(join(checkout, "ignored.txt"), "ignored\n")
       else if (scenario.startsWith("mode")) {
         git(checkout, "config", "core.fileMode", scenario.endsWith("false") ? "false" : "true")
         chmodSync(join(checkout, "tracked.md"), 0o755)
@@ -768,11 +775,24 @@ describe("gitomic project and checkout synchronization", () => {
         if (scenario.endsWith("file")) writeFileSync(join(checkout, "module"), "wrong type")
       }
       const rows = worktreeByteDifferences(checkout)
-      const clean = ["raw equal", "ignored", "mode false", "gitlink directory", "sha256"].includes(scenario)
+      const clean = ["raw equal", "ignored", "mode false", "gitlink directory", "sha256", "staged add absent"].includes(
+        scenario,
+      )
       expect(rows.map((row) => row.path)).toEqual(
-        clean ? [] : [scenario === "symlink" ? "link" : scenario.startsWith("gitlink") ? "module" : "tracked.md"],
+        clean
+          ? []
+          : [
+              scenario === "staged add"
+                ? "new.md"
+                : scenario === "symlink"
+                  ? "link"
+                  : scenario.startsWith("gitlink")
+                    ? "module"
+                    : "tracked.md",
+            ],
       )
       if (scenario === "deletion") expect(rows[0]?.worktree).toBe("absent")
+      if (scenario === "staged add") expect(rows[0]?.head).toBe("absent")
       if (scenario.startsWith("gitlink") && !clean) expect(rows[0]?.worktree).toBe("type-mismatch")
       if (scenario === "filtered equal" || scenario === "edit") {
         expect(rows[0]?.head).toMatchObject({ oid: git(checkout, "rev-parse", "HEAD:tracked.md"), mode: "100644" })
