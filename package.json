@@ -93,13 +93,13 @@
   },
   "devDependencies": {
     "@types/node": "26.6.3",
-    "isomorphic-git": "1.42.5",
+    "isomorphic-git": "1.43.1",
     "oxfmt": "^0.59.0",
     "oxlint": "1.85.0",
     "removely": "0.3.0",
     "typescript": "^7.0.2",
     "unstorage": "^1.17.5",
-    "vitest": "^4.1.10"
+    "vitest": "4.1.11"
   },
   "peerDependencies": {
     "isomorphic-git": "^1.38.7"
