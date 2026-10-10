@@ -133,7 +133,13 @@ export {
   type ShellBackendOptions,
 } from "./shell.ts"
 export { openRemoteRepository, type OpenedRemoteRepository, type OpenRemoteRepositoryOptions } from "./repository.ts"
-export { GRAPH_LAYER_GRACE, maintainStore, type MaintainStoreOptions, type StoreMaintenance } from "./maintain-store.ts"
+export {
+  GRAPH_LAYER_GRACE,
+  MAINTAIN_STORE_TIMEOUT_MS,
+  maintainStore,
+  type MaintainStoreOptions,
+  type StoreMaintenance,
+} from "./maintain-store.ts"
 export { normalizeRef } from "./options.ts"
 export { parseOwnershipManifest } from "./ownership-manifest.ts"
 export {

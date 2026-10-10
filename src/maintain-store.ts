@@ -63,10 +63,28 @@ export type StoreMaintenance =
       packRefsMs?: number
     }>
 
+/**
+ * Every git command maintainStore runs is bounded by this, whoever calls it (hh 28530, @cto 22c154e1): a caller that
+ * passes nothing is bounded, and an explicit bound may shorten it, never remove it.
+ */
+export const MAINTAIN_STORE_TIMEOUT_MS = 120_000
+
 export type MaintainStoreOptions = Readonly<{
-  /** Each git command's own bound; a command past it is stopped and the call answers `failed` with `timeout`. */
+  /**
+   * A shorter bound for each git command, in milliseconds. Capped at {@link MAINTAIN_STORE_TIMEOUT_MS}; a command past
+   * its bound is stopped and the call answers `failed` with `timeout`.
+   */
   timeoutMs?: number
 }>
+
+/** The bound each command gets: the default, or a shorter explicit one; never none. */
+function commandBoundMs(requested: number | undefined): number {
+  if (requested === undefined) return MAINTAIN_STORE_TIMEOUT_MS
+  if (!(requested > 0)) {
+    throw new RangeError(`maintainStore timeoutMs must be a positive number, got ${String(requested)}`)
+  }
+  return Math.min(requested, MAINTAIN_STORE_TIMEOUT_MS)
+}
 
 type Step = Extract<StoreMaintenance, { outcome: "failed" }>["step"]
 
@@ -82,10 +100,10 @@ class StepFailed extends Error {
   }
 }
 
-async function git(repo: string, step: Step, args: readonly string[], timeoutMs: number | undefined): Promise<string> {
+async function git(repo: string, step: Step, args: readonly string[], timeoutMs: number): Promise<string> {
   let result
   try {
-    result = await runGit(["--git-dir", repo, ...args], timeoutMs === undefined ? {} : { timeoutMs })
+    result = await runGit(["--git-dir", repo, ...args], { timeoutMs })
   } catch (error) {
     if (error instanceof GitTimeout) throw new StepFailed(step, "timeout", error.message)
     throw error
@@ -121,7 +139,7 @@ function readChain(repo: string): { layers: number } | { problem: string } {
 
 /** Write the store's commit-graph incrementally and pack its refs; see {@link StoreMaintenance} for what it answers. */
 export async function maintainStore(repo: string, options: MaintainStoreOptions = {}): Promise<StoreMaintenance> {
-  const { timeoutMs } = options
+  const timeoutMs = commandBoundMs(options.timeoutMs)
   let commitGraphMs: number | undefined
   let packRefsMs: number | undefined
   try {

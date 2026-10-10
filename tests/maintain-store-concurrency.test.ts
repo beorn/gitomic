@@ -10,6 +10,7 @@
  * @testonly none
  */
 import { execFile } from "node:child_process"
+import { readFileSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { promisify } from "node:util"
 import { afterEach, describe, expect, test } from "vitest"
@@ -40,6 +41,18 @@ function maintainLoop(repo: string) {
   }
 }
 
+/**
+ * A `clone --mirror --shared` copy of `source`, beside it so the helper's cleanup removes it: the shape the live stores
+ * have (every ref mirrored, objects reached through alternates), as the accepted plan names it.
+ */
+async function sharedMirror(source: string, name: string): Promise<string> {
+  const mirror = join(dirname(source), `${name}.git`)
+  await execFileAsync("git", ["clone", "--quiet", "--mirror", "--shared", source, mirror])
+  // The shape under test, asserted rather than assumed: its objects come from the source through alternates.
+  expect(readFileSync(join(mirror, "objects", "info", "alternates"), "utf8").trim()).toBe(join(source, "objects"))
+  return mirror
+}
+
 async function attempt(cwd: string, args: string[]): Promise<{ ok: true } | { ok: false; stderr: string }> {
   try {
     await execFileAsync("git", args, { cwd })
@@ -50,14 +63,16 @@ async function attempt(cwd: string, args: string[]): Promise<{ ok: true } | { ok
 }
 
 describe("maintainStore overlapping writers loses and refuses no write", () => {
-  test("kept-copy shape: CAS ref publishes all land while maintenance loops", async () => {
-    const store = await createBareRepo()
-    cleanups.push(store.cleanup)
-    await appendEmptyHistory(store.repo, store.initial, 60)
-    const commits = (await git(store.repo, "rev-list", "--reverse", "refs/heads/main")).split("\n").filter(Boolean)
+  test("kept-copy shape: CAS publishes of new commits all land on a shared mirror while maintenance loops", async () => {
+    const source = await createBareRepo()
+    cleanups.push(source.cleanup)
+    await appendEmptyHistory(source.repo, source.initial, 60)
     for (let index = 0; index < 200; index++) {
-      await git(store.repo, "update-ref", `refs/km/items/i${index}`, commits[0] as string)
+      await git(source.repo, "update-ref", `refs/km/items/i${index}`, source.initial)
     }
+    const kept = await sharedMirror(source.repo, "kept")
+    const store = { repo: kept }
+    const tree = (await git(kept, "rev-parse", "refs/heads/main^{tree}")).trim()
     const loop = maintainLoop(store.repo)
     const refused: string[] = []
     const expected = new Map<string, string>()
@@ -66,9 +81,9 @@ describe("maintainStore overlapping writers loses and refuses no write", () => {
     await Promise.all(
       Array.from({ length: 20 }, async (_, lane) => {
         const ref = `refs/km/items/i${lane}`
-        let current = commits[0] as string
+        let current = source.initial
         for (let step = 1; step <= 12 || loop.outcomes.length < OVERLAP; step++) {
-          const next = commits[(lane + step) % commits.length] as string
+          const next = (await git(store.repo, "commit-tree", tree, "-p", current, "-m", `${ref} step ${step}`)).trim()
           const result = await attempt(store.repo, ["update-ref", ref, next, current])
           if (!result.ok) {
             refused.push(`${ref} ${current}->${next}: ${result.stderr.trim()}`)
@@ -88,13 +103,14 @@ describe("maintainStore overlapping writers loses and refuses no write", () => {
     expect(loop.outcomes.filter((outcome) => outcome.outcome !== "maintained")).toEqual([])
   }, 120_000)
 
-  test("state-authority shape: every push lands while maintenance loops on the receiving store", async () => {
-    const origin = await createBareRepo()
-    cleanups.push(origin.cleanup)
-    await appendEmptyHistory(origin.repo, origin.initial, 20)
+  test("state-authority shape: every push lands on a shared mirror while maintenance loops on it", async () => {
+    const source = await createBareRepo()
+    cleanups.push(source.cleanup)
+    await appendEmptyHistory(source.repo, source.initial, 20)
     for (let index = 0; index < 200; index++) {
-      await git(origin.repo, "update-ref", `refs/km/items/i${index}`, origin.initial)
+      await git(source.repo, "update-ref", `refs/km/items/i${index}`, source.initial)
     }
+    const origin = { repo: await sharedMirror(source.repo, "authority") }
     // Beside the origin, so the helper's own cleanup removes it.
     const pusher = join(dirname(origin.repo), "pusher.git")
     await execFileAsync("git", ["clone", "--quiet", "--bare", origin.repo, pusher])
