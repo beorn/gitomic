@@ -158,6 +158,10 @@ async function openKept(
  * beside it already set `gc.auto=0` (openTemporary), and only the kept one was left open (hh #27525). Reads the
  * store's OWN config once and writes only a value that differs, so a guarded remote costs one git call on later
  * opens.
+ *
+ * gc stays off here; maintenance belongs to the owner: km daemon on the kept copy, state-authority-pack on origin
+ * (hh 28530). Both call `maintainStore` (maintain-store.ts): a non-pruning commit-graph write and pack-refs,
+ * without which every fetch and push parses one commit per ref.
  */
 const KEPT_STORE_GC_GUARDS = [
   ["gc.auto", "0"],
