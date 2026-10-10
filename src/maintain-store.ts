@@ -71,12 +71,14 @@ export type MaintainStoreOptions = Readonly<{
 type Step = Extract<StoreMaintenance, { outcome: "failed" }>["step"]
 
 class StepFailed extends Error {
-  constructor(
-    readonly step: Step,
-    readonly code: number | "timeout",
-    readonly detail: string,
-  ) {
+  readonly step: Step
+  readonly code: number | "timeout"
+  readonly detail: string
+  constructor(step: Step, code: number | "timeout", detail: string) {
     super(`${step}: ${detail}`)
+    this.step = step
+    this.code = code
+    this.detail = detail
   }
 }
 
