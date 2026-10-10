@@ -35,6 +35,7 @@ import {
   PublicationRejected,
   PublicationUnknown,
   RelativeOnlyEditRefused,
+  RemoteWriteOutcomeUnknown,
   RetriesExhausted,
   TreePathCollision,
 } from "./errors.ts"
@@ -83,6 +84,7 @@ export {
   PublicationRejected,
   PublicationUnknown,
   RelativeOnlyEditRefused,
+  RemoteWriteOutcomeUnknown,
   RetriesExhausted,
   TreePathCollision,
 }

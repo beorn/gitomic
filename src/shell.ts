@@ -9,7 +9,14 @@ import { dirname, join, resolve } from "node:path"
 import { fullJitter, type RandomUnit } from "@bearly/pacing"
 
 import { syncDirectory } from "./durable.ts"
-import { Conflict, GitSignaled, GitTimeout, HistoryEdgesTeardown, PublicationRejected } from "./errors.ts"
+import {
+  Conflict,
+  GitSignaled,
+  GitTimeout,
+  HistoryEdgesTeardown,
+  PublicationRejected,
+  RemoteWriteOutcomeUnknown,
+} from "./errors.ts"
 import {
   historyEdgeParentBytes,
   historyEdgeRecordStartBytes,
@@ -2196,12 +2203,11 @@ async function observeRemote(
   return (ref) => tips.get(ref) ?? "absent"
 }
 
-function remoteWriteOutcomeUnknown(updates: readonly Pick<RefUpdate, "ref" | "expect">[], cause: unknown): Error {
-  const leases = updates.map(({ ref, expect }) => `${ref} expected ${expect}`).join("; ")
-  return new Error(
-    `remote write outcome is unknown for ${leases}; inspect the remote refs at their expected object ids before retrying`,
-    { cause },
-  )
+function remoteWriteOutcomeUnknown(
+  updates: readonly Pick<RefUpdate, "ref" | "expect">[],
+  cause: unknown,
+): RemoteWriteOutcomeUnknown {
+  return new RemoteWriteOutcomeUnknown(updates, { cause })
 }
 
 async function diagnoseMissingObjectFetch(

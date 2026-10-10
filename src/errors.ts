@@ -50,6 +50,24 @@ export class RetriesExhausted extends Error {
   }
 }
 
+/**
+ * A push whose run git could not finish, so whether the remote refs moved is unknown. The refs and the object ids
+ * each push leased against are kept as `updates`, so a caller can inspect them before any retry.
+ */
+export class RemoteWriteOutcomeUnknown extends Error {
+  override readonly name = "RemoteWriteOutcomeUnknown"
+  readonly updates: readonly { readonly ref: string; readonly expect: Oid | null }[]
+
+  constructor(updates: readonly { readonly ref: string; readonly expect: Oid | null }[], options?: ErrorOptions) {
+    const leases = updates.map(({ ref, expect }) => `${ref} expected ${expect}`).join("; ")
+    super(
+      `remote write outcome is unknown for ${leases}; inspect the remote refs at their expected object ids before retrying`,
+      options,
+    )
+    this.updates = updates.map(({ ref, expect }) => ({ ref, expect }))
+  }
+}
+
 /** A publish threw and its transaction receipt could not prove that it landed. */
 export class PublicationUnknown extends AggregateError {
   readonly label: string

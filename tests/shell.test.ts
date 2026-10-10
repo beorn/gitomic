@@ -1390,6 +1390,10 @@ describe.sequential("shell backend failure boundaries", () => {
       expect(failure).toBeInstanceOf(Error)
       if (!(failure instanceof Error)) throw new Error("timed-out remote write unexpectedly succeeded")
       expect(failure.message).toContain(`remote write outcome is unknown for ${ref} expected ${expected}`)
+      // Typed, so a caller can tell an uncertain push from a failure that proves nothing moved.
+      expect(failure).toBeInstanceOf(gitomic.RemoteWriteOutcomeUnknown)
+      if (!(failure instanceof gitomic.RemoteWriteOutcomeUnknown)) throw new Error("uncertain push lost its type")
+      expect(failure.updates).toEqual([{ ref, expect: expected }])
       expect(failure.cause).toBeInstanceOf(gitomic.GitTimeout)
       if (!(failure.cause instanceof gitomic.GitTimeout)) throw new Error("remote write lost timeout cause")
       expect(failure.cause.message).toContain("10 ms limit")
