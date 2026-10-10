@@ -114,32 +114,68 @@ describe("maintainStore", () => {
     expect(result.detail).toMatch(/exited/u)
   })
 
-  test("a real split merge retires a valid layer and keeps it inside the grace; a layer aged past it is expired", async () => {
-    const { repo } = await storeWithLooseRefs(2)
+  test("on a shared mirror under writers, a split merge keeps a newly retired layer inside the grace and expires an aged one", async () => {
+    const source = await storeWithLooseRefs(2)
+    const repo = join(dirname(source.repo), "retire-mirror.git")
+    await git(dirname(source.repo), "clone", "--quiet", "--mirror", "--shared", source.repo, repo)
+    expect(readFileSync(join(repo, "objects", "info", "alternates"), "utf8").trim()).toBe(join(source.repo, "objects"))
     const directory = chainDirectory(repo)
     const chain = () => readFileSync(join(directory, "commit-graph-chain"), "utf8").split("\n").filter(Boolean)
     const layerFiles = () =>
       readdirSync(directory)
         .filter((name) => name.endsWith(".graph"))
         .map((name) => name.slice("graph-".length, -".graph".length))
+    const tree = (await git(repo, "rev-parse", "refs/heads/main^{tree}")).trim()
     const grow = async (count: number) =>
       appendEmptyHistory(repo, (await git(repo, "rev-parse", "refs/heads/main")).trim(), count)
+    /** A writer publishing new commits by compare-and-swap onto its own ref for as long as `upkeep` runs. */
+    const underWriter = async <T>(ref: string, upkeep: () => Promise<T>): Promise<{ result: T; published: number }> => {
+      let current = (await git(repo, "rev-parse", "refs/heads/main")).trim()
+      await git(repo, "update-ref", ref, current)
+      let running = true
+      let published = 0
+      let firstPublished!: () => void
+      const writing = new Promise<void>((resolve) => (firstPublished = resolve))
+      const writer = (async () => {
+        while (running) {
+          const next = (await git(repo, "commit-tree", tree, "-p", current, "-m", `${ref} ${published}`)).trim()
+          await git(repo, "update-ref", ref, next, current)
+          current = next
+          published++
+          firstPublished()
+        }
+      })()
+      try {
+        // Upkeep starts only once the writer is publishing, and the writer runs until upkeep returns.
+        await writing
+        const result = await upkeep()
+        return { result, published }
+      } finally {
+        running = false
+        await writer
+        expect((await git(repo, "rev-parse", ref)).trim()).toBe(current)
+      }
+    }
 
     expect((await maintainStore(repo)).outcome).toBe("maintained")
     const first = chain()
     await grow(60)
-    // A layer this large against the base merges them: git's own --split strategy retires the old layer.
-    const merged = await maintainStore(repo)
-    expect(merged).toMatchObject({ outcome: "maintained", layers: chain().length })
+    // A layer this large against the base merges them: git's own --split strategy retires the old layer, while a
+    // writer keeps publishing new commits onto the store.
+    const merge = await underWriter("refs/km/items/writer-merge", () => maintainStore(repo))
+    expect(merge.result).toMatchObject({ outcome: "maintained" })
+    expect(merge.published).toBeGreaterThanOrEqual(1)
     const retired = first.filter((hash) => !chain().includes(hash))
     expect(retired.length, `chain ${first.join(",")} -> ${chain().join(",")}`).toBeGreaterThan(0)
-    // Inside the grace a freshly retired, valid layer stays on disk for a reader that opened the old chain.
+    // Inside the grace a newly retired, valid layer stays on disk for a reader that opened the old chain.
     for (const hash of retired) expect(layerFiles()).toContain(hash)
 
     const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000)
     for (const hash of retired) utimesSync(join(directory, `graph-${hash}.graph`), twoHoursAgo, twoHoursAgo)
     await grow(2)
-    expect((await maintainStore(repo)).outcome).toBe("maintained")
+    const expire = await underWriter("refs/km/items/writer-expire", () => maintainStore(repo))
+    expect(expire.result).toMatchObject({ outcome: "maintained" })
+    expect(expire.published).toBeGreaterThanOrEqual(1)
     for (const hash of retired) expect(layerFiles()).not.toContain(hash)
     for (const hash of chain()) expect(layerFiles()).toContain(hash)
   })
