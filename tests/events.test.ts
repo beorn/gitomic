@@ -1370,9 +1370,9 @@ describe("chainsUnder over an explicit ref list (#28716)", () => {
     const backend = createMemBackend()
     const repo = "events-explicit-refs-refused"
     await seed(repo, backend, "refs/events/listed/", ["a"])
-    await expect(
-      chainsUnder("refs/events/listed/", { repo, backend, refs: ["refs/events/other/a"] }),
-    ).rejects.toThrow(/refs\/events\/other\/a.*not under refs\/events\/listed\//)
+    await expect(chainsUnder("refs/events/listed/", { repo, backend, refs: ["refs/events/other/a"] })).rejects.toThrow(
+      /refs\/events\/other\/a.*not under refs\/events\/listed\//,
+    )
     await expect(
       chainsUnder("refs/events/listed/", { repo, backend, refs: ["refs/events/listed/a"], remote: "origin" }),
     ).rejects.toThrow(/locally/)
