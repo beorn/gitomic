@@ -1342,3 +1342,61 @@ describe("complete traversal past the read budget (#27354)", () => {
     }
   })
 })
+
+describe("chainsUnder over an explicit ref list (#28716)", () => {
+  const seed = async (repo: string, backend: GitomicBackend, prefix: string, names: readonly string[]) => {
+    for (const name of names) {
+      const events = await openEvents({ repo, ref: `${prefix}${name}`, backend })
+      await events.append([{ type: "opened" }, { type: `note-${name}` }], { expect: null })
+    }
+  }
+
+  test("walks exactly the named refs, each chain equal to the whole-prefix walk's", async () => {
+    const backend = createMemBackend()
+    const repo = "events-explicit-refs"
+    await seed(repo, backend, "refs/events/listed/", ["a", "b", "c", "d"])
+    const whole = await chainsUnder("refs/events/listed/", { repo, backend })
+    const some = await chainsUnder("refs/events/listed/", {
+      repo,
+      backend,
+      refs: ["refs/events/listed/a", "refs/events/listed/c"],
+    })
+    expect([...some.keys()].sort()).toEqual(["refs/events/listed/a", "refs/events/listed/c"])
+    expect(some.get("refs/events/listed/c")).toEqual(whole.get("refs/events/listed/c"))
+    expect(some.get("refs/events/listed/a")).toEqual(whole.get("refs/events/listed/a"))
+  })
+
+  test("a named ref outside the prefix, or named refs with a remote, refuse before any read", async () => {
+    const backend = createMemBackend()
+    const repo = "events-explicit-refs-refused"
+    await seed(repo, backend, "refs/events/listed/", ["a"])
+    await expect(
+      chainsUnder("refs/events/listed/", { repo, backend, refs: ["refs/events/other/a"] }),
+    ).rejects.toThrow(/refs\/events\/other\/a.*not under refs\/events\/listed\//)
+    await expect(
+      chainsUnder("refs/events/listed/", { repo, backend, refs: ["refs/events/listed/a"], remote: "origin" }),
+    ).rejects.toThrow(/locally/)
+  })
+
+  test("on the shell backend, named refs are one exact listing and one walk", async () => {
+    const fixture = await createBareRepo()
+    try {
+      const backend = createShellBackend()
+      await seed(fixture.repo, backend, "refs/events/listed/", ["a", "b", "c"])
+      const spy = vi.spyOn(childProcess, "spawn")
+      const chains = await chainsUnder("refs/events/listed/", {
+        repo: fixture.repo,
+        backend,
+        refs: ["refs/events/listed/b", "refs/events/listed/c"],
+      })
+      expect([...chains.keys()].sort()).toEqual(["refs/events/listed/b", "refs/events/listed/c"])
+      const walks = spy.mock.calls.filter(
+        (call) => call[0] === "git" && (call[1] as string[]).some((arg) => arg === "rev-list" || arg === "log"),
+      )
+      expect(walks).toHaveLength(1)
+      expect(gitSpawns(spy)).toBeLessThanOrEqual(2)
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+})
