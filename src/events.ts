@@ -208,6 +208,13 @@ export type ChainsUnderOptions = ListRefsOptions & {
    * one that filled `limit` — is refused by ref, never returned short.
    */
   complete?: boolean
+  /**
+   * Walk exactly these full ref names instead of every ref under the prefix. Each must be
+   * under the prefix; one absent from the repository is omitted, as `listRefs` omits it.
+   * One call is still one walk, so a caller that already listed the prefix bounds the
+   * commits one walk holds by passing the listing a slice at a time. Local only.
+   */
+  refs?: readonly string[]
 }
 
 /** The one trailer key gitomic/events names: the envelope's `type`. Its value is opaque. */
@@ -765,14 +772,23 @@ export async function listRefs(prefix: string, options: ListRefsOptions): Promis
  * ONE `readHistory` over all of them, with each chain rebuilt from its commits'
  * first parents. A chain the shared walk did not reach its root on is refused
  * loudly rather than returned short; `complete: true` continues those chains in
- * bounded waves, per ref, until each reaches its root.
+ * bounded waves, per ref, until each reaches its root. With `refs`, only those
+ * refs are listed and walked (#28716).
  */
 export async function chainsUnder(prefix: string, options: ChainsUnderOptions): Promise<ReadonlyMap<string, Event[]>> {
   const limit = normalizeLimit(options.limit)
   const complete = options.complete === true
   const backend = requireEvents(options.backend ?? createShellBackend())
   let refs: ReadonlyMap<string, Oid>
-  if (options.remote === undefined) {
+  if (options.refs !== undefined) {
+    if (options.remote !== undefined) {
+      throw new TypeError("chainsUnder reads named refs locally only; omit remote, or omit refs to read the prefix")
+    }
+    for (const ref of options.refs) {
+      if (!ref.startsWith(prefix)) throw new TypeError(`chainsUnder: ${ref} is not under ${prefix}`)
+    }
+    refs = options.refs.length === 0 ? new Map() : await backend.listRefs(options.repo, options.refs)
+  } else if (options.remote === undefined) {
     refs = await backend.listRefs(options.repo, prefix)
   } else {
     // ONE fetch brings every tip under the prefix and its objects, into

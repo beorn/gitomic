@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `chainsUnder(prefix, { refs })` walks exactly the named refs under the prefix
+  (local only; a name outside the prefix, or `refs` with `remote`, refuses before
+  any read; an absent ref is omitted as `listRefs` omits it). One call is still
+  one walk, so a caller that already listed the prefix bounds the commits one walk
+  holds by passing the listing a slice at a time (28716).
+
 ## 0.10.0 — 2026-10-03
 
 ### Breaking
