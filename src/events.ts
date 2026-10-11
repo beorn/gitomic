@@ -19,6 +19,7 @@ import {
   GENESIS_MESSAGE,
   GITOMIC_IDENT,
   isCurrentGeneratedCommit,
+  refUnderPrefix,
   validateOid,
   zeroOid,
 } from "./git-object.ts"
@@ -785,7 +786,7 @@ export async function chainsUnder(prefix: string, options: ChainsUnderOptions): 
       throw new TypeError("chainsUnder reads named refs locally only; omit remote, or omit refs to read the prefix")
     }
     for (const ref of options.refs) {
-      if (!ref.startsWith(prefix)) throw new TypeError(`chainsUnder: ${ref} is not under ${prefix}`)
+      if (!refUnderPrefix(ref, prefix)) throw new TypeError(`chainsUnder: ${ref} is not under ${prefix}`)
     }
     refs = options.refs.length === 0 ? new Map() : await backend.listRefs(options.repo, options.refs)
   } else if (options.remote === undefined) {

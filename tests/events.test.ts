@@ -1376,6 +1376,10 @@ describe("chainsUnder over an explicit ref list (#28716)", () => {
     await expect(
       chainsUnder("refs/events/listed/", { repo, backend, refs: ["refs/events/listed/a"], remote: "origin" }),
     ).rejects.toThrow(/locally/)
+    // The same boundary the whole-prefix arm lists by: `refs/events/listedx` is not under `refs/events/listed`.
+    await expect(chainsUnder("refs/events/listed", { repo, backend, refs: ["refs/events/listedx"] })).rejects.toThrow(
+      /refs\/events\/listedx.*not under refs\/events\/listed/,
+    )
   })
 
   test("on the shell backend, named refs are one exact listing and one walk", async () => {
