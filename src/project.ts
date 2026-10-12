@@ -525,6 +525,14 @@ type IndexCarry =
       readonly expectedDirtyPaths: string[]
       readonly repairedIndexFrom?: string
       readonly normalized?: NormalizedIndexProof
+      /**
+       * A tree-ish whose tree the index holds exactly, when the carry left it there. It is the base the projection's
+       * `read-tree -m -u` must run against: a projection that re-enters after its own probe already moved the index
+       * onto `to` (a directory<->file swap in particular) is refused by a merge against `from`, because the stale base
+       * disagrees with the index STRUCTURALLY while losing nothing. Unset when no commit's tree was matched (the walk
+       * branch, which merges before returning).
+       */
+      readonly indexBase?: string
     }
   | { readonly ok: false; readonly outcome: Extract<CheckoutSyncOutcome, { readonly ok: false }> }
 
@@ -638,7 +646,7 @@ function carryIndexTo(
   const expected = [...expectedDirtyPaths]
   for (const commit of alreadyAt === undefined ? [tip] : [tip, alreadyAt]) {
     const same = git(repoRoot, readonlyArgs(["diff-index", "--cached", "--quiet", commit, "--"]), undefined, baseEnv)
-    if (same.status === 0) return { ok: true, expectedDirtyPaths: expected }
+    if (same.status === 0) return { ok: true, expectedDirtyPaths: expected, indexBase: commit }
     if (same.status !== 1) {
       return refuse(
         `${ref} in the checkout ${repoRoot}: the index could not be compared with ${commit} (${gitDetail(same)}). ` +
@@ -659,7 +667,12 @@ function carryIndexTo(
       const normalized = proveNormalizedIndex(repoRoot, tip, indexTree, expected, baseEnv)
       if (normalized !== undefined) {
         const resolved = new Set(normalized.paths.map((capture) => capture.path))
-        return { ok: true, expectedDirtyPaths: expected.filter((path) => !resolved.has(path)), normalized }
+        return {
+          ok: true,
+          expectedDirtyPaths: expected.filter((path) => !resolved.has(path)),
+          normalized,
+          indexBase: indexTree.tree,
+        }
       }
     } catch (error) {
       return refuse(`${ref} in ${repoRoot}: normalization proof failed (${String(error)}). Nothing was changed.`)
@@ -714,7 +727,7 @@ function carryIndexTo(
   if (!matching.ok) return refuse(`${ref} in ${repoRoot}: ${matching.detail}. Nothing was changed.`)
   const staged = stageAuthoredPaths(repoRoot, ref, ancestor, tip, matching.paths, expected, baseEnv)
   if (!staged.ok) return { ok: false, outcome: staged.outcome }
-  const merged = git(repoRoot, ["read-tree", "-m", "-u", ancestor, tip], undefined, baseEnv)
+  const merged = git(repoRoot, ["read-tree", "-m", "-u", staged.mergeBase ?? ancestor, tip], undefined, baseEnv)
   if (merged.status !== 0) {
     const unstaged = unstageAuthoredPaths(repoRoot, ancestor, matching.paths, baseEnv)
     const unstageNote = unstaged === undefined ? "" : ` The matching paths could not be unstaged: ${unstaged}.`
@@ -807,7 +820,21 @@ export function isBareRepository(repoRoot: string, baseEnv?: NodeJS.ProcessEnv):
 type DirtRead = { readonly ok: true; readonly paths: string[] } | { readonly ok: false; readonly detail: string }
 
 type AuthoredStage =
-  | { readonly ok: true; readonly expectedDirtyPaths: string[]; readonly normalized?: NormalizedIndexProof }
+  | {
+      readonly ok: true
+      readonly expectedDirtyPaths: string[]
+      readonly normalized?: NormalizedIndexProof
+      /**
+       * The tree the index holds once the authored paths are staged — the honest base for the `read-tree -m -u` that
+       * follows. Staging moves the index off the caller's `from`, and a directory<->file swap makes that divergence
+       * STRUCTURAL: git answers a two-way merge against the stale `from` with `Untracked working tree file '<path>'
+       * would be removed by merge`, refusing a move that loses nothing — every authored path was just verified
+       * byte-for-byte against the landing, so the checkout's content at those paths IS the landing's. A base that
+       * already holds the index's shape leaves no local divergence there, and the swap merges like any other move.
+       * Absent when nothing was staged; callers then keep the old base.
+       */
+      readonly mergeBase?: string
+    }
   | { readonly ok: false; readonly outcome: Extract<CheckoutSyncOutcome, { readonly ok: false }> }
 
 /** Compare checkout bytes in the same clean-filtered representation that Git stages. */
@@ -818,6 +845,32 @@ function filteredCheckoutBlob(
   baseEnv?: NodeJS.ProcessEnv,
 ): GitOutcome {
   return gitWithInput(repoRoot, ["hash-object", `--path=${path}`, "--stdin"], content, undefined, baseEnv)
+}
+
+/**
+ * `tip`'s tree entry at one path - mode and oid - or undefined when `tip` holds nothing there.
+ *
+ * Asked ALONE, because a batch `ls-tree` silently omits a TREE entry whenever a path beneath it is named in the same
+ * call, and a directory<->file swap names exactly that pair. To the callers below the omission is indistinguishable
+ * from a removal, so a boundary path has to be resolved on its own before they can tell the two apart.
+ */
+function landedEntry(
+  repoRoot: string,
+  tip: string,
+  path: string,
+  baseEnv?: NodeJS.ProcessEnv,
+):
+  | { readonly ok: true; readonly entry: { readonly mode: string; readonly oid: string } | undefined }
+  | { readonly ok: false; readonly detail: string } {
+  const listed = git(repoRoot, readonlyArgs(["ls-tree", "-z", tip, "--", path]), undefined, baseEnv)
+  if (listed.status !== 0) return { ok: false, detail: `reading ${tip}'s entry for ${path}: ${gitDetail(listed)}` }
+  if (listed.stdout === "") return { ok: true, entry: undefined }
+  const tab = listed.stdout.indexOf("\t")
+  const [mode, , oid] = listed.stdout.slice(0, tab).split(" ")
+  if (tab < 0 || mode === undefined || oid === undefined) {
+    return { ok: false, detail: `reading ${tip}'s entry for ${path}: unparsable ls-tree output` }
+  }
+  return { ok: true, entry: { mode, oid } }
 }
 
 /** Prove exact matches and name every dirty landing path that Git's two-way merge must not overwrite. */
@@ -859,18 +912,41 @@ function matchingLandingDirt(
     if (mode !== undefined && oid !== undefined) landed.set(entry.slice(tab + 1), { mode, oid })
   }
   const paths: string[] = []
+  const blockers: string[] = []
   for (const path of candidates) {
     let stat: ReturnType<typeof lstatSync> | undefined
     try {
       stat = lstatSync(join(topLevel, path))
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      const code = (error as NodeJS.ErrnoException).code
+      // ENOENT is absence. ENOTDIR is the same absence when a parent component is a file - exactly the
+      // shape a directory<->file swap leaves in the checkout - so it is not dirt the projection must
+      // refuse; the target comparison below still blocks when the landing kept the path.
+      if (code !== "ENOENT" && code !== "ENOTDIR") {
         return { ok: false, detail: `reading ${path}: ${error instanceof Error ? error.message : String(error)}` }
       }
     }
-    const target = landed.get(path)
+    let target = landed.get(path)
+    if (target === undefined && stat?.isDirectory()) {
+      // A directory in the checkout the batch listing did not resolve is the swap's boundary, not a removal: resolve
+      // it alone so the branch below can tell a landing DIRECTORY from a landing that deleted the path.
+      const one = landedEntry(topLevel, to, path, baseEnv)
+      if (!one.ok) return { ok: false, detail: one.detail }
+      target = one.entry
+    }
+    if (target?.mode === "040000") {
+      // The landing turns this path into a DIRECTORY: git stores a tree, not a blob, and the content rides in the
+      // child paths, each a candidate of its own. A checkout holding a directory there holds that shape at the
+      // boundary, and a checkout holding nothing is not dirt either - the merge creates the directory over an
+      // absent path. Only a checkout still holding a FILE is the stale shape, because that file's content is not
+      // the landing's, so only that blocks.
+      if (stat !== undefined && !stat.isDirectory()) blockers.push(path)
+      else paths.push(path)
+      continue
+    }
     if (stat === undefined) {
       if (target === undefined) paths.push(path)
+      else blockers.push(path)
     } else if (
       stat.isFile() &&
       (target?.mode === "100644" || target?.mode === "100755") &&
@@ -880,13 +956,15 @@ function matchingLandingDirt(
         const filtered = filteredCheckoutBlob(topLevel, path, readFileSync(join(topLevel, path)), baseEnv)
         if (filtered.status !== 0) return { ok: false, detail: `clean-filtering ${path}: ${gitDetail(filtered)}` }
         if (filtered.stdout.trim() === target.oid) paths.push(path)
+        else blockers.push(path)
       } catch (error) {
         return { ok: false, detail: `reading ${path}: ${error instanceof Error ? error.message : String(error)}` }
       }
+    } else {
+      blockers.push(path)
     }
   }
-  const matching = new Set(paths)
-  return { ok: true, paths, blockers: candidates.filter((path) => !matching.has(path)) }
+  return { ok: true, paths, blockers }
 }
 
 /**
@@ -954,25 +1032,67 @@ function stageAuthoredPaths(
     baseEnv,
   )
   if (listed.status !== 0) return unreadable(`${to}'s tree entries for the authored paths`, listed)
-  const landed = new Map<string, string>()
+  const landed = new Map<string, { mode: string; oid: string }>()
   for (const entry of nulPaths(listed.stdout)) {
     const tab = entry.indexOf("\t")
-    landed.set(entry.slice(tab + 1), entry.slice(0, tab).split(" ")[2] ?? "")
+    const [mode, , oid] = entry.slice(0, tab).split(" ")
+    if (mode !== undefined && oid !== undefined) landed.set(entry.slice(tab + 1), { mode, oid })
   }
   // Verify every path before staging any: never a half-staged index.
+  // A directory<->file swap needs the index to cross the boundary in two steps: `update-index` refuses
+  // "'X' appears as both a file and as a directory" while the old entry is still there, so the paths the landing
+  // turns into DIRECTORIES are force-removed first (`--remove` cannot do it - it drops only paths MISSING from the
+  // checkout, and these are present as directories), and the rest is staged after. Within that second call
+  // removals precede additions for the same reason in the opposite direction: the path the landing turns into a
+  // file must leave the index before the file enters it.
+  const absent: string[] = []
+  const present: string[] = []
+  const dropped: string[] = []
   for (const path of authoredPaths) {
-    const landedOid = landed.get(path) ?? null
+    let target = landed.get(path)
     let content: Buffer | undefined
+    let directory = false
     try {
       content = readFileSync(join(topLevel, path))
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      const code = (error as NodeJS.ErrnoException).code
+      // ENOENT is absence, and ENOTDIR is the same absence when a parent component is a file. EISDIR is the mirror:
+      // the checkout holds a DIRECTORY where the landing names a path. All three are exactly the shapes a
+      // directory<->file swap leaves, so none is dirt the projection must refuse on its own; the landing comparison
+      // below still refuses whenever the checkout does not hold what the landing does.
+      if (code === "EISDIR") directory = true
+      else if (code !== "ENOENT" && code !== "ENOTDIR") {
         return unreadable(`the checkout file ${path} (${(error as Error).message})`, {
           status: 1,
           stdout: "",
           stderr: "",
         })
       }
+    }
+    if (target === undefined && directory) {
+      // The batch listing drops a TREE entry when a path beneath it is named in the same call - the directory<->file
+      // swap itself. Resolve the boundary alone before deciding whether the checkout holds the landing's shape.
+      const one = landedEntry(topLevel, to, path, baseEnv)
+      if (!one.ok) return unreadable(one.detail, { status: 1, stdout: "", stderr: "" })
+      target = one.entry
+    }
+    const landedOid = target?.oid ?? null
+    // A path the landing turns into a DIRECTORY carries no blob of its own: git stores a tree, and the content rides
+    // in the child paths, each named authored in its own right. A checkout already holding a directory holds that
+    // shape at the boundary, so the only thing to stage is the index's stale FILE entry - dropping it here is what
+    // lets the children index below instead of the join refusing "'<path>' appears as both a file and as a
+    // directory". A checkout still holding a file has not made the swap, and refuses.
+    if (target?.mode === "040000") {
+      if (!landingPaths.has(path)) return mismatch(path, null, target.oid, "the landing did not change that path")
+      if (directory) {
+        dropped.push(path)
+        continue
+      }
+      if (content === undefined) continue
+      return mismatch(path, null, target.oid, "the checkout holds a file where the landing holds a directory")
+    }
+    if (directory) {
+      return mismatch(path, null, landedOid, "the checkout holds a directory where the landing holds a file")
     }
     let checkoutOid: string | null = null
     if (content !== undefined) {
@@ -985,6 +1105,8 @@ function stageAuthoredPaths(
     if (checkoutOid !== landedOid) {
       return mismatch(path, checkoutOid, landedOid, "the checkout does not hold the landed content")
     }
+    if (content === undefined) absent.push(path)
+    else present.push(path)
   }
 
   const refusal = (detail: string, rollback: boolean): AuthoredStage => {
@@ -1007,7 +1129,15 @@ function stageAuthoredPaths(
       return refusal(String(error), false)
     }
   }
-  const staged = git(topLevel, ["update-index", "--add", "--remove", "--", ...authoredPaths], undefined, baseEnv)
+  if (dropped.length > 0) {
+    const removal = git(topLevel, ["update-index", "--force-remove", "--", ...dropped], undefined, baseEnv)
+    if (removal.status !== 0) {
+      return normalized === undefined
+        ? unreadable("dropping the authored directory paths", removal)
+        : refusal(gitDetail(removal), true)
+    }
+  }
+  const staged = git(topLevel, ["update-index", "--add", "--remove", "--", ...absent, ...present], undefined, baseEnv)
   if (staged.status !== 0) {
     return normalized === undefined
       ? unreadable("staging the authored paths", staged)
@@ -1015,6 +1145,7 @@ function stageAuthoredPaths(
   }
   const authored = new Set(authoredPaths)
   let updated = normalized
+  let mergeBase: string | undefined
   if (normalized !== undefined) {
     try {
       const after = indexTreeFromCopy(topLevel, baseEnv)
@@ -1042,13 +1173,21 @@ function stageAuthoredPaths(
         preserved: normalized.preserved.filter((capture) => !authored.has(capture.path)),
       }
       reverifyNormalizedIndex(topLevel, updated)
+      mergeBase = after.tree
     } catch (error) {
       return refusal(String(error), true)
     }
+  } else {
+    // No normalization proof to reuse: read the staged index's own tree so a structural swap has a base that matches
+    // it. The read is a `write-tree` over a copy, lock-free like every other index read here.
+    const after = indexTreeFromCopy(topLevel, baseEnv)
+    if (!after.ok) return unreadable(`the staged index tree (${after.detail})`, { status: 1, stdout: "", stderr: "" })
+    mergeBase = after.tree
   }
   return {
     ok: true,
     expectedDirtyPaths: expectedDirtyPaths.filter((path) => !authored.has(path)),
+    ...(mergeBase === undefined ? {} : { mergeBase }),
     ...(updated === undefined ? {} : { normalized: updated }),
   }
 }
@@ -1230,7 +1369,12 @@ export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): Check
       }
     }
   }
-  const merged = git(repoRoot, ["read-tree", "-m", "-u", normalized?.tree ?? from, to], undefined, baseEnv)
+  const merged = git(
+    repoRoot,
+    ["read-tree", "-m", "-u", authored.mergeBase ?? carried.indexBase ?? normalized?.tree ?? from, to],
+    undefined,
+    baseEnv,
+  )
   if (merged.status !== 0) {
     const unstaged = unstageAuthoredPaths(repoRoot, from, stagedPaths, baseEnv, normalized, to)
     const unstageNote =
@@ -1603,7 +1747,13 @@ function projectFetchedCommit(request: RemoteFirstProjectionRequest, sourceOid: 
       }
     }
   }
-  const probed = git(repoRoot, ["read-tree", "-m", "-u", normalized?.tree ?? localTip, to])
+  const probed = git(repoRoot, [
+    "read-tree",
+    "-m",
+    "-u",
+    authored.mergeBase ?? carried.indexBase ?? normalized?.tree ?? localTip,
+    to,
+  ])
   if (probed.status !== 0) {
     const unstaged = unstageAuthoredPaths(repoRoot, localTip, stagedPaths, undefined, normalized, to)
     const expected = [...expectedDirtyPaths].sort()

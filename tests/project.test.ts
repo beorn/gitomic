@@ -1238,6 +1238,44 @@ describe("gitomic project and checkout synchronization", () => {
       },
     )
 
+    test("an index left at an ancestor crosses the ancestor's directory<->file swap", () => {
+      const root = mkdtempSync(join(tmpdir(), "gitomic-swap-carry-"))
+      roots.push(root)
+      git(root, "init", "-q", "--initial-branch=main", "swap")
+      const repo = join(root, "swap")
+      mkdirSync(join(repo, ".km"))
+      writeFileSync(join(repo, ".km/config.yaml"), "base\n")
+      git(repo, "add", "-A")
+      git(repo, "commit", "-qm", "base km dir")
+      const ancestor = git(repo, "rev-parse", "HEAD")
+      rmSync(join(repo, ".km"), { recursive: true, force: true })
+      writeFileSync(join(repo, ".km"), "trap\n")
+      git(repo, "add", "-A")
+      git(repo, "commit", "-qm", "swap km dir to file")
+      const head = git(repo, "rev-parse", "HEAD")
+      // The index remembers the ancestor while the checkout already holds the landing's shape.
+      git(repo, "read-tree", ancestor)
+      const expectedDirtyPaths = worktreeDirtyPaths(repo)
+      expect(expectedDirtyPaths).toEqual([".km"])
+
+      const outcome = synchronizeCheckoutToCommit({
+        repoRoot: repo,
+        from: head,
+        to: head,
+        ref: "refs/heads/main",
+        expectedDirtyPaths,
+      })
+
+      expect(outcome, JSON.stringify(outcome)).toEqual({
+        ok: true,
+        kind: "synchronized",
+        dirtyPaths: [],
+        repairedIndexFrom: ancestor,
+      })
+      expect(readFileSync(join(repo, ".km"), "utf8")).toBe("trap\n")
+      expect(worktreeDirtyPaths(repo)).toEqual([])
+    })
+
     test("a git read past the output limit names ENOBUFS, never its truncated output", () => {
       const root = mkdtempSync(join(tmpdir(), "gitomic-enobufs-"))
       roots.push(root)
@@ -2085,6 +2123,47 @@ describe("gitomic project and checkout synchronization", () => {
       expect(worktreeDirtyPaths(checkout)).toEqual([])
     })
 
+    test("a path the landing turns from a file into a directory projects clean: EISDIR is the same swap", async () => {
+      const { root, bare, checkout } = remoteFixture()
+      // base: ".km" is a FILE
+      writeFileSync(join(checkout, ".km"), "trap\n")
+      git(checkout, "add", ".km")
+      git(checkout, "commit", "-qm", "base km file")
+      git(checkout, "push", "-q", "origin", "main")
+
+      // the checkout already holds the landing's shape: ".km" is a DIRECTORY
+      rmSync(join(checkout, ".km"), { force: true })
+      mkdirSync(join(checkout, ".km"))
+      writeFileSync(join(checkout, ".km/config.yaml"), "trap\n")
+      const expectedDirtyPaths = worktreeDirtyPaths(checkout)
+
+      git(root, "clone", "-q", bare, "swapper2")
+      const swapper = join(root, "swapper2")
+      git(swapper, "config", "user.email", "swapper@example.invalid")
+      git(swapper, "config", "user.name", "Swapper")
+      rmSync(join(swapper, ".km"), { force: true })
+      mkdirSync(join(swapper, ".km"))
+      writeFileSync(join(swapper, ".km/config.yaml"), "trap\n")
+      git(swapper, "add", ".km")
+      git(swapper, "commit", "-qm", "swap km file to dir")
+      git(swapper, "push", "-q", "origin", "main")
+      const to = git(swapper, "rev-parse", "HEAD")
+
+      const outcome = await projectRemoteFirstFastForward({
+        repoRoot: checkout,
+        to,
+        ref: "refs/heads/main",
+        remote: "origin",
+        expectedDirtyPaths,
+        authoredPaths: [".km", ".km/config.yaml"],
+      })
+
+      expect(outcome, JSON.stringify(outcome)).toMatchObject({ ok: true, kind: "synchronized", dirtyPaths: [] })
+      expect(git(checkout, "rev-parse", "HEAD")).toBe(to)
+      expect(indexHolds(checkout, to)).toBe(true)
+      expect(worktreeDirtyPaths(checkout)).toEqual([])
+    })
+
     test("a landing that also carries another writer's path (a CAS retry) ends clean at the landing's tree", async () => {
       const { root, bare, checkout } = remoteFixture()
       writeFileSync(join(checkout, "tracked.md"), "# authored\n")
@@ -2155,6 +2234,48 @@ describe("gitomic project and checkout synchronization", () => {
       expect(outcome.ok ? "" : outcome.error).toContain("the landing did not change that path")
       expect(git(checkout, "rev-parse", "HEAD")).toBe(before)
       expect(indexHolds(checkout, before)).toBe(true)
+    })
+
+    test("a path the landing turns from a directory into a file projects clean: ENOTDIR is absence, not dirt", async () => {
+      const { root, bare, checkout } = remoteFixture()
+      // base: ".km" is a directory holding config.yaml
+      mkdirSync(join(checkout, ".km"))
+      writeFileSync(join(checkout, ".km/config.yaml"), "base\n")
+      git(checkout, "add", ".km/config.yaml")
+      git(checkout, "commit", "-qm", "base km dir")
+      git(checkout, "push", "-q", "origin", "main")
+
+      // the checkout already holds the landing's shape: ".km" is a FILE, so ".km/config.yaml" cannot exist
+      rmSync(join(checkout, ".km"), { recursive: true })
+      writeFileSync(join(checkout, ".km"), "trap\n")
+      const expectedDirtyPaths = worktreeDirtyPaths(checkout)
+
+      // the landing performs the same directory -> file swap
+      git(root, "clone", "-q", bare, "swapper")
+      const swapper = join(root, "swapper")
+      git(swapper, "config", "user.email", "swapper@example.invalid")
+      git(swapper, "config", "user.name", "Swapper")
+      git(swapper, "rm", "-q", ".km/config.yaml")
+      rmSync(join(swapper, ".km"), { recursive: true, force: true })
+      writeFileSync(join(swapper, ".km"), "trap\n")
+      git(swapper, "add", ".km")
+      git(swapper, "commit", "-qm", "swap km dir to file")
+      git(swapper, "push", "-q", "origin", "main")
+      const to = git(swapper, "rev-parse", "HEAD")
+
+      const outcome = await projectRemoteFirstFastForward({
+        repoRoot: checkout,
+        to,
+        ref: "refs/heads/main",
+        remote: "origin",
+        expectedDirtyPaths,
+        authoredPaths: [".km", ".km/config.yaml"],
+      })
+
+      expect(outcome, JSON.stringify(outcome)).toMatchObject({ ok: true, kind: "synchronized", dirtyPaths: [] })
+      expect(git(checkout, "rev-parse", "HEAD")).toBe(to)
+      expect(indexHolds(checkout, to)).toBe(true)
+      expect(worktreeDirtyPaths(checkout)).toEqual([])
     })
 
     test("synchronizeCheckoutToCommit stages the authored paths of an object-side landing and ends clean", () => {
