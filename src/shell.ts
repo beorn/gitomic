@@ -2361,7 +2361,9 @@ export function waitOutHeldFetchLockMs(random: RandomUnit = Math.random): number
  * ONE `update-ref`, which holds its first ref's lock from prepare to its last rename — measured 2026-10-12 on a cold
  * copy of the live STATE origin at 3,096 refs: p50 582 ms, max 624 ms (@cto 474f2c8c). Geometric ×3 to a cap of at
  * least twice that max; git's own `core.filesRefLockTimeout` wait (100 ms) inside every attempt adds to the reach.
- * Fixed, not jittered: one process waiting on its own rival needs no spread, and a test can name the pauses.
+ * The hold grows with N (every landed write adds a ref): when the adoption's N doubles, measure again and resize; past
+ * that the window is stale. Fixed, not jittered: one process waiting on its own rival needs no spread, and a test can
+ * name the pauses.
  */
 const PUBLISH_HELD_LOCK_PAUSES_MS = [50, 150, 450, 1350] as const
 
