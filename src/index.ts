@@ -359,6 +359,7 @@ export async function openReader(options: OpenReaderOptions): Promise<Reader> {
           oid = commit.parent
         }
       }
+      // Other CommitMeta fields may borrow the history listing; callers retaining them must copy them.
       return commits.map((commit) => ({
         ...commit,
         oid: ownUtf8(commit.oid),
