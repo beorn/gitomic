@@ -197,7 +197,10 @@ describe("read-only reader", () => {
       { encoding: "utf8", timeout: 10_000 },
     )
     expect(stderr).toBe("")
-    const result = JSON.parse(stdout)
+    const result = JSON.parse(stdout) as {
+      ids: Array<{ oid: string; parent: string | null; parents: string[] }>
+      retainedBytes: number
+    }
     expect(result.ids).toEqual([
       { oid: "a".repeat(40), parent: "b".repeat(40), parents: ["b".repeat(40), "c".repeat(40)] },
       { oid: "b".repeat(40), parent: null, parents: [] },
@@ -283,7 +286,10 @@ describe("read-only reader", () => {
       { encoding: "utf8", timeout: 10_000 },
     )
     expect(stderr).toBe("")
-    const result = JSON.parse(stdout)
+    const result = JSON.parse(stdout) as {
+      changes: Array<{ path: string; from: string | null; to: string | null }>
+      retainedBytes: number
+    }
     expect(result.changes).toEqual([
       { path: "notes/add-é.md", from: null, to: "d".repeat(40) },
       { path: "notes/change-雪.md", from: "c".repeat(40), to: "d".repeat(40) },
