@@ -1967,9 +1967,21 @@ async function publishLocal(
   const failed = (code: number | null, detail: string) =>
     new Error(`git update-ref --stdin failed (${code})${detail ? `: ${detail}` : ""}`)
 
-  const first = await attempt(new Set())
+  let first = await attempt(new Set())
   if (first.code === 0) return outcomesOf(updates, new Set())
-  const firstDetail = first.stderr.toString("utf8").trim()
+  let firstDetail = first.stderr.toString("utf8").trim()
+  // A held ref lock is another live writer mid-update, often this same process adopting one fetched ref twice (hh
+  // 28492: km's start fold and its publisher's first pass creating one item ref in one kept copy), or a lock a killed
+  // git left behind. Wait it out and re-run the SAME transaction, as the fetch and the kept-copy refresh already do, so
+  // a create that meets the ref the rival just made is classified from the re-read below: adopted at its oid, or a
+  // Conflict naming that oid. Only a lock still held past the window is named "locked".
+  for (const pause of PUBLISH_HELD_LOCK_PAUSES_MS) {
+    if (lockHeld(firstDetail) === undefined) break
+    await pauseFor(pause)
+    first = await attempt(new Set())
+    if (first.code === 0) return outcomesOf(updates, new Set())
+    firstDetail = first.stderr.toString("utf8").trim()
+  }
   const firstHeld = lockHeld(firstDetail)
   if (firstHeld !== undefined) throw firstHeld
 
@@ -2323,6 +2335,20 @@ const HELD_LOCK_SPREAD_MS = 75
 /** Full-jitter wait from @bearly/pacing (25676) over the held-lock window: never above HELD_LOCK_FLOOR_MS + HELD_LOCK_SPREAD_MS. */
 export function waitOutHeldFetchLockMs(random: RandomUnit = Math.random): number {
   return HELD_LOCK_FLOOR_MS + Math.floor(fullJitter(HELD_LOCK_SPREAD_MS, HELD_LOCK_SPREAD_MS, 0, random))
+}
+
+/**
+ * A ref lock another live writer holds clears in milliseconds; a local publish waits these out, re-running its
+ * transaction, before it names the lock (hh 28492). Fixed, not jittered: one process waiting on its own rival needs no
+ * spread, and a test can name the pauses.
+ */
+const PUBLISH_HELD_LOCK_PAUSES_MS = [50, 150, 450] as const
+
+function pauseFor(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    // raw-lifecycle-ok: the publish retry awaits this pause, so it cannot outlive its caller.
+    setTimeout(resolve, ms)
+  })
 }
 
 /** A short jittered wait, so a retry does not land inside the lock window of the fetch that holds it. */

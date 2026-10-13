@@ -478,7 +478,12 @@ lease is lost, nothing lands. A lost `also` lease throws `Conflict` and is never
 retried; a lost chain lease is the usual race. A failure that is not a per-ref
 rejection (network, auth, a missing remote) is an ordinary error, never a
 `Conflict`. Remote unchanged is "as advertised at push time, not locked"; local
-unchanged is verified inside the transaction.
+unchanged is verified inside the transaction. A local ref lock another writer
+holds at publish time is waited out (50, 150, then 450 ms, re-running the whole
+transaction each time) before anything is decided from it: a rival that created
+the ref at oid meanwhile reads as unchanged, one that left another oid is a
+Conflict naming that oid, and only a lock that outlives the window is a
+Conflict observed `locked`.
 
 **A null `oid` deletes.** `{ ref, expect, oid: null }` removes `ref` in the same
 atomic publish, leased at `expect`, which must be a real id. A delete is strict:

@@ -192,7 +192,7 @@ async function createGitWrapper(): Promise<{
     wrapper,
     [
       "#!/usr/bin/env node",
-      'const { appendFileSync } = require("node:fs")',
+      'const { appendFileSync, existsSync, readFileSync, writeFileSync } = require("node:fs")',
       "const args = process.argv.slice(2)",
       "const commands = process.env.GITOMIC_COMMAND_LOG",
       'if (commands) appendFileSync(commands, JSON.stringify(args) + "\\n")',
@@ -241,6 +241,19 @@ async function createGitWrapper(): Promise<{
       "  return",
       "}",
       'const updateRef = args.indexOf("update-ref")',
+      // One stderr text per successive update-ref call, then success: what git says while a rival holds a ref lock
+      // and then once the rival's own update has landed (hh 28492). The marker file counts the calls across processes.
+      "if (updateRef >= 0 && process.env.GITOMIC_UPDATE_REF_ERRORS) {",
+      "  const errors = JSON.parse(process.env.GITOMIC_UPDATE_REF_ERRORS)",
+      "  const mark = process.env.GITOMIC_UPDATE_REF_ERRORS_MARK",
+      '  const seen = existsSync(mark) ? Number(readFileSync(mark, "utf8")) : 0',
+      "  writeFileSync(mark, String(seen + 1))",
+      "  if (seen < errors.length) {",
+      "    process.stderr.write(errors[seen])",
+      "    process.exit(128)",
+      "  }",
+      "  process.exit(0)",
+      "}",
       "if (updateRef >= 0 && process.env.GITOMIC_UPDATE_REF_ERROR) {",
       "  process.stderr.write(process.env.GITOMIC_UPDATE_REF_ERROR)",
       "  process.exit(128)",
@@ -252,6 +265,10 @@ async function createGitWrapper(): Promise<{
       'if (args.includes("for-each-ref") && process.env.GITOMIC_FAKE_LOCAL_REFS !== undefined) {',
       "  process.stdout.write(process.env.GITOMIC_FAKE_LOCAL_REFS)",
       "  process.exit(0)",
+      "}",
+      // An unset `extensions.refStorage`, as git answers it: no output, exit 1 (the files backend).
+      'if (args.includes("config") && args.includes("--get") && args.includes("extensions.refStorage")) {',
+      "  process.exit(1)",
       "}",
       'if (args.includes("rev-parse")) {',
       "  process.stdout.write(`${process.env.GITOMIC_FAKE_HEAD}\\n`)",
@@ -1725,6 +1742,86 @@ describe.sequential("shell backend failure boundaries", () => {
       restore()
       await wrapper.cleanup()
     }
+  })
+
+  /**
+   * @failure A local publish whose create met a ref lock another writer held for a moment threw "is at locked, not
+   *          absent" at once, so a rival that created the same ref at the same oid failed the whole publish: km's start
+   *          fold lost its item refs to the publisher's first pass that way on every cold kept copy (hh 28492).
+   */
+  describe.sequential("a held ref lock on a local publish", () => {
+    const ref = "refs/km/items/01M3BFMHWVFZJ41FY03E4AS0JP"
+    const zero = "0".repeat(40)
+    const next = "2".repeat(40)
+    const held = `fatal: prepare: cannot lock ref '${ref}': Unable to create '/tmp/gitomic-fake.git/${ref}.lock': File exists.\n`
+    const exists = `fatal: prepare: cannot lock ref '${ref}': reference already exists\n`
+
+    async function publishCreate(env: Record<string, string>) {
+      const wrapper = await createGitWrapper()
+      const directory = await mkdtemp(join(tmpdir(), "gitomic-held-lock-"))
+      const commands = join(directory, "commands.log")
+      const restore = replaceEnvironment({
+        GITOMIC_FAKE_GITDIR: "/tmp/gitomic-fake.git",
+        GITOMIC_COMMAND_LOG: commands,
+        GITOMIC_UPDATE_REF_ERRORS_MARK: join(directory, "update-ref-calls"),
+        LC_ALL: "C",
+        PATH: `${wrapper.bin}${delimiter}${process.env.PATH ?? ""}`,
+        ...env,
+      })
+      const timers = vi.spyOn(globalThis, "setTimeout")
+      try {
+        const outcome = await createShellBackend().publish!("ignored", [{ ref, expect: zero, oid: next }]).then(
+          (result) => ({ result, error: undefined }),
+          (error: unknown) => ({ result: undefined, error }),
+        )
+        const updateRefs = (await readFile(commands, "utf8").catch(() => ""))
+          .split("\n")
+          .filter((line) => line.includes('"update-ref"')).length
+        const pauses = timers.mock.calls
+          .map(([, delay]) => delay)
+          .filter((delay): delay is number => typeof delay === "number" && delay >= 50)
+        return { ...outcome, updateRefs, pauses }
+      } finally {
+        timers.mockRestore()
+        restore()
+        await rm(directory, { recursive: true, force: true })
+        await wrapper.cleanup()
+      }
+    }
+
+    test("adopts the ref a rival created at the same oid while it held the lock: unchanged, never locked", async () => {
+      const { result, error, updateRefs, pauses } = await publishCreate({
+        GITOMIC_UPDATE_REF_ERRORS: JSON.stringify([held, exists]),
+        GITOMIC_FAKE_LOCAL_REFS: `${next} ${ref}\n`,
+      })
+      expect(error).toBeUndefined()
+      expect(result).toEqual({ outcomes: [{ ref, outcome: "unchanged" }] })
+      expect(updateRefs).toBe(3)
+      expect(pauses).toEqual([50])
+    })
+
+    test("names the oid a rival left on the ref, never the lock, when it differs", async () => {
+      const other = "3".repeat(40)
+      const { result, error } = await publishCreate({
+        GITOMIC_UPDATE_REF_ERRORS: JSON.stringify([held, exists]),
+        GITOMIC_FAKE_LOCAL_REFS: `${other} ${ref}\n`,
+      })
+      expect(result).toBeUndefined()
+      expect(error).toBeInstanceOf(Conflict)
+      expect((error as Error).message).toContain(`${ref} is at ${other}, not absent`)
+      expect((error as Error).message).not.toContain("locked")
+    })
+
+    test("names the lock only after waiting it out, while it stays held and the ref stays absent", async () => {
+      const { result, error, pauses } = await publishCreate({
+        GITOMIC_UPDATE_REF_ERROR: held,
+        GITOMIC_FAKE_LOCAL_REFS: "",
+      })
+      expect(result).toBeUndefined()
+      expect(error).toBeInstanceOf(Conflict)
+      expect((error as Error).message).toContain(`${ref} is at locked, not absent`)
+      expect(pauses).toEqual([50, 150, 450])
+    })
   })
 
   /** @failure A rival that moved the ref after the remote advertised it made an atomic publish "unknown", so a CAS loop stopped instead of replaying. */
