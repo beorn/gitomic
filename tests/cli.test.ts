@@ -1246,12 +1246,15 @@ describe("gitomic CLI — --json receipt on write verbs", () => {
 
 describe("gitomic CLI — usage errors (exit 2, never silent)", () => {
   test.each(["--help", "-h"])("%s prints every verb without opening a repository", async (flag) => {
-    await expect(promisify(execFile)("git", ["rev-parse", "--git-dir"], { cwd: workdir })).rejects.toMatchObject({
+    // A managed temporary directory may sit inside a repository; keep discovery inside this fixture.
+    const env = { ...process.env, GIT_CEILING_DIRECTORIES: join(workdir, "..") }
+    await expect(promisify(execFile)("git", ["rev-parse", "--git-dir"], { cwd: workdir, env })).rejects.toMatchObject({
       code: 128,
     })
 
     const result = await promisify(execFile)("bun", [fileURLToPath(new URL("../src/bin.ts", import.meta.url)), flag], {
       cwd: workdir,
+      env,
       encoding: "utf8",
     })
 
