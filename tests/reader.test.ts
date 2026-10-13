@@ -2,6 +2,9 @@
 // @level l1
 // @consumer read-only Git snapshot consumers
 
+import { execFile } from "node:child_process"
+import { promisify } from "node:util"
+
 import { describe, expect, test, vi } from "vitest"
 
 import { open, openReader } from "../src/index.js"
@@ -147,6 +150,64 @@ describe("read-only reader", () => {
     expect(calls).toEqual([{ tips: [commits[2]], limit: 2 }])
   })
 
+  test.each(["batched", "per-commit"])("log %s IDs do not retain whole history backing storage", async (mode) => {
+    const { stdout, stderr } = await promisify(execFile)(
+      "bun",
+      [
+        "-e",
+        `
+          import { Buffer } from "node:buffer";
+          import { heapStats } from "bun:jsc";
+          import { openReader } from ${JSON.stringify(new URL("../src/index.ts", import.meta.url).href)};
+          import { createMemBackend } from ${JSON.stringify(new URL("../src/mem.ts", import.meta.url).href)};
+          const mem = createMemBackend();
+          const repo = "reader-owned-history";
+          const reader = await openReader({ repo, backend: mem });
+          const template = await mem.readCommit(repo, await reader.head());
+          const tip = "a".repeat(40);
+          const parent = "b".repeat(40);
+          const mergeParent = "c".repeat(40);
+          function readCommit(oid) {
+            const history = Buffer.from("x".repeat(8 * 1024 * 1024) + "\\0" +
+              [oid, ...(oid === tip ? [parent, mergeParent] : [])].join("\\0"), "utf8").toString("utf8");
+            const ids = history.split("\\0").slice(1);
+            return { ...template, oid: ids[0], parent: ids[1] ?? null, parents: ids.slice(1) };
+          }
+          const backend = {
+            ...mem,
+            readCommit: async (_repo, oid) => readCommit(oid),
+            readHistory: ${JSON.stringify(mode)} === "batched"
+              ? async () => [readCommit(tip), readCommit(parent)]
+              : undefined,
+          };
+          const logReader = await openReader({ repo, backend });
+          Bun.gc(true);
+          const baseline = heapStats().extraMemorySize;
+          // A history consumer caches identities, while message/author metadata has its own lifetime.
+          globalThis.retainedIds = (await logReader.log({ from: tip, limit: 2 }))
+            .map(({ oid, parent, parents }) => ({ oid, parent, parents }));
+          await new Promise(resolve => setTimeout(resolve, 0));
+          Bun.gc(true);
+          console.log(JSON.stringify({
+            ids: globalThis.retainedIds,
+            retainedBytes: heapStats().extraMemorySize - baseline,
+          }));
+        `,
+      ],
+      { encoding: "utf8", timeout: 10_000 },
+    )
+    expect(stderr).toBe("")
+    const result = JSON.parse(stdout) as {
+      ids: Array<{ oid: string; parent: string | null; parents: string[] }>
+      retainedBytes: number
+    }
+    expect(result.ids).toEqual([
+      { oid: "a".repeat(40), parent: "b".repeat(40), parents: ["b".repeat(40), "c".repeat(40)] },
+      { oid: "b".repeat(40), parent: null, parents: [] },
+    ])
+    expect(result.retainedBytes).toBeLessThan(4 * 1024 * 1024)
+  })
+
   test("diff sorts add/remove/modify identities and respects the backend file projection", async () => {
     const mem = createMemBackend()
     const repo = "reader-projected-diff"
@@ -178,6 +239,64 @@ describe("read-only reader", () => {
     ])
     expect(readTree).toHaveBeenCalledTimes(2)
     expect(await reader.diff(second.oid, second.oid)).toEqual([])
+  })
+
+  test("diff values do not retain the backing storage of whole tree listings", async () => {
+    // The accepted lifetime contract concerns Bun's sliced strings, even when Vitest runs on Node.
+    // Keep all three changed identities alive across GC: equality tests cannot detect their backing storage.
+    const { stdout, stderr } = await promisify(execFile)(
+      "bun",
+      [
+        "-e",
+        `
+          import { Buffer } from "node:buffer";
+          import { heapStats } from "bun:jsc";
+          import { openReader } from ${JSON.stringify(new URL("../src/index.ts", import.meta.url).href)};
+          import { createMemBackend } from ${JSON.stringify(new URL("../src/mem.ts", import.meta.url).href)};
+          const before = "a".repeat(40);
+          const after = "b".repeat(40);
+          const oldOid = "c".repeat(40);
+          const newOid = "d".repeat(40);
+          const backend = {
+            ...createMemBackend(),
+            async readTree(_repo, commit) {
+              const records = commit === before
+                ? [["notes/change-雪.md", oldOid], ["notes/remove-🦊.md", oldOid]]
+                : [["notes/add-é.md", newOid], ["notes/change-雪.md", newOid]];
+              const listing = Buffer.from("x".repeat(8 * 1024 * 1024) + "\\0" +
+                records.map(([path, oid]) => oid + "\\t" + path).join("\\0"), "utf8").toString("utf8");
+              return new Map(listing.split("\\0").slice(1).map(record => {
+                const tab = record.indexOf("\\t");
+                return [record.slice(tab + 1), { oid: record.slice(0, tab), mode: "100644" }];
+              }));
+            },
+          };
+          const reader = await openReader({ repo: "reader-owned-diff", backend });
+          Bun.gc(true);
+          const baseline = heapStats().extraMemorySize;
+          globalThis.retainedChanges = await reader.diff(before, after);
+          await new Promise(resolve => setTimeout(resolve, 0));
+          Bun.gc(true);
+          console.log(JSON.stringify({
+            changes: globalThis.retainedChanges,
+            retainedBytes: heapStats().extraMemorySize - baseline,
+          }));
+        `,
+      ],
+      { encoding: "utf8", timeout: 10_000 },
+    )
+    expect(stderr).toBe("")
+    const result = JSON.parse(stdout) as {
+      changes: Array<{ path: string; from: string | null; to: string | null }>
+      retainedBytes: number
+    }
+    expect(result.changes).toEqual([
+      { path: "notes/add-é.md", from: null, to: "d".repeat(40) },
+      { path: "notes/change-雪.md", from: "c".repeat(40), to: "d".repeat(40) },
+      { path: "notes/remove-🦊.md", from: "c".repeat(40), to: null },
+    ])
+    // Allow runtime noise far beyond these few hundred bytes, but never either 8 MiB listing.
+    expect(result.retainedBytes).toBeLessThan(4 * 1024 * 1024)
   })
 
   test("diff requires both endpoints to exist, including equal missing endpoints", async () => {
