@@ -1266,7 +1266,9 @@ describe.sequential("shell backend failure boundaries", () => {
     }
   })
 
-  test("uses one selected executable for the version probe, repository resolution, reads and writes", async () => {
+  // @failure Complete history reads flush per record, while a global buffering change delays streaming readers (28856).
+  // Existing executable coverage never observed per-command buffering or its inherited environment scope.
+  test("uses one selected executable and buffers only complete history reads", async () => {
     const pair = await createRemoteRepos()
     const directory = await mkdtemp(join(tmpdir(), "gitomic-selected-git-"))
     const selected = join(directory, "selected-git")
@@ -1280,7 +1282,7 @@ describe.sequential("shell backend failure boundaries", () => {
         "#!/usr/bin/env node",
         'const { appendFileSync } = require("node:fs")',
         'const { spawnSync } = require("node:child_process")',
-        `appendFileSync(${JSON.stringify(calls)}, JSON.stringify(process.argv.slice(2)) + "\\n")`,
+        `appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ args: process.argv.slice(2), flush: process.env.GIT_FLUSH }) + "\\n")`,
         `const result = spawnSync(${JSON.stringify(native)}, process.argv.slice(2), { stdio: "inherit" })`,
         "if (result.error) throw result.error",
         "process.exit(result.status ?? 1)",
@@ -1288,17 +1290,32 @@ describe.sequential("shell backend failure boundaries", () => {
       { mode: 0o755 },
     )
     try {
-      const backend = createShellBackend({ gitExecutable: "selected-git", baseEnv: { PATH: directory } })
+      const backend = createShellBackend({
+        gitExecutable: "selected-git",
+        baseEnv: { PATH: directory, GIT_FLUSH: "1" },
+      })
       expect(await backend.head(pair.left, "refs/heads/main")).toBe(pair.initial)
-      expect((await backend.readHistory!(pair.left, [pair.initial], { limit: 1 }))[0]?.oid).toBe(pair.initial)
+      expect((await backend.readHistory!(pair.left, [pair.initial], { limit: 1 }))[0]).toEqual(
+        await backend.readCommit(pair.left, pair.initial),
+      )
+      const streamed = []
+      for await (const edge of backend.readHistoryEdges!(pair.left, [pair.initial])) streamed.push(edge)
+      expect(streamed).toContainEqual({ kind: "commit", oid: pair.initial })
       expect((await backend.listRefs!(pair.left, "refs/heads/", "origin")).get("refs/heads/main")).toBe(pair.initial)
       await expect(
         backend.publish!(pair.left, [{ ref: "refs/yrd/selected-git-test", expect: "0".repeat(40), oid: pair.initial }]),
       ).resolves.toBeDefined()
-      const argv = (await readFile(calls, "utf8"))
+      const observed = (await readFile(calls, "utf8"))
         .trim()
         .split("\n")
-        .map((line) => JSON.parse(line) as string[])
+        .map((line) => JSON.parse(line) as { args: string[]; flush: string })
+      const complete = observed.filter(({ args }) => args.some((arg) => arg.includes("%ct%x00%an")))
+      expect(complete).toHaveLength(1)
+      expect(complete[0]?.flush).toBe("0")
+      const other = observed.filter((row) => !complete.includes(row))
+      expect(other.find(({ args }) => args.includes("--format=%H%x00%P%x00"))?.flush).toBe("1")
+      expect(new Set(other.map(({ flush }) => flush))).toEqual(new Set(["1"]))
+      const argv = observed.map(({ args }) => args)
       expect(argv.some((args) => args.includes("--version"))).toBe(true)
       expect(argv.some((args) => args.includes("--git-common-dir"))).toBe(true)
       expect(argv.some((args) => args.includes("update-ref"))).toBe(true)

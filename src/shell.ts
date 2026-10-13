@@ -1331,7 +1331,8 @@ async function readHistory(
       "--format=%H%x00%P%x00%ct%x00%an%x00%ae%x00%cn%x00%ce%x00%B%x00",
       "--stdin",
     ],
-    { baseEnv, input: revisions },
+    // This call consumes complete output; buffering avoids one pipe delivery per commit.
+    { baseEnv, input: revisions, env: { GIT_FLUSH: "0" } },
   )
   const fields = decodeUtf8(output, "git rev-list history").split("\0")
   const trailing = fields.pop()
