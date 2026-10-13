@@ -529,16 +529,25 @@ class AbsoluteDeadlineExpired extends Error {
   }
 }
 
+/**
+ * What the caller's absolute deadline still allows, with group teardown reserved, or `undefined` without one. A spawn
+ * or a wait that needs `needMs` and cannot have it throws {@link AbsoluteDeadlineExpired} naming the command it was for.
+ */
+function remainingBeforeAbsoluteDeadline(command: string, args: readonly string[], needMs = 0): number | undefined {
+  const runtime = shellRuntime.getStore()
+  if (runtime?.absoluteDeadlineMs === undefined) return undefined
+  const now = performance.now()
+  const remaining = runtime.absoluteDeadlineMs - now - GROUP_STOP_GRACE_MS
+  if (remaining <= needMs) throw new AbsoluteDeadlineExpired(runtime.absoluteDeadlineMs, now, command, args)
+  return remaining
+}
+
 async function run(command: string, args: readonly string[], options: GitOptions = {}): Promise<GitResult> {
   const runtime = shellRuntime.getStore()
   const selectedTimeoutMs = options.timeoutMs === undefined ? runtime?.localTimeoutMs : options.timeoutMs
   let timeoutMs = selectedTimeoutMs === undefined ? undefined : normalizeTimeoutMs(selectedTimeoutMs, "timeoutMs")
-  if (runtime?.absoluteDeadlineMs !== undefined) {
-    const now = performance.now()
-    const remaining = runtime.absoluteDeadlineMs - now - GROUP_STOP_GRACE_MS
-    if (remaining <= 0) throw new AbsoluteDeadlineExpired(runtime.absoluteDeadlineMs, now, command, args)
-    timeoutMs = timeoutMs === undefined ? remaining : Math.min(timeoutMs, remaining)
-  }
+  const remaining = remainingBeforeAbsoluteDeadline(command, args)
+  if (remaining !== undefined) timeoutMs = timeoutMs === undefined ? remaining : Math.min(timeoutMs, remaining)
   // oxlint-disable-next-line promise/param-names -- resolveResult cannot shadow the imported path.resolve.
   return new Promise((resolveResult, reject) => {
     const maxBytes = options.maxBytes === undefined ? undefined : normalizeHistoryEdgeByteCap(options.maxBytes)
@@ -1920,11 +1929,15 @@ function outcomesOf(updates: readonly RefUpdate[], unchanged: ReadonlySet<string
  * under the ref locks before committing any of them, so either every ref moves
  * or none does.
  *
- * On ANY failure, the error text decides nothing, with one exception: a lock
- * held by another writer is a Conflict on that ref, observed "locked", so a
- * chain race retries as contention should. Otherwise ONE `for-each-ref` reads
- * every ref in the transaction, and each is classified from that structured
- * output:
+ * A ref lock another writer holds is waited out FIRST: the whole transaction
+ * re-runs, unchanged, after each pause in {@link PUBLISH_HELD_LOCK_PAUSES_MS}
+ * (a prepare failure modifies nothing, so a re-run cannot double-apply), and
+ * only a lock still held after the last pause is a Conflict on that ref,
+ * observed "locked", so a chain race retries as contention should.
+ *
+ * On ANY other failure, the error text decides nothing: ONE `for-each-ref`
+ * reads every ref in the transaction, and each is classified from that
+ * structured output:
  * - at oid: `verify <ref> <oid>` (unchanged);
  * - at expect, or absent for a create: keep `update`;
  * - a delete keeps its `delete` line only at expect;
@@ -1932,15 +1945,17 @@ function outcomesOf(updates: readonly RefUpdate[], unchanged: ReadonlySet<string
  *   re-run.
  * With no Conflict, the whole transaction runs ONCE more with the rewritten
  * lines, and its failure is final. That is one process on success and at most
- * three on failure.
+ * six on failure: four `update-ref` attempts (the first plus one per pause),
+ * the `for-each-ref`, and the rewritten run.
  */
 async function publishLocal(
   repo: string,
   updates: readonly RefUpdate[],
   baseEnv?: NodeJS.ProcessEnv,
 ): Promise<PublishResult> {
+  const updateRefArgs = durableGitArgs(repo, ["update-ref", "--stdin"])
   const attempt = (unchanged: ReadonlySet<string>) =>
-    run(selectedGit(), durableGitArgs(repo, ["update-ref", "--stdin"]), {
+    run(selectedGit(), updateRefArgs, {
       baseEnv,
       input: [
         "start",
@@ -1977,6 +1992,9 @@ async function publishLocal(
   // Conflict naming that oid. Only a lock still held past the window is named "locked".
   for (const pause of PUBLISH_HELD_LOCK_PAUSES_MS) {
     if (lockHeld(firstDetail) === undefined) break
+    // The caller's absolute deadline bounds this wait as it bounds every spawn: a pause that would outlive it is not
+    // taken, and the publish stops here with AbsoluteDeadlineExpired, as the fetch loop does.
+    remainingBeforeAbsoluteDeadline(selectedGit(), updateRefArgs, pause)
     await pauseFor(pause)
     first = await attempt(new Set())
     if (first.code === 0) return outcomesOf(updates, new Set())
@@ -2338,24 +2356,20 @@ export function waitOutHeldFetchLockMs(random: RandomUnit = Math.random): number
 }
 
 /**
- * A ref lock another live writer holds clears in milliseconds; a local publish waits these out, re-running its
- * transaction, before it names the lock (hh 28492). Fixed, not jittered: one process waiting on its own rival needs no
- * spread, and a test can name the pauses.
+ * A local publish waits these out, re-running its transaction, before it names a ref lock another live writer holds
+ * (hh 28492). Sized from the rival it waits for: km's publisher pass adopting every item ref a cold kept copy lacks in
+ * ONE `update-ref`, which holds its first ref's lock from prepare to its last rename — measured 2026-10-12 on a cold
+ * copy of the live STATE origin at 3,096 refs: p50 582 ms, max 624 ms (@cto 474f2c8c). Geometric ×3 to a cap of at
+ * least twice that max; git's own `core.filesRefLockTimeout` wait (100 ms) inside every attempt adds to the reach.
+ * Fixed, not jittered: one process waiting on its own rival needs no spread, and a test can name the pauses.
  */
-const PUBLISH_HELD_LOCK_PAUSES_MS = [50, 150, 450] as const
+const PUBLISH_HELD_LOCK_PAUSES_MS = [50, 150, 450, 1350] as const
 
+/** The one pause both held-lock retries await; neither can outlive its caller. */
 function pauseFor(ms: number): Promise<void> {
   return new Promise((resolve) => {
-    // raw-lifecycle-ok: the publish retry awaits this pause, so it cannot outlive its caller.
+    // raw-lifecycle-ok: the retry awaits this pause, so it cannot outlive its caller.
     setTimeout(resolve, ms)
-  })
-}
-
-/** A short jittered wait, so a retry does not land inside the lock window of the fetch that holds it. */
-function waitOutHeldFetchLock(): Promise<void> {
-  return new Promise((resolve) => {
-    // raw-lifecycle-ok: the fetch retry awaits this wait, so it cannot outlive its caller.
-    setTimeout(resolve, waitOutHeldFetchLockMs())
   })
 }
 
@@ -2420,7 +2434,7 @@ async function fetchRefs(
       // only a cache of remote tips, so fetching again reads them afresh.
       const race = lostFetchedRefRace(error, namespace)
       if (race !== undefined && attempt < FETCH_RACE_ATTEMPTS) {
-        if (race === "held") await waitOutHeldFetchLock()
+        if (race === "held") await pauseFor(waitOutHeldFetchLockMs())
         continue
       }
       if (race !== undefined) {

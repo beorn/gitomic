@@ -479,7 +479,7 @@ retried; a lost chain lease is the usual race. A failure that is not a per-ref
 rejection (network, auth, a missing remote) is an ordinary error, never a
 `Conflict`. Remote unchanged is "as advertised at push time, not locked"; local
 unchanged is verified inside the transaction. A local ref lock another writer
-holds at publish time is waited out (50, 150, then 450 ms, re-running the whole
+holds at publish time is waited out (50, 150, 450, then 1350 ms, re-running the whole
 transaction each time) before anything is decided from it: a rival that created
 the ref at oid meanwhile reads as unchanged, one that left another oid is a
 Conflict naming that oid, and only a lock that outlives the window is a

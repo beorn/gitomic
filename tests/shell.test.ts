@@ -1756,7 +1756,7 @@ describe.sequential("shell backend failure boundaries", () => {
     const held = `fatal: prepare: cannot lock ref '${ref}': Unable to create '/tmp/gitomic-fake.git/${ref}.lock': File exists.\n`
     const exists = `fatal: prepare: cannot lock ref '${ref}': reference already exists\n`
 
-    async function publishCreate(env: Record<string, string>) {
+    async function publishCreate(env: Record<string, string>, options: gitomic.ShellBackendOptions = {}) {
       const wrapper = await createGitWrapper()
       const directory = await mkdtemp(join(tmpdir(), "gitomic-held-lock-"))
       const commands = join(directory, "commands.log")
@@ -1770,7 +1770,7 @@ describe.sequential("shell backend failure boundaries", () => {
       })
       const timers = vi.spyOn(globalThis, "setTimeout")
       try {
-        const outcome = await createShellBackend().publish!("ignored", [{ ref, expect: zero, oid: next }]).then(
+        const outcome = await createShellBackend(options).publish!("ignored", [{ ref, expect: zero, oid: next }]).then(
           (result) => ({ result, error: undefined }),
           (error: unknown) => ({ result: undefined, error }),
         )
@@ -1820,8 +1820,47 @@ describe.sequential("shell backend failure boundaries", () => {
       expect(result).toBeUndefined()
       expect(error).toBeInstanceOf(Conflict)
       expect((error as Error).message).toContain(`${ref} is at locked, not absent`)
-      expect(pauses).toEqual([50, 150, 450])
+      expect(pauses).toEqual([50, 150, 450, 1350])
     })
+
+    test("stops at the caller's absolute deadline rather than taking a pause that would outlive it", async () => {
+      // run() reserves GROUP_STOP_GRACE_MS (2 s) before the deadline; 700 ms remain for the publish itself: three
+      // wrapper spawns and the first two pauses fit, the 450 ms pause does not.
+      const { result, error, updateRefs, pauses } = await publishCreate(
+        { GITOMIC_UPDATE_REF_ERROR: held, GITOMIC_FAKE_LOCAL_REFS: "" },
+        { absoluteDeadlineMs: performance.now() + 2_000 + 700 },
+      )
+      expect(result).toBeUndefined()
+      expect((error as Error).name).toBe("AbsoluteDeadlineExpired")
+      expect(updateRefs).toBe(3)
+      // Under a deadline every spawn also arms its own kill timer; only the schedule's pauses are the wait.
+      expect(pauses.filter((delay) => [50, 150, 450, 1350].includes(delay))).toEqual([50, 150])
+    })
+
+    /**
+     * @failure The first schedule (50, 150, 450 ms) was sized from nothing: the live rival — the publisher's first pass
+     *          adopting every item ref a cold kept copy lacks in ONE update-ref — held its first ref lock for up to
+     *          624 ms over 3,096 refs on a copy of the live STATE origin (2026-10-12); before any wait, a lock held
+     *          that long was named "locked" at once, and real git adds its own 100 ms lock wait to every attempt.
+     */
+    test("waits out a real lock a rival holds for 1.5× the measured live adoption, then adopts the ref it left", async () => {
+      const { repo, initial, cleanup } = await createBareRepo({ refFormat: "files" })
+      try {
+        // The rival mid-update: git's own lock file, already holding the oid it will commit.
+        await mkdir(join(repo, "refs/km/items"), { recursive: true })
+        await writeFile(join(repo, `${ref}.lock`), `${initial}\n`)
+        const release = new Promise<void>((resolve) => {
+          // raw-lifecycle-ok: the test awaits the publish this rival races, so the timer cannot outlive it.
+          setTimeout(() => void rename(join(repo, `${ref}.lock`), join(repo, ref)).then(resolve), 950)
+        })
+        const result = await createShellBackend().publish!(repo, [{ ref, expect: zero, oid: initial }])
+        await release
+        expect(result).toEqual({ outcomes: [{ ref, outcome: "unchanged" }] })
+        expect(await git(repo, "rev-parse", ref)).toBe(initial)
+      } finally {
+        await cleanup()
+      }
+    }, 30_000)
   })
 
   /** @failure A rival that moved the ref after the remote advertised it made an atomic publish "unknown", so a CAS loop stopped instead of replaying. */
