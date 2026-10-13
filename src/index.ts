@@ -116,6 +116,7 @@ export {
 export { identProblem, objectOid } from "./git-object.ts"
 export type { Edit } from "./edits.js"
 export { matchGlob } from "./glob.ts"
+export { parseCommit } from "./git-object.ts"
 export {
   batchCheck,
   createShellBackend,

@@ -14,9 +14,8 @@ import { promisify } from "node:util"
 
 import { describe, expect, test } from "vitest"
 
-import { apply, identProblem, open, resolveGitAuthor } from "../src/index.js"
+import { apply, identProblem, open, parseCommit, resolveGitAuthor } from "../src/index.js"
 import type { CommitInput, GitomicBackend, Ident } from "../src/index.js"
-import { parseCommit } from "../src/git-object.js"
 import { openEvents } from "../src/events.js"
 import { createIsoBackend } from "../src/iso.js"
 import { createMemBackend } from "../src/mem.js"
