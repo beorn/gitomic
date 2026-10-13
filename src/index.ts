@@ -330,6 +330,11 @@ export async function apply(
   )
 }
 
+// Backend string slices may retain a much larger listing; public cached identities own their UTF-8 bytes.
+function ownUtf8(value: string): string {
+  return Buffer.from(value, "utf8").toString("utf8")
+}
+
 export async function openReader(options: OpenReaderOptions): Promise<Reader> {
   const context = await prepareReader(options)
   return {
@@ -343,17 +348,23 @@ export async function openReader(options: OpenReaderOptions): Promise<Reader> {
       // One batched walk when the backend has one: a single git process for the
       // whole range instead of one per commit. The start is pinned above, so a
       // writer landing mid-read cannot leak into this history either way.
-      if (context.backend.readHistory !== undefined) {
-        return context.backend.readHistory(context.repo, [start], { limit })
-      }
-      let oid: Oid | null = start
       const commits: CommitMeta[] = []
-      while (oid !== null && commits.length < limit) {
-        const commit = await context.backend.readCommit(context.repo, oid)
-        commits.push(commit)
-        oid = commit.parent
+      if (context.backend.readHistory !== undefined) {
+        commits.push(...(await context.backend.readHistory(context.repo, [start], { limit })))
+      } else {
+        let oid: Oid | null = start
+        while (oid !== null && commits.length < limit) {
+          const commit = await context.backend.readCommit(context.repo, oid)
+          commits.push(commit)
+          oid = commit.parent
+        }
       }
-      return commits
+      return commits.map((commit) => ({
+        ...commit,
+        oid: ownUtf8(commit.oid),
+        parent: commit.parent === null ? null : ownUtf8(commit.parent),
+        parents: commit.parents.map(ownUtf8),
+      }))
     },
     async diff(from, to) {
       validateOid(from)
@@ -370,9 +381,9 @@ export async function openReader(options: OpenReaderOptions): Promise<Reader> {
         if (beforeOid !== afterOid) {
           // Own these small values: backend slices can otherwise keep whole tree listings alive.
           changes.push({
-            path: Buffer.from(path, "utf8").toString("utf8"),
-            from: beforeOid === undefined ? null : Buffer.from(beforeOid, "utf8").toString("utf8"),
-            to: afterOid === undefined ? null : Buffer.from(afterOid, "utf8").toString("utf8"),
+            path: ownUtf8(path),
+            from: beforeOid === undefined ? null : ownUtf8(beforeOid),
+            to: afterOid === undefined ? null : ownUtf8(afterOid),
           })
         }
       }
@@ -868,6 +879,7 @@ function makeSnapshot(
       await base.wholeListing()
       const exposed = [...base.listing.keys()].filter((path) => path.startsWith(normalized))
       assertExposed(base.listing, exposed)
+      // Returned keys can be listing slices; callers retaining them beyond this snapshot must copy them.
       return base
         .publicPaths()
         .filter((path) => path.startsWith(normalized))

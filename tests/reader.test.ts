@@ -150,6 +150,61 @@ describe("read-only reader", () => {
     expect(calls).toEqual([{ tips: [commits[2]], limit: 2 }])
   })
 
+  test.each(["batched", "per-commit"])("log %s IDs do not retain whole history backing storage", async (mode) => {
+    const { stdout, stderr } = await promisify(execFile)(
+      "bun",
+      [
+        "-e",
+        `
+          import { Buffer } from "node:buffer";
+          import { heapStats } from "bun:jsc";
+          import { openReader } from ${JSON.stringify(new URL("../src/index.ts", import.meta.url).href)};
+          import { createMemBackend } from ${JSON.stringify(new URL("../src/mem.ts", import.meta.url).href)};
+          const mem = createMemBackend();
+          const repo = "reader-owned-history";
+          const reader = await openReader({ repo, backend: mem });
+          const template = await mem.readCommit(repo, await reader.head());
+          const tip = "a".repeat(40);
+          const parent = "b".repeat(40);
+          const mergeParent = "c".repeat(40);
+          function readCommit(oid) {
+            const history = Buffer.from("x".repeat(8 * 1024 * 1024) + "\\0" +
+              [oid, ...(oid === tip ? [parent, mergeParent] : [])].join("\\0"), "utf8").toString("utf8");
+            const ids = history.split("\\0").slice(1);
+            return { ...template, oid: ids[0], parent: ids[1] ?? null, parents: ids.slice(1) };
+          }
+          const backend = {
+            ...mem,
+            readCommit: async (_repo, oid) => readCommit(oid),
+            readHistory: ${JSON.stringify(mode)} === "batched"
+              ? async () => [readCommit(tip), readCommit(parent)]
+              : undefined,
+          };
+          const logReader = await openReader({ repo, backend });
+          Bun.gc(true);
+          const baseline = heapStats().extraMemorySize;
+          // A history consumer caches identities, while message/author metadata has its own lifetime.
+          globalThis.retainedIds = (await logReader.log({ from: tip, limit: 2 }))
+            .map(({ oid, parent, parents }) => ({ oid, parent, parents }));
+          await new Promise(resolve => setTimeout(resolve, 0));
+          Bun.gc(true);
+          console.log(JSON.stringify({
+            ids: globalThis.retainedIds,
+            retainedBytes: heapStats().extraMemorySize - baseline,
+          }));
+        `,
+      ],
+      { encoding: "utf8", timeout: 10_000 },
+    )
+    expect(stderr).toBe("")
+    const result = JSON.parse(stdout)
+    expect(result.ids).toEqual([
+      { oid: "a".repeat(40), parent: "b".repeat(40), parents: ["b".repeat(40), "c".repeat(40)] },
+      { oid: "b".repeat(40), parent: null, parents: [] },
+    ])
+    expect(result.retainedBytes).toBeLessThan(4 * 1024 * 1024)
+  })
+
   test("diff sorts add/remove/modify identities and respects the backend file projection", async () => {
     const mem = createMemBackend()
     const repo = "reader-projected-diff"
