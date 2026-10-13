@@ -357,12 +357,14 @@ export async function openReader(options: OpenReaderOptions): Promise<Reader> {
     async diff(from, to) {
       validateOid(from)
       validateOid(to)
-      const before = makeSnapshot(context, from)
-      const after = makeSnapshot(context, to)
-      const [beforePaths, afterPaths] = await Promise.all([before.keys(), after.keys()])
+      const [before, after] = await Promise.all([
+        readLazyBase(context.backend, context.repo, from),
+        readLazyBase(context.backend, context.repo, to),
+      ])
       const changes: Change[] = []
-      for (const path of [...new Set([...beforePaths, ...afterPaths])].sort()) {
-        const [beforeOid, afterOid] = await Promise.all([before.oid(path), after.oid(path)])
+      for (const path of [...new Set([...before.publicPaths(), ...after.publicPaths()])].sort()) {
+        const beforeOid = before.oid(path)
+        const afterOid = after.oid(path)
         if (beforeOid !== afterOid) changes.push({ path, from: beforeOid ?? null, to: afterOid ?? null })
       }
       return changes

@@ -180,6 +180,45 @@ describe("read-only reader", () => {
     expect(await reader.diff(second.oid, second.oid)).toEqual([])
   })
 
+  test("diff requires both endpoints to exist, including equal missing endpoints", async () => {
+    const backend = createMemBackend()
+    const reader = await openReader({ repo: "reader-missing-diff", backend })
+    const present = await reader.head()
+    const missing = "f".repeat(40)
+
+    for (const [from, to] of [
+      [missing, present],
+      [present, missing],
+      [missing, missing],
+    ] as const) {
+      await expect(reader.diff(from, to)).rejects.toThrow(missing)
+    }
+  })
+
+  test.each(["120000", "160000"] as const)(
+    "diff refuses unchanged unsupported mode %s in its whole scope",
+    async (mode) => {
+      const mem = createMemBackend()
+      const repo = `reader-diff-mode-${mode}`
+      const writer = await open({ repo, ref: "main", backend: mem })
+      const first = await writer.transact(async (map) => map.set("changed", "before"), "before")
+      const second = await writer.transact(async (map) => map.set("changed", "after"), "after")
+      const backend: GitomicBackend = {
+        ...mem,
+        readTree: async (name, commit, prefix) => {
+          const listing = new Map(await mem.readTree(name, commit, prefix))
+          listing.set("unchanged/unsupported", { mode, oid: first.oid })
+          return listing
+        },
+      }
+      const reader = await openReader({ repo, backend })
+      const reason = `unsupported Git tree mode ${mode} at "unchanged/unsupported"`
+
+      await expect(reader.diff(first.oid, second.oid)).rejects.toThrow(reason)
+      await expect(reader.diff(second.oid, second.oid)).rejects.toThrow(reason)
+    },
+  )
+
   test("defaults to main and validates refs before invoking the backend", async () => {
     const mem = createMemBackend()
     const observedRefs: string[] = []
