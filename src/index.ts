@@ -357,6 +357,7 @@ export async function openReader(options: OpenReaderOptions): Promise<Reader> {
     async diff(from, to) {
       validateOid(from)
       validateOid(to)
+      // Diff exposes both whole trees; readLazyBase reuses the whole-exposure validation that keys() applied.
       const [before, after] = await Promise.all([
         readLazyBase(context.backend, context.repo, from),
         readLazyBase(context.backend, context.repo, to),
