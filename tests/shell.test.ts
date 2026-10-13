@@ -1756,10 +1756,20 @@ describe.sequential("shell backend failure boundaries", () => {
     const held = `fatal: prepare: cannot lock ref '${ref}': Unable to create '/tmp/gitomic-fake.git/${ref}.lock': File exists.\n`
     const exists = `fatal: prepare: cannot lock ref '${ref}': reference already exists\n`
 
-    async function publishCreate(env: Record<string, string>, options: gitomic.ShellBackendOptions = {}) {
+    async function publishCreate(
+      env: Record<string, string>,
+      options: gitomic.ShellBackendOptions = {},
+      // The clock gitomic's deadline checks read, as a function of the update-ref spawns so far: a row that names
+      // which pause outlives the deadline then never depends on how long the host took to spawn the wrapper.
+      clock?: (updateRefs: number) => number,
+    ) {
       const wrapper = await createGitWrapper()
       const directory = await mkdtemp(join(tmpdir(), "gitomic-held-lock-"))
       const commands = join(directory, "commands.log")
+      const updateRefCalls = () =>
+        (fs.existsSync(commands) ? fs.readFileSync(commands, "utf8") : "")
+          .split("\n")
+          .filter((line) => line.includes('"update-ref"')).length
       const restore = replaceEnvironment({
         GITOMIC_FAKE_GITDIR: "/tmp/gitomic-fake.git",
         GITOMIC_COMMAND_LOG: commands,
@@ -1769,19 +1779,20 @@ describe.sequential("shell backend failure boundaries", () => {
         ...env,
       })
       const timers = vi.spyOn(globalThis, "setTimeout")
+      const now =
+        clock === undefined ? undefined : vi.spyOn(performance, "now").mockImplementation(() => clock(updateRefCalls()))
       try {
         const outcome = await createShellBackend(options).publish!("ignored", [{ ref, expect: zero, oid: next }]).then(
           (result) => ({ result, error: undefined }),
           (error: unknown) => ({ result: undefined, error }),
         )
-        const updateRefs = (await readFile(commands, "utf8").catch(() => ""))
-          .split("\n")
-          .filter((line) => line.includes('"update-ref"')).length
+        const updateRefs = updateRefCalls()
         const pauses = timers.mock.calls
           .map(([, delay]) => delay)
           .filter((delay): delay is number => typeof delay === "number" && delay >= 50)
         return { ...outcome, updateRefs, pauses }
       } finally {
+        now?.mockRestore()
         timers.mockRestore()
         restore()
         await rm(directory, { recursive: true, force: true })
@@ -1824,11 +1835,14 @@ describe.sequential("shell backend failure boundaries", () => {
     })
 
     test("stops at the caller's absolute deadline rather than taking a pause that would outlive it", async () => {
-      // run() reserves GROUP_STOP_GRACE_MS (2 s) before the deadline; 700 ms remain for the publish itself: three
-      // wrapper spawns and the first two pauses fit, the 450 ms pause does not.
+      // run() reserves GROUP_STOP_GRACE_MS (2 s) before the deadline; 700 ms remain for the publish itself. The clock
+      // moves 100 ms per update-ref spawn and not otherwise, so after three spawns 400 ms remain: the first two
+      // pauses (50, 150) fit and the 450 ms pause does not, whatever the host's spawn time.
+      const start = performance.now()
       const { result, error, updateRefs, pauses } = await publishCreate(
         { GITOMIC_UPDATE_REF_ERROR: held, GITOMIC_FAKE_LOCAL_REFS: "" },
-        { absoluteDeadlineMs: performance.now() + 2_000 + 700 },
+        { absoluteDeadlineMs: start + 2_000 + 700 },
+        (spawns) => start + 100 * spawns,
       )
       expect(result).toBeUndefined()
       expect((error as Error).name).toBe("AbsoluteDeadlineExpired")
