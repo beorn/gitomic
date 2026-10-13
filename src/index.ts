@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer"
 import { randomUUID } from "node:crypto"
 
 import {
@@ -366,7 +367,14 @@ export async function openReader(options: OpenReaderOptions): Promise<Reader> {
       for (const path of [...new Set([...before.publicPaths(), ...after.publicPaths()])].sort()) {
         const beforeOid = before.oid(path)
         const afterOid = after.oid(path)
-        if (beforeOid !== afterOid) changes.push({ path, from: beforeOid ?? null, to: afterOid ?? null })
+        if (beforeOid !== afterOid) {
+          // Own these small values: backend slices can otherwise keep whole tree listings alive.
+          changes.push({
+            path: Buffer.from(path, "utf8").toString("utf8"),
+            from: beforeOid === undefined ? null : Buffer.from(beforeOid, "utf8").toString("utf8"),
+            to: afterOid === undefined ? null : Buffer.from(afterOid, "utf8").toString("utf8"),
+          })
+        }
       }
       return changes
     },

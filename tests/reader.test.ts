@@ -2,6 +2,9 @@
 // @level l1
 // @consumer read-only Git snapshot consumers
 
+import { execFile } from "node:child_process"
+import { promisify } from "node:util"
+
 import { describe, expect, test, vi } from "vitest"
 
 import { open, openReader } from "../src/index.js"
@@ -178,6 +181,61 @@ describe("read-only reader", () => {
     ])
     expect(readTree).toHaveBeenCalledTimes(2)
     expect(await reader.diff(second.oid, second.oid)).toEqual([])
+  })
+
+  test("diff values do not retain the backing storage of whole tree listings", async () => {
+    // The accepted lifetime contract concerns Bun's sliced strings, even when Vitest runs on Node.
+    // Keep all three changed identities alive across GC: equality tests cannot detect their backing storage.
+    const { stdout, stderr } = await promisify(execFile)(
+      "bun",
+      [
+        "-e",
+        `
+          import { Buffer } from "node:buffer";
+          import { heapStats } from "bun:jsc";
+          import { openReader } from ${JSON.stringify(new URL("../src/index.ts", import.meta.url).href)};
+          import { createMemBackend } from ${JSON.stringify(new URL("../src/mem.ts", import.meta.url).href)};
+          const before = "a".repeat(40);
+          const after = "b".repeat(40);
+          const oldOid = "c".repeat(40);
+          const newOid = "d".repeat(40);
+          const backend = {
+            ...createMemBackend(),
+            async readTree(_repo, commit) {
+              const records = commit === before
+                ? [["notes/change-雪.md", oldOid], ["notes/remove-🦊.md", oldOid]]
+                : [["notes/add-é.md", newOid], ["notes/change-雪.md", newOid]];
+              const listing = Buffer.from("x".repeat(8 * 1024 * 1024) + "\\0" +
+                records.map(([path, oid]) => oid + "\\t" + path).join("\\0"), "utf8").toString("utf8");
+              return new Map(listing.split("\\0").slice(1).map(record => {
+                const tab = record.indexOf("\\t");
+                return [record.slice(tab + 1), { oid: record.slice(0, tab), mode: "100644" }];
+              }));
+            },
+          };
+          const reader = await openReader({ repo: "reader-owned-diff", backend });
+          Bun.gc(true);
+          const baseline = heapStats().extraMemorySize;
+          globalThis.retainedChanges = await reader.diff(before, after);
+          await new Promise(resolve => setTimeout(resolve, 0));
+          Bun.gc(true);
+          console.log(JSON.stringify({
+            changes: globalThis.retainedChanges,
+            retainedBytes: heapStats().extraMemorySize - baseline,
+          }));
+        `,
+      ],
+      { encoding: "utf8", timeout: 10_000 },
+    )
+    expect(stderr).toBe("")
+    const result = JSON.parse(stdout)
+    expect(result.changes).toEqual([
+      { path: "notes/add-é.md", from: null, to: "d".repeat(40) },
+      { path: "notes/change-雪.md", from: "c".repeat(40), to: "d".repeat(40) },
+      { path: "notes/remove-🦊.md", from: "c".repeat(40), to: null },
+    ])
+    // Allow runtime noise far beyond these few hundred bytes, but never either 8 MiB listing.
+    expect(result.retainedBytes).toBeLessThan(4 * 1024 * 1024)
   })
 
   test("diff requires both endpoints to exist, including equal missing endpoints", async () => {
