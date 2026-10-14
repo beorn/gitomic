@@ -42,7 +42,27 @@ export type RepositoryCandidateOptions = {
    * under `[gitomic "<url>"]`, because the clone keeps no config; without it, from `repo`'s own config.
    */
   readonly url?: string
+  /**
+   * Measurement only (27155): called as each step of a run ends, with its wall time in milliseconds, so a caller can
+   * say where a gated write's candidate time went. A step that throws reports nothing. It runs inline: keep it cheap.
+   */
+  readonly onStep?: (step: CandidateStep, ms: number) => void
 }
+
+/**
+ * One timed step of {@link repositoryCandidate}: reading the base's declaration (its presence, then its keys),
+ * checking its trust, resolving the git dir, materializing one candidate commit, and each declared command until its
+ * process started (`deriveSpawn`, `checkSpawn`) and for its whole run (`derive`, `check`).
+ */
+export type CandidateStep =
+  | "declaration"
+  | "trust"
+  | "gitDir"
+  | "materialize"
+  | "deriveSpawn"
+  | "derive"
+  | "checkSpawn"
+  | "check"
 
 /** Where a repository's trust is recorded: its own git config for a path, the caller's global config for a URL. */
 export type TrustScope = { readonly repo: string; readonly url?: string }
@@ -268,22 +288,46 @@ export function repositoryCandidate(options: RepositoryCandidateOptions): Candid
         ],
       }
     }
-    if ((await context.readBase(CANDIDATE_CONFIG)) === undefined) return { report: [] }
-    const untrusted = await untrustedDeclaration(options, context.base)
+    const timed = stepTimer(options.onStep)
+    if ((await timed("declaration", () => context.readBase(CANDIDATE_CONFIG))) === undefined) return { report: [] }
+    const untrusted = await timed("trust", () => untrustedDeclaration(options, context.base))
     if (untrusted !== undefined) return { refuse: [untrusted] }
-    const declared = await readDeclaration(options.repo, context.base)
+    const declared = await timed("declaration", () => readDeclaration(options.repo, context.base))
     if ("refuse" in declared) return declared
-    const gitDir = await resolveGitDir(options.repo)
+    const gitDir = await timed("gitDir", () => resolveGitDir(options.repo))
+    const run: Runner = { gitDir, context, timeoutMs: declared.timeoutMs, timed, onStep: options.onStep }
     let materialized: Oid | undefined
     if (declared.derive !== undefined) {
-      materialized = await context.materialize()
-      const derived = await derive(gitDir, context, declared.derive, declared.timeoutMs, materialized)
+      materialized = await timed("materialize", () => context.materialize())
+      const derived = await derive(run, declared.derive, materialized)
       if (derived === "edited") materialized = undefined
       else if (derived !== undefined) return derived
     }
     if (declared.check === undefined) return { report: [] }
-    return check(gitDir, context, declared.check, declared.timeoutMs, materialized)
+    return check(run, declared.check, materialized)
   }
+}
+
+type StepTimer = <T>(step: CandidateStep, work: () => Promise<T>) => Promise<T>
+
+/** Time each step for `onStep`; without one, run the work and measure nothing. */
+function stepTimer(onStep: RepositoryCandidateOptions["onStep"]): StepTimer {
+  return async (step, work) => {
+    if (onStep === undefined) return await work()
+    const start = performance.now()
+    const value = await work()
+    onStep(step, performance.now() - start)
+    return value
+  }
+}
+
+/** What every declared command of one run shares. */
+type Runner = {
+  readonly gitDir: string
+  readonly context: CandidateContext
+  readonly timeoutMs: number
+  readonly timed: StepTimer
+  readonly onStep: RepositoryCandidateOptions["onStep"]
 }
 
 async function readDeclaration(
@@ -343,20 +387,21 @@ async function resolveGitDir(repo: string): Promise<string> {
 
 type Ran = { code: number; stdout: string; stderr: string } | { timedOut: true }
 
-async function runDeclared(
-  gitDir: string,
-  context: CandidateContext,
-  command: string,
-  timeoutMs: number,
-  materialized?: Oid,
-): Promise<Ran> {
-  const candidate = materialized ?? (await context.materialize())
+async function runDeclared(run: Runner, kind: "derive" | "check", command: string, materialized?: Oid): Promise<Ran> {
+  const { context, onStep } = run
+  const candidate = materialized ?? (await run.timed("materialize", () => context.materialize()))
   try {
-    const result = await runCommand("sh", ["-c", command], {
-      env: { GITOMIC_REPO: gitDir, GITOMIC_BASE: context.base, GITOMIC_CANDIDATE: candidate },
-      input: context.changed.map((path) => `${path}\0`).join(""),
-      timeoutMs,
-    })
+    const started = performance.now()
+    const result = await run.timed(kind, () =>
+      runCommand("sh", ["-c", command], {
+        env: { GITOMIC_REPO: run.gitDir, GITOMIC_BASE: context.base, GITOMIC_CANDIDATE: candidate },
+        input: context.changed.map((path) => `${path}\0`).join(""),
+        timeoutMs: run.timeoutMs,
+        ...(onStep === undefined
+          ? {}
+          : { onSpawn: () => onStep(kind === "derive" ? "deriveSpawn" : "checkSpawn", performance.now() - started) }),
+      }),
+    )
     return { code: result.code, stdout: result.stdout.toString("utf8"), stderr: result.stderr.toString("utf8") }
   } catch (error) {
     if (error instanceof GitTimeout) return { timedOut: true }
@@ -374,13 +419,12 @@ function tail(text: string): string {
 
 /** Apply derive edits; every emitted put/rm operation invalidates the materialized candidate. */
 async function derive(
-  gitDir: string,
-  context: CandidateContext,
+  run: Runner,
   command: string,
-  timeoutMs: number,
   materialized: Oid,
 ): Promise<CandidateVerdict | "edited" | undefined> {
-  const ran = await runDeclared(gitDir, context, command, timeoutMs, materialized)
+  const { context, timeoutMs } = run
+  const ran = await runDeclared(run, "derive", command, materialized)
   if ("timedOut" in ran) return { refuse: [`derive \`${command}\` did not finish within its ${timeoutMs} ms limit`] }
   if (ran.code === 1) {
     const reasons = lines(ran.stdout)
@@ -426,14 +470,9 @@ async function derive(
   return edited ? "edited" : undefined
 }
 
-async function check(
-  gitDir: string,
-  context: CandidateContext,
-  command: string,
-  timeoutMs: number,
-  materialized?: Oid,
-): Promise<CandidateVerdict> {
-  const ran = await runDeclared(gitDir, context, command, timeoutMs, materialized)
+async function check(run: Runner, command: string, materialized?: Oid): Promise<CandidateVerdict> {
+  const { timeoutMs } = run
+  const ran = await runDeclared(run, "check", command, materialized)
   if ("timedOut" in ran) return { refuse: [`check \`${command}\` did not finish within its ${timeoutMs} ms limit`] }
   if (ran.code === 0) return { report: lines(ran.stdout) }
   if (ran.code === 1) {

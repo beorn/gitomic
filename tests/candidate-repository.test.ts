@@ -202,6 +202,34 @@ describe("repositoryCandidate — the gate the repository's trusted base declare
     expect(await store.head()).toBe(before)
   })
 
+  test("onStep times every step of a derive-and-check run, each command's spawn inside its run (27155)", async () => {
+    const derive = await script("derive.sh", 'printf \'{"put":{"docs/derived.md":"d\\\\n"}}\'')
+    const check = await script("check.sh", "exit 0")
+    await declare(`[candidate]\n\tderive = ${derive}\n\tcheck = ${check}\n`)
+    const steps: [string, number][] = []
+    const committed = await store.transact(async (map) => map.set("docs/a.md", "a\n"), "timed write", {
+      candidate: repositoryCandidate({ repo: fixture.repo, onStep: (step, ms) => steps.push([step, ms]) }),
+    })
+    expect(await store.at(committed.oid).get("docs/derived.md")).toBe("d\n")
+    // derive edited, so check materializes the derived candidate again: two materializations.
+    expect(steps.map(([step]) => step)).toEqual([
+      "declaration",
+      "trust",
+      "declaration",
+      "gitDir",
+      "materialize",
+      "deriveSpawn",
+      "derive",
+      "materialize",
+      "checkSpawn",
+      "check",
+    ])
+    for (const [step, ms] of steps) expect(Number.isFinite(ms) && ms >= 0, `${step} ${ms}`).toBe(true)
+    const ms = (name: string) => steps.find(([step]) => step === name)?.[1] ?? Number.NaN
+    expect(ms("deriveSpawn")).toBeLessThanOrEqual(ms("derive"))
+    expect(ms("checkSpawn")).toBeLessThanOrEqual(ms("check"))
+  })
+
   test("a check past its timeout refuses naming the check and the limit", async () => {
     const check = await script("check.sh", "sleep 30")
     await declare(`[candidate]\n\tcheck = ${check}\n\ttimeoutMs = 300\n`)

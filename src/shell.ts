@@ -83,6 +83,8 @@ type GitOptions = {
   timeoutMs?: number
   /** Bound combined stdout/stderr bytes; overflow stops the command group before rejecting. */
   maxBytes?: number
+  /** Called once the child process has started (its `spawn` event), before it has run; for timing only (27155). */
+  onSpawn?: () => void
 }
 
 /** Options for {@link runGit}. */
@@ -587,6 +589,7 @@ async function run(command: string, args: readonly string[], options: GitOptions
       settle(() => reject(new Error(`${describeGitCommand(command, args)} could not start: it has no stdio pipes`)))
       return
     }
+    if (options.onSpawn !== undefined) child.once("spawn", options.onSpawn)
     const settleOutcome = (code: number | null, signal: NodeJS.Signals | null): void => {
       settle(() => {
         const capturedStderr = Buffer.concat(stderr)

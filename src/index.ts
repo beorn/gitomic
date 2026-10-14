@@ -108,6 +108,7 @@ export {
   readRepositoryDeclaration,
   repositoryCandidate,
   trustDeclaration,
+  type CandidateStep,
   type RepositoryCandidateOptions,
   type RepositoryDeclaration,
   type StateCheckoutDeclaration,
