@@ -5,11 +5,12 @@
  * @reach fs-walk <fixture-only: shell backends run against temporary Git repositories and their trace files>
  */
 
-import { spawnSync } from "node:child_process"
+import { execFile, spawnSync } from "node:child_process"
 import fs from "node:fs"
 import { chmod, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { delimiter, dirname, join } from "node:path"
+import { promisify } from "node:util"
 
 import { describe, expect, test, vi } from "vitest"
 
@@ -1211,6 +1212,64 @@ describe.sequential("shell backend failure boundaries", () => {
     },
     20000,
   )
+
+  // @failure Direct history consumers retain the full decoded Git batch through small identity/author fields.
+  // @level l1
+  // @consumer event-chain callers of the public shell backend, bypassing openReader's own identity copies
+  // Existing value-equality tests cannot observe backing storage. Reuse the reader suite's Bun lifetime witness.
+  test("history identities and small metadata release discarded message backing storage", async () => {
+    const fixture = await createBareRepo()
+    try {
+      const tree = await git(fixture.repo, "rev-parse", `${fixture.initial}^{tree}`)
+      const tip = await gitWithInput(
+        fixture.repo,
+        "large discarded message\n\n" + "x".repeat(16 * 1024 * 1024) + "\n",
+        "commit-tree",
+        tree,
+        "-p",
+        fixture.initial,
+      )
+      const { stdout, stderr } = await promisify(execFile)(
+        "bun",
+        [
+          "-e",
+          `
+            import { heapStats } from "bun:jsc";
+            import { createShellBackend } from ${JSON.stringify(new URL("../src/index.ts", import.meta.url).href)};
+            const backend = createShellBackend();
+            Bun.gc(true);
+            const baseline = heapStats().extraMemorySize;
+            globalThis.retained = (await backend.readHistory(process.argv[1], [process.argv[2]], { limit: 1 }))
+              .map(({ oid, parent, parents, author, committer }) => ({ oid, parent, parents, author, committer }));
+            await new Promise(resolve => setTimeout(resolve, 0));
+            Bun.gc(true);
+            console.log(JSON.stringify({ metadata: globalThis.retained, retainedBytes: heapStats().extraMemorySize - baseline }));
+          `,
+          fixture.repo,
+          tip,
+        ],
+        { encoding: "utf8", timeout: 10_000 },
+      )
+      expect(stderr).toBe("")
+      const result = JSON.parse(stdout) as {
+        metadata: Array<{ oid: string; parent: string | null; parents: string[]; author: unknown; committer: unknown }>
+        retainedBytes: number
+      }
+      expect(result.metadata).toEqual([
+        {
+          oid: tip,
+          parent: fixture.initial,
+          parents: [fixture.initial],
+          author: { name: "gitomic", email: "gitomic@localhost" },
+          committer: { name: "gitomic", email: "gitomic@localhost" },
+        },
+      ])
+      // Runtime noise may exceed the small metadata, but not the discarded 16 MiB message backing storage.
+      expect(result.retainedBytes).toBeLessThan(4 * 1024 * 1024)
+    } finally {
+      await fixture.cleanup()
+    }
+  })
 
   // #26689: runtime callers must not silently receive forwarding for an invalid host policy.
   test.each(["", "ignore", null, 0, false])("rejects an invalid SIGTERM policy %j at construction", (sigterm) => {
