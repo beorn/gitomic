@@ -358,7 +358,9 @@ describe("repositoryCandidate — a declared command the caller runs in process 
       mode: "use",
       resolve: async (_kind, _command, context) => {
         const content = await context.map.get("docs/a.md")
-        return content === "a\n" ? async () => ({ code: 0, stdout: "read the candidate first\n", stderr: "" }) : undefined
+        return content === "a\n"
+          ? async () => ({ code: 0, stdout: "read the candidate first\n", stderr: "" })
+          : undefined
       },
     })
     expect(committed.report).toEqual(["read the candidate first"])
