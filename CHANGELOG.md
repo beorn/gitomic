@@ -18,7 +18,14 @@
   unchanged for every valid tree; a one-path commit on a 30,484-path tree went
   from 108 ms to 37 ms (27155). Handed a file and a directory with one name, it
   now refuses with `TreePathCollision` where the index route silently dropped
-  one side.
+  one side. A rebuilt directory drops an empty subtree, as `write-tree` did; a
+  directory the write does not touch keeps any empty subtree it already holds,
+  which the index route dropped from the whole tree.
+- Every backend's `writeCommit` refuses a path git cannot hold, by name, with
+  the same check `normalizePath` uses: empty, `.` or `..` components, a leading
+  or trailing slash, NUL, and `.git` in any case or NTFS spelling (`.git.`,
+  `git~1`). The shell index route silently ignored a `.git` path; a direct
+  caller that never normalized now gets a `TypeError` naming the path (27155).
 
 ## 0.10.0 — 2026-10-03
 
