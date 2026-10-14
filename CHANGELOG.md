@@ -15,7 +15,8 @@
 - `readCandidateCommands({ repo, ref?, url? }, base)`: the derive and check
   commands a write at `base` would run, read and trusted as `repositoryCandidate`
   reads and trusts them; `{}` with no declaration, the write's `{ refuse }` when
-  it is untrusted or unreadable (27155).
+  it is untrusted or its keys refuse, and a throw for a fault reading the
+  declaration or its trust, as in the gate (27155).
 - `chainsUnder(prefix, { refs })` walks exactly the named refs under the prefix
   (local only; a name outside the prefix, or `refs` with `remote`, refuses before
   any read; an absent ref is omitted as `listRefs` omits it). One call is still

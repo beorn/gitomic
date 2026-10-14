@@ -336,8 +336,9 @@ export type CandidateCommands = { readonly derive?: string; readonly check?: str
 /**
  * The commands {@link repositoryCandidate} would run for a write at `base`, read and trusted exactly as it reads and
  * trusts them (27155 (iii-b)), so a caller that runs declared commands in process prepares only what a write would
- * run. A base with no declaration declares no commands; an untrusted or unreadable one returns the refusal a write
- * at `base` would get.
+ * run. A base with no declaration declares no commands. An untrusted declaration, or one whose `[candidate]` keys
+ * refuse, returns the refusal a write at `base` would get; a fault reading the declaration or its trust throws, as it
+ * does in the gate.
  */
 export async function readCandidateCommands(
   options: DeclarationScope,
