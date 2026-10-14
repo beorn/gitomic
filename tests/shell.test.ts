@@ -289,7 +289,7 @@ async function createGitWrapper(): Promise<{
   }
 }
 
-describe.sequential("shell backend failure boundaries", () => {
+describe("shell backend failure boundaries", { concurrent: false }, () => {
   test("fails open when Git is too old for the durability contract", async () => {
     const wrapper = await createGitWrapper()
     const restore = replaceEnvironment({
@@ -1827,7 +1827,7 @@ describe.sequential("shell backend failure boundaries", () => {
    *          absent" at once, so a rival that created the same ref at the same oid failed the whole publish: km's start
    *          fold lost its item refs to the publisher's first pass that way on every cold kept copy (hh 28492).
    */
-  describe.sequential("a held ref lock on a local publish", () => {
+  describe("a held ref lock on a local publish", { concurrent: false }, () => {
     const ref = "refs/km/items/01M3BFMHWVFZJ41FY03E4AS0JP"
     const zero = "0".repeat(40)
     const next = "2".repeat(40)
