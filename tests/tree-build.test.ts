@@ -222,6 +222,17 @@ describe("the shell backend builds a commit's tree from the touched directories 
       "a/.git  /x.md",
       "a/GIT~1/x.md",
       "a\0b.md",
+      // A backslash: normalizePath refused it alone until @cto b9f44d25 (a), so a direct writeCommit could write it.
+      "a\\b.md",
+      // fsck's hasDotgit, the spellings @cto b9f44d25 (b) named: HFS+ ignores these code points when it compares names
+      // (git's next_hfs_char), and NTFS ends a name at a stream suffix (git's is_ntfs_dotgit).
+      ".g‌it/x.md",
+      "a/﻿.git/x.md",
+      "a/.GIT⁯/x.md",
+      ".git::$INDEX_ALLOCATION/x.md",
+      "a/.git:stream/x.md",
+      "a/git~1 ./x.md",
+      "a/GIT~1:$DATA/x.md",
     ]
     try {
       for (const form of forms) {
@@ -236,7 +247,17 @@ describe("the shell backend builds a commit's tree from the touched directories 
         }
       }
       // Names that only look like the forms above are ordinary paths.
-      for (const name of [".gitignore", ".gitmodules", "a/.gitx/y.md", "git~2/z.md", "..x/y.md"]) {
+      for (const name of [
+        ".gitignore",
+        ".gitmodules",
+        "a/.gitx/y.md",
+        "git~2/z.md",
+        "..x/y.md",
+        "a/.git‌x/y.md",
+        "a/.gitx:y/z.md",
+        "a/x:.git/y.md",
+        "a:b.md",
+      ]) {
         expect(normalizePath(name)).toBe(name)
         for (const leg of legs) await leg.backend.writeCommit(leg.repo, input(shell.initial, [[name, "x\n"]]))
       }
@@ -362,8 +383,24 @@ describe("the shell backend builds a commit's tree from the touched directories 
         ],
       ]
       for (const [label, change] of rows) await expectSameTree(fixture.repo, change, label)
-      const unchanged = await expectSameTree(fixture.repo, input(parent, [["a/missing.md", undefined]]), "no-op")
-      expect(unchanged).toBe(await treeOf(fixture.repo, parent))
+      // The inputs a live write carries that a replayed diff never does are no-ops (@cto 9f1ea4f3): each leaves the
+      // parent's tree id as it was.
+      const noOps: [string, CommitInput][] = [
+        ["deleting an absent path", input(parent, [["a/missing.md", undefined]])],
+        ["deleting a directory's name", input(parent, [["a/b", undefined]])],
+        [
+          "putting identical bytes, an executable among them",
+          input(parent, [
+            ["top.md", "top\n"],
+            ["hooks/guard.sh", "#!/bin/sh\n"],
+            ["a/b/c/deep.md", "deep\n"],
+          ]),
+        ],
+      ]
+      const parentTree = await treeOf(fixture.repo, parent)
+      for (const [label, change] of noOps) {
+        expect(await expectSameTree(fixture.repo, change, label), `${label} keeps the parent's tree`).toBe(parentTree)
+      }
     } finally {
       await fixture.cleanup()
     }

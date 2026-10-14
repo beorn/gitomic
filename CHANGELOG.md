@@ -22,10 +22,13 @@
   directory the write does not touch keeps any empty subtree it already holds,
   which the index route dropped from the whole tree.
 - Every backend's `writeCommit` refuses a path git cannot hold, by name, with
-  the same check `normalizePath` uses: empty, `.` or `..` components, a leading
-  or trailing slash, NUL, and `.git` in any case or NTFS spelling (`.git.`,
-  `git~1`). The shell index route silently ignored a `.git` path; a direct
-  caller that never normalized now gets a `TypeError` naming the path (27155).
+  the same check `normalizePath` uses: a backslash, empty, `.` or `..`
+  components, a leading or trailing slash, NUL, and `.git` in every spelling
+  `git fsck` flags as hasDotgit (any case; HFS+ ignorable code points such as
+  `.g‌it`; NTFS trailing dots or spaces, a `:` stream suffix such as
+  `.git::$INDEX_ALLOCATION`, and `git~1`). The shell index route silently
+  ignored a `.git` path; a direct caller that never normalized now gets a
+  `TypeError` naming the path (27155).
 
 ## 0.10.0 — 2026-10-03
 

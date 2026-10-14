@@ -46,24 +46,38 @@ export function assertGitPrefixMatched(count: number, repo: string, commit: stri
   )
 }
 
+/** Code points HFS+ ignores when it compares names, so `.g‌it` opens `.git` there (git's `next_hfs_char`). */
+const HFS_IGNORABLE = /[‌-‏‪-‮⁪-⁯﻿]/gu
+
+/**
+ * Whether one path component is git's own directory on some filesystem, by the two rules `git fsck` applies to every
+ * tree entry (hasDotgit): HFS+ drops its ignorable code points and folds case (`is_hfs_dotgit`), and NTFS ends a name
+ * at a `:` stream suffix, drops trailing dots and spaces, folds case and also answers to the short name `git~1`
+ * (`is_ntfs_dotgit`). NTFS also splits a name at a backslash; {@link invalidTreePathReason} refuses every backslash
+ * before this runs. Each spelling here, and each near-miss its tests accept, was checked against `git fsck --strict`.
+ */
+function namesGitDirectory(part: string): boolean {
+  if (part.replace(HFS_IGNORABLE, "").toLowerCase() === ".git") return true
+  const stem = (part.split(":", 1)[0] ?? "").replace(/[. ]+$/u, "").toLowerCase()
+  return stem === ".git" || stem === "git~1"
+}
+
 /**
  * Why `path` cannot be a path in a tree gitomic writes, or `undefined` when it can. The one check every writer shares
- * (27155, @cto 6c9330ac): {@link normalizePath} for a caller's path, and every backend's `writeCommit` for a direct
- * caller that never normalized, so shell, iso and mem refuse the same paths. Git's index silently drops a `.git` path
- * ("Ignoring path"), and a tree that holds one fails `git fsck --strict` (hasDotgit), so a remote that runs fsck
- * rejects the push; `.git` counts in any case and in its NTFS spellings (trailing dots or spaces, `git~1`).
+ * (27155, @cto 6c9330ac and b9f44d25): {@link normalizePath} for a caller's path, and every backend's `writeCommit` for
+ * a direct caller that never normalized, so shell, iso and mem refuse the same paths. A backslash is refused because
+ * normalizePath always refused it, and git's index silently drops a `.git` path ("Ignoring path") while a tree that
+ * holds one fails `git fsck --strict` (hasDotgit), so a remote that runs fsck rejects the push.
  */
 export function invalidTreePathReason(path: string): string | undefined {
+  if (path.includes("\\")) return "it holds a backslash"
   if (path.length === 0) return "it is empty"
   if (path.startsWith("/") || path.endsWith("/")) return "it starts or ends with a slash"
   if (path.includes("\0")) return "it holds a NUL byte"
   for (const part of path.split("/")) {
     if (part === "") return "it has an empty component"
     if (part === "." || part === "..") return `it has a ${JSON.stringify(part)} component`
-    const lower = part.toLowerCase()
-    if (lower === "git~1" || lower.replace(/[. ]+$/u, "") === ".git") {
-      return `its component ${JSON.stringify(part)} names git's own directory`
-    }
+    if (namesGitDirectory(part)) return `its component ${JSON.stringify(part)} names git's own directory`
   }
   return undefined
 }
@@ -77,7 +91,7 @@ export function assertTreePath(path: string): void {
 export function normalizePath(path: string): string {
   assertUtf8(path, "git tree path")
   const normalized = path.normalize("NFC")
-  const reason = normalized.includes("\\") ? "it holds a backslash" : invalidTreePathReason(normalized)
+  const reason = invalidTreePathReason(normalized)
   if (reason !== undefined) {
     throw new TypeError(`invalid git tree path: ${JSON.stringify(path)}: ${reason}`)
   }
