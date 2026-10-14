@@ -15,6 +15,7 @@ import {
   CANDIDATE_CONFIG,
   createShellBackend,
   open,
+  readCandidateCommands,
   readRepositoryDeclaration,
   repositoryCandidate,
   trustDeclaration,
@@ -350,6 +351,56 @@ describe("repositoryCandidate — a declared command the caller runs in process 
     expect(existsSync(check.marker), "the declared check was not spawned").toBe(false)
   })
 
+  test("shadow: a resolver that rejects leaves the verdict and the ref to the declared command, and compare is told", async () => {
+    const check = await markingCheck(0)
+    await declare(`[candidate]\n\tcheck = ${check.command}\n`)
+    const seen: (CandidateRun | { error: string })[] = []
+    const committed = await writeWith({
+      mode: "shadow",
+      resolve: async () => {
+        throw new Error("candidate read failed")
+      },
+      compare: (_kind, _command, { inProcess }) => seen.push(inProcess),
+    })
+    expect(committed.report, "the declared check decided").toEqual(["declared said 0"])
+    expect(existsSync(check.marker), "the declared check ran").toBe(true)
+    expect(await store.head()).toBe(committed.oid)
+    expect(seen).toEqual([{ error: "resolve: candidate read failed" }])
+  })
+
+  test("use: a resolver that rejects fails the write naming its kind and command, and the ref does not move", async () => {
+    const check = await markingCheck(0)
+    await declare(`[candidate]\n\tcheck = ${check.command}\n`)
+    const before = await store.head()
+    const thrown = new Error("candidate read failed")
+    const failed = writeWith({
+      mode: "use",
+      resolve: async () => {
+        throw thrown
+      },
+    })
+    await expect(failed).rejects.toThrow(`check \`${check.command}\` failed in process: resolve: candidate read failed`)
+    await expect(failed).rejects.toMatchObject({ cause: thrown })
+    expect(existsSync(check.marker), "nothing was spawned").toBe(false)
+    expect(await store.head()).toBe(before)
+  })
+
+  test("use: a resolver that answers with a promise is awaited, and its command decides", async () => {
+    const check = await markingCheck(1)
+    await declare(`[candidate]\n\tcheck = ${check.command}\n`)
+    const committed = await writeWith({
+      mode: "use",
+      resolve: async (_kind, _command, context) => {
+        const content = await context.map.get("docs/a.md")
+        return content === "a\n"
+          ? async () => ({ code: 0, stdout: "read the candidate first\n", stderr: "" })
+          : undefined
+      },
+    })
+    expect(committed.report).toEqual(["read the candidate first"])
+    expect(existsSync(check.marker), "the declared check was not spawned").toBe(false)
+  })
+
   test("a command the resolver does not claim runs as declared", async () => {
     const check = await markingCheck(0)
     await declare(`[candidate]\n\tcheck = ${check.command}\n`)
@@ -417,17 +468,19 @@ describe("repositoryCandidate — a declared command the caller runs in process 
     expect(seen).toEqual([{ error: "checker module failed" }])
   })
 
-  test("use: an in-process command that throws fails the write by name, and the ref does not move", async () => {
+  test("use: an in-process command that throws fails the write naming its kind and command, and the ref does not move", async () => {
     const check = await markingCheck(0)
     await declare(`[candidate]\n\tcheck = ${check.command}\n`)
     const before = await store.head()
+    const thrown = new Error("checker module failed")
     const failed = writeWith({
       mode: "use",
       resolve: () => async () => {
-        throw new Error("checker module failed")
+        throw thrown
       },
     })
-    await expect(failed).rejects.toThrow("checker module failed")
+    await expect(failed).rejects.toThrow(`check \`${check.command}\` failed in process: checker module failed`)
+    await expect(failed).rejects.toMatchObject({ cause: thrown })
     expect(await store.head()).toBe(before)
   })
 
@@ -497,5 +550,55 @@ describe("repositoryCandidate — a declared command the caller runs in process 
       "check",
       "checkInProcess",
     ])
+  })
+})
+
+describe("readCandidateCommands — what a write at a base would run, read and trusted as the gate reads it (27155)", () => {
+  test("a trusted declaration's derive and check, and nothing for a base that declares none", async () => {
+    const empty = await store.transact(async (map) => map.set("docs/a.md", "a\n"), "no gate yet")
+    expect(await readCandidateCommands({ repo: fixture.repo }, empty.oid)).toEqual({})
+    await declare("[candidate]\n\tderive = derive-it --flag\n\tcheck = check-it --state-root /x\n")
+    expect(await readCandidateCommands({ repo: fixture.repo }, await store.head())).toEqual({
+      derive: "derive-it --flag",
+      check: "check-it --state-root /x",
+    })
+  })
+
+  test("an untrusted declaration returns the refusal a write would get, naming gitomic trust", async () => {
+    const declared = await store.transact(
+      async (map) => map.set(CANDIDATE_CONFIG, "[candidate]\n\tcheck = never-trusted\n"),
+      "declare without trusting",
+    )
+    const read = await readCandidateCommands({ repo: fixture.repo }, declared.oid)
+    expect(read).toEqual({ refuse: [expect.stringMatching(/is not trusted to run .*run: gitomic trust '/u)] })
+  })
+
+  test("a base whose declaration refuses gets the same refusal from the reader and from a write", async () => {
+    // One sequence reads and trusts the declaration for both (@cto 15e1c1ac): an untrusted one, then a bad key.
+    const untrusted = await store.transact(
+      async (map) => map.set(CANDIDATE_CONFIG, "[candidate]\n\tcheck = never-trusted\n"),
+      "declare without trusting",
+    )
+    // Each case reads the reader at the head a write builds on, then makes that write.
+    async function sameRefusal(label: string, base: string): Promise<void> {
+      const read = await readCandidateCommands({ repo: fixture.repo }, base)
+      if (!("refuse" in read)) throw new Error(`${label}: the reader did not refuse`)
+      const written = await write("docs/a.md", `${label}\n`).then(
+        () => undefined,
+        (error: unknown) => error,
+      )
+      expect(written, label).toBeInstanceOf(CandidateRefused)
+      expect((written as CandidateRefused).reasons, label).toEqual(read.refuse)
+    }
+    await sameRefusal("untrusted", untrusted.oid)
+    await declare("[candidate]\n\tcheck = check-it\n\tchek = typo\n")
+    await sameRefusal("a bad key", await store.head())
+  })
+
+  test("an unknown key refuses as the gate refuses it", async () => {
+    await declare("[candidate]\n\tcheck = check-it\n\tchek = typo\n")
+    expect(await readCandidateCommands({ repo: fixture.repo }, await store.head())).toEqual({
+      refuse: [expect.stringContaining("unknown key candidate.chek")],
+    })
   })
 })
