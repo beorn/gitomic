@@ -1,6 +1,7 @@
 // @failure Workspace imports can depend on ignored build output, while package installs can expose the wrong entrypoints or runtime dependencies.
 // @level l1
 // @consumer workspace and package consumers
+// @source-grep the workspace/package entrypoint contract: package.json, CHANGELOG/README and src/*.ts are read to pin that workspace imports never depend on ignored build output and a published package exposes the right entrypoints and runtime dependencies
 
 import { execFile } from "node:child_process"
 import { readFile, stat } from "node:fs/promises"

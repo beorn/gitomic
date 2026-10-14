@@ -2,6 +2,7 @@
 // version, duplicate paths, path safety, or source-object coverage.
 // @level l1
 // @consumer generic Gitomic ownership-manifest callers
+// @source-grep the ownership-manifest boundary: parseOwnershipManifest's source is read to prove workflow policy (@tent/@km/state-beads/gitomic-state) is kept out of the generic implementation — a source-level neutrality its value-level tests cannot see
 
 import { readFile } from "node:fs/promises"
 
