@@ -5,6 +5,7 @@
 // or a commit silently changes paths nobody edited.
 // @level l1
 // @consumer 27155: the km daemon's candidate and final commits, and every gitomic apply
+// @testonly none
 /**
  * @reach fs-walk <fixture-only: Git tree reads use temporary bare repositories>
  */
@@ -89,10 +90,12 @@ async function seedTree(
   }
   const write = async (dir: Dir): Promise<string> => {
     const records: Buffer[] = []
-    for (const [name, child] of dir.dirs)
+    for (const [name, child] of dir.dirs) {
       records.push(Buffer.from(`040000 tree ${await write(child)}\t${name}\0`, "utf8"))
-    for (const [name, entry] of dir.files)
+    }
+    for (const [name, entry] of dir.files) {
       records.push(Buffer.from(`${entry.mode} ${entry.type} ${entry.oid}\t${name}\0`, "utf8"))
+    }
     return await gitWithInput(repo, Buffer.concat(records), "mktree", "-z")
   }
   return await git(repo, "commit-tree", await write(root), "-p", parent, "-m", "seed")
@@ -120,8 +123,9 @@ describe("the shell backend builds a commit's tree from the touched directories 
     const wrapperDir = await mkdtemp(join(tmpdir(), "gitomic-tree-build-git-"))
     try {
       const files: Record<string, { mode: string; type: string; oid: string }> = {}
-      for (let index = 0; index < 50; index += 1)
+      for (let index = 0; index < 50; index += 1) {
         files[`pm/area-${index % 5}/bead-${index}.md`] = await blob(fixture.repo, `${index}\n`)
+      }
       const parent = await seedTree(fixture.repo, fixture.initial, files)
       const realGit = execFileSync("sh", ["-c", "command -v git"]).toString().trim()
       const log = join(wrapperDir, "argv.log")
@@ -324,8 +328,9 @@ describe("the shell backend builds a commit's tree from the touched directories 
     const fixture = await createBareRepo()
     try {
       const files: Record<string, { mode: string; type: string; oid: string }> = {}
-      for (let index = 0; index < 120; index += 1)
+      for (let index = 0; index < 120; index += 1) {
         files[`pm/g${index % 6}/i${index % 4}/bead-${index}.md`] = await blob(fixture.repo, `${index}\n`)
+      }
       const parent = await seedTree(fixture.repo, fixture.initial, files)
       const changes: [string, string | undefined][] = []
       for (let index = 0; index < 25; index += 1) {
