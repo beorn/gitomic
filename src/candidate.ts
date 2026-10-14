@@ -44,7 +44,8 @@ export type RepositoryCandidateOptions = {
   readonly url?: string
   /**
    * Measurement only (27155): called as each step of a run ends, with its wall time in milliseconds, so a caller can
-   * say where a gated write's candidate time went. A step that throws reports nothing. It runs inline: keep it cheap.
+   * say where a gated write's candidate time went. A step that throws reports nothing. It runs inline: keep it cheap,
+   * and never let it throw, because a throwing onStep fails the write.
    */
   readonly onStep?: (step: CandidateStep, ms: number) => void
 }
@@ -391,7 +392,7 @@ async function runDeclared(run: Runner, kind: "derive" | "check", command: strin
   const { context, onStep } = run
   const candidate = materialized ?? (await run.timed("materialize", () => context.materialize()))
   try {
-    const started = performance.now()
+    const started = onStep === undefined ? 0 : performance.now()
     const result = await run.timed(kind, () =>
       runCommand("sh", ["-c", command], {
         env: { GITOMIC_REPO: run.gitDir, GITOMIC_BASE: context.base, GITOMIC_CANDIDATE: candidate },
