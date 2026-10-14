@@ -15,6 +15,7 @@ import {
   CANDIDATE_CONFIG,
   createShellBackend,
   open,
+  readCandidateCommands,
   readRepositoryDeclaration,
   repositoryCandidate,
   trustDeclaration,
@@ -417,17 +418,19 @@ describe("repositoryCandidate — a declared command the caller runs in process 
     expect(seen).toEqual([{ error: "checker module failed" }])
   })
 
-  test("use: an in-process command that throws fails the write by name, and the ref does not move", async () => {
+  test("use: an in-process command that throws fails the write naming its kind and command, and the ref does not move", async () => {
     const check = await markingCheck(0)
     await declare(`[candidate]\n\tcheck = ${check.command}\n`)
     const before = await store.head()
+    const thrown = new Error("checker module failed")
     const failed = writeWith({
       mode: "use",
       resolve: () => async () => {
-        throw new Error("checker module failed")
+        throw thrown
       },
     })
-    await expect(failed).rejects.toThrow("checker module failed")
+    await expect(failed).rejects.toThrow(`check \`${check.command}\` failed in process: checker module failed`)
+    await expect(failed).rejects.toMatchObject({ cause: thrown })
     expect(await store.head()).toBe(before)
   })
 
@@ -497,5 +500,33 @@ describe("repositoryCandidate — a declared command the caller runs in process 
       "check",
       "checkInProcess",
     ])
+  })
+})
+
+describe("readCandidateCommands — what a write at a base would run, read and trusted as the gate reads it (27155)", () => {
+  test("a trusted declaration's derive and check, and nothing for a base that declares none", async () => {
+    const empty = await store.transact(async (map) => map.set("docs/a.md", "a\n"), "no gate yet")
+    expect(await readCandidateCommands({ repo: fixture.repo }, empty.oid)).toEqual({})
+    await declare("[candidate]\n\tderive = derive-it --flag\n\tcheck = check-it --state-root /x\n")
+    expect(await readCandidateCommands({ repo: fixture.repo }, await store.head())).toEqual({
+      derive: "derive-it --flag",
+      check: "check-it --state-root /x",
+    })
+  })
+
+  test("an untrusted declaration returns the refusal a write would get, naming gitomic trust", async () => {
+    const declared = await store.transact(
+      async (map) => map.set(CANDIDATE_CONFIG, "[candidate]\n\tcheck = never-trusted\n"),
+      "declare without trusting",
+    )
+    const read = await readCandidateCommands({ repo: fixture.repo }, declared.oid)
+    expect(read).toEqual({ refuse: [expect.stringMatching(/is not trusted to run .*run: gitomic trust '/u)] })
+  })
+
+  test("an unknown key refuses as the gate refuses it", async () => {
+    await declare("[candidate]\n\tcheck = check-it\n\tchek = typo\n")
+    expect(await readCandidateCommands({ repo: fixture.repo }, await store.head())).toEqual({
+      refuse: [expect.stringContaining("unknown key candidate.chek")],
+    })
   })
 })

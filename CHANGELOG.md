@@ -9,7 +9,13 @@
   command and returns an implementation that gets the spawned command's inputs
   as values; `"use"` lets it decide under the declared limit, `"shadow"` runs
   both, lets the declared command decide and reports both runs to `compare`.
-  Declaration reading and trust are unchanged (27155).
+  Declaration reading and trust are unchanged (27155). Under `"use"` an
+  in-process throw fails the write naming the kind and the declared command,
+  with the throw as its `cause`.
+- `readCandidateCommands({ repo, ref?, url? }, base)`: the derive and check
+  commands a write at `base` would run, read and trusted as `repositoryCandidate`
+  reads and trusts them; `{}` with no declaration, the write's `{ refuse }` when
+  it is untrusted or unreadable (27155).
 - `chainsUnder(prefix, { refs })` walks exactly the named refs under the prefix
   (local only; a name outside the prefix, or `refs` with `remote`, refuses before
   any read; an absent ref is omitted as `listRefs` omits it). One call is still

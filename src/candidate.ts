@@ -195,7 +195,7 @@ export async function trustDeclaration(scope: TrustScope, blob: string): Promise
 }
 
 /** Why the declaration at `base` may not run here, or `undefined` when it is the trusted blob. */
-async function untrustedDeclaration(options: RepositoryCandidateOptions, base: string): Promise<string | undefined> {
+async function untrustedDeclaration(options: DeclarationScope, base: string): Promise<string | undefined> {
   const declaration = await readRepositoryDeclaration(options.repo, base)
   if (declaration === undefined) return undefined
   const trusted = await trustedBlobs(options)
@@ -327,6 +327,33 @@ export async function readStateCheckoutDeclaration(
 
 type Declaration = { derive?: string; check?: string; timeoutMs: number }
 
+/** Where a declaration is read and its trust found: the repository, its ref and the URL it is a clone of. */
+type DeclarationScope = Pick<RepositoryCandidateOptions, "repo" | "ref" | "url">
+
+/** The derive and check commands a repository declares at one commit. */
+export type CandidateCommands = { readonly derive?: string; readonly check?: string }
+
+/**
+ * The commands {@link repositoryCandidate} would run for a write at `base`, read and trusted exactly as it reads and
+ * trusts them (27155 (iii-b)), so a caller that runs declared commands in process prepares only what a write would
+ * run. A base with no declaration declares no commands; an untrusted or unreadable one returns the refusal a write
+ * at `base` would get.
+ */
+export async function readCandidateCommands(
+  options: DeclarationScope,
+  base: string,
+): Promise<CandidateCommands | (CandidateVerdict & { refuse: string[] })> {
+  if ((await readRepositoryDeclaration(options.repo, base)) === undefined) return {}
+  const untrusted = await untrustedDeclaration(options, base)
+  if (untrusted !== undefined) return { refuse: [untrusted] }
+  const declared = await readDeclaration(options.repo, base)
+  if ("refuse" in declared) return declared
+  return {
+    ...(declared.derive === undefined ? {} : { derive: declared.derive }),
+    ...(declared.check === undefined ? {} : { check: declared.check }),
+  }
+}
+
 /** The candidate that runs the repository's own declared derive and check commands. Shell-backed repositories only. */
 export function repositoryCandidate(options: RepositoryCandidateOptions): Candidate {
   return async (context) => {
@@ -453,7 +480,13 @@ async function runDeclared(
   const input: DeclaredCommandInput = { gitDir: run.gitDir, base: context.base, candidate, changed: context.changed }
   const claimed = run.inProcess?.resolve(kind, command, context)
   if (claimed !== undefined && run.inProcess?.mode === "use") {
-    return run.timed(kind, () => runInProcess(claimed, input, run.timeoutMs))
+    try {
+      return await run.timed(kind, () => runInProcess(claimed, input, run.timeoutMs))
+    } catch (error) {
+      // A throw is a fault of the gate, never its verdict: the write fails, naming what threw (27155, @cto cc4f0c66).
+      const reason = error instanceof Error ? error.message : String(error)
+      throw new Error(`${kind} \`${command}\` failed in process: ${reason}`, { cause: error })
+    }
   }
   const declared = await spawnDeclared(run, kind, command, input)
   if (claimed !== undefined) {
