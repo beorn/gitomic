@@ -48,12 +48,15 @@ export type RepositoryCandidateOptions = {
    * and never let it throw, because a throwing onStep fails the write.
    */
   readonly onStep?: (step: CandidateStep, ms: number) => void
+  /** Declared commands the caller runs in its own process instead of spawning them (27155 (iii)). */
+  readonly inProcess?: InProcessOptions
 }
 
 /**
  * One timed step of {@link repositoryCandidate}: reading the base's declaration (its presence, then its keys),
  * checking its trust, resolving the git dir, materializing one candidate commit, and each declared command until its
- * process started (`deriveSpawn`, `checkSpawn`) and for its whole run (`derive`, `check`).
+ * process started (`deriveSpawn`, `checkSpawn`) and for its whole run (`derive`, `check`). A command run in process
+ * is its `derive` or `check` step under "use", and its own `deriveInProcess` or `checkInProcess` step under "shadow".
  */
 export type CandidateStep =
   | "declaration"
@@ -62,8 +65,53 @@ export type CandidateStep =
   | "materialize"
   | "deriveSpawn"
   | "derive"
+  | "deriveInProcess"
   | "checkSpawn"
   | "check"
+  | "checkInProcess"
+
+/** What a declared command is given: the environment and stdin a spawned `sh -c` command gets, as values. */
+export type DeclaredCommandInput = {
+  /** GITOMIC_REPO. */
+  readonly gitDir: string
+  /** GITOMIC_BASE. */
+  readonly base: Oid
+  /** GITOMIC_CANDIDATE: the candidate, materialized as an unpublished commit. */
+  readonly candidate: Oid
+  /** The paths the write changed, as the spawned command reads them from stdin. */
+  readonly changed: readonly string[]
+}
+
+/** A declared command's run: its exit code and output, or the declared limit that stopped it. */
+export type CandidateRun =
+  | { readonly code: number; readonly stdout: string; readonly stderr: string }
+  | { readonly timedOut: true }
+
+/** One declared command run in the caller's process: the inputs a spawned command gets, the result it would give. */
+export type InProcessCommand = (
+  input: DeclaredCommandInput,
+) => Promise<{ readonly code: number; readonly stdout: string; readonly stderr: string }>
+
+/**
+ * Declared commands a caller runs in its own process (27155 (iii), @cto 67b6d4c1). gitomic still reads and trusts the
+ * declaration itself, then hands `resolve` each exact declared command: a returned implementation runs it, and
+ * `undefined` runs the command as declared. Under "use" the in-process run decides, under the declared limit. Under
+ * "shadow" both run, the declared command decides, and `compare` sees both runs; an in-process throw reaches
+ * `compare` as `{ error }` and never changes the verdict. `compare` runs inline and must not throw.
+ */
+export type InProcessOptions = {
+  readonly mode: "use" | "shadow"
+  readonly resolve: (
+    kind: "derive" | "check",
+    command: string,
+    context: CandidateContext,
+  ) => InProcessCommand | undefined
+  readonly compare?: (
+    kind: "derive" | "check",
+    command: string,
+    runs: { readonly declared: CandidateRun; readonly inProcess: CandidateRun | { readonly error: string } },
+  ) => void
+}
 
 /** Where a repository's trust is recorded: its own git config for a path, the caller's global config for a URL. */
 export type TrustScope = { readonly repo: string; readonly url?: string }
@@ -296,7 +344,14 @@ export function repositoryCandidate(options: RepositoryCandidateOptions): Candid
     const declared = await timed("declaration", () => readDeclaration(options.repo, context.base))
     if ("refuse" in declared) return declared
     const gitDir = await timed("gitDir", () => resolveGitDir(options.repo))
-    const run: Runner = { gitDir, context, timeoutMs: declared.timeoutMs, timed, onStep: options.onStep }
+    const run: Runner = {
+      gitDir,
+      context,
+      timeoutMs: declared.timeoutMs,
+      timed,
+      onStep: options.onStep,
+      inProcess: options.inProcess,
+    }
     let materialized: Oid | undefined
     if (declared.derive !== undefined) {
       materialized = await timed("materialize", () => context.materialize())
@@ -329,6 +384,7 @@ type Runner = {
   readonly timeoutMs: number
   readonly timed: StepTimer
   readonly onStep: RepositoryCandidateOptions["onStep"]
+  readonly inProcess: RepositoryCandidateOptions["inProcess"]
 }
 
 async function readDeclaration(
@@ -386,17 +442,45 @@ async function resolveGitDir(repo: string): Promise<string> {
   return result.stdout.toString("utf8").trim()
 }
 
-type Ran = { code: number; stdout: string; stderr: string } | { timedOut: true }
-
-async function runDeclared(run: Runner, kind: "derive" | "check", command: string, materialized?: Oid): Promise<Ran> {
-  const { context, onStep } = run
+async function runDeclared(
+  run: Runner,
+  kind: "derive" | "check",
+  command: string,
+  materialized?: Oid,
+): Promise<CandidateRun> {
+  const { context } = run
   const candidate = materialized ?? (await run.timed("materialize", () => context.materialize()))
+  const input: DeclaredCommandInput = { gitDir: run.gitDir, base: context.base, candidate, changed: context.changed }
+  const claimed = run.inProcess?.resolve(kind, command, context)
+  if (claimed !== undefined && run.inProcess?.mode === "use") {
+    return run.timed(kind, () => runInProcess(claimed, input, run.timeoutMs))
+  }
+  const declared = await spawnDeclared(run, kind, command, input)
+  if (claimed !== undefined) {
+    const inProcess = await run.timed(kind === "derive" ? "deriveInProcess" : "checkInProcess", () =>
+      runInProcess(claimed, input, run.timeoutMs).catch((error: unknown) => ({
+        error: error instanceof Error ? error.message : String(error),
+      })),
+    )
+    run.inProcess?.compare?.(kind, command, { declared, inProcess })
+  }
+  return declared
+}
+
+/** The declared command as `sh -c`, with its inputs as environment and NUL-separated stdin. */
+async function spawnDeclared(
+  run: Runner,
+  kind: "derive" | "check",
+  command: string,
+  input: DeclaredCommandInput,
+): Promise<CandidateRun> {
+  const { onStep } = run
   try {
     const started = onStep === undefined ? 0 : performance.now()
     const result = await run.timed(kind, () =>
       runCommand("sh", ["-c", command], {
-        env: { GITOMIC_REPO: run.gitDir, GITOMIC_BASE: context.base, GITOMIC_CANDIDATE: candidate },
-        input: context.changed.map((path) => `${path}\0`).join(""),
+        env: { GITOMIC_REPO: input.gitDir, GITOMIC_BASE: input.base, GITOMIC_CANDIDATE: input.candidate },
+        input: input.changed.map((path) => `${path}\0`).join(""),
         timeoutMs: run.timeoutMs,
         ...(onStep === undefined
           ? {}
@@ -407,6 +491,27 @@ async function runDeclared(run: Runner, kind: "derive" | "check", command: strin
   } catch (error) {
     if (error instanceof GitTimeout) return { timedOut: true }
     throw error
+  }
+}
+
+/**
+ * A claimed command under the declared limit, as a spawned one runs: past the limit it reads as timed out. Its work
+ * cannot be killed, so a pure-JS hang still holds the caller's thread; the caller bounds what it claims (27155 (iii)).
+ */
+async function runInProcess(
+  command: InProcessCommand,
+  input: DeclaredCommandInput,
+  timeoutMs: number,
+): Promise<CandidateRun> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const limit = new Promise<CandidateRun>((resolve) => {
+    timer = setTimeout(() => resolve({ timedOut: true }), timeoutMs)
+  })
+  try {
+    const result = await Promise.race([command(input), limit])
+    return "timedOut" in result ? result : { code: result.code, stdout: result.stdout, stderr: result.stderr }
+  } finally {
+    clearTimeout(timer)
   }
 }
 

@@ -3,6 +3,7 @@
 // @level l2
 // @consumer 24168 slice A: STATE declares `.gitomic.conf` and every prose/config write runs it; km's writes use it too
 
+import { existsSync } from "node:fs"
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -17,6 +18,9 @@ import {
   readRepositoryDeclaration,
   repositoryCandidate,
   trustDeclaration,
+  type CandidateRun,
+  type InProcessCommand,
+  type InProcessOptions,
   type Store,
 } from "../src/index.js"
 import { runCommand } from "../src/shell.js"
@@ -307,5 +311,150 @@ describe("repositoryCandidate — the gate the repository's trusted base declare
     await expect(write("docs/a.md", "a\n")).rejects.toMatchObject({
       reasons: [expect.stringMatching(/\.gitomic\.conf: unknown key candidate\.chek/u)],
     })
+  })
+})
+
+/**
+ * 27155 (iii), @cto 67b6d4c1 item 2: a caller may run a declared command in its own process. gitomic still reads and
+ * trusts the declaration itself and hands the caller the exact declared command; only a command the caller claims runs
+ * in process, with the inputs a spawned command gets, and every other command runs as declared.
+ */
+describe("repositoryCandidate — a declared command the caller runs in process (27155)", () => {
+  /** A declared check that leaves a marker, so a row can tell whether it was spawned. */
+  async function markingCheck(exit: number): Promise<{ readonly command: string; readonly marker: string }> {
+    const marker = join(scripts, "check-ran")
+    return { command: await script("check.sh", `: > "${marker}"\necho "declared said ${exit}"\nexit ${exit}`), marker }
+  }
+
+  function writeWith(inProcess: InProcessOptions, path = "docs/a.md", content = "a\n") {
+    return store.transact(async (map) => map.set(path, content), `write ${path}`, {
+      candidate: repositoryCandidate({ repo: fixture.repo, inProcess }),
+    })
+  }
+
+  test("use: a claimed check runs in process and decides; the declared command is never spawned", async () => {
+    const check = await markingCheck(1)
+    await declare(`[candidate]\n\tcheck = ${check.command}\n`)
+    const asked: [string, string][] = []
+    const committed = await writeWith({
+      mode: "use",
+      resolve: (kind, command) => {
+        asked.push([kind, command])
+        return command === check.command ? async () => ({ code: 0, stdout: "in process said ok\n", stderr: "" }) : undefined
+      },
+    })
+    expect(committed.report).toEqual(["in process said ok"])
+    expect(asked, "the resolver is handed the exact declared command").toEqual([["check", check.command]])
+    expect(existsSync(check.marker), "the declared check was not spawned").toBe(false)
+  })
+
+  test("a command the resolver does not claim runs as declared", async () => {
+    const check = await markingCheck(0)
+    await declare(`[candidate]\n\tcheck = ${check.command}\n`)
+    const committed = await writeWith({ mode: "use", resolve: () => undefined })
+    expect(committed.report).toEqual(["declared said 0"])
+    expect(existsSync(check.marker)).toBe(true)
+  })
+
+  test("the in-process command gets the spawned command's inputs: git dir, base, candidate and changed paths", async () => {
+    const check = await script(
+      "check.sh",
+      'paths=$(tr "\\0" " ")\necho "$GITOMIC_REPO|$GITOMIC_BASE|$GITOMIC_CANDIDATE|$paths"',
+    )
+    await declare(`[candidate]\n\tcheck = ${check}\n`)
+    const runs: { declared: CandidateRun; inProcess: CandidateRun | { error: string } }[] = []
+    const echo: InProcessCommand = async (input) => ({
+      code: 0,
+      stdout: `${input.gitDir}|${input.base}|${input.candidate}|${input.changed.map((path) => `${path} `).join("")}\n`,
+      stderr: "",
+    })
+    await writeWith({ mode: "shadow", resolve: () => echo, compare: (_kind, _command, both) => runs.push(both) }, "docs/b.md")
+    expect(runs).toHaveLength(1)
+    const [{ declared, inProcess }] = runs as [(typeof runs)[number]]
+    expect("code" in declared && declared.code).toBe(0)
+    expect(inProcess, "the same four inputs, byte for byte").toEqual(declared)
+  })
+
+  test("shadow: the declared command decides, and compare sees both runs", async () => {
+    const check = await markingCheck(1)
+    await declare(`[candidate]\n\tcheck = ${check.command}\n`)
+    const compared: [string, CandidateRun, CandidateRun | { error: string }][] = []
+    const before = await store.head()
+    const refused = writeWith({
+      mode: "shadow",
+      resolve: () => async () => ({ code: 0, stdout: "in process said ok\n", stderr: "" }),
+      compare: (kind, _command, { declared, inProcess }) => compared.push([kind, declared, inProcess]),
+    })
+    await expect(refused).rejects.toMatchObject({ reasons: ["declared said 1"] })
+    expect(await store.head()).toBe(before)
+    expect(existsSync(check.marker)).toBe(true)
+    expect(compared).toEqual([
+      ["check", { code: 1, stdout: "declared said 1\n", stderr: "" }, { code: 0, stdout: "in process said ok\n", stderr: "" }],
+    ])
+  })
+
+  test("shadow: an in-process command that throws is reported to compare, and the declared verdict stands", async () => {
+    const check = await markingCheck(0)
+    await declare(`[candidate]\n\tcheck = ${check.command}\n`)
+    const seen: (CandidateRun | { error: string })[] = []
+    const committed = await writeWith({
+      mode: "shadow",
+      resolve: () => async () => {
+        throw new Error("checker module failed")
+      },
+      compare: (_kind, _command, { inProcess }) => seen.push(inProcess),
+    })
+    expect(committed.report).toEqual(["declared said 0"])
+    expect(seen).toEqual([{ error: "checker module failed" }])
+  })
+
+  test("use: an in-process command that throws fails the write by name, and the ref does not move", async () => {
+    const check = await markingCheck(0)
+    await declare(`[candidate]\n\tcheck = ${check.command}\n`)
+    const before = await store.head()
+    const failed = writeWith({
+      mode: "use",
+      resolve: () => async () => {
+        throw new Error("checker module failed")
+      },
+    })
+    await expect(failed).rejects.toThrow("checker module failed")
+    expect(await store.head()).toBe(before)
+  })
+
+  test("use: an in-process command past the declared timeout refuses naming the check and the limit", async () => {
+    const check = await markingCheck(0)
+    await declare(`[candidate]\n\tcheck = ${check.command}\n\ttimeoutMs = 300\n`)
+    const refused = writeWith({ mode: "use", resolve: () => () => new Promise(() => {}) })
+    await expect(refused).rejects.toMatchObject({
+      reasons: [expect.stringMatching(/check .*check\.sh.* did not finish within its 300 ms limit/u)],
+    })
+  })
+
+  test("use: a claimed derive runs in process and its edits land in the same commit", async () => {
+    const derive = await script("derive.sh", "exit 7")
+    const check = await script("check.sh", 'git --git-dir="$GITOMIC_REPO" show "$GITOMIC_CANDIDATE:docs/derived.md"')
+    await declare(`[candidate]\n\tderive = ${derive}\n\tcheck = ${check}\n`)
+    const committed = await writeWith({
+      mode: "use",
+      resolve: (kind) =>
+        kind === "derive" ? async () => ({ code: 0, stdout: '{"put":{"docs/derived.md":"d\\n"}}', stderr: "" }) : undefined,
+    })
+    expect(await store.at(committed.oid).get("docs/derived.md")).toBe("d\n")
+    expect(committed.report, "the declared check read the derived candidate").toEqual(["d"])
+  })
+
+  test("onStep times a shadowed command's in-process run as its own step", async () => {
+    const check = await markingCheck(0)
+    await declare(`[candidate]\n\tcheck = ${check.command}\n`)
+    const steps: string[] = []
+    await store.transact(async (map) => map.set("docs/a.md", "a\n"), "timed shadow write", {
+      candidate: repositoryCandidate({
+        repo: fixture.repo,
+        onStep: (step) => steps.push(step),
+        inProcess: { mode: "shadow", resolve: () => async () => ({ code: 0, stdout: "", stderr: "" }) },
+      }),
+    })
+    expect(steps).toEqual(["declaration", "trust", "declaration", "gitDir", "materialize", "checkSpawn", "check", "checkInProcess"])
   })
 })

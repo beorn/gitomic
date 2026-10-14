@@ -4,6 +4,12 @@
 
 ### Added
 
+- `repositoryCandidate({ inProcess })` runs a declared derive or check in the
+  caller's process: `resolve(kind, command, context)` claims an exact declared
+  command and returns an implementation that gets the spawned command's inputs
+  as values; `"use"` lets it decide under the declared limit, `"shadow"` runs
+  both, lets the declared command decide and reports both runs to `compare`.
+  Declaration reading and trust are unchanged (27155).
 - `chainsUnder(prefix, { refs })` walks exactly the named refs under the prefix
   (local only; a name outside the prefix, or `refs` with `remote`, refuses before
   any read; an absent ref is omitted as `listRefs` omits it). One call is still
