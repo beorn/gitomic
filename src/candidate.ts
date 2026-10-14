@@ -95,9 +95,11 @@ export type InProcessCommand = (
 /**
  * Declared commands a caller runs in its own process (27155 (iii), @cto 67b6d4c1). gitomic still reads and trusts the
  * declaration itself, then hands `resolve` each exact declared command: a returned implementation runs it, and
- * `undefined` runs the command as declared. Under "use" the in-process run decides, under the declared limit. Under
- * "shadow" both run, the declared command decides, and `compare` sees both runs; an in-process throw reaches
- * `compare` as `{ error }` and never changes the verdict. `compare` runs inline and must not throw.
+ * `undefined` runs the command as declared. `resolve` may answer asynchronously, so it can read the candidate's
+ * contents to decide (27155 (iii-b)); like `compare`, it must not throw, because a throw fails the write. Under "use"
+ * the in-process run decides, under the declared limit. Under "shadow" both run, the declared command decides, and
+ * `compare` sees both runs; an in-process throw reaches `compare` as `{ error }` and never changes the verdict.
+ * `compare` runs inline and must not throw.
  */
 export type InProcessOptions = {
   readonly mode: "use" | "shadow"
@@ -105,7 +107,7 @@ export type InProcessOptions = {
     kind: "derive" | "check",
     command: string,
     context: CandidateContext,
-  ) => InProcessCommand | undefined
+  ) => InProcessCommand | undefined | Promise<InProcessCommand | undefined>
   readonly compare?: (
     kind: "derive" | "check",
     command: string,
@@ -344,15 +346,33 @@ export async function readCandidateCommands(
   options: DeclarationScope,
   base: string,
 ): Promise<CandidateCommands | (CandidateVerdict & { refuse: string[] })> {
-  if ((await readRepositoryDeclaration(options.repo, base)) === undefined) return {}
-  const untrusted = await untrustedDeclaration(options, base)
-  if (untrusted !== undefined) return { refuse: [untrusted] }
-  const declared = await readDeclaration(options.repo, base)
+  const present = async () => (await readRepositoryDeclaration(options.repo, base)) !== undefined
+  const declared = await trustedDeclaration(options, base, present, stepTimer(undefined))
+  if (declared === undefined) return {}
   if ("refuse" in declared) return declared
   return {
     ...(declared.derive === undefined ? {} : { derive: declared.derive }),
     ...(declared.check === undefined ? {} : { check: declared.check }),
   }
+}
+
+/**
+ * The declaration a write at `base` runs, read and trusted in one sequence (27155 (iii-b), @cto 15e1c1ac): `undefined`
+ * when `base` declares none, the refusal a write gets, or its keys. {@link repositoryCandidate} and
+ * {@link readCandidateCommands} both read it here, so a refusal added to one is a refusal of both, and a caller that
+ * imports what the reader returns can never be handed a command a write would refuse to run. `present` is the caller's
+ * own presence read: the store's base for a write, git for a reader outside one.
+ */
+async function trustedDeclaration(
+  options: DeclarationScope,
+  base: string,
+  present: () => Promise<boolean>,
+  timed: StepTimer,
+): Promise<Declaration | (CandidateVerdict & { refuse: string[] }) | undefined> {
+  if (!(await timed("declaration", present))) return undefined
+  const untrusted = await timed("trust", () => untrustedDeclaration(options, base))
+  if (untrusted !== undefined) return { refuse: [untrusted] }
+  return timed("declaration", () => readDeclaration(options.repo, base))
 }
 
 /** The candidate that runs the repository's own declared derive and check commands. Shell-backed repositories only. */
@@ -366,10 +386,9 @@ export function repositoryCandidate(options: RepositoryCandidateOptions): Candid
       }
     }
     const timed = stepTimer(options.onStep)
-    if ((await timed("declaration", () => context.readBase(CANDIDATE_CONFIG))) === undefined) return { report: [] }
-    const untrusted = await timed("trust", () => untrustedDeclaration(options, context.base))
-    if (untrusted !== undefined) return { refuse: [untrusted] }
-    const declared = await timed("declaration", () => readDeclaration(options.repo, context.base))
+    const present = async () => (await context.readBase(CANDIDATE_CONFIG)) !== undefined
+    const declared = await trustedDeclaration(options, context.base, present, timed)
+    if (declared === undefined) return { report: [] }
     if ("refuse" in declared) return declared
     const gitDir = await timed("gitDir", () => resolveGitDir(options.repo))
     const run: Runner = {
@@ -479,7 +498,7 @@ async function runDeclared(
   const { context } = run
   const candidate = materialized ?? (await run.timed("materialize", () => context.materialize()))
   const input: DeclaredCommandInput = { gitDir: run.gitDir, base: context.base, candidate, changed: context.changed }
-  const claimed = run.inProcess?.resolve(kind, command, context)
+  const claimed = await run.inProcess?.resolve(kind, command, context)
   if (claimed !== undefined && run.inProcess?.mode === "use") {
     try {
       return await run.timed(kind, () => runInProcess(claimed, input, run.timeoutMs))

@@ -351,6 +351,20 @@ describe("repositoryCandidate — a declared command the caller runs in process 
     expect(existsSync(check.marker), "the declared check was not spawned").toBe(false)
   })
 
+  test("use: a resolver that answers with a promise is awaited, and its command decides", async () => {
+    const check = await markingCheck(1)
+    await declare(`[candidate]\n\tcheck = ${check.command}\n`)
+    const committed = await writeWith({
+      mode: "use",
+      resolve: async (_kind, _command, context) => {
+        const content = await context.map.get("docs/a.md")
+        return content === "a\n" ? async () => ({ code: 0, stdout: "read the candidate first\n", stderr: "" }) : undefined
+      },
+    })
+    expect(committed.report).toEqual(["read the candidate first"])
+    expect(existsSync(check.marker), "the declared check was not spawned").toBe(false)
+  })
+
   test("a command the resolver does not claim runs as declared", async () => {
     const check = await markingCheck(0)
     await declare(`[candidate]\n\tcheck = ${check.command}\n`)
@@ -521,6 +535,28 @@ describe("readCandidateCommands — what a write at a base would run, read and t
     )
     const read = await readCandidateCommands({ repo: fixture.repo }, declared.oid)
     expect(read).toEqual({ refuse: [expect.stringMatching(/is not trusted to run .*run: gitomic trust '/u)] })
+  })
+
+  test("a base whose declaration refuses gets the same refusal from the reader and from a write", async () => {
+    // One sequence reads and trusts the declaration for both (@cto 15e1c1ac): an untrusted one, then a bad key.
+    const untrusted = await store.transact(
+      async (map) => map.set(CANDIDATE_CONFIG, "[candidate]\n\tcheck = never-trusted\n"),
+      "declare without trusting",
+    )
+    // Each case reads the reader at the head a write builds on, then makes that write.
+    async function sameRefusal(label: string, base: string): Promise<void> {
+      const read = await readCandidateCommands({ repo: fixture.repo }, base)
+      if (!("refuse" in read)) throw new Error(`${label}: the reader did not refuse`)
+      const written = await write("docs/a.md", `${label}\n`).then(
+        () => undefined,
+        (error: unknown) => error,
+      )
+      expect(written, label).toBeInstanceOf(CandidateRefused)
+      expect((written as CandidateRefused).reasons, label).toEqual(read.refuse)
+    }
+    await sameRefusal("untrusted", untrusted.oid)
+    await declare("[candidate]\n\tcheck = check-it\n\tchek = typo\n")
+    await sameRefusal("a bad key", await store.head())
   })
 
   test("an unknown key refuses as the gate refuses it", async () => {

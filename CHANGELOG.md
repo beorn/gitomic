@@ -9,7 +9,8 @@
   command and returns an implementation that gets the spawned command's inputs
   as values; `"use"` lets it decide under the declared limit, `"shadow"` runs
   both, lets the declared command decide and reports both runs to `compare`.
-  Declaration reading and trust are unchanged (27155). Under `"use"` an
+  Declaration reading and trust are unchanged (27155). `resolve` may answer
+  with a promise, so it can read the candidate's contents first. Under `"use"` an
   in-process throw fails the write naming the kind and the declared command,
   with the throw as its `cause`.
 - `readCandidateCommands({ repo, ref?, url? }, base)`: the derive and check
