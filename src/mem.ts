@@ -34,7 +34,7 @@ import type {
   TreeListing,
 } from "./types.js"
 import { rejectLegacyProvenance, validateRefNames } from "./options.ts"
-import { assertGitPrefixMatched, normalizePath, normalizePrefix } from "./path.ts"
+import { assertGitPrefixMatched, assertTreePath, normalizePath, normalizePrefix } from "./path.ts"
 import {
   historyEdgeParentBytes,
   historyEdgeRecordStartBytes,
@@ -154,6 +154,7 @@ export function createMemBackend(): GitomicBackend {
 
   const writeCommit = async (name: string, input: CommitInput): Promise<Oid> => {
     rejectLegacyProvenance(input)
+    for (const path of input.changes.keys()) assertTreePath(path)
     const repo = getRepo(name)
     const parents = commitParents(input)
     const parent = repo.commits.get(input.parent)

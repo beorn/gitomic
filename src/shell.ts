@@ -49,7 +49,7 @@ import {
   transactionMatches,
   validateOid,
 } from "./git-object.ts"
-import { assertGitPrefixMatched, normalizePath, normalizePrefix } from "./path.ts"
+import { assertGitPrefixMatched, assertTreePath, normalizePath, normalizePrefix } from "./path.ts"
 import { assertTreeEntryMode } from "./types.ts"
 import type {
   BlobValue,
@@ -579,6 +579,14 @@ async function run(command: string, args: readonly string[], options: GitOptions
       release()
       finish()
     }
+    // A child that failed to start (EMFILE, ENOENT) reports it with an "error" event and may have no pipes at all.
+    // Listen first and touch no pipe it lacks: a later "error" with no listener takes the whole host down (@cto
+    // 6c9330ac).
+    child.once("error", (error) => settle(() => reject(error)))
+    if ([child.stdin, child.stdout, child.stderr].some((pipe: unknown) => pipe === null || pipe === undefined)) {
+      settle(() => reject(new Error(`${describeGitCommand(command, args)} could not start: it has no stdio pipes`)))
+      return
+    }
     const settleOutcome = (code: number | null, signal: NodeJS.Signals | null): void => {
       settle(() => {
         const capturedStderr = Buffer.concat(stderr)
@@ -630,7 +638,6 @@ async function run(command: string, args: readonly string[], options: GitOptions
     }
     child.stdout.on("data", (chunk: Buffer) => collect(stdout, chunk))
     child.stderr.on("data", (chunk: Buffer) => collect(stderr, chunk))
-    child.once("error", (error) => settle(() => reject(error)))
     // A stopped command settles when its own process exits, not when its pipes close.
     child.once("exit", (code, signal) => {
       exitCode = code
@@ -1043,6 +1050,7 @@ async function writeCommit(
   signing?: { timeoutMs: number },
 ): Promise<Oid> {
   rejectLegacyProvenance(input)
+  for (const path of input.changes.keys()) assertTreePath(path)
   const parents = commitParents(input)
   const idents = commitIdents(input)
   const message = formatCommitMessage(input.writer, input.instance, input.message, input.seq, input.trailers)
@@ -1112,6 +1120,19 @@ async function writeCommit(
 type TreeRecord = { readonly mode: string; readonly type: string; readonly oid: Oid }
 
 /**
+ * `ls-tree` children one tree build runs at once. 300 sibling directories listed all at once exhausted a 1024 file
+ * descriptor limit (@cto 6c9330ac); 8 keeps a wide write well inside it at the same per-level latency for a narrow one.
+ */
+const LIST_TREE_CONCURRENCY = 8
+
+/** Git's empty tree id, SHA-1 and SHA-256 (git's own EMPTY_TREE constants), chosen by the repository's id length. */
+function emptyTreeOid(like: Oid): Oid {
+  return like.length === 64
+    ? "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321"
+    : "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+}
+
+/**
  * The tree `changes` make of `parentTree`, rebuilding only the directories they touch (27155). Each touched directory
  * is listed top-down (`ls-tree -z` of its tree id, one level at a time), its entries replaced, and the new trees are
  * written bottom-up (`mktree -z --batch`, one git child per depth). Git writes and orders every object, so the id is the
@@ -1140,6 +1161,13 @@ async function buildTree(
     if (content !== undefined && source !== undefined) for (const dir of treeAncestors(key(source))) read.add(dir)
   }
   const listings = await listDirectories(repo, parentTree, read, baseEnv)
+  // The index route never records an empty subtree (write-tree drops it), so a rebuilt directory drops one too, and a
+  // put over an empty subtree replaces it rather than colliding. An untouched directory keeps any it holds.
+  const empty = emptyTreeOid(parentTree)
+  for (const dir of rebuilt) {
+    const listing = listings.get(dir) as Map<string, TreeRecord>
+    for (const [name, entry] of listing) if (entry.type === "tree" && entry.oid === empty) listing.delete(name)
+  }
 
   const executables = new Set<string>()
   for (const [changed, content] of changes) {
@@ -1243,13 +1271,16 @@ async function listDirectories(
   const listings = new Map<string, Map<string, TreeRecord>>()
   for (const level of byTreeDepth(dirs)) {
     if (level === undefined) continue
-    await Promise.all(
-      level.map(async (dir) => {
-        const entry = dir === "" ? undefined : listings.get(treeParent(dir))?.get(treeName(dir))
-        const oid = dir === "" ? parentTree : entry?.type === "tree" ? entry.oid : undefined
-        listings.set(dir, oid === undefined ? new Map<string, TreeRecord>() : await listTree(repo, oid, baseEnv))
-      }),
-    )
+    // A level can hold hundreds of directories: list them a bounded batch at a time, never one child each at once.
+    for (let start = 0; start < level.length; start += LIST_TREE_CONCURRENCY) {
+      await Promise.all(
+        level.slice(start, start + LIST_TREE_CONCURRENCY).map(async (dir) => {
+          const entry = dir === "" ? undefined : listings.get(treeParent(dir))?.get(treeName(dir))
+          const oid = dir === "" ? parentTree : entry?.type === "tree" ? entry.oid : undefined
+          listings.set(dir, oid === undefined ? new Map<string, TreeRecord>() : await listTree(repo, oid, baseEnv))
+        }),
+      )
+    }
   }
   return listings
 }
@@ -1280,10 +1311,15 @@ async function writeTrees(
   return written
 }
 
-/** One `ls-tree -z` of a tree id: its entries keyed by raw name bytes. */
+/**
+ * One `ls-tree -z` of a tree id: its entries keyed by raw name bytes. `--full-tree`, as this file's other ls-tree
+ * reads: without it an inherited work tree (GIT_WORK_TREE, core.worktree) and a subdirectory cwd scope the listing to
+ * that subdirectory, and a rebuilt tree would silently lose every entry outside it.
+ */
 async function listTree(repo: string, tree: Oid, baseEnv?: NodeJS.ProcessEnv): Promise<Map<string, TreeRecord>> {
   const entries = new Map<string, TreeRecord>()
-  for (const record of (await git(repo, ["ls-tree", "-z", tree], { baseEnv })).toString("latin1").split("\0")) {
+  const listing = await git(repo, ["ls-tree", "--full-tree", "-z", tree], { baseEnv })
+  for (const record of listing.toString("latin1").split("\0")) {
     if (record === "") continue
     const tab = record.indexOf("\t")
     const [mode, type, oid] = record.slice(0, Math.max(0, tab)).split(" ")

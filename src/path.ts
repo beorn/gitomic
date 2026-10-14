@@ -46,18 +46,40 @@ export function assertGitPrefixMatched(count: number, repo: string, commit: stri
   )
 }
 
+/**
+ * Why `path` cannot be a path in a tree gitomic writes, or `undefined` when it can. The one check every writer shares
+ * (27155, @cto 6c9330ac): {@link normalizePath} for a caller's path, and every backend's `writeCommit` for a direct
+ * caller that never normalized, so shell, iso and mem refuse the same paths. Git's index silently drops a `.git` path
+ * ("Ignoring path"), and a tree that holds one fails `git fsck --strict` (hasDotgit), so a remote that runs fsck
+ * rejects the push; `.git` counts in any case and in its NTFS spellings (trailing dots or spaces, `git~1`).
+ */
+export function invalidTreePathReason(path: string): string | undefined {
+  if (path.length === 0) return "it is empty"
+  if (path.startsWith("/") || path.endsWith("/")) return "it starts or ends with a slash"
+  if (path.includes("\0")) return "it holds a NUL byte"
+  for (const part of path.split("/")) {
+    if (part === "") return "it has an empty component"
+    if (part === "." || part === "..") return `it has a ${JSON.stringify(part)} component`
+    const lower = part.toLowerCase()
+    if (lower === "git~1" || lower.replace(/[. ]+$/u, "") === ".git") {
+      return `its component ${JSON.stringify(part)} names git's own directory`
+    }
+  }
+  return undefined
+}
+
+/** Refuse a path {@link invalidTreePathReason} names, by the path and the reason. */
+export function assertTreePath(path: string): void {
+  const reason = invalidTreePathReason(path)
+  if (reason !== undefined) throw new TypeError(`invalid git tree path: ${JSON.stringify(path)}: ${reason}`)
+}
+
 export function normalizePath(path: string): string {
   assertUtf8(path, "git tree path")
   const normalized = path.normalize("NFC")
-  if (
-    normalized.length === 0 ||
-    normalized.startsWith("/") ||
-    normalized.endsWith("/") ||
-    normalized.includes("\\") ||
-    normalized.includes("\0") ||
-    normalized.split("/").some((part) => part === "" || part === "." || part === "..")
-  ) {
-    throw new TypeError(`invalid git tree path: ${JSON.stringify(path)}`)
+  const reason = normalized.includes("\\") ? "it holds a backslash" : invalidTreePathReason(normalized)
+  if (reason !== undefined) {
+    throw new TypeError(`invalid git tree path: ${JSON.stringify(path)}: ${reason}`)
   }
   if (normalized.startsWith(INTERNAL_PREFIX) || normalized === INTERNAL_PREFIX.slice(0, -1)) {
     throw new TypeError(`${INTERNAL_PREFIX} is a reserved gitomic path namespace`)

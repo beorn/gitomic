@@ -10,16 +10,18 @@
  * @reach fs-walk <fixture-only: Git tree reads use temporary bare repositories>
  */
 
-import { execFileSync } from "node:child_process"
+import childProcess, { execFileSync } from "node:child_process"
+import { EventEmitter } from "node:events"
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { describe, expect, test } from "vitest"
+import { describe, expect, test, vi } from "vitest"
 
-import { createShellBackend, TreePathCollision, type CommitInput, type GitomicBackend } from "../src/index.js"
+import { createShellBackend, runGit, TreePathCollision, type CommitInput, type GitomicBackend } from "../src/index.js"
 import { createIsoBackend } from "../src/iso.js"
 import { createMemBackend } from "../src/mem.js"
+import { normalizePath } from "../src/path.js"
 import { createBareRepo, git, gitWithInput } from "./helpers/git.js"
 
 const T0 = 1_800_000_000
@@ -66,6 +68,7 @@ async function indexRouteTree(repo: string, change: CommitInput): Promise<string
     run(["update-index", "--add", "-z", "--index-info"], Buffer.concat(lines))
     return run(["write-tree"]).toString().trim()
   } finally {
+    // raw-delete-allow: the oracle's own mkdtemp index; gitomic is standalone and takes no removely dependency
     await rm(dir, { recursive: true, force: true })
   }
 }
@@ -138,8 +141,173 @@ describe("the shell backend builds a commit's tree from the touched directories 
       expect(built).toBe(await indexRouteTree(fixture.repo, change))
       const commands = (await readFile(log, "utf8")).split("\n").filter(Boolean)
       expect(commands.filter((line) => /(^| )(read-tree|update-index|write-tree)( |$)/u.test(line))).toEqual([])
+      // Only the touched directories are listed, each by its own tree id, never recursively (@cto 6c9330ac).
+      const listed = commands.filter((line) => / ls-tree( |$)/u.test(line))
+      expect(listed.filter((line) => / -r( |$)/u.test(line))).toEqual([])
+      const touched = [
+        await treeOf(fixture.repo, parent),
+        await git(fixture.repo, "rev-parse", `${parent}:pm`),
+        await git(fixture.repo, "rev-parse", `${parent}:pm/area-2`),
+      ]
+      expect(listed.map((line) => line.split(" ").at(-1)).sort()).toEqual([...touched].sort())
+      for (const line of listed) expect(line).toContain("--full-tree")
     } finally {
+      // raw-delete-allow: a test's own mkdtemp scratch; gitomic is standalone and takes no removely dependency
       await rm(wrapperDir, { recursive: true, force: true })
+      await fixture.cleanup()
+    }
+  })
+
+  test("an inherited work tree and a subdirectory cwd never scope the listing (@cto 6c9330ac)", async () => {
+    const fixture = await createBareRepo()
+    const work = await mkdtemp(join(tmpdir(), "gitomic-tree-build-worktree-"))
+    try {
+      const parent = await seedTree(fixture.repo, fixture.initial, {
+        "top.md": await blob(fixture.repo, "top\n"),
+        "other/kept.md": await blob(fixture.repo, "kept\n"),
+        "pm/a.md": await blob(fixture.repo, "a\n"),
+      })
+      execFileSync("mkdir", ["-p", join(work, "pm")])
+      const change = input(parent, [["pm/a.md", "edited\n"]])
+      // Run the write in a child whose cwd is the work tree's pm/ with GIT_WORK_TREE inherited, as a hook would.
+      const script = [
+        `const { createShellBackend } = await import(${JSON.stringify(join(import.meta.dirname, "..", "src", "index.ts"))})`,
+        `const input = JSON.parse(process.env.TB_INPUT)`,
+        `input.changes = new Map(input.changes)`,
+        `console.log(await createShellBackend().writeCommit(${JSON.stringify(fixture.repo)}, input))`,
+      ].join("\n")
+      const oid = execFileSync("bun", ["-e", script], {
+        cwd: join(work, "pm"),
+        env: {
+          ...process.env,
+          GIT_WORK_TREE: work,
+          TB_INPUT: JSON.stringify({ ...change, changes: [...change.changes] }),
+        },
+      })
+        .toString()
+        .trim()
+      expect(await treeOf(fixture.repo, oid)).toBe(await indexRouteTree(fixture.repo, change))
+      expect((await git(fixture.repo, "ls-tree", "-r", "--name-only", oid)).split("\n").sort()).toEqual([
+        "other/kept.md",
+        "pm/a.md",
+        "top.md",
+      ])
+    } finally {
+      // raw-delete-allow: a test's own mkdtemp scratch; gitomic is standalone and takes no removely dependency
+      await rm(work, { recursive: true, force: true })
+      await fixture.cleanup()
+    }
+  })
+
+  test("every backend's writeCommit refuses each path git cannot hold, by name (@cto 6c9330ac)", async () => {
+    const shell = await createBareRepo()
+    const iso = await createBareRepo()
+    const legs: { name: string; backend: GitomicBackend; repo: string }[] = [
+      { name: "shell", backend: createShellBackend(), repo: shell.repo },
+      { name: "iso", backend: createIsoBackend(), repo: iso.repo },
+      { name: "mem", backend: createMemBackend(), repo: "tree-build-paths" },
+    ]
+    const forms = [
+      "",
+      "/lead.md",
+      "trail/",
+      "a//b.md",
+      "./a.md",
+      "a/./b.md",
+      "a/../b.md",
+      "..",
+      ".git/config",
+      "a/.GIT/x.md",
+      "a/.Git./x.md",
+      "a/.git  /x.md",
+      "a/GIT~1/x.md",
+      "a\0b.md",
+    ]
+    try {
+      for (const form of forms) {
+        expect(() => normalizePath(form), `normalizePath ${JSON.stringify(form)}`).toThrow(
+          `invalid git tree path: ${JSON.stringify(form)}`,
+        )
+        for (const leg of legs) {
+          await expect(
+            leg.backend.writeCommit(leg.repo, input(shell.initial, [[form, "x\n"]])),
+            `${leg.name} ${JSON.stringify(form)}`,
+          ).rejects.toThrow(`invalid git tree path: ${JSON.stringify(form)}`)
+        }
+      }
+      // Names that only look like the forms above are ordinary paths.
+      for (const name of [".gitignore", ".gitmodules", "a/.gitx/y.md", "git~2/z.md", "..x/y.md"]) {
+        expect(normalizePath(name)).toBe(name)
+        for (const leg of legs) await leg.backend.writeCommit(leg.repo, input(shell.initial, [[name, "x\n"]]))
+      }
+    } finally {
+      await Promise.all([shell.cleanup(), iso.cleanup()])
+    }
+  })
+
+  test("a write touching hundreds of sibling directories lists them inside a small descriptor budget", async () => {
+    const fixture = await createBareRepo()
+    try {
+      const files: Record<string, { mode: string; type: string; oid: string }> = {}
+      const shared = await blob(fixture.repo, "x\n")
+      for (let index = 0; index < 300; index += 1) files[`pm/d${index}/x.md`] = shared
+      const parent = await seedTree(fixture.repo, fixture.initial, files)
+      const change = input(
+        parent,
+        Array.from({ length: 300 }, (_, index): [string, string] => [`pm/d${index}/x.md`, `edited ${index}\n`]),
+      )
+      const script = [
+        `const { createShellBackend } = await import(${JSON.stringify(join(import.meta.dirname, "..", "src", "index.ts"))})`,
+        `const input = JSON.parse(process.env.TB_INPUT)`,
+        `input.changes = new Map(input.changes)`,
+        `console.log(await createShellBackend().writeCommit(${JSON.stringify(fixture.repo)}, input))`,
+      ].join("\n")
+      // 256 descriptors: 300 ls-tree children at once (three pipes each) cannot fit; a bounded batch does.
+      const oid = execFileSync("sh", ["-c", 'ulimit -n 256 && exec bun -e "$TB_SCRIPT"'], {
+        env: {
+          ...process.env,
+          TB_SCRIPT: script,
+          TB_INPUT: JSON.stringify({ ...change, changes: [...change.changes] }),
+        },
+        maxBuffer: 1 << 26,
+      })
+        .toString()
+        .trim()
+      expect(await treeOf(fixture.repo, oid)).toBe(await indexRouteTree(fixture.repo, change))
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  test("a child that cannot start rejects loudly and never leaves an unheard error event (@cto 6c9330ac)", async () => {
+    const failure = Object.assign(new Error("spawn git EMFILE"), { code: "EMFILE", syscall: "spawn git" })
+    const spawn = vi.spyOn(childProcess, "spawn").mockImplementation(() => {
+      // What node returns when it could not create the child's pipes: no stdio, an "error" on the next tick.
+      const child = Object.assign(new EventEmitter(), { pid: undefined, stdin: null, stdout: null, stderr: null })
+      process.nextTick(() => child.emit("error", failure))
+      return child as unknown as ReturnType<typeof childProcess.spawn>
+    })
+    try {
+      await expect(runGit(["--version"])).rejects.toThrow(/could not start|EMFILE/u)
+      // Let the scheduled "error" fire: with no listener it would throw out of the event loop and fail the run.
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    } finally {
+      spawn.mockRestore()
+    }
+  })
+
+  test("an empty subtree in a rebuilt directory is dropped, and a put over one replaces it, as the index route", async () => {
+    const fixture = await createBareRepo()
+    try {
+      const emptyTree = await gitWithInput(fixture.repo, "", "mktree", "-z")
+      const parent = await seedTree(fixture.repo, fixture.initial, {
+        "pm/a.md": await blob(fixture.repo, "a\n"),
+        "pm/hollow": { mode: "040000", type: "tree", oid: emptyTree },
+        slot: { mode: "040000", type: "tree", oid: emptyTree },
+      })
+      await expectSameTree(fixture.repo, input(parent, [["pm/a.md", "edited\n"]]), "a sibling empty subtree")
+      await expectSameTree(fixture.repo, input(parent, [["slot", "now a file\n"]]), "a put over an empty subtree")
+    } finally {
       await fixture.cleanup()
     }
   })

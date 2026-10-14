@@ -22,7 +22,7 @@ import {
 import type { GitObject, GitTreeObjectEntry } from "./git-object.js"
 import { createDurableObjectWriter } from "./iso-durable.ts"
 import { rejectLegacyProvenance } from "./options.ts"
-import { assertGitPrefixMatched, assertRegularBlob, normalizePath, normalizePrefix } from "./path.ts"
+import { assertGitPrefixMatched, assertRegularBlob, assertTreePath, normalizePath, normalizePrefix } from "./path.ts"
 import { createShellRuntime } from "./shell.ts"
 import { assertTreeEntryMode } from "./types.ts"
 import type { BlobValue, CommitInput, GitomicBackend, Oid, TreeEntry, TreeEntryMode, TreeListing } from "./types.js"
@@ -231,6 +231,7 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
 
   const writeCommit = async (repo: string, input: CommitInput): Promise<Oid> => {
     rejectLegacyProvenance(input)
+    for (const path of input.changes.keys()) assertTreePath(path)
     const gitdir = await resolveGitDir(repo)
     const parents = commitParents(input)
     const parentResult = await readCommit({ fs, gitdir, oid: input.parent, cache })
