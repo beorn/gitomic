@@ -1133,60 +1133,33 @@ async function buildTree(
 ): Promise<Oid> {
   const key = (path: string) => Buffer.from(path, "utf8").toString("latin1")
   const path = (raw: string) => Buffer.from(raw, "latin1").toString("utf8")
-  const parentOf = (raw: string) => raw.slice(0, Math.max(0, raw.lastIndexOf("/")))
-  const nameOf = (raw: string) => raw.slice(raw.lastIndexOf("/") + 1)
-  const depthOf = (dir: string) => (dir === "" ? 0 : dir.split("/").length)
-  const ancestors = (raw: string): string[] => {
-    const dirs: string[] = []
-    for (let dir = parentOf(raw); ; dir = parentOf(dir)) {
-      dirs.push(dir)
-      if (dir === "") return dirs
-    }
-  }
-  const rebuilt = new Set(changes.flatMap(([changed]) => ancestors(key(changed))))
+  const rebuilt = new Set(changes.flatMap(([changed]) => treeAncestors(key(changed))))
   const read = new Set(rebuilt)
   for (const [changed, content] of changes) {
     const source = input.modeSources?.get(changed)
-    if (content !== undefined && source !== undefined) for (const dir of ancestors(key(source))) read.add(dir)
+    if (content !== undefined && source !== undefined) for (const dir of treeAncestors(key(source))) read.add(dir)
   }
-
-  // Top-down: a directory's tree id comes from its parent's listing; absent from it, the directory is new.
-  const listings = new Map<string, Map<string, TreeRecord>>()
-  const byDepth = (dirs: Iterable<string>) => {
-    const levels: string[][] = []
-    for (const dir of dirs) (levels[depthOf(dir)] ??= []).push(dir)
-    return levels
-  }
-  for (const level of byDepth(read)) {
-    if (level === undefined) continue
-    await Promise.all(
-      level.map(async (dir) => {
-        const entry = dir === "" ? undefined : listings.get(parentOf(dir))?.get(nameOf(dir))
-        const oid = dir === "" ? parentTree : entry?.type === "tree" ? entry.oid : undefined
-        listings.set(dir, oid === undefined ? new Map() : await listTree(repo, oid, baseEnv))
-      }),
-    )
-  }
+  const listings = await listDirectories(repo, parentTree, read, baseEnv)
 
   const executables = new Set<string>()
   for (const [changed, content] of changes) {
     if (content === undefined) continue
     const source = key(input.modeSources?.get(changed) ?? changed)
-    if (listings.get(parentOf(source))?.get(nameOf(source))?.mode === "100755") executables.add(path(source))
+    if (listings.get(treeParent(source))?.get(treeName(source))?.mode === "100755") executables.add(path(source))
   }
   // A put over a directory that nothing below it empties: the file and the directory would share one name.
   const overDirectory: { raw: string; tree: Oid }[] = []
   let blobPosition = 0
   for (const [changed, content] of changes) {
     const raw = key(changed)
-    const listing = listings.get(parentOf(raw)) as Map<string, TreeRecord>
-    const existing = listing.get(nameOf(raw))
+    const listing = listings.get(treeParent(raw)) as Map<string, TreeRecord>
+    const existing = listing.get(treeName(raw))
     if (content === undefined) {
-      if (existing !== undefined && existing.type !== "tree") listing.delete(nameOf(raw))
+      if (existing !== undefined && existing.type !== "tree") listing.delete(treeName(raw))
       continue
     }
     if (existing?.type === "tree" && !rebuilt.has(raw)) overDirectory.push({ raw, tree: existing.oid })
-    listing.set(nameOf(raw), {
+    listing.set(treeName(raw), {
       mode: keptMode(input, changed, executables),
       type: "blob",
       oid: blobs[blobPosition++] as Oid,
@@ -1198,29 +1171,14 @@ async function buildTree(
   }
 
   // Bottom-up: one mktree per depth writes every non-empty rebuilt directory of that depth.
-  const levels = byDepth(rebuilt)
+  const levels = byTreeDepth(rebuilt)
   for (let depth = levels.length - 1; depth >= 0; depth--) {
-    const level = (levels[depth] ?? []).filter((dir) => (listings.get(dir) as Map<string, TreeRecord>).size > 0)
-    const written = new Map<string, Oid>()
-    if (level.length > 0) {
-      const records = level.map((dir) =>
-        [...(listings.get(dir) as Map<string, TreeRecord>)]
-          .map(([name, entry]) => `${entry.mode} ${entry.type} ${entry.oid}\t${name}\0`)
-          .join(""),
-      )
-      const output = text(
-        await gitWrite(repo, ["mktree", "-z", "--batch"], {
-          baseEnv,
-          input: Buffer.from(records.join("\0"), "latin1"),
-        }),
-      ).split("\n")
-      if (output.length !== level.length) {
-        throw new Error(`git mktree --batch returned ${output.length} tree ids for ${level.length} trees`)
-      }
-      for (const [position, dir] of level.entries()) {
-        written.set(dir, validateOid(output[position], `invalid tree id for ${JSON.stringify(path(dir))}`))
-      }
-    }
+    const written = await writeTrees(
+      repo,
+      (levels[depth] ?? []).filter((dir) => (listings.get(dir) as Map<string, TreeRecord>).size > 0),
+      listings,
+      baseEnv,
+    )
     for (const dir of levels[depth] ?? []) {
       const oid = written.get(dir)
       if (dir === "") {
@@ -1229,20 +1187,97 @@ async function buildTree(
           validateOid(text(await gitWrite(repo, ["mktree", "-z"], { baseEnv, input: "" })), "invalid empty tree id")
         )
       }
-      const parent = listings.get(parentOf(dir)) as Map<string, TreeRecord>
-      const holder = parent.get(nameOf(dir))
+      const parent = listings.get(treeParent(dir)) as Map<string, TreeRecord>
+      const holder = parent.get(treeName(dir))
       if (oid === undefined) {
-        if (holder?.type === "tree") parent.delete(nameOf(dir))
+        if (holder?.type === "tree") parent.delete(treeName(dir))
         continue
       }
       if (holder !== undefined && holder.type !== "tree") {
         const first = [...(listings.get(dir) as Map<string, TreeRecord>).keys()].sort()[0] ?? ""
         throw new TreePathCollision(path(dir), path(`${dir}/${first}`))
       }
-      parent.set(nameOf(dir), { mode: "040000", type: "tree", oid })
+      parent.set(treeName(dir), { mode: "040000", type: "tree", oid })
     }
   }
   throw new Error("tree build ended without writing the root tree")
+}
+
+/** The directory holding a raw tree path ("" for a root entry). */
+function treeParent(raw: string): string {
+  return raw.slice(0, Math.max(0, raw.lastIndexOf("/")))
+}
+
+/** The last component of a raw tree path. */
+function treeName(raw: string): string {
+  return raw.slice(raw.lastIndexOf("/") + 1)
+}
+
+/** Every directory above a raw tree path, the root ("") last. */
+function treeAncestors(raw: string): string[] {
+  const dirs: string[] = []
+  for (let dir = treeParent(raw); ; dir = treeParent(dir)) {
+    dirs.push(dir)
+    if (dir === "") return dirs
+  }
+}
+
+/** Directories grouped by depth: index 0 holds the root, index n the directories n levels below it. */
+function byTreeDepth(dirs: Iterable<string>): string[][] {
+  const levels: string[][] = []
+  for (const dir of dirs) (levels[dir === "" ? 0 : dir.split("/").length] ??= []).push(dir)
+  return levels
+}
+
+/**
+ * The parent tree's listing of every named directory, top-down: a directory's tree id comes from its parent's
+ * listing, and a directory absent from it (or held there by a file) is new and lists empty. One level at a time,
+ * each level's `ls-tree` children in parallel.
+ */
+async function listDirectories(
+  repo: string,
+  parentTree: Oid,
+  dirs: Iterable<string>,
+  baseEnv?: NodeJS.ProcessEnv,
+): Promise<Map<string, Map<string, TreeRecord>>> {
+  const listings = new Map<string, Map<string, TreeRecord>>()
+  for (const level of byTreeDepth(dirs)) {
+    if (level === undefined) continue
+    await Promise.all(
+      level.map(async (dir) => {
+        const entry = dir === "" ? undefined : listings.get(treeParent(dir))?.get(treeName(dir))
+        const oid = dir === "" ? parentTree : entry?.type === "tree" ? entry.oid : undefined
+        listings.set(dir, oid === undefined ? new Map<string, TreeRecord>() : await listTree(repo, oid, baseEnv))
+      }),
+    )
+  }
+  return listings
+}
+
+/** One `mktree -z --batch` for the given directories' entries; their new tree ids, by directory. */
+async function writeTrees(
+  repo: string,
+  dirs: readonly string[],
+  listings: ReadonlyMap<string, ReadonlyMap<string, TreeRecord>>,
+  baseEnv?: NodeJS.ProcessEnv,
+): Promise<Map<string, Oid>> {
+  const written = new Map<string, Oid>()
+  if (dirs.length === 0) return written
+  const records = dirs.map((dir) =>
+    [...(listings.get(dir) ?? [])]
+      .map(([name, entry]) => `${entry.mode} ${entry.type} ${entry.oid}\t${name}\0`)
+      .join(""),
+  )
+  const input = Buffer.from(records.join("\0"), "latin1")
+  const output = text(await gitWrite(repo, ["mktree", "-z", "--batch"], { baseEnv, input })).split("\n")
+  if (output.length !== dirs.length) {
+    throw new Error(`git mktree --batch returned ${output.length} tree ids for ${dirs.length} trees`)
+  }
+  for (const [position, dir] of dirs.entries()) {
+    const label = JSON.stringify(Buffer.from(dir, "latin1").toString("utf8"))
+    written.set(dir, validateOid(output[position], `invalid tree id for ${label}`))
+  }
+  return written
 }
 
 /** One `ls-tree -z` of a tree id: its entries keyed by raw name bytes. */
