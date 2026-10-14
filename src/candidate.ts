@@ -497,6 +497,8 @@ async function spawnDeclared(
 /**
  * A claimed command under the declared limit, as a spawned one runs: past the limit it reads as timed out. Its work
  * cannot be killed, so a pure-JS hang still holds the caller's thread; the caller bounds what it claims (27155 (iii)).
+ * Synchronous work also holds the limit's own timer, so a result that arrives after the deadline is a timeout too,
+ * never a pass (@dev/review2 REVISE on 869c4d6).
  */
 async function runInProcess(
   command: InProcessCommand,
@@ -507,9 +509,11 @@ async function runInProcess(
   const limit = new Promise<CandidateRun>((resolve) => {
     timer = setTimeout(() => resolve({ timedOut: true }), timeoutMs)
   })
+  const started = performance.now()
   try {
     const result = await Promise.race([command(input), limit])
-    return "timedOut" in result ? result : { code: result.code, stdout: result.stdout, stderr: result.stderr }
+    if ("timedOut" in result || performance.now() - started > timeoutMs) return { timedOut: true }
+    return { code: result.code, stdout: result.stdout, stderr: result.stderr }
   } finally {
     clearTimeout(timer)
   }

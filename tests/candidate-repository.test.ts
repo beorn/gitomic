@@ -440,6 +440,27 @@ describe("repositoryCandidate — a declared command the caller runs in process 
     })
   })
 
+  test("use: an in-process command that finishes past the limit is a timeout, never a pass, and the ref does not move", async () => {
+    const check = await markingCheck(0)
+    await declare(`[candidate]\n\tcheck = ${check.command}\n\ttimeoutMs = 10\n`)
+    const before = await store.head()
+    // Synchronous work holds the thread, so the limit's timer cannot fire before the result is in (@dev/review2 REVISE).
+    const refused = writeWith({
+      mode: "use",
+      resolve: () => async () => {
+        const end = performance.now() + 60
+        while (performance.now() < end) {
+          // busy: a synchronous checker over its limit
+        }
+        return { code: 0, stdout: "late but fine\n", stderr: "" }
+      },
+    })
+    await expect(refused).rejects.toMatchObject({
+      reasons: [expect.stringMatching(/check .*check\.sh.* did not finish within its 10 ms limit/u)],
+    })
+    expect(await store.head()).toBe(before)
+  })
+
   test("use: a claimed derive runs in process and its edits land in the same commit", async () => {
     const derive = await script("derive.sh", "exit 7")
     const check = await script("check.sh", 'git --git-dir="$GITOMIC_REPO" show "$GITOMIC_CANDIDATE:docs/derived.md"')
