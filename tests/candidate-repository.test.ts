@@ -351,6 +351,40 @@ describe("repositoryCandidate — a declared command the caller runs in process 
     expect(existsSync(check.marker), "the declared check was not spawned").toBe(false)
   })
 
+  test("shadow: a resolver that rejects leaves the verdict and the ref to the declared command, and compare is told", async () => {
+    const check = await markingCheck(0)
+    await declare(`[candidate]\n\tcheck = ${check.command}\n`)
+    const seen: (CandidateRun | { error: string })[] = []
+    const committed = await writeWith({
+      mode: "shadow",
+      resolve: async () => {
+        throw new Error("candidate read failed")
+      },
+      compare: (_kind, _command, { inProcess }) => seen.push(inProcess),
+    })
+    expect(committed.report, "the declared check decided").toEqual(["declared said 0"])
+    expect(existsSync(check.marker), "the declared check ran").toBe(true)
+    expect(await store.head()).toBe(committed.oid)
+    expect(seen).toEqual([{ error: "resolve: candidate read failed" }])
+  })
+
+  test("use: a resolver that rejects fails the write naming its kind and command, and the ref does not move", async () => {
+    const check = await markingCheck(0)
+    await declare(`[candidate]\n\tcheck = ${check.command}\n`)
+    const before = await store.head()
+    const thrown = new Error("candidate read failed")
+    const failed = writeWith({
+      mode: "use",
+      resolve: async () => {
+        throw thrown
+      },
+    })
+    await expect(failed).rejects.toThrow(`check \`${check.command}\` failed in process: resolve: candidate read failed`)
+    await expect(failed).rejects.toMatchObject({ cause: thrown })
+    expect(existsSync(check.marker), "nothing was spawned").toBe(false)
+    expect(await store.head()).toBe(before)
+  })
+
   test("use: a resolver that answers with a promise is awaited, and its command decides", async () => {
     const check = await markingCheck(1)
     await declare(`[candidate]\n\tcheck = ${check.command}\n`)

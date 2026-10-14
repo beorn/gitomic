@@ -11,8 +11,9 @@
   both, lets the declared command decide and reports both runs to `compare`.
   Declaration reading and trust are unchanged (27155). `resolve` may answer
   with a promise, so it can read the candidate's contents first. Under `"use"` an
-  in-process throw fails the write naming the kind and the declared command,
-  with the throw as its `cause`.
+  in-process throw or a rejected `resolve` fails the write naming the kind and
+  the declared command, with the throw as its `cause`; under `"shadow"` the
+  declared command decides and `compare` gets `{ error }`.
 - `readCandidateCommands({ repo, ref?, url? }, base)`: the derive and check
   commands a write at `base` would run, read and trusted as `repositoryCandidate`
   reads and trusts them; `{}` with no declaration, the write's `{ refuse }` when

@@ -96,10 +96,11 @@ export type InProcessCommand = (
  * Declared commands a caller runs in its own process (27155 (iii), @cto 67b6d4c1). gitomic still reads and trusts the
  * declaration itself, then hands `resolve` each exact declared command: a returned implementation runs it, and
  * `undefined` runs the command as declared. `resolve` may answer asynchronously, so it can read the candidate's
- * contents to decide (27155 (iii-b)); like `compare`, it must not throw, because a throw fails the write. Under "use"
- * the in-process run decides, under the declared limit. Under "shadow" both run, the declared command decides, and
- * `compare` sees both runs; an in-process throw reaches `compare` as `{ error }` and never changes the verdict.
- * `compare` runs inline and must not throw.
+ * contents to decide (27155 (iii-b)), and a rejection is a fault like a command's throw. Under "use" the in-process
+ * run decides, under the declared limit, and a throw or a rejected `resolve` fails the write naming the kind and the
+ * command. Under "shadow" both run, the declared command decides, and `compare` sees both runs; an in-process throw or
+ * a rejected `resolve` reaches `compare` as `{ error }` and never changes the verdict. `compare` runs inline and must
+ * not throw.
  */
 export type InProcessOptions = {
   readonly mode: "use" | "shadow"
@@ -498,7 +499,20 @@ async function runDeclared(
   const { context } = run
   const candidate = materialized ?? (await run.timed("materialize", () => context.materialize()))
   const input: DeclaredCommandInput = { gitDir: run.gitDir, base: context.base, candidate, changed: context.changed }
-  const claimed = await run.inProcess?.resolve(kind, command, context)
+  let claimed: InProcessCommand | undefined
+  try {
+    claimed = await run.inProcess?.resolve(kind, command, context)
+  } catch (error) {
+    // A resolver that rejects is the same fault as a command that throws (@cto 521b52a7): under "use" the write fails
+    // by name; under "shadow" the declared command still decides, and compare is told why nothing ran in process.
+    const reason = `resolve: ${error instanceof Error ? error.message : String(error)}`
+    if (run.inProcess?.mode === "use") {
+      throw new Error(`${kind} \`${command}\` failed in process: ${reason}`, { cause: error })
+    }
+    const declared = await spawnDeclared(run, kind, command, input)
+    run.inProcess?.compare?.(kind, command, { declared, inProcess: { error: reason } })
+    return declared
+  }
   if (claimed !== undefined && run.inProcess?.mode === "use") {
     try {
       return await run.timed(kind, () => runInProcess(claimed, input, run.timeoutMs))
