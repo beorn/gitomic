@@ -1529,7 +1529,14 @@ async function readHistory(
     // This call consumes complete output; buffering avoids one pipe delivery per commit.
     { baseEnv, input: revisions, env: { GIT_FLUSH: "0" } },
   )
-  const fields = decodeUtf8(output, "git rev-list history").split("\0")
+  // Decode each field into its own string so small identities cannot retain the whole history batch.
+  const fields: string[] = []
+  let fieldStart = 0
+  for (let fieldEnd = output.indexOf(0); fieldEnd !== -1; fieldEnd = output.indexOf(0, fieldStart)) {
+    fields.push(decodeUtf8(output.subarray(fieldStart, fieldEnd), "git rev-list history"))
+    fieldStart = fieldEnd + 1
+  }
+  fields.push(decodeUtf8(output.subarray(fieldStart), "git rev-list history"))
   const trailing = fields.pop()
   if (trailing?.trim()) throw new Error("git rev-list returned trailing history data")
   if (fields.length % HISTORY_FIELDS !== 0) throw new Error("git rev-list returned a malformed history record")
