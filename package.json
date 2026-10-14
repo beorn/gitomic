@@ -99,7 +99,7 @@
     "removely": "0.3.0",
     "typescript": "^7.0.2",
     "unstorage": "^1.17.5",
-    "vitest": "4.1.11"
+    "vitest": "5.0.4"
   },
   "peerDependencies": {
     "isomorphic-git": "^1.38.7"
