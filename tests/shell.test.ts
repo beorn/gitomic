@@ -360,7 +360,7 @@ describe.sequential("shell backend failure boundaries", () => {
         .trim()
         .split("\n")
         .map((line) => JSON.parse(line) as TraceEvent)
-      const writeCommands = ["hash-object", "update-index", "write-tree", "commit-tree", "update-ref"]
+      const writeCommands = ["hash-object", "mktree", "commit-tree", "update-ref"]
       for (const command of writeCommands) {
         const starts = events.filter((event) => event.event === "start" && event.argv?.includes(command))
         expect(starts.length, `${command} did not run`).toBeGreaterThan(0)
@@ -370,7 +370,9 @@ describe.sequential("shell backend failure boundaries", () => {
         }
       }
       expect(events.filter((event) => event.event === "start" && event.argv?.includes("hash-object"))).toHaveLength(1)
-      expect(events.filter((event) => event.event === "start" && event.argv?.includes("update-index"))).toHaveLength(1)
+      // One tree write per rebuilt depth (the root, one, one/two), and no whole-tree index (27155).
+      expect(events.filter((event) => event.event === "start" && event.argv?.includes("mktree"))).toHaveLength(3)
+      expect(events.filter((event) => event.event === "start" && event.argv?.includes("read-tree"))).toHaveLength(0)
       // One ref write per transaction: the publish. No pin, no unpin, no
       // multi-command ref transaction to sequence them.
       const refWrites = events.filter((event) => event.event === "start" && event.argv?.includes("update-ref"))

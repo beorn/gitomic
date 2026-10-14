@@ -182,7 +182,9 @@ describe("author and committer are data, identical on every backend", () => {
         .map((line) => JSON.parse(line) as { event?: string; argv?: string[] })
         .filter((entry) => entry.event === "start")
       expect(starts.filter((entry) => entry.argv?.includes("commit-tree"))).toHaveLength(2)
-      expect(starts.some((entry) => entry.argv?.includes("ls-files"))).toBe(true)
+      // The tree builder reads modes with ls-tree and writes trees with mktree, both under the selected environment.
+      expect(starts.some((entry) => entry.argv?.includes("ls-tree"))).toBe(true)
+      expect(starts.some((entry) => entry.argv?.includes("mktree"))).toBe(true)
       expect(starts.some((entry) => entry.argv?.includes("rev-list"))).toBe(true)
     } finally {
       await fixture.cleanup()

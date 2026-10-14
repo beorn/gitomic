@@ -10,6 +10,16 @@
   one walk, so a caller that already listed the prefix bounds the commits one walk
   holds by passing the listing a slice at a time (28716).
 
+### Changed
+
+- The shell backend's `writeCommit` rebuilds only the directories a change
+  touches (`ls-tree -z` top-down, `mktree -z --batch` bottom-up) instead of
+  loading the parent's whole tree into a temporary index. The commit id is
+  unchanged for every valid tree; a one-path commit on a 30,484-path tree went
+  from 108 ms to 37 ms (27155). Handed a file and a directory with one name, it
+  now refuses with `TreePathCollision` where the index route silently dropped
+  one side.
+
 ## 0.10.0 — 2026-10-03
 
 ### Breaking
