@@ -340,7 +340,9 @@ describe("repositoryCandidate — a declared command the caller runs in process 
       mode: "use",
       resolve: (kind, command) => {
         asked.push([kind, command])
-        return command === check.command ? async () => ({ code: 0, stdout: "in process said ok\n", stderr: "" }) : undefined
+        return command === check.command
+          ? async () => ({ code: 0, stdout: "in process said ok\n", stderr: "" })
+          : undefined
       },
     })
     expect(committed.report).toEqual(["in process said ok"])
@@ -368,7 +370,10 @@ describe("repositoryCandidate — a declared command the caller runs in process 
       stdout: `${input.gitDir}|${input.base}|${input.candidate}|${input.changed.map((path) => `${path} `).join("")}\n`,
       stderr: "",
     })
-    await writeWith({ mode: "shadow", resolve: () => echo, compare: (_kind, _command, both) => runs.push(both) }, "docs/b.md")
+    await writeWith(
+      { mode: "shadow", resolve: () => echo, compare: (_kind, _command, both) => runs.push(both) },
+      "docs/b.md",
+    )
     expect(runs).toHaveLength(1)
     const [{ declared, inProcess }] = runs as [(typeof runs)[number]]
     expect("code" in declared && declared.code).toBe(0)
@@ -389,7 +394,11 @@ describe("repositoryCandidate — a declared command the caller runs in process 
     expect(await store.head()).toBe(before)
     expect(existsSync(check.marker)).toBe(true)
     expect(compared).toEqual([
-      ["check", { code: 1, stdout: "declared said 1\n", stderr: "" }, { code: 0, stdout: "in process said ok\n", stderr: "" }],
+      [
+        "check",
+        { code: 1, stdout: "declared said 1\n", stderr: "" },
+        { code: 0, stdout: "in process said ok\n", stderr: "" },
+      ],
     ])
   })
 
@@ -438,7 +447,9 @@ describe("repositoryCandidate — a declared command the caller runs in process 
     const committed = await writeWith({
       mode: "use",
       resolve: (kind) =>
-        kind === "derive" ? async () => ({ code: 0, stdout: '{"put":{"docs/derived.md":"d\\n"}}', stderr: "" }) : undefined,
+        kind === "derive"
+          ? async () => ({ code: 0, stdout: '{"put":{"docs/derived.md":"d\\n"}}', stderr: "" })
+          : undefined,
     })
     expect(await store.at(committed.oid).get("docs/derived.md")).toBe("d\n")
     expect(committed.report, "the declared check read the derived candidate").toEqual(["d"])
@@ -455,6 +466,15 @@ describe("repositoryCandidate — a declared command the caller runs in process 
         inProcess: { mode: "shadow", resolve: () => async () => ({ code: 0, stdout: "", stderr: "" }) },
       }),
     })
-    expect(steps).toEqual(["declaration", "trust", "declaration", "gitDir", "materialize", "checkSpawn", "check", "checkInProcess"])
+    expect(steps).toEqual([
+      "declaration",
+      "trust",
+      "declaration",
+      "gitDir",
+      "materialize",
+      "checkSpawn",
+      "check",
+      "checkInProcess",
+    ])
   })
 })
