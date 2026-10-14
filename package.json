@@ -92,7 +92,7 @@
     "@bearly/pacing": "^0.1.0"
   },
   "devDependencies": {
-    "@types/node": "26.6.3",
+    "@types/node": "26.6.5",
     "isomorphic-git": "1.44.2",
     "oxfmt": "^0.59.0",
     "oxlint": "1.85.0",
