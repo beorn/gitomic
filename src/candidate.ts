@@ -313,7 +313,7 @@ type StepTimer = <T>(step: CandidateStep, work: () => Promise<T>) => Promise<T>
 /** Time each step for `onStep`; without one, run the work and measure nothing. */
 function stepTimer(onStep: RepositoryCandidateOptions["onStep"]): StepTimer {
   return async (step, work) => {
-    if (onStep === undefined) return await work()
+    if (onStep === undefined) return work()
     const start = performance.now()
     const value = await work()
     onStep(step, performance.now() - start)
