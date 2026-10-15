@@ -1341,8 +1341,8 @@ async function syncCommitDirectories(
   baseEnv?: NodeJS.ProcessEnv,
 ): Promise<void> {
   if (process.platform !== "linux") return
-  // An unchanged tree (including genesis) writes only its commit. Preserve the
-  // event path's process budget; tree discovery is needed only for content writes.
+  // An unchanged content tree writes only its commit. Preserve the event path's
+  // process budget; genesis and content writes also discover their written trees.
   const objects =
     parents === undefined
       ? [oid]
