@@ -542,7 +542,7 @@ async function runWrite(
   source: AddressSource,
 ): Promise<number> {
   const { positionals, flags, repeated } = extractFlags(args, {
-    "-m": "value",
+    "-m": "repeated",
     "--writer": "value",
     "--expect": "repeated",
     "--create": "repeated",
@@ -553,7 +553,7 @@ async function runWrite(
   })
   const attribution = parseAttribution(optionalStringFlag(flags, "--author"), repeated.get("--trailer") ?? [])
   const address = requirePositional(positionals, 0, "<address>")
-  const message = requireStringFlag(flags, "-m", "-m <message>")
+  const message = requireMessageFlag(repeated)
   const writer = optionalStringFlag(flags, "--writer")
   const checkoutPath = optionalStringFlag(flags, "--checkout")
   const expectedDirtyPaths = checkoutPath !== undefined ? worktreeDirtyPaths(checkoutPath) : []
@@ -595,7 +595,7 @@ async function runWrite(
 
 async function runRm(args: string[], stdout: CliWriter, stderr: CliWriter, source: AddressSource): Promise<number> {
   const { positionals, flags, repeated } = extractFlags(args, {
-    "-m": "value",
+    "-m": "repeated",
     "--writer": "value",
     "--expect": "repeated",
     "--author": "value",
@@ -604,7 +604,7 @@ async function runRm(args: string[], stdout: CliWriter, stderr: CliWriter, sourc
   })
   const attribution = parseAttribution(optionalStringFlag(flags, "--author"), repeated.get("--trailer") ?? [])
   const address = requirePositional(positionals, 0, "<address>")
-  const message = requireStringFlag(flags, "-m", "-m <message>")
+  const message = requireMessageFlag(repeated)
   const writer = optionalStringFlag(flags, "--writer")
   const paths = positionals.slice(1)
   if (paths.length === 0) throw new UsageError("rm requires at least one <path>")
@@ -634,7 +634,7 @@ async function runRm(args: string[], stdout: CliWriter, stderr: CliWriter, sourc
 
 async function runMv(args: string[], stdout: CliWriter, stderr: CliWriter, source: AddressSource): Promise<number> {
   const { positionals, flags, repeated } = extractFlags(args, {
-    "-m": "value",
+    "-m": "repeated",
     "--writer": "value",
     "--author": "value",
     "--trailer": "repeated",
@@ -644,7 +644,7 @@ async function runMv(args: string[], stdout: CliWriter, stderr: CliWriter, sourc
   const address = requirePositional(positionals, 0, "<address>")
   const from = requirePositional(positionals, 1, "<from>")
   const to = requirePositional(positionals, 2, "<to>")
-  const message = requireStringFlag(flags, "-m", "-m <message>")
+  const message = requireMessageFlag(repeated)
   const writer = optionalStringFlag(flags, "--writer")
 
   using repository = await openAddressFor(address, source)
@@ -1357,6 +1357,18 @@ function requireStringFlag(flags: ReadonlyMap<string, string | true>, flag: stri
   const value = optionalStringFlag(flags, flag)
   if (value === undefined) throw new UsageError(`missing ${label}`)
   return value
+}
+
+/**
+ * The commit-message flag (`-m`), declared "repeated" in a verb's flag spec:
+ * repeated values join as paragraphs with a blank line, exactly as git joins
+ * repeated -m (29414 for apply, 29417 for write/rm/mv). Every verb reads its
+ * message through here so they all agree.
+ */
+function requireMessageFlag(repeated: RepeatedFlagValues): string {
+  const values = repeated.get("-m")
+  if (values === undefined || values.length === 0) throw new UsageError("missing -m <message>")
+  return values.join("\n\n")
 }
 
 function describeAddress(address: string, at: string | undefined): string {

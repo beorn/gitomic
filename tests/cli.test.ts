@@ -838,6 +838,15 @@ describe("gitomic CLI — write", () => {
     expect((await run(backend, ["read", ADDRESS, "a.md"])).stdout).toBe("two\n")
   })
 
+  test("two -m values join as paragraphs, as git joins them (29417)", async () => {
+    const backend = createMemBackend()
+    const file = await fileWith("a.md", "one\n")
+    const result = await run(backend, ["write", ADDRESS, "-m", "subject line", "-m", "body paragraph", `a.md=${file}`])
+    expect(result.code).toBe(0)
+    const commit = await backend.readCommit("repo", result.stdout.trim())
+    expect(commit.message).toMatch(/^gitomic: subject line\n\nbody paragraph\n/u)
+  })
+
   test("--writer labels the subject and remains readable without a Writer trailer", async () => {
     const backend = createMemBackend()
     const result = await writeOne(backend, "a.md", "one\n", ["--writer", "cli-test"])
@@ -891,6 +900,16 @@ describe("gitomic CLI — write", () => {
 })
 
 describe("gitomic CLI — rm", () => {
+  test("two -m values join as paragraphs, as git joins them (29417)", async () => {
+    const backend = createMemBackend()
+    await writeOne(backend, "a.md", "one\n")
+
+    const result = await run(backend, ["rm", ADDRESS, "-m", "subject line", "-m", "body paragraph", "a.md"])
+    expect(result.code).toBe(0)
+    const commit = await backend.readCommit("repo", result.stdout.trim())
+    expect(commit.message).toMatch(/^gitomic: subject line\n\nbody paragraph\n/u)
+  })
+
   test("rm with an explicit --expect removes the path", async () => {
     const backend = createMemBackend()
     await writeOne(backend, "a.md", "one\n")
@@ -946,6 +965,16 @@ describe("gitomic CLI — rm", () => {
 })
 
 describe("gitomic CLI — mv", () => {
+  test("two -m values join as paragraphs, as git joins them (29417)", async () => {
+    const backend = createMemBackend()
+    await writeOne(backend, "from.md", "body\n")
+
+    const result = await run(backend, ["mv", ADDRESS, "-m", "subject line", "-m", "body paragraph", "from.md", "to.md"])
+    expect(result.code).toBe(0)
+    const commit = await backend.readCommit("repo", result.stdout.trim())
+    expect(commit.message).toMatch(/^gitomic: subject line\n\nbody paragraph\n/u)
+  })
+
   test("mv moves the content and clears the source (no --expect flag exists)", async () => {
     const backend = createMemBackend()
     await writeOne(backend, "from.md", "body\n")
