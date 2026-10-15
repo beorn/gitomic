@@ -22,9 +22,19 @@ import { createShellBackend, runGit, TreePathCollision, type CommitInput, type G
 import { createIsoBackend } from "../src/iso.js"
 import { createMemBackend } from "../src/mem.js"
 import { normalizePath } from "../src/path.js"
+import * as publicApi from "../src/index.js"
 import { createBareRepo, git, gitWithInput } from "./helpers/git.js"
 
 const T0 = 1_800_000_000
+//29260 Part2: consumers use the unchanged shared validator through the public
+// barrel, so Part1's separately approved rule can arrive without a second rule.
+test("the public barrel exposes the reason-returning tree path check", () => {
+  const check = (publicApi as unknown as { invalidTreePathReason: (path: string) => string | undefined })
+    .invalidTreePathReason
+  expect(typeof check).toBe("function")
+  expect(check("notes/valid.md")).toBeUndefined()
+  expect(check("notes/../bad.md")).toContain("..")
+})
 const INSTANCE = "00000000-0000-4000-8000-000000000000"
 
 function input(parent: string, changes: [string, string | undefined][], extra: Partial<CommitInput> = {}): CommitInput {
