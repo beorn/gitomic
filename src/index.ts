@@ -114,6 +114,7 @@ export {
   type CandidateStep,
   type DeclaredCommandInput,
   type InProcessCommand,
+  type InProcessDeclared,
   type InProcessOptions,
   type RepositoryCandidateOptions,
   type RepositoryDeclaration,

@@ -484,6 +484,29 @@ describe("repositoryCandidate — a declared command the caller runs in process 
     expect(await store.head()).toBe(before)
   })
 
+  test("use: an in-process command that answers { declared } runs the declared command, whose verdict decides", async () => {
+    const check = await markingCheck(1)
+    await declare(`[candidate]\n\tcheck = ${check.command}\n`)
+    const before = await store.head()
+    const refused = writeWith({ mode: "use", resolve: () => async () => ({ declared: "worker crashed" }) })
+    await expect(refused).rejects.toMatchObject({ reasons: ["declared said 1"] })
+    expect(existsSync(check.marker), "the declared check was spawned").toBe(true)
+    expect(await store.head()).toBe(before)
+  })
+
+  test("shadow: an in-process command that answers { declared } leaves the declared verdict, and compare is not told", async () => {
+    const check = await markingCheck(0)
+    await declare(`[candidate]\n\tcheck = ${check.command}\n`)
+    const compared: unknown[] = []
+    const committed = await writeWith({
+      mode: "shadow",
+      resolve: () => async () => ({ declared: "worker hung" }),
+      compare: (_kind, _command, runs) => void compared.push(runs),
+    })
+    expect(committed.report).toEqual(["declared said 0"])
+    expect(compared, "no in-process run to compare").toEqual([])
+  })
+
   test("use: an in-process command past the declared timeout refuses naming the check and the limit", async () => {
     const check = await markingCheck(0)
     await declare(`[candidate]\n\tcheck = ${check.command}\n\ttimeoutMs = 300\n`)
