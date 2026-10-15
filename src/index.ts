@@ -42,7 +42,7 @@ import {
 } from "./errors.ts"
 import { cloneIdent, GITOMIC_IDENT, validateOid } from "./git-object.ts"
 import { assertTreeShape, normalizePath, normalizePrefix } from "./path.ts"
-export { invalidTreePathReason } from "./path.ts"
+export { assertRegularBlob, invalidTreePathReason } from "./path.ts"
 import { assertExposed, createSnapshotBase, readLazyBase, type LazyBase } from "./lazy-base.ts"
 import { createShellBackend } from "./shell.ts"
 import type {
