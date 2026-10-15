@@ -87,10 +87,19 @@ export type CandidateRun =
   | { readonly code: number; readonly stdout: string; readonly stderr: string }
   | { readonly timedOut: true }
 
-/** One declared command run in the caller's process: the inputs a spawned command gets, the result it would give. */
+/**
+ * One declared command run in the caller's process: the inputs a spawned command gets, the result it would give. It may
+ * answer `{ declared: <reason> }` instead when its host could not run it (a dead or hung worker), and the write then runs
+ * that command as declared, exactly as an unclaimed one (27155, @cto 2d26f5ce). A command that throws is a fault of the
+ * gate, never a fallback. It is told the declared limit its run is held to, so a host can bound its own run inside it.
+ */
 export type InProcessCommand = (
   input: DeclaredCommandInput,
-) => Promise<{ readonly code: number; readonly stdout: string; readonly stderr: string }>
+  limit: { readonly timeoutMs: number },
+) => Promise<{ readonly code: number; readonly stdout: string; readonly stderr: string } | InProcessDeclared>
+
+/** What a claimed in-process command answers when its host could not run it: run it as declared, and why. */
+export type InProcessDeclared = { readonly declared: string }
 
 /**
  * Declared commands a caller runs in its own process (27155 (iii), @cto 67b6d4c1). gitomic still reads and trusts the
@@ -100,7 +109,8 @@ export type InProcessCommand = (
  * run decides, under the declared limit, and a throw or a rejected `resolve` fails the write naming the kind and the
  * command. Under "shadow" both run, the declared command decides, and `compare` sees both runs; an in-process throw or
  * a rejected `resolve` reaches `compare` as `{ error }` and never changes the verdict. `compare` runs inline and must
- * not throw.
+ * not throw. A claimed command that answers `{ declared }` runs as declared for that write in either mode, and in
+ * shadow gives `compare` nothing.
  */
 export type InProcessOptions = {
   readonly mode: "use" | "shadow"
@@ -514,13 +524,17 @@ async function runDeclared(
     return declared
   }
   if (claimed !== undefined && run.inProcess?.mode === "use") {
+    let ran: CandidateRun | InProcessDeclared
     try {
-      return await run.timed(kind, () => runInProcess(claimed, input, run.timeoutMs))
+      ran = await run.timed(kind, () => runInProcess(claimed, input, run.timeoutMs))
     } catch (error) {
       // A throw is a fault of the gate, never its verdict: the write fails, naming what threw (27155, @cto cc4f0c66).
       const reason = error instanceof Error ? error.message : String(error)
       throw new Error(`${kind} \`${command}\` failed in process: ${reason}`, { cause: error })
     }
+    // Its host could not run it: this write runs the command as declared, through the one declared-run path.
+    if ("declared" in ran) return spawnDeclared(run, kind, command, input)
+    return ran
   }
   const declared = await spawnDeclared(run, kind, command, input)
   if (claimed !== undefined) {
@@ -529,7 +543,8 @@ async function runDeclared(
         error: error instanceof Error ? error.message : String(error),
       })),
     )
-    run.inProcess?.compare?.(kind, command, { declared, inProcess })
+    // A host that could not run the command gave no in-process run to compare.
+    if (!("declared" in inProcess)) run.inProcess?.compare?.(kind, command, { declared, inProcess })
   }
   return declared
 }
@@ -571,14 +586,15 @@ async function runInProcess(
   command: InProcessCommand,
   input: DeclaredCommandInput,
   timeoutMs: number,
-): Promise<CandidateRun> {
+): Promise<CandidateRun | InProcessDeclared> {
   let timer: ReturnType<typeof setTimeout> | undefined
   const limit = new Promise<CandidateRun>((resolve) => {
     timer = setTimeout(() => resolve({ timedOut: true }), timeoutMs)
   })
   const started = performance.now()
   try {
-    const result = await Promise.race([command(input), limit])
+    const result = await Promise.race([command(input, { timeoutMs }), limit])
+    if ("declared" in result) return { declared: result.declared }
     if ("timedOut" in result || performance.now() - started > timeoutMs) return { timedOut: true }
     return { code: result.code, stdout: result.stdout, stderr: result.stderr }
   } finally {
