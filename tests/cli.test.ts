@@ -978,6 +978,26 @@ describe("gitomic CLI — mv", () => {
 })
 
 describe("gitomic CLI — apply", () => {
+  test("two -m values join as paragraphs, as git joins them (29414)", async () => {
+    const backend = createMemBackend()
+    const putFile = await fileWith("new.md", "new content\n")
+    const result = await run(backend, [
+      "apply",
+      ADDRESS,
+      "-m",
+      "subject line",
+      "-m",
+      "body paragraph",
+      "put",
+      "new.md",
+      putFile,
+      "--create",
+    ])
+    expect(result.code).toBe(0)
+    const commit = await backend.readCommit("repo", result.stdout.trim())
+    expect(commit.message).toMatch(/^gitomic: subject line\n\nbody paragraph\n/u)
+  })
+
   test("put-bytes reads invalid UTF-8 from a file and commits the exact bytes", async () => {
     const backend = createMemBackend()
     const bytes = Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0xff, 0x00)

@@ -692,9 +692,12 @@ async function runApply(
     if (token === undefined || CLAUSE_KEYWORDS.has(token)) break
     queue.shift()
     switch (token) {
-      case "-m":
-        message = requireQueuedValue(queue, token)
+      case "-m": {
+        // Repeated -m joins as paragraphs, exactly as git joins them (29414).
+        const value = requireQueuedValue(queue, token)
+        message = message === undefined ? value : `${message}\n\n${value}`
         break
+      }
       case "--writer":
         writer = requireQueuedValue(queue, token)
         break
