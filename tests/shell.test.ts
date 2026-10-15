@@ -155,6 +155,26 @@ const gitInitHelp = spawnSync("git", ["init", "-h"], { encoding: "utf8" })
 const supportsReftable = `${gitInitHelp.stdout}${gitInitHelp.stderr}`.includes("--ref-format")
 const supportsObjectFormat = `${gitInitHelp.stdout}${gitInitHelp.stderr}`.includes("--object-format")
 
+// @failure A genesis commit names Git's virtual empty tree without storing it, so a clean cache fails fsck.
+// @level l1
+// @consumer event-chain roots advertised by km's kept repositories; #29438
+test.each(["sha1", "sha256"])("genesis stores its required empty tree in a fresh %s repository", async (format) => {
+  const directory = await mkdtemp(join(tmpdir(), "gitomic-genesis-"))
+  const repo = join(directory, "state.git")
+  try {
+    // createBareRepo materializes the empty tree during setup and would mask this failure.
+    await gitomic.runGit(["init", "--bare", `--object-format=${format}`, repo])
+    const backend = createShellBackend()
+    const genesis = await backend.writeGenesis!(repo)
+    await git(repo, "update-ref", "refs/km/items/probe", genesis)
+    const integrity = await gitomic.runGit(["--git-dir", repo, "fsck", "--full"])
+    expect(integrity.code, `${integrity.stdout}\n${integrity.stderr}`).toBe(0)
+    expect(await backend.writeGenesis!(repo)).toBe(genesis)
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
 type TraceEvent = {
   event?: string
   argv?: string[]

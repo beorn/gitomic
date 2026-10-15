@@ -41,7 +41,6 @@ import {
   identProblem,
   isZeroOid,
   leaseConflict,
-  objectOid,
   parseCommit,
   refUnderPrefix,
   TRANSACTION_SEARCH_LIMIT,
@@ -286,8 +285,8 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
       const gitdir = await resolveGitDir(repo)
       let genesis = genesisByGitDir.get(gitdir)
       if (genesis === undefined) {
-        genesis = writeGenesis(gitdir, await objectFormat(repo), baseEnv).then(async (oid) => {
-          await syncCommitDirectories(gitdir, oid, undefined, baseEnv)
+        genesis = writeGenesis(gitdir, baseEnv).then(async (oid) => {
+          await syncCommitDirectories(gitdir, oid, [], baseEnv)
           return oid
         })
         genesisByGitDir.set(gitdir, genesis)
@@ -1342,8 +1341,8 @@ async function syncCommitDirectories(
   baseEnv?: NodeJS.ProcessEnv,
 ): Promise<void> {
   if (process.platform !== "linux") return
-  // An unchanged tree (including genesis) writes only its commit. Preserve the
-  // event path's process budget; tree discovery is needed only for content writes.
+  // An unchanged content tree writes only its commit. Preserve the event path's
+  // process budget; genesis and content writes also discover their written trees.
   const objects =
     parents === undefined
       ? [oid]
@@ -1434,12 +1433,12 @@ function identityEnv(
 }
 
 /**
- * Write the empty root every event chain starts from. The empty tree is one
- * git always has, so this is one `commit-tree`; the same bytes on every run
- * give the same oid, which is what makes it idempotent.
+ * Write the empty root every event chain starts from. Git recognizes the empty
+ * tree without storing it, but fsck requires its object once a ref reaches the
+ * root. Materialize it first; identical bytes preserve the idempotent root oid.
  */
-async function writeGenesis(repo: string, format: "sha1" | "sha256", baseEnv?: NodeJS.ProcessEnv): Promise<Oid> {
-  const emptyTree = objectOid("tree", Buffer.alloc(0), format)
+async function writeGenesis(repo: string, baseEnv?: NodeJS.ProcessEnv): Promise<Oid> {
+  const emptyTree = text(await gitWrite(repo, ["mktree"], { baseEnv, input: Buffer.alloc(0) }))
   return text(
     await gitWrite(repo, ["commit-tree", emptyTree], {
       baseEnv,
