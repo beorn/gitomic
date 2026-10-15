@@ -91,10 +91,11 @@ export type CandidateRun =
  * One declared command run in the caller's process: the inputs a spawned command gets, the result it would give. It may
  * answer `{ declared: <reason> }` instead when its host could not run it (a dead or hung worker), and the write then runs
  * that command as declared, exactly as an unclaimed one (27155, @cto 2d26f5ce). A command that throws is a fault of the
- * gate, never a fallback.
+ * gate, never a fallback. It is told the declared limit its run is held to, so a host can bound its own run inside it.
  */
 export type InProcessCommand = (
   input: DeclaredCommandInput,
+  limit: { readonly timeoutMs: number },
 ) => Promise<{ readonly code: number; readonly stdout: string; readonly stderr: string } | InProcessDeclared>
 
 /** What a claimed in-process command answers when its host could not run it: run it as declared, and why. */
@@ -592,7 +593,7 @@ async function runInProcess(
   })
   const started = performance.now()
   try {
-    const result = await Promise.race([command(input), limit])
+    const result = await Promise.race([command(input, { timeoutMs }), limit])
     if ("declared" in result) return { declared: result.declared }
     if ("timedOut" in result || performance.now() - started > timeoutMs) return { timedOut: true }
     return { code: result.code, stdout: result.stdout, stderr: result.stderr }

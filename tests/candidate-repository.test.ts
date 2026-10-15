@@ -507,6 +507,21 @@ describe("repositoryCandidate — a declared command the caller runs in process 
     expect(compared, "no in-process run to compare").toEqual([])
   })
 
+  test("use: an in-process command is told the declared limit its run is held to", async () => {
+    const check = await markingCheck(1)
+    await declare(`[candidate]\n\tcheck = ${check.command}\n\ttimeoutMs = 4321\n`)
+    const told: number[] = []
+    const committed = await writeWith({
+      mode: "use",
+      resolve: () => async (_input, limit) => {
+        told.push(limit.timeoutMs)
+        return { code: 0, stdout: "in process\n", stderr: "" }
+      },
+    })
+    expect(committed.report).toEqual(["in process"])
+    expect(told).toEqual([4321])
+  })
+
   test("use: an in-process command past the declared timeout refuses naming the check and the limit", async () => {
     const check = await markingCheck(0)
     await declare(`[candidate]\n\tcheck = ${check.command}\n\ttimeoutMs = 300\n`)
