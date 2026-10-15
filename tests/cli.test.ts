@@ -429,6 +429,18 @@ describe("gitomic CLI — read verbs", () => {
     expect(result.stdout.trim().split("\n")).toEqual(["a.md:value=42"])
   })
 
+  test("grep refuses a second scope argument instead of silently searching only the first", async () => {
+    const backend = createMemBackend()
+    await writeOne(backend, "a.md", "hello world\n")
+    await writeOne(backend, "dir/c.md", "hello again\n")
+
+    const result = await run(backend, ["grep", ADDRESS, "hello", "*.md", "dir/**"])
+    expect(result.code).toBe(2)
+    expect(result.stderr).toContain("grep")
+    expect(result.stderr).toContain("dir/**")
+    expect(result.stdout).toBe("")
+  })
+
   // grep's catch-and-skip-with-a-stderr-note path for a non-UTF-8 blob is not
   // exercised here: the mem backend's own storage is `ReadonlyMap<string,
   // string>` (see src/mem.ts's `MemCommit.files`), and gitomic's own `map.set`

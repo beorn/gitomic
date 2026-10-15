@@ -319,6 +319,7 @@ async function runGrep(args: string[], stdout: CliWriter, stderr: CliWriter, sou
   const address = requirePositional(positionals, 0, "<address>")
   const pattern = requirePositional(positionals, 1, "<pattern>")
   const glob = positionals.at(2)
+  assertNoExtraPositionals(positionals, 3, "<addr> <pattern> [glob]", "grep")
   const at: Oid | undefined = optionalStringFlag(flags, "--at")
   const regex = compilePattern(pattern)
   using repository = await openAddressFor(address, source)
