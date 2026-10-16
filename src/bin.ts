@@ -43,6 +43,7 @@ import {
 } from "./index.ts"
 import { putPrecondition, readTextFile } from "./checkout-edits.ts"
 import { decodeUtf8 } from "./utf8.ts"
+import { invalidTreePathReason, isPublicPath } from "./path.ts"
 
 /**
  * `gitomic` — the file-level door: read and write a Git ref by address, with
@@ -366,13 +367,28 @@ async function runLog(args: string[], stdout: CliWriter, stderr: CliWriter, sour
     const history = await reader.log({ from, limit: glob === undefined ? limit : HISTORY_SCAN_LIMIT })
     let commits: CommitMeta[] = history
     if (glob !== undefined) {
+      const normalized = glob.normalize("NFC")
+      // Literal file history asks the existing scoped snapshot question, rather than expanding two whole trees.
+      // Other patterns retain glob semantics, including invalid/reserved path spellings that simply match nothing.
+      const literalPath =
+        !/[*?[]/u.test(normalized) && invalidTreePathReason(normalized) === undefined && isPublicPath(normalized)
+          ? normalized
+          : undefined
       commits = []
       for (const commit of history) {
-        const paths =
-          commit.parent === null
-            ? await reader.at(commit.oid).keys()
-            : (await reader.diff(commit.parent, commit.oid)).map(({ path }) => path)
-        if (paths.some((path) => matchGlob(glob, path))) commits.push(commit)
+        if (literalPath !== undefined) {
+          const [before, after] = await Promise.all([
+            commit.parent === null ? Promise.resolve(undefined) : reader.at(commit.parent).oid(literalPath),
+            reader.at(commit.oid).oid(literalPath),
+          ])
+          if (before !== after) commits.push(commit)
+        } else {
+          const paths =
+            commit.parent === null
+              ? await reader.at(commit.oid).keys()
+              : (await reader.diff(commit.parent, commit.oid)).map(({ path }) => path)
+          if (paths.some((path) => matchGlob(glob, path))) commits.push(commit)
+        }
         if (commits.length === limit) break
       }
       const scope = `${describeAddress(address, from)} filter=${JSON.stringify(glob)}; first-parent blob changes (mode-only changes excluded)`

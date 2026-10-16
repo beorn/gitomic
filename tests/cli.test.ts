@@ -524,6 +524,9 @@ describe("gitomic CLI — history reads", () => {
     const filtered = await run(backend, ["log", ADDRESS, "dir/*.txt", "-n", "2", "--json"])
     expect(filtered).toMatchObject({ code: 0, stderr: "" })
     expect((JSON.parse(filtered.stdout) as CommitMeta[]).map(({ oid }) => oid)).toEqual([second.oid, first.oid])
+    const literalLifecycle = await run(backend, ["log", ADDRESS, "dir/gone.txt", "-n", "2", "--json"])
+    expect(literalLifecycle).toMatchObject({ code: 0, stderr: "" })
+    expect((JSON.parse(literalLifecycle.stdout) as CommitMeta[]).map(({ oid }) => oid)).toEqual([second.oid, first.oid])
 
     // A root-complete short result is success, with explicit completeness context.
     for (const json of [false, true]) {
@@ -605,6 +608,13 @@ describe("gitomic CLI — history reads", () => {
 
   test("exactly 1024 records with a remaining parent fails before stdout unless the requested matches were found", async () => {
     const { backend, tip } = await historyOfSize(1_025)
+    // 29598: a literal-file lookup must not expand every tree; the real STATE specimen did so 2,048 times.
+    // Existing cap/output coverage checked correctness but could not detect that allocation and I/O cost.
+    const wholeTrees = vi.fn(backend.readTree)
+    const literal = await run({ ...backend, readTree: wholeTrees }, ["log", ADDRESS, "hh.hab.tsx", "-n", "4", "--json"])
+    expect(literal).toMatchObject({ code: 1, stdout: "" })
+    expect(literal.stderr).toContain("found 0 of 4")
+    expect(wholeTrees).not.toHaveBeenCalled()
     for (const json of [[], ["--json"]]) {
       const result = await run(backend, ["log", ADDRESS, "absent/**", "-n", "1", ...json])
       expect(result).toMatchObject({ code: 1, stdout: "" })
@@ -650,6 +660,17 @@ describe("gitomic CLI — history reads", () => {
           timestamp: 946_684_800,
         },
       ])
+      const literalRoot = await run(backend, ["log", fixture.repo, "image.bin", "--at", root, "--json"])
+      expect(literalRoot).toMatchObject({ code: log.code, stdout: log.stdout })
+      expect(literalRoot.stderr).toContain('filter="image.bin"')
+      const executableTree = await gitWithInput(fixture.repo, `100755 blob ${blob}\timage.bin\0`, "mktree", "-z")
+      const modeOnly = await git(fixture.repo, "commit-tree", executableTree, "-p", root, "-m", "mode only")
+      const emptyTree = await gitWithInput(fixture.repo, "", "mktree")
+      const removed = await git(fixture.repo, "commit-tree", emptyTree, "-p", modeOnly, "-m", "remove binary")
+      const lifecycle = await run(backend, ["log", fixture.repo, "image.bin", "--at", removed, "-n", "3", "--json"])
+      expect(lifecycle.code).toBe(0)
+      expect((JSON.parse(lifecycle.stdout) as CommitMeta[]).map(({ oid }) => oid)).toEqual([removed, root])
+      expect(lifecycle.stderr).toContain("2 of 3")
       const diff = await run(backend, ["diff", fixture.repo, "--base", fixture.initial, "--at", root, "--json"])
       expect(diff).toMatchObject({ code: 0, stderr: "" })
       expect(JSON.parse(diff.stdout)).toEqual([{ path: "image.bin", from: null, to: blob }])
@@ -719,6 +740,10 @@ describe("gitomic CLI — history reads", () => {
       readTree: async (repo, oid, prefix) => {
         if (++files === 3) throw new Error("later tree unavailable")
         return backend.readTree(repo, oid, prefix)
+      },
+      readTreeExact: async (repo, oid, path) => {
+        if (++files === 3) throw new Error("later tree unavailable")
+        return backend.readTreeExact(repo, oid, path)
       },
     }
     const filtered = await run(failingFilter, ["log", ADDRESS, "counter", "-n", "2", ...json])
