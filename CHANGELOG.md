@@ -29,7 +29,6 @@
 
 - Source CI uses Bun 1.4.3, the measured-good runtime for the shared CLI's early-close handling;
   the published CLI keeps its Node interpreter and Node `>=20` contract.
-
 - The shell backend's `writeCommit` rebuilds only the directories a change
   touches (`ls-tree -z` top-down, `mktree -z --batch` bottom-up) instead of
   loading the parent's whole tree into a temporary index. The commit id is

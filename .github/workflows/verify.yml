@@ -1,4 +1,4 @@
-# vendor-kit: verify@488c385e47b3 — generated; edit km/packages/km-infra/vendor-kit/templates/verify.yml in km, then re-sync
+# vendor-kit: verify@d65f8b2eb362 — generated; edit km/packages/km-infra/vendor-kit/templates/verify.yml in km, then re-sync
 name: Verify
 
 # Light per-push gate: the suite + build must stay green on main so a release

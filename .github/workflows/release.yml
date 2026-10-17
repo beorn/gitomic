@@ -1,4 +1,4 @@
-# vendor-kit: release@d884da4dd603 — generated; edit km/packages/km-infra/vendor-kit/templates/release.yml in km, then re-sync
+# vendor-kit: release@f0dc264d1ed7 — generated; edit km/packages/km-infra/vendor-kit/templates/release.yml in km, then re-sync
 name: Release
 
 on:
