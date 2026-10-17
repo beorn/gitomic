@@ -367,22 +367,40 @@ describe("gitomic project and checkout synchronization", () => {
       expect(worktreeDirtyPaths(checkout)).toEqual([])
     })
 
-    test("old conflicting direct dirt is saved by exact blob and origin then projects", async () => {
-      const { checkout, landAtOrigin } = remoteFixture(true)
-      writeFileSync(join(checkout, "tracked.md"), "# direct local edit\n")
-      const localTip = git(checkout, "rev-parse", "HEAD")
-      const remoteTip = landAtOrigin("tracked.md", "# remote edit\n")
-      advancePastQuietPeriod()
+    // #27743 AC2/AC4: blockers are Git-root-relative even when a nested vault requests repair.
+    test.each([".", "pm"])(
+      "old conflicting direct dirt is saved by exact blob and origin then projects from %s",
+      async (directory) => {
+        const { checkout, landAtOrigin } = remoteFixture(true)
+        const requestedRoot = join(checkout, directory)
+        if (directory !== ".") mkdirSync(requestedRoot)
+        writeFileSync(join(checkout, "tracked.md"), "# direct local edit\n")
+        const localTip = git(checkout, "rev-parse", "HEAD")
+        const remoteTip = landAtOrigin("tracked.md", "# remote edit\n")
+        advancePastQuietPeriod()
 
-      const result = await projectCheckoutWithSetAside({ repoRoot: checkout })
+        const result = await projectCheckoutWithSetAside({ repoRoot: requestedRoot })
 
-      expect(result).toMatchObject({ ok: true, kind: "set-aside", to: remoteTip, localTip })
-      if (!result.ok || result.kind !== "set-aside") throw new Error("expected set-aside outcome")
-      expect(git(checkout, "show", `${result.preserveRef}:tracked.md`)).toBe("# direct local edit")
-      expect(git(checkout, "rev-parse", "HEAD")).toBe(remoteTip)
-      expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# remote edit\n")
-      expect(worktreeDirtyPaths(checkout)).toEqual([])
-    })
+        expect(result, JSON.stringify(result)).toMatchObject({ ok: true, kind: "set-aside", to: remoteTip, localTip })
+        if (!result.ok || result.kind !== "set-aside") throw new Error("expected set-aside outcome")
+        expect(git(checkout, "show", `${result.preserveRef}:tracked.md`)).toBe("# direct local edit")
+        expect(git(checkout, "rev-parse", "HEAD")).toBe(remoteTip)
+        expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# remote edit\n")
+        expect(worktreeDirtyPaths(checkout)).toEqual([])
+        const preserved = git(
+          checkout,
+          "for-each-ref",
+          "--format=%(refname) %(objectname)",
+          "refs/preserve/state-checkout/",
+        )
+        const second = await projectCheckoutWithSetAside({ repoRoot: requestedRoot })
+        expect(second).toMatchObject({ ok: true, kind: "already-current" })
+        expect(git(checkout, "write-tree")).toBe(git(checkout, "rev-parse", `${remoteTip}^{tree}`))
+        expect(
+          git(checkout, "for-each-ref", "--format=%(refname) %(objectname)", "refs/preserve/state-checkout/"),
+        ).toBe(preserved)
+      },
+    )
 
     test("dirty capture restarts from the verified ref after a crash before movement", async () => {
       const { checkout, landAtOrigin } = remoteFixture(true)
@@ -1353,7 +1371,7 @@ describe("gitomic project and checkout synchronization", () => {
     // @level l1 @consumer projectCheckout fast-forward callers @testonly none
     describe("normalized HEAD index", () => {
       function fixture(advances = true, landingPath = "tracked.md") {
-        const original = remoteFixture()
+        const original = remoteFixture(true)
         const { checkout } = original
         git(checkout, "config", "core.autocrlf", "false")
         writeFileSync(join(checkout, ".gitattributes"), "* text=auto\n")
@@ -1377,14 +1395,20 @@ describe("gitomic project and checkout synchronization", () => {
         return { ...original, raw, head, to }
       }
 
-      test.each(["tracked.md", "other.md"])(
-        "fast-forward to %s admits only Git's normalization and preserves unrelated raw dirt",
-        async (landingPath) => {
+      test.each([
+        { landingPath: "tracked.md", repair: false },
+        { landingPath: "other.md", repair: false },
+        { landingPath: "tracked.md", repair: true },
+        { landingPath: "other.md", repair: true },
+      ])(
+        "fast-forward to $landingPath (set-aside=$repair) admits only Git's normalization and preserves unrelated raw dirt",
+        async ({ landingPath, repair }) => {
           const { checkout, to, raw } = fixture(true, landingPath)
           const dirt = "# unrelated raw work\r\n"
           writeFileSync(join(checkout, "bystander.md"), dirt)
 
-          const result = await projectCheckout({ repoRoot: checkout })
+          const project = repair ? projectCheckoutWithSetAside : projectCheckout
+          const result = await project({ repoRoot: checkout })
 
           expect(result, JSON.stringify(result)).toMatchObject({ ok: true, kind: "synchronized" })
           expect(git(checkout, "rev-parse", "HEAD")).toBe(to)
