@@ -403,38 +403,54 @@ describe("gitomic project and checkout synchronization", () => {
     )
 
     // #27743: an unreadable Git root must never fall back to a nested repair path.
-    test("an unreadable repair root refuses by name before set-aside capture or clearing", async () => {
-      const { checkout } = remoteFixture(true)
-      const requestedRoot = join(checkout, "pm")
-      mkdirSync(requestedRoot)
-      const head = git(checkout, "rev-parse", "HEAD")
-      const native = await vi.importActual<typeof import("node:child_process")>("node:child_process")
-      const mocked = vi.mocked(spawnSync)
-      let failedRootRead = false
-      mocked.mockImplementation((command, args, options) => {
-        const result = native.spawnSync(command, args, options)
-        if (command === "git" && args?.includes("--show-toplevel")) {
-          failedRootRead = true
-          return { ...result, status: 128, stdout: "", stderr: "injected root read failure" }
+    test.each([{ repair: false }, { repair: true }])(
+      "an unreadable repair root (set-aside=$repair) refuses by name before projection or clearing",
+      async ({ repair }) => {
+        const { checkout } = remoteFixture(true)
+        const requestedRoot = join(checkout, "pm")
+        mkdirSync(requestedRoot)
+        const head = git(checkout, "rev-parse", "HEAD")
+        const index = git(checkout, "write-tree")
+        const bytes = readFileSync(join(checkout, "tracked.md"))
+        const native = await vi.importActual<typeof import("node:child_process")>("node:child_process")
+        const mocked = vi.mocked(spawnSync)
+        let failedRootRead = false
+        mocked.mockImplementation((command, args, options) => {
+          const result = native.spawnSync(command, args, options)
+          if (command === "git" && args?.includes("--show-toplevel")) {
+            failedRootRead = true
+            return { ...result, status: 128, stdout: "", stderr: "injected root read failure" }
+          }
+          return result
+        })
+        try {
+          const project = repair ? projectCheckoutWithSetAside : projectCheckout
+          const result = await project({ repoRoot: requestedRoot })
+          expect(result, JSON.stringify(result)).toMatchObject({
+            ok: false,
+            kind: repair ? "set-aside-refused" : "dirt-unverifiable",
+            localTip: head,
+            to: head,
+          })
+          if (result.ok) throw new Error("expected root-read refusal")
+          expect(failedRootRead).toBe(true)
+          expect(result.error).toContain(requestedRoot)
+          expect(result.error).toContain("injected root read failure")
+          expect(result.error).toContain(head)
+          expect(result.error).toContain("no index/worktree projection was attempted")
+          if (repair) {
+            expect(result.error).toContain("initial projection dirt-unverifiable")
+            expect(result.error).toContain("no set-aside capture or clearing was attempted")
+          }
+          expect(git(checkout, "rev-parse", "HEAD")).toBe(head)
+          expect(git(checkout, "write-tree")).toBe(index)
+          expect(readFileSync(join(checkout, "tracked.md")).equals(bytes)).toBe(true)
+          expect(git(checkout, "for-each-ref", "refs/preserve/state-checkout/")).toBe("")
+        } finally {
+          mocked.mockImplementation(native.spawnSync)
         }
-        return result
-      })
-      try {
-        const result = await projectCheckoutWithSetAside({ repoRoot: requestedRoot })
-        expect(result).toMatchObject({ ok: false, kind: "set-aside-refused", localTip: head, to: head })
-        if (result.ok) throw new Error("expected root-read refusal")
-        expect(failedRootRead).toBe(true)
-        expect(result.error).toContain(requestedRoot)
-        expect(result.error).toContain("injected root read failure")
-        expect(result.error).toContain("already-current")
-        expect(result.error).toContain("no set-aside capture or clearing was attempted")
-        expect(git(checkout, "rev-parse", "HEAD")).toBe(head)
-        expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# original\n")
-        expect(git(checkout, "for-each-ref", "refs/preserve/state-checkout/")).toBe("")
-      } finally {
-        mocked.mockImplementation(native.spawnSync)
-      }
-    })
+      },
+    )
 
     test("dirty capture restarts from the verified ref after a crash before movement", async () => {
       const { checkout, landAtOrigin } = remoteFixture(true)
