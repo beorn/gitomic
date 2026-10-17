@@ -1430,19 +1430,23 @@ describe("gitomic project and checkout synchronization", () => {
       }
 
       test.each([
-        { landingPath: "tracked.md", repair: false },
-        { landingPath: "other.md", repair: false },
-        { landingPath: "tracked.md", repair: true },
-        { landingPath: "other.md", repair: true },
+        { landingPath: "tracked.md", repair: false, directory: "." },
+        { landingPath: "other.md", repair: false, directory: "." },
+        { landingPath: "tracked.md", repair: true, directory: "." },
+        { landingPath: "other.md", repair: true, directory: "." },
+        // CTO precision 4: qualify the unchanged public projector's nested normalization path separately.
+        { landingPath: "tracked.md", repair: false, directory: "pm" },
       ])(
-        "fast-forward to $landingPath (set-aside=$repair) admits only Git's normalization and preserves unrelated raw dirt",
-        async ({ landingPath, repair }) => {
+        "fast-forward to $landingPath from $directory (set-aside=$repair) admits only Git's normalization and preserves unrelated raw dirt",
+        async ({ landingPath, repair, directory }) => {
           const { checkout, to, raw } = fixture(true, landingPath)
+          const requestedRoot = join(checkout, directory)
+          if (directory !== ".") mkdirSync(requestedRoot)
           const dirt = "# unrelated raw work\r\n"
           writeFileSync(join(checkout, "bystander.md"), dirt)
 
           const project = repair ? projectCheckoutWithSetAside : projectCheckout
-          const result = await project({ repoRoot: checkout })
+          const result = await project({ repoRoot: requestedRoot })
 
           expect(result, JSON.stringify(result)).toMatchObject({ ok: true, kind: "synchronized" })
           expect(git(checkout, "rev-parse", "HEAD")).toBe(to)
