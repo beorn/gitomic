@@ -1243,8 +1243,9 @@ describe("gitomic CLI — apply", () => {
   // 29724: a clause path is resolved against the repository ROOT, so a path composed from a cwd one level deeper
   // mints a whole new directory. The specimen was a vault-relative put of @i/10-yrd/29716-….md landed at the root
   // in the same commit its author believed was an edit (2f77738d) — and @i was ALREADY present at that base, from
-  // earlier strays, so the directory that write minted was @i/10-yrd. The notice therefore names the highest path
-  // prefix absent at --base, which is why it fires below and stays silent for an ordinary edit.
+  // earlier strays, so the directory that write minted was @i/10-yrd. The notice therefore names the SHALLOWEST
+  // path prefix absent at --base (the top of the new subtree; everything under it is implied), which is why it
+  // fires below and stays silent for an ordinary edit.
   test("a put that mints a new directory names it on stderr (29724)", async () => {
     const backend = createMemBackend()
     await writeOne(backend, "@i/1-instruments/29619-quality-vs-cost.md", "the earlier stray\n")
@@ -1298,6 +1299,16 @@ describe("gitomic CLI — apply", () => {
     ])
     expect(result.code).toBe(0)
     expect(result.stderr).toBe("gitomic: minted new directories: vault, notes\n")
+  })
+
+  test("two absent ancestors report the shallowest one, which implies the rest (29724)", async () => {
+    const backend = createMemBackend()
+    await writeOne(backend, "docs/keep.md", "keep\n")
+    const putFile = await fileWith("deep.md", "deep\n")
+    const result = await run(backend, ["apply", ADDRESS, "-m", "deep mint", "put", "a/b/f.md", putFile, "--create"])
+    expect(result.code).toBe(0)
+    // `a` is the new root of the subtree, so it is the one named; `a/b` is implied and is NOT a second line.
+    expect(result.stderr).toBe("gitomic: minted a new directory: a\n")
   })
 })
 

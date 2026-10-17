@@ -476,28 +476,33 @@ function ancestorPrefixes(path: string): string[] {
 }
 
 /**
- * The directories these written paths MINT in the base tree, in first-seen order: for each path, the HIGHEST
- * ancestor prefix the base does not hold.
+ * The directories these written paths MINT in the base tree, in first-seen order: for each path, the SHALLOWEST
+ * ancestor prefix the base does not hold — the top of the new subtree, which implies everything under it.
  *
  * Existence is asked of `keys`, never `has`/`oid`/`get`: those three are the blob question, and the backend
  * contract answers `undefined` for a directory — "a directory answers `undefined` too" (types.ts, readTreeExact) —
  * so `has("pm")` is not a question about the directory `pm` at all. A directory exists exactly when some listed
  * path sits under it, which is what `keys("<prefix>/")` answers. `keys` IS the whole listing, so the first ask
- * loads it once and every later prefix filters that one listing in memory.
+ * loads it once and every later prefix filters that one listing in memory; the walk stops at the first absent
+ * prefix, so a path minting its whole tree asks once.
  *
- * The HIGHEST absent prefix, not the shallowest, is the directory this write creates: a new subdirectory under a
- * top-level directory that already exists reports the subdirectory it minted, because the existing parent is not
- * news. 29724 is exactly that shape — a write into an already-present top-level `@i/` minted `@i/10-yrd/` in
- * silence, and the specimen `2f77738d` is why the rule is anchored on the deepest absent prefix, not the first.
+ * The SHALLOWEST absent prefix, never a deeper one: from an empty base `put a/b/f.md` names `a`, because `a` is
+ * the new root and `a/b` is implied (@chief ruling 0954d270, 2026-10-17 — one new root per written path,
+ * deduplicated across the invocation and printed on one line). When the shallow ancestors DO exist, the first
+ * absent one is the new subdirectory, which is 29724's own specimen: a write into an already-present top-level
+ * `@i/` minted `@i/10-yrd/` in silence at `2f77738d`, so the notice names `@i/10-yrd`.
  */
 async function mintedPrefixes(snapshot: Snapshot, paths: readonly string[]): Promise<string[]> {
   const minted: string[] = []
   for (const path of paths) {
-    let highestAbsent: string | undefined
+    let shallowestAbsent: string | undefined
     for (const prefix of ancestorPrefixes(path)) {
-      if ((await snapshot.keys(`${prefix}/`)).length === 0) highestAbsent = prefix
+      if ((await snapshot.keys(`${prefix}/`)).length === 0) {
+        shallowestAbsent = prefix
+        break
+      }
     }
-    if (highestAbsent !== undefined && !minted.includes(highestAbsent)) minted.push(highestAbsent)
+    if (shallowestAbsent !== undefined && !minted.includes(shallowestAbsent)) minted.push(shallowestAbsent)
   }
   return minted
 }
