@@ -464,6 +464,67 @@ async function matchingKeys(snapshot: Snapshot, glob: string | undefined): Promi
   return glob === undefined ? keys : keys.filter((key) => matchGlob(glob, key))
 }
 
+/**
+ * The ancestor prefixes a write to `path` can MINT, shallowest first: `a/b/c.md` can mint `a` or `a/b`, and a
+ * top-level `a.md` can mint nothing. The path's own last segment is the file being written, never a directory.
+ */
+function ancestorPrefixes(path: string): string[] {
+  const segments = path.split("/")
+  const prefixes: string[] = []
+  for (let depth = 1; depth < segments.length; depth += 1) prefixes.push(segments.slice(0, depth).join("/"))
+  return prefixes
+}
+
+/**
+ * The directories these written paths MINT in the base tree, in first-seen order: for each path, the HIGHEST
+ * ancestor prefix the base does not hold.
+ *
+ * Existence is asked of `keys`, never `has`/`oid`/`get`: those three are the blob question, and the backend
+ * contract answers `undefined` for a directory — "a directory answers `undefined` too" (types.ts, readTreeExact) —
+ * so `has("pm")` is not a question about the directory `pm` at all. A directory exists exactly when some listed
+ * path sits under it, which is what `keys("<prefix>/")` answers. `keys` IS the whole listing, so the first ask
+ * loads it once and every later prefix filters that one listing in memory.
+ *
+ * The HIGHEST absent prefix, not the shallowest, is the directory this write creates: a new subdirectory under a
+ * top-level directory that already exists reports the subdirectory it minted, because the existing parent is not
+ * news. 29724 is exactly that shape — a write into an already-present top-level `@i/` minted `@i/10-yrd/` in
+ * silence, and the specimen `2f77738d` is why the rule is anchored on the deepest absent prefix, not the first.
+ */
+async function mintedPrefixes(snapshot: Snapshot, paths: readonly string[]): Promise<string[]> {
+  const minted: string[] = []
+  for (const path of paths) {
+    let highestAbsent: string | undefined
+    for (const prefix of ancestorPrefixes(path)) {
+      if ((await snapshot.keys(`${prefix}/`)).length === 0) highestAbsent = prefix
+    }
+    if (highestAbsent !== undefined && !minted.includes(highestAbsent)) minted.push(highestAbsent)
+  }
+  return minted
+}
+
+/** The paths an edit WRITES: every kind but `rm`, and a `mv` writes its destination. */
+function writtenPaths(edits: readonly Edit[]): string[] {
+  const paths: string[] = []
+  for (const edit of edits) {
+    if (edit.kind === "rm") continue
+    paths.push(edit.kind === "mv" ? edit.to : edit.path)
+  }
+  return paths
+}
+
+/**
+ * Name the directories a landed write minted, on stderr — narration of a write that happened: no refusal, no gate,
+ * and deliberately SILENT for the ordinary edit, so the line stays a signal (29724). Called only after `apply`
+ * returns OK, because an all-or-nothing refusal must never narrate a write that did not land.
+ */
+async function noticeMintedPrefixes(snapshot: Snapshot, paths: readonly string[], stderr: CliWriter): Promise<void> {
+  const minted = await mintedPrefixes(snapshot, paths)
+  if (minted.length === 0) return
+  const named = minted.join(", ")
+  const line = minted.length === 1 ? `minted a new directory: ${named}` : `minted new directories: ${named}`
+  stderr.write(`gitomic: ${line}\n`)
+}
+
 function compilePattern(pattern: string): RegExp {
   try {
     return new RegExp(pattern)
@@ -595,6 +656,7 @@ async function runWrite(
   }
 
   const committed = await apply(store, base, edits, message, await writeOptions(attribution, repository, stderr))
+  await noticeMintedPrefixes(snapshot, writtenPaths(edits), stderr)
   let projectionOutcome: ProjectOutcomeReceipt | undefined
   if (checkoutPath !== undefined) {
     projectionOutcome = await projectAfterWrite(
@@ -668,7 +730,8 @@ async function runMv(args: string[], stdout: CliWriter, stderr: CliWriter, sourc
   const store = await open({ ...repository, ...(writer === undefined ? {} : { writer }) })
   const base = await store.head()
   await refuseCheckoutOfPublishedRepository(repository, store, base)
-  const expect = await store.at(base).oid(from)
+  const snapshot = store.at(base)
+  const expect = await snapshot.oid(from)
   if (expect === undefined) throw new Error(`source path not found: ${JSON.stringify(from)} at ${address}`)
   const committed = await apply(
     store,
@@ -677,6 +740,7 @@ async function runMv(args: string[], stdout: CliWriter, stderr: CliWriter, sourc
     message,
     await writeOptions(attribution, repository, stderr),
   )
+  await noticeMintedPrefixes(snapshot, [to], stderr)
   writeReceipt(stdout, stderr, committed, flags.get("--json") === true)
   return OK
 }
@@ -772,6 +836,7 @@ async function runApply(
     edits.push(await parseClause(clause, snapshot, claimStdin, address))
   }
   const committed = await apply(store, startBase, edits, message, await writeOptions(attribution, repository, stderr))
+  await noticeMintedPrefixes(snapshot, writtenPaths(edits), stderr)
   let projectionOutcome: ProjectOutcomeReceipt | undefined
   if (checkoutPath !== undefined) {
     projectionOutcome = await projectAfterWrite(

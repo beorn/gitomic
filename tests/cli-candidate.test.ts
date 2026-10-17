@@ -170,7 +170,8 @@ describe("gitomic CLI — the repository's gate and one exit-code table", () => 
     vi.stubEnv("GIT_CONFIG_VALUE_1", "")
     vi.stubEnv("GIT_CONFIG_KEY_2", "user.email")
     vi.stubEnv("GIT_CONFIG_VALUE_2", "")
-    const result = await run(backend, ["write", address(), "-m", "anonymous", `docs/a.md=${await file("a.md", "a\n")}`])
+    // A top-level path mints no directory, so this write's whole stderr stays the identity note asserted below (29724).
+    const result = await run(backend, ["write", address(), "-m", "anonymous", `a.md=${await file("a.md", "a\n")}`])
     expect(result.code).toBe(0)
     expect(result.stderr).toMatch(
       /^gitomic: no author identity \(git var GIT_AUTHOR_IDENT exit 128: .+\); authoring as the committer\n$/u,

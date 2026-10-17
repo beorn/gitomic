@@ -1239,6 +1239,66 @@ describe("gitomic CLI — apply", () => {
     expect(result.code).toBe(2)
     expect(result.stderr).toContain("frobnicate")
   })
+
+  // 29724: a clause path is resolved against the repository ROOT, so a path composed from a cwd one level deeper
+  // mints a whole new directory. The specimen was a vault-relative put of @i/10-yrd/29716-….md landed at the root
+  // in the same commit its author believed was an edit (2f77738d) — and @i was ALREADY present at that base, from
+  // earlier strays, so the directory that write minted was @i/10-yrd. The notice therefore names the highest path
+  // prefix absent at --base, which is why it fires below and stays silent for an ordinary edit.
+  test("a put that mints a new directory names it on stderr (29724)", async () => {
+    const backend = createMemBackend()
+    await writeOne(backend, "@i/1-instruments/29619-quality-vs-cost.md", "the earlier stray\n")
+    const putFile = await fileWith("stray.md", "stray\n")
+    const result = await run(backend, [
+      "apply",
+      ADDRESS,
+      "-m",
+      "stray",
+      "put",
+      "@i/10-yrd/29716.md",
+      putFile,
+      "--create",
+    ])
+    expect(result.code).toBe(0)
+    expect(result.stderr).toBe("gitomic: minted a new directory: @i/10-yrd\n")
+    expect(result.stdout.trim().length).toBeGreaterThan(0)
+  })
+
+  test("a put that mints a top-level segment names that segment, and an ordinary edit prints nothing (29724)", async () => {
+    const backend = createMemBackend()
+    await writeOne(backend, "docs/keep.md", "keep\n")
+    const first = await fileWith("new.md", "new\n")
+    const minted = await run(backend, ["apply", ADDRESS, "-m", "mint", "put", "vault/29716.md", first, "--create"])
+    expect(minted.code).toBe(0)
+    expect(minted.stderr).toBe("gitomic: minted a new directory: vault\n")
+    const second = await fileWith("more.md", "more\n")
+    const ordinary = await run(backend, ["apply", ADDRESS, "-m", "ordinary", "put", "docs/more.md", second, "--create"])
+    expect(ordinary.code).toBe(0)
+    expect(ordinary.stderr).toBe("")
+  })
+
+  test("a write that mints more than one directory names each on its one line (29724)", async () => {
+    const backend = createMemBackend()
+    await writeOne(backend, "docs/keep.md", "keep\n")
+    const first = await fileWith("one.md", "one\n")
+    const second = await fileWith("two.md", "two\n")
+    const result = await run(backend, [
+      "apply",
+      ADDRESS,
+      "-m",
+      "two mints",
+      "put",
+      "vault/one.md",
+      first,
+      "--create",
+      "put",
+      "notes/two.md",
+      second,
+      "--create",
+    ])
+    expect(result.code).toBe(0)
+    expect(result.stderr).toBe("gitomic: minted new directories: vault, notes\n")
+  })
 })
 
 describe("gitomic CLI — apply keyword-named paths (./ escape)", () => {
