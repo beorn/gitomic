@@ -1825,6 +1825,14 @@ export type ProjectCheckoutOutcome = RemoteFirstProjectionOutcome & {
   readonly localTip?: string | undefined
 }
 
+function readCheckoutRoot(repoRoot: string): { ok: true; root: string } | { ok: false; error: string } {
+  const top = git(repoRoot, readonlyArgs(["rev-parse", "--show-toplevel"]))
+  if (top.status !== 0 || top.stdout === "") {
+    return { ok: false, error: top.status !== 0 ? gitDetail(top) : "Git returned an empty checkout root" }
+  }
+  return { ok: true, root: top.stdout }
+}
+
 /**
  * Fetch a remote branch and project a checkout to that branch's remote tip.
  *
@@ -1881,10 +1889,24 @@ export async function projectCheckout(request: ProjectCheckoutRequest): Promise<
   const localTipRead = git(repoRoot, readonlyArgs(["rev-parse", "--verify", ref]))
   const localTip = localTipRead.status === 0 ? localTipRead.stdout : undefined
 
-  const expectedDirtyPaths = worktreeDirtyPaths(repoRoot)
+  const rootRead = readCheckoutRoot(repoRoot)
+  if (!rootRead.ok) {
+    return {
+      ok: false,
+      kind: "dirt-unverifiable",
+      to,
+      ...(localTip !== undefined ? { localTip } : {}),
+      error:
+        `${ref} in the checkout ${repoRoot}: cannot resolve the checkout root (${rootRead.error}); ` +
+        `source ${sourceRef} at ${remote} (${to})${localTip !== undefined ? `; local ${localTip}` : ""}; ` +
+        "no index/worktree projection was attempted",
+    }
+  }
+  const actualRoot = rootRead.root
+  const expectedDirtyPaths = worktreeDirtyPaths(actualRoot)
   const outcome = projectFetchedCommit(
     {
-      repoRoot,
+      repoRoot: actualRoot,
       to,
       ref,
       remote,
@@ -1897,7 +1919,12 @@ export async function projectCheckout(request: ProjectCheckoutRequest): Promise<
   )
   const projectionOutcome = outcome.ok
     ? outcome
-    : { ...outcome, error: `${outcome.error} Source: ${sourceRef} at ${remote}.` }
+    : {
+        ...outcome,
+        error:
+          `${outcome.error} Source: ${sourceRef} at ${remote}.` +
+          (actualRoot === repoRoot ? "" : ` Requested via ${repoRoot}.`),
+      }
 
   return {
     ...projectionOutcome,
@@ -2204,7 +2231,21 @@ export async function projectCheckoutWithSetAside(
 ): Promise<StateCheckoutRepairOutcome> {
   const projected = await projectCheckout(request)
   if (projected.to === undefined || projected.localTip === undefined) return projected
-  const { repoRoot } = request
+  const rootRead = readCheckoutRoot(request.repoRoot)
+  if (!rootRead.ok) {
+    return {
+      ok: false,
+      kind: "set-aside-refused",
+      localTip: projected.localTip,
+      to: projected.to,
+      error:
+        `${request.repoRoot}: cannot resolve the checkout root (${rootRead.error}); ` +
+        `initial projection ${projected.kind}${"error" in projected ? `: ${projected.error}` : ""}; ` +
+        "no set-aside capture or clearing was attempted",
+    }
+  }
+  const repoRoot = rootRead.root
+  const repairPath = repoRoot === request.repoRoot ? repoRoot : `${repoRoot} (requested via ${request.repoRoot})`
   const ref = request.ref ?? "refs/heads/main"
   const branchRef = ref.startsWith("refs/heads/") ? ref : `refs/heads/${ref}`
   const remote = request.remote ?? "origin"
@@ -2216,7 +2257,7 @@ export async function projectCheckoutWithSetAside(
     localTip,
     to,
     ...(preserveRef === undefined ? {} : { preserveRef }),
-    error: `${branchRef} in ${repoRoot}: ${reason}. Local ${localTip}; source ${sourceRef} at ${remote} (${to}). Nothing was published.`,
+    error: `${branchRef} in ${repairPath}: ${reason}. Local ${localTip}; source ${sourceRef} at ${remote} (${to}). Nothing was published.`,
   })
   let policy: Awaited<ReturnType<typeof readStateCheckoutDeclaration>>
   try {
