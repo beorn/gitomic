@@ -2204,7 +2204,21 @@ export async function projectCheckoutWithSetAside(
 ): Promise<StateCheckoutRepairOutcome> {
   const projected = await projectCheckout(request)
   if (projected.to === undefined || projected.localTip === undefined) return projected
-  const { repoRoot } = request
+  const top = git(request.repoRoot, readonlyArgs(["rev-parse", "--show-toplevel"]))
+  if (top.status !== 0 || top.stdout === "") {
+    return {
+      ok: false,
+      kind: "set-aside-refused",
+      localTip: projected.localTip,
+      to: projected.to,
+      error:
+        `${request.repoRoot}: cannot resolve the checkout root (${gitDetail(top)}); ` +
+        `initial projection ${projected.kind}${"error" in projected ? `: ${projected.error}` : ""}; ` +
+        "no set-aside capture or clearing was attempted",
+    }
+  }
+  const repoRoot = top.stdout
+  const repairPath = repoRoot === request.repoRoot ? repoRoot : `${repoRoot} (requested via ${request.repoRoot})`
   const ref = request.ref ?? "refs/heads/main"
   const branchRef = ref.startsWith("refs/heads/") ? ref : `refs/heads/${ref}`
   const remote = request.remote ?? "origin"
@@ -2216,7 +2230,7 @@ export async function projectCheckoutWithSetAside(
     localTip,
     to,
     ...(preserveRef === undefined ? {} : { preserveRef }),
-    error: `${branchRef} in ${repoRoot}: ${reason}. Local ${localTip}; source ${sourceRef} at ${remote} (${to}). Nothing was published.`,
+    error: `${branchRef} in ${repairPath}: ${reason}. Local ${localTip}; source ${sourceRef} at ${remote} (${to}). Nothing was published.`,
   })
   let policy: Awaited<ReturnType<typeof readStateCheckoutDeclaration>>
   try {
