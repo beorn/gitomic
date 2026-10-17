@@ -320,6 +320,8 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
     },
     fetchRefs: async (repo, refs, remote, options) =>
       fetchRefs(await resolveGitDir(repo), refs, remote, remoteTimeoutMs, baseEnv, options?.absent ?? "throw"),
+    fetchedTip: async (repo, ref, remote) =>
+      optionalRef(await resolveGitDir(repo), fetchedLocal(remote, ref), baseEnv, "commit"),
   }
   // Each backend owns its executable even when two backends run concurrently.
   // Keeping the selection in the async call chain lets the Git plumbing below
@@ -350,8 +352,18 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
   }
 }
 
-async function optionalRef(repo: string, ref: string, baseEnv?: NodeJS.ProcessEnv): Promise<Oid | undefined> {
-  const result = await run(selectedGit(), gitArgs(repo, ["rev-parse", "--verify", "--quiet", ref]), { baseEnv })
+async function optionalRef(
+  repo: string,
+  ref: string,
+  baseEnv?: NodeJS.ProcessEnv,
+  peel?: "commit",
+): Promise<Oid | undefined> {
+  // `peel: "commit"` asks for the commit `ref` names, not the name's own value: a ref whose object
+  // was pruned still resolves by name and prints a sha nothing can read, and a ref that names a blob
+  // or a tree resolves too. Both answer `undefined` here, so a caller that is deciding whether the
+  // objects are already present ("fetch or not") is told the truth instead of a name.
+  const target = peel === "commit" ? `${ref}^{commit}` : ref
+  const result = await run(selectedGit(), gitArgs(repo, ["rev-parse", "--verify", "--quiet", target]), { baseEnv })
   if (result.code === 1 && result.stdout.length === 0) return undefined
   if (result.code !== 0) {
     const detail = result.stderr.toString("utf8").trim()
@@ -2534,6 +2546,15 @@ export function fetchedNamespace(remote: string): string {
   return `refs/gitomic/fetched/${key}/`
 }
 
+/**
+ * gitomic's private ref for one application ref at one remote: what a fetch of `remote` writes, and
+ * the only local name a chain read may weigh the remote's answer against. One producer, so a reader
+ * never spells the namespace itself and the fetch and the check can never drift apart.
+ */
+function fetchedLocal(remote: string, ref: string): string {
+  return `${fetchedNamespace(remote)}${ref.slice("refs/".length)}`
+}
+
 const FETCH_RACE_ATTEMPTS = 3
 
 /**
@@ -2593,7 +2614,7 @@ async function fetchRefs(
   absent: "throw" | "omit" = "throw",
 ): Promise<ReadonlyMap<string, Oid>> {
   const namespace = fetchedNamespace(remote)
-  const local = (ref: string) => `${namespace}${ref.slice("refs/".length)}`
+  const local = (ref: string) => fetchedLocal(remote, ref)
   const prefix = typeof refs === "string" ? refs : undefined
   const named = typeof refs === "string" ? [] : [...refs]
   if (prefix !== undefined && !prefix.startsWith("refs/")) {

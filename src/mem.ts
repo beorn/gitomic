@@ -386,6 +386,9 @@ export function createMemBackend(): GitomicBackend {
     fetchRefs: async () => {
       throw new TypeError("the mem backend has no remotes; fetchRefs needs a remote")
     },
+    fetchedTip: async () => {
+      throw new TypeError("the mem backend has no remotes; fetchedTip needs a remote")
+    },
     // The initial commit every mem repo already holds IS the genesis.
     writeGenesis: async (name) => {
       getRepo(name)

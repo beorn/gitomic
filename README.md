@@ -462,6 +462,17 @@ is one; `chainsUnder` against a remote is two, a fetch and a walk. A chain
 longer than the walk's wave is the only one that adds a process per wave, and
 only for `complete: true`.
 
+A remote chain read skips its fetch when the oid the remote just listed already
+sits at gitomic's private fetched ref. The read still asks the remote every time
+and returns that answer, and the skip is decided on equality with what was just
+listed, never on a local ref alone, so nothing is served from a cache. What the
+skip saves is network, not processes: a held read is `ls-remote` plus `rev-parse`,
+two processes, the same count a read cost before, and a moved or unheld tip adds
+the fetch and so costs three. Over a reader making twelve reads of one chain
+whose tip moves once, processes go 24 to 25 and network operations 24 to 13. A
+read that names `fetch:` extras keeps its unconditional fetch, because extras are
+never listed remotely.
+
 **MULTI: many refs, all or none.** `append` and `transact` take
 `also: [{ ref, expect, oid }]`: more refs that land in the SAME atomic publish
 as the event (`expect: null` means absent). Locally that is one

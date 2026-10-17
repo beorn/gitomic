@@ -410,6 +410,20 @@ export type GitomicBackend = {
     remote: string,
     options?: FetchRefsOptions,
   ): Promise<ReadonlyMap<string, Oid>>
+  /**
+   * The oid gitomic holds at its own private ref for `ref` in `remote`'s namespace
+   * (`refs/gitomic/fetched/<remote-key>/<ref without refs/>`), or `undefined` when that ref is absent
+   * or the object it names cannot be read as a commit.
+   *
+   * This is the one question a chain read asks before fetching: an oid the remote just listed that
+   * already sits here is already held, so a fetch would bring nothing the read can use. It answers
+   * the commit the private ref peels to, never the bare ref name, because a ref whose object was
+   * pruned still resolves by name — a name is not an object. `undefined` therefore means "fetch",
+   * which is what a read does when it cannot prove the objects are here.
+   *
+   * The mem backend has no remotes and throws, exactly as `fetchRefs` does.
+   */
+  fetchedTip(repo: string, ref: string, remote: string): Promise<Oid | undefined>
 }
 
 /** How `fetchRefs` treats a named ref the remote does not have. */

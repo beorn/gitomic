@@ -223,6 +223,13 @@ export const EVENT_KEY = "Event"
 const DEFAULT_LIMIT = 50
 const MAX_LIMIT = 1_024
 
+// `fetchRefs` and `fetchedTip` are the two halves of one question a remote read asks — may I skip the
+// fetch because I already hold this oid? `fetchedTip` is REQUIRED of every backend, while `fetchRefs`
+// is optional, because a backend can hold and read event chains without being able to fetch from a
+// remote; a typed backend can therefore answer one half and not the other. They are not asserted here:
+// holding event chains is not the same as being able to read them remotely, and a local backend that
+// never touches a remote answers neither method (mem answers both by refusing). `openEvents` asserts
+// the pair where a remote read starts, the one place that asks.
 type Capable = GitomicBackend & Required<Pick<GitomicBackend, "listRefs" | "readHistory" | "writeGenesis" | "publish">>
 
 function requireEvents(backend: GitomicBackend): Capable {
@@ -412,15 +419,40 @@ export async function openEvents(options: EventsOptions): Promise<Events> {
   if (remote === undefined) {
     tip = async () => (await backend.listRefs(repo, ref)).get(ref) ?? null
   } else {
+    // The pair is asserted at the open of a remote read — never per call, and never for a local read,
+    // which asks neither method. A backend that cannot read remotely says so once, before the first
+    // fetch, rather than at the first read. `fetchedTip` is required by the type but `fetchRefs` is
+    // optional, so this runtime check is what turns an absent half into a loud refusal for every
+    // backend, typed or not.
     const fetchRefs = backend.fetchRefs
-    if (fetchRefs === undefined) {
-      throw new TypeError("this backend cannot read remotely; omit remote or use the shell/iso backend")
+    const fetchedTip = backend.fetchedTip
+    if (typeof fetchRefs !== "function" || typeof fetchedTip !== "function") {
+      // Name the half that is missing: the pair is one question, and a backend that answers only one of
+      // them fails at the first read with a message that would otherwise send its author looking at the
+      // wrong method.
+      const missing = [
+        ...(typeof fetchRefs === "function" ? [] : ["fetchRefs"]),
+        ...(typeof fetchedTip === "function" ? [] : ["fetchedTip"]),
+      ]
+      throw new TypeError(
+        `this backend cannot read remotely: ${missing.join(" and ")} missing; omit remote or use the shell/iso backend`,
+      )
     }
     tip = async () => {
       const listed = (await backend.listRefs(repo, ref, remote)).get(ref) ?? null
-      // Bring the objects over into gitomic's private namespace: no application
-      // ref moves, and no local ref is treated as a cache of the remote.
-      if (listed !== null) {
+      // The remote's answer is the authority, and it is taken fresh on every
+      // read: the oid returned below is always the one just listed. The fetch is
+      // not a read — it only brings the objects over into gitomic's private
+      // namespace, and no application ref moves. When the oid the remote just
+      // listed already sits at that private ref, the fetch cannot change
+      // anything this read returns, so it is skipped; the skip is decided on
+      // equality with what was just listed, never on a local ref alone, so
+      // nothing is ever served from a cache. A ref that is named but whose
+      // commit cannot be read does not count as held, so a damaged object store
+      // is still repaired by the fetch. `extra` refs are not listed remotely, so
+      // nothing says whether they moved: a read naming them keeps its fetch.
+      const held = listed !== null && extra.length === 0 ? await fetchedTip(repo, ref, remote) : undefined
+      if (listed !== null && held !== listed) {
         const fetched = await fetchRefs(
           repo,
           [ref, ...extra],

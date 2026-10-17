@@ -27,6 +27,20 @@
 
 ### Changed
 
+- A remote chain read fetches only what it does not already hold. The remote's answer is still taken
+  fresh on every read — the `ls-remote` is unchanged and is what the read returns — and the
+  `git fetch` is skipped when the oid just listed already sits at gitomic's private fetched ref. What
+  the skip saves is network, not processes: a held read is `ls-remote` plus `rev-parse`, two
+  processes, the same count a read cost before, and a moved or unheld tip adds the fetch and so costs
+  three. Over a reader making twelve reads of one chain whose tip moves once, processes go 24 to 25
+  and network operations 24 to 13. Nothing is cached: the skip is decided on equality with what was
+  just listed, and a private ref whose commit cannot be read (an object that was pruned, or a ref
+  naming a blob or a tree) does not count as held, so a damaged object store is still repaired by the
+  fetch. A read that names `fetch:` extras keeps its unconditional fetch, because extras are never
+  listed remotely. The new REQUIRED backend method `GitomicBackend.fetchedTip(repo, ref, remote)`
+  answers it: the oid gitomic holds at its private ref for that remote, or `undefined` when it holds
+  none or the commit cannot be read. The shell and iso backends implement it from the same
+  private-name producer `fetchRefs` uses; the mem backend throws, exactly as it does for `fetchRefs`.
 - Source CI uses Bun 1.4.3, the measured-good runtime for the shared CLI's early-close handling;
   the published CLI keeps its Node interpreter and Node `>=20` contract.
 - The shell backend's `writeCommit` rebuilds only the directories a change
