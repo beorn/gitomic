@@ -2116,7 +2116,8 @@ function projectFetchedCommit(request: RemoteFirstProjectionRequest, sourceOid: 
     return {
       ...verified,
       error:
-        verified.error +
+        `${ref} in ${repoRoot}: recovery transition ${localTip} -> ${to} ran and the ref advanced; ` +
+        `post-transition verification failed: ${verified.error.replace(/\bnothing was changed\./giu, "Recovery did not finish.")}` +
         recoveryRefusalFacts(
           repoRoot,
           localTip,

@@ -1587,6 +1587,39 @@ describe("gitomic project and checkout synchronization", () => {
         },
       )
 
+      // @failure A post-transition recovery refusal denies the checkout and ref changes that already happened.
+      // @level l1 @consumer on-demand checkout recovery diagnostics @testonly none
+      test("recovery reports an advanced ref honestly when post-transition index verification fails", async () => {
+        const { checkout, head, to } = fixture()
+        const indexPath = join(git(checkout, "rev-parse", "--absolute-git-dir"), "index")
+        let transitioned = false
+
+        const result = await projectCheckout({
+          repoRoot: checkout,
+          recovery: true,
+          beforeRefAdvance: () => {
+            // Observe the real native transition before introducing a concurrent index failure.
+            expect(git(checkout, "rev-parse", "HEAD")).toBe(head)
+            expect(git(checkout, "write-tree")).toBe(git(checkout, "rev-parse", `${to}^{tree}`))
+            expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# successor\n")
+            transitioned = true
+            writeFileSync(indexPath, "concurrent incomplete index\n")
+          },
+        })
+
+        expect(transitioned).toBe(true)
+        expect(git(checkout, "rev-parse", "HEAD")).toBe(to)
+        expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# successor\n")
+        expect(result).toMatchObject({ ok: false, kind: "dirt-unverifiable" })
+        if (result.ok) throw new Error("expected post-transition verification refusal")
+        expect(result.error).toContain("the index could not be compared")
+        expect(result.error).toContain("index file smaller than expected")
+        expect(result.error).not.toMatch(/nothing was changed/i)
+        expect(result.error).toContain(`${head} -> ${to}`)
+        expect(result.error).toMatch(/transition.*ran/i)
+        expect(result.error).toMatch(/ref.*advanced/i)
+      })
+
       // @failure A Git-clean raw edit is overwritten between normalization proof and the recovery transition.
       // @level l1 @consumer on-demand checkout recovery raw custody @testonly none
       test.each(["same-stat", "clean-form"] as const)(
