@@ -1170,6 +1170,78 @@ describe("gitomic project and checkout synchronization", () => {
       return { parent, head }
     }
 
+    // @failure Recovery calls an ancestor index a genuine stage and falsely reports a stale checkout current.
+    // @level l1 @consumer on-demand recovery baseline provenance @testonly none
+    test.each(["stale-raw", "current-raw"] as const)(
+      "recovery keeps historical index provenance with %s bytes",
+      async (shape) => {
+        const { checkout } = remoteFixture()
+        const { parent, head } = commitThenLeaveIndexAtParent(checkout)
+        git(checkout, "push", "-q", "origin", "main")
+        git(checkout, "fetch", "-q", "origin", "main")
+        if (shape === "current-raw") {
+          writeFileSync(join(checkout, "tracked.md"), "# committed by the hook\n")
+          writeFileSync(join(checkout, "added.md"), "# added by the hook\n")
+        }
+        const indexPath = join(git(checkout, "rev-parse", "--absolute-git-dir"), "index")
+        const index = readFileSync(indexPath)
+        const tracked = readFileSync(join(checkout, "tracked.md"))
+        const refs = git(checkout, "for-each-ref", "--format=%(refname) %(objectname)")
+
+        const result = await projectCheckout({ repoRoot: checkout, recovery: true })
+
+        if (shape === "stale-raw") {
+          expect(result, JSON.stringify(result)).toMatchObject({ ok: false })
+          if (result.ok) throw new Error("historical raw bytes must not be accepted as unrelated staging")
+          expect(result.error).toMatch(/added\.md|tracked\.md/)
+          expect(readFileSync(indexPath)).toEqual(index)
+          expect(readFileSync(join(checkout, "tracked.md"))).toEqual(tracked)
+        } else {
+          expect(result, JSON.stringify(result)).toMatchObject({
+            ok: true,
+            kind: "synchronized",
+            repairedIndexFrom: parent,
+          })
+          expect(git(checkout, "write-tree")).toBe(git(checkout, "rev-parse", `${head}^{tree}`))
+          expect(worktreeDirtyPaths(checkout)).toEqual([])
+        }
+        expect(git(checkout, "rev-parse", "HEAD")).toBe(head)
+        expect(git(checkout, "for-each-ref", "--format=%(refname) %(objectname)")).toBe(refs)
+      },
+    )
+
+    // @failure An older published receipt is used as raw HEAD, refusing a current checkout with unrelated staging.
+    // @level l1 @consumer remote-first on-demand recovery @testonly none
+    test("recovery checks current published HEAD when a receipt is superseded", async () => {
+      const { checkout, bare } = remoteFixture()
+      const receipt = git(checkout, "rev-parse", "HEAD")
+      writeFileSync(join(checkout, "tracked.md"), "# newer published content\n")
+      git(checkout, "add", "tracked.md")
+      git(checkout, "commit", "-qm", "newer published tip")
+      git(checkout, "push", "-q", "origin", "main")
+      git(checkout, "fetch", "-q", "origin", "main")
+      const head = git(checkout, "rev-parse", "HEAD")
+      writeFileSync(join(checkout, "bystander.md"), "# genuine unrelated stage\n")
+      git(checkout, "add", "bystander.md")
+      const indexPath = join(git(checkout, "rev-parse", "--absolute-git-dir"), "index")
+      const index = readFileSync(indexPath)
+
+      const result = await projectRemoteFirstFastForward({
+        repoRoot: checkout,
+        remote: bare,
+        ref: "refs/heads/main",
+        to: receipt,
+        recovery: true,
+        expectedDirtyPaths: worktreeDirtyPaths(checkout),
+      })
+
+      expect(result, JSON.stringify(result)).toMatchObject({ ok: true, kind: "already-current" })
+      expect(git(checkout, "rev-parse", "HEAD")).toBe(head)
+      expect(readFileSync(indexPath)).toEqual(index)
+      expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# newer published content\n")
+      expect(readFileSync(join(checkout, "bystander.md"), "utf8")).toBe("# genuine unrelated stage\n")
+    })
+
     test("after the commit is pushed, project repairs the index to HEAD and reports it", async () => {
       const { checkout } = remoteFixture()
       const { parent, head } = commitThenLeaveIndexAtParent(checkout)
@@ -1478,37 +1550,42 @@ describe("gitomic project and checkout synchronization", () => {
 
       // @failure Recovery discards a genuine stage present beside Git-normalized HEAD bytes, or refuses its second run.
       // @level l1 @consumer on-demand checkout recovery @testonly none
-      test("recovery retains an already-present foreign stage through two invocations", async () => {
-        const { checkout, to } = fixture()
-        const staged = "# unrelated staged work\r\n"
-        writeFileSync(join(checkout, "bystander.md"), staged)
-        git(checkout, "add", "bystander.md")
-        const retainedEntry = git(checkout, "ls-files", "--stage", "--", "bystander.md")
+      test.each(["normalized", "foreign-only"] as const)(
+        "recovery retains an already-present foreign stage through two invocations (%s)",
+        async (shape) => {
+          const original = shape === "normalized" ? fixture() : remoteFixture()
+          const { checkout } = original
+          const to = "to" in original ? original.to : original.landAtOrigin("tracked.md", "# successor\n")
+          const staged = "# unrelated staged work\r\n"
+          writeFileSync(join(checkout, "bystander.md"), staged)
+          git(checkout, "add", "bystander.md")
+          const retainedEntry = git(checkout, "ls-files", "--stage", "--", "bystander.md")
 
-        const result = await projectCheckout({
-          repoRoot: checkout,
-          recovery: true as const,
-        })
+          const result = await projectCheckout({
+            repoRoot: checkout,
+            recovery: true as const,
+          })
 
-        expect(result, JSON.stringify(result)).toMatchObject({ ok: true, kind: "synchronized" })
-        expect(git(checkout, "rev-parse", "HEAD")).toBe(to)
-        expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# successor\n")
-        expect(git(checkout, "ls-files", "--stage", "--", "bystander.md")).toBe(retainedEntry)
-        expect(readFileSync(join(checkout, "bystander.md"), "utf8")).toBe(staged)
-        const indexPath = join(git(checkout, "rev-parse", "--absolute-git-dir"), "index")
-        const afterFirst = readFileSync(indexPath)
+          expect(result, JSON.stringify(result)).toMatchObject({ ok: true, kind: "synchronized" })
+          expect(git(checkout, "rev-parse", "HEAD")).toBe(to)
+          expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# successor\n")
+          expect(git(checkout, "ls-files", "--stage", "--", "bystander.md")).toBe(retainedEntry)
+          expect(readFileSync(join(checkout, "bystander.md"), "utf8")).toBe(staged)
+          const indexPath = join(git(checkout, "rev-parse", "--absolute-git-dir"), "index")
+          const afterFirst = readFileSync(indexPath)
 
-        const repeated = await projectCheckout({
-          repoRoot: checkout,
-          recovery: true as const,
-        })
+          const repeated = await projectCheckout({
+            repoRoot: checkout,
+            recovery: true as const,
+          })
 
-        expect(repeated, JSON.stringify(repeated)).toMatchObject({ ok: true, kind: "already-current" })
-        expect(git(checkout, "rev-parse", "HEAD")).toBe(to)
-        expect(git(checkout, "ls-files", "--stage", "--", "bystander.md")).toBe(retainedEntry)
-        expect(readFileSync(indexPath)).toEqual(afterFirst)
-        expect(readFileSync(join(checkout, "bystander.md"), "utf8")).toBe(staged)
-      })
+          expect(repeated, JSON.stringify(repeated)).toMatchObject({ ok: true, kind: "already-current" })
+          expect(git(checkout, "rev-parse", "HEAD")).toBe(to)
+          expect(git(checkout, "ls-files", "--stage", "--", "bystander.md")).toBe(retainedEntry)
+          expect(readFileSync(indexPath)).toEqual(afterFirst)
+          expect(readFileSync(join(checkout, "bystander.md"), "utf8")).toBe(staged)
+        },
+      )
 
       // @failure A Git-clean raw edit is overwritten between normalization proof and the recovery transition.
       // @level l1 @consumer on-demand checkout recovery raw custody @testonly none

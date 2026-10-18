@@ -773,17 +773,21 @@ function carryIndexTo(
     )
   }
   // Already-current needs its own proof; this class only enables an actual fast-forward.
+  let unclassifiedRecovery: IndexCarry | undefined
   if (alreadyAt !== undefined && (alreadyAt !== tip || recovery === true)) {
     try {
       const normalized = proveNormalizedIndex(repoRoot, tip, indexTree, expected, baseEnv, recovery)
       if (normalized !== undefined) {
         const resolved = new Set(normalized.paths.map((capture) => capture.path))
-        return {
+        const candidate: IndexCarry = {
           ok: true,
           expectedDirtyPaths: expected.filter((path) => !resolved.has(path)),
           normalized,
           indexBase: normalized.tree,
         }
+        // With no representation change, an old index tree must first retain its existing ancestor provenance.
+        if (recovery === true && normalized.paths.length === 0) unclassifiedRecovery = candidate
+        else return candidate
       }
     } catch (error) {
       return refuse(`${ref} in ${repoRoot}: normalization proof failed (${String(error)}). Nothing was changed.`)
@@ -817,6 +821,7 @@ function carryIndexTo(
     if (match === undefined && lines.length < count) break
   }
   if (match === undefined) {
+    if (unclassifiedRecovery !== undefined) return unclassifiedRecovery
     return refuse(
       `${ref} in the checkout ${repoRoot}: the index holds neither ${tip}'s tree nor that of any of its ` +
         `${scanned - 1} first-parent ancestors, so it carries staged changes no projection may overwrite. ` +
@@ -832,12 +837,29 @@ function carryIndexTo(
         `(${gitDetail(delta)}). Nothing was changed.`,
     )
   }
+  if (recovery === true) {
+    try {
+      verifyRecoveryContent(repoRoot, tip, ancestor, tip, baseEnv)
+    } catch (error) {
+      return refuse(`${ref} in ${repoRoot}: ${String(error)}. Nothing was changed.`)
+    }
+  }
   // Dirt is measured against HEAD (`tip`), so a worktree file already equal to tip is absent from `expected` even
   // though the stale index still holds `ancestor`. Inspect the skipped commit's delta instead.
   const matching = matchingLandingDirt(repoRoot, ancestor, tip, nulPaths(delta.stdout), baseEnv)
   if (!matching.ok) return refuse(`${ref} in ${repoRoot}: ${matching.detail}. Nothing was changed.`)
   const staged = stageAuthoredPaths(repoRoot, ref, ancestor, tip, matching.paths, expected, baseEnv)
   if (!staged.ok) return { ok: false, outcome: staged.outcome }
+  if (recovery === true) {
+    try {
+      verifyRecoveryContent(repoRoot, tip, staged.mergeBase ?? ancestor, tip, baseEnv)
+    } catch (error) {
+      const rollback = unstageAuthoredPaths(repoRoot, ancestor, matching.paths, baseEnv)
+      return refuse(
+        `${ref} in ${repoRoot}: ${String(error)}. Matching-path staging was attempted; ${rollback === undefined ? "the staged entries were restored" : `restoring staged entries failed: ${rollback}`}. No transition ran.`,
+      )
+    }
+  }
   const merged = git(repoRoot, ["read-tree", "-m", "-u", staged.mergeBase ?? ancestor, tip], undefined, baseEnv)
   if (merged.status !== 0) {
     const unstaged = unstageAuthoredPaths(repoRoot, ancestor, matching.paths, baseEnv)
@@ -1777,7 +1799,7 @@ function projectFetchedCommit(request: RemoteFirstProjectionRequest, sourceOid: 
         return reported(
           synchronizeCheckoutToCommit({
             repoRoot,
-            from: to,
+            from: request.recovery === true ? localTip : to,
             to: localTip,
             ref,
             expectedDirtyPaths,
