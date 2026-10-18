@@ -111,6 +111,8 @@ async function openKept(
     const building = join(cacheDir, `.tmp-${process.pid}-${randomUUID()}.git`)
     try {
       await build(source, building, seed, timeoutMs)
+      // Publish a ready shared store: first openers must not race to write its config after the rename.
+      await guardKeptStore(source, building, timeoutMs)
     } catch (failure) {
       removeFailedBuild(source, building, failure)
       throw failure

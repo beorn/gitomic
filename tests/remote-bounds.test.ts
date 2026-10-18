@@ -490,10 +490,28 @@ describe("a kept remote repository", () => {
   test("a kept repository carries the shared-store gc guards, on its first build AND when reopened", async () => {
     const fixture = await createBareRepo()
     const cacheDir = join(await mkdtemp(join(tmpdir(), "gitomic-kept-guard-")), "remotes")
+    const source = pathToFileURL(fixture.repo).href
+    const renameSync = fs.renameSync
+    let publishedConfig: { status: number | null; text: string } | undefined
+    const publication = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (to === keptPath(cacheDir, source)) {
+        // Another opener can use this path as soon as rename returns. Inspect the real config before publication,
+        // not only after our open resolves: late guards let two first openers contend on config.lock (hh 29958).
+        const config = spawnSync("git", ["--git-dir", String(from), "config", "--local", "--list"], {
+          encoding: "utf8",
+        })
+        publishedConfig = { status: config.status, text: config.stdout.toLowerCase() }
+      }
+      return renameSync(from, to)
+    })
     try {
-      const source = pathToFileURL(fixture.repo).href
       const first = await openRemoteRepository(source, { cacheDir })
       first[Symbol.dispose]()
+
+      expect(publishedConfig?.status).toBe(0)
+      expect(publishedConfig?.text.split("\n")).toEqual(
+        expect.arrayContaining(["gc.auto=0", "gc.pruneexpire=never", "maintenance.auto=false"]),
+      )
 
       // The exact guards tools/lib/store-gc.ts STORE_GC_GUARDS and the state authority (#27167) carry, copied.
       expect(await git(first.repo, "config", "--get", "gc.auto")).toBe("0")
@@ -512,6 +530,7 @@ describe("a kept remote repository", () => {
       expect(await git(second.repo, "config", "--get", "gc.pruneExpire")).toBe("never")
       expect(await git(second.repo, "config", "--get", "maintenance.auto")).toBe("false")
     } finally {
+      publication.mockRestore()
       await rm(join(cacheDir, ".."), { recursive: true, force: true })
       await fixture.cleanup()
     }
