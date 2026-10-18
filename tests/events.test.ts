@@ -270,6 +270,29 @@ describe("reserved trailer keys are refused loudly at append (ruling A)", () => 
     })
   })
 
+  test.each([
+    ["trailer", "U+2028", "\u2028"],
+    ["trailer", "U+2029", "\u2029"],
+    ["writer", "U+2028", "\u2028"],
+    ["writer", "U+2029", "\u2029"],
+    ["title", "U+2028", "\u2028"],
+    ["title", "U+2029", "\u2029"],
+  ])("refuses %s containing %s without appending", async (field, name, separator) => {
+    await withTargets(async (target) => {
+      const options = { repo: target.repo, ref: CHAIN, backend: target.backend }
+      const events = await openEvents(options)
+      const value = `before${separator}after`
+      if (field === "writer") {
+        await expect(openEvents({ ...options, writer: value }), target.name).rejects.toThrow(name)
+      } else {
+        const input =
+          field === "title" ? { type: "x", title: value } : { type: "x", props: [["Reason", value]] as const }
+        await expect(events.append([input], { expect: null }), target.name).rejects.toThrow(name)
+      }
+      expect(await events.head(), target.name).toBeNull()
+    })
+  })
+
   test("per-call trailers reject event and Gitomic-owned keys and malformed values", async () => {
     await withTargets(async (target) => {
       const events = await openEvents({ repo: target.repo, ref: CHAIN, backend: target.backend })
