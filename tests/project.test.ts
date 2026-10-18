@@ -1493,11 +1493,11 @@ describe("gitomic project and checkout synchronization", () => {
     // @failure Git-normalized staged HEAD bytes brick projection, or their admission overwrites unique local work.
     // @level l1 @consumer projectCheckout fast-forward callers @testonly none
     describe("normalized HEAD index", () => {
-      function fixture(advances = true, landingPath = "tracked.md") {
+      function fixture(advances = true, landingPath = "tracked.md", attributes = "* text=auto\n") {
         const original = remoteFixture(true)
         const { checkout } = original
         git(checkout, "config", "core.autocrlf", "false")
-        writeFileSync(join(checkout, ".gitattributes"), "* text=auto\n")
+        writeFileSync(join(checkout, ".gitattributes"), attributes)
         git(checkout, "add", ".gitattributes")
         const raw = "# raw HEAD\r\nretained bytes\r\n"
         writeFileSync(join(checkout, "tracked.md"), raw)
@@ -1592,14 +1592,46 @@ describe("gitomic project and checkout synchronization", () => {
       test.each(["same-stat", "clean-form"] as const)(
         "recovery preserves a %s raw edit before its native transition",
         async (shape) => {
-          const { checkout, head } = fixture(true, "bystander.md")
+          const { checkout, head } = fixture(true, "bystander.md", "* text=auto\n*.md text eol=lf\n")
           git(checkout, "fetch", "-q", "origin", "main")
           const path = join(checkout, "bystander.md")
           const original = readFileSync(path, "utf8")
+          git(checkout, "config", "core.trustctime", "false")
+          git(checkout, "config", "core.checkStat", "minimal")
+          if (shape === "clean-form") {
+            // Prime the real index's stat cache with an earlier raw representation of the same clean blob.
+            writeFileSync(path, original.replaceAll("\n", "\r\n"))
+            git(checkout, "add", "bystander.md")
+            const prior = statSync(path)
+            writeFileSync(path, original)
+            utimesSync(path, prior.atime, prior.mtime)
+          } else {
+            // A fresh same-second stat entry has independent racy-Git protection; exercise an aged cached entry.
+            const aged = new Date(Date.now() - 60_000)
+            utimesSync(path, aged, aged)
+            git(checkout, "add", "bystander.md")
+          }
           const stat = statSync(path)
+          expect(git(checkout, "rev-parse", ":bystander.md")).toBe(git(checkout, "rev-parse", `${head}:bystander.md`))
           const edited =
             shape === "same-stat" ? original.replace("bystander", "bystandEr") : original.replaceAll("\n", "\r\n")
-          git(checkout, "update-index", "--assume-unchanged", "bystander.md")
+          if (shape === "same-stat") {
+            expect(Buffer.byteLength(edited)).toBe(Buffer.byteLength(original))
+          } else {
+            const clean = spawnSync("git", ["-C", checkout, "hash-object", "--path=bystander.md", "--stdin"], {
+              input: edited,
+              encoding: "utf8",
+            })
+            const raw = spawnSync("git", ["-C", checkout, "hash-object", "--no-filters", "--stdin"], {
+              input: edited,
+              encoding: "utf8",
+            })
+            expect(clean.status).toBe(0)
+            expect(raw.status).toBe(0)
+            const headBlob = git(checkout, "rev-parse", `${head}:bystander.md`)
+            expect(clean.stdout.trim()).toBe(headBlob)
+            expect(raw.stdout.trim()).not.toBe(headBlob)
+          }
           const indexPath = join(git(checkout, "rev-parse", "--absolute-git-dir"), "index")
           const index = readFileSync(indexPath)
           const refs = git(checkout, "for-each-ref", "--format=%(refname) %(objectname)")
@@ -1629,12 +1661,17 @@ describe("gitomic project and checkout synchronization", () => {
               fired = true
               writeFileSync(path, edited)
               utimesSync(path, stat.atime, stat.mtime)
+              const observed = statSync(path)
+              expect(observed.mtime.getTime()).toBe(stat.mtime.getTime())
+              if (shape === "same-stat") expect(observed.size).toBe(stat.size)
             }
             return native.spawnSync(command, args, options)
           })
           try {
             const result = await projectCheckout({ repoRoot: checkout, recovery: true })
             expect(fired).toBe(true)
+            // Check actual bytes first: removing ONLY the raw comparison must fail on overwrite, not just ordering.
+            expect(readFileSync(path, "utf8")).toBe(edited)
             expect(transitionStarted).toBe(false)
             expect(result, JSON.stringify(result)).toMatchObject({ ok: false })
             if (result.ok) throw new Error("expected raw custody refusal")

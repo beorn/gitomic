@@ -641,6 +641,7 @@ function proveNormalizedIndex(
       tree = run(["write-tree"])
       if (!tree) throw new Error("recovery baseline tree is empty")
     } finally {
+      // raw-delete-allow: remove only this call's mkdtemp recovery-index scratch; standalone Gitomic has no runtime removely dependency
       rmSync(scratch, { recursive: true, force: true })
     }
   }
@@ -652,6 +653,58 @@ function proveNormalizedIndex(
     preserved: expected.filter((path) => !resolved.has(path)).map((path) => readCapturedPath(repoRoot, path)),
     ...(recovery === true ? { retained } : {}),
   }
+}
+
+/** Facts read only after recovery has already refused; never an additional admission check. */
+function recoveryRefusalFacts(
+  repoRoot: string,
+  recordedHead: string,
+  baseline: string,
+  target: string,
+  baseEnv?: NodeJS.ProcessEnv,
+): string {
+  const rawMismatches: string[] = []
+  let rawComparisonError: string | undefined
+  try {
+    verifyRecoveryContent(repoRoot, recordedHead, baseline, target, baseEnv, rawMismatches)
+  } catch (error) {
+    rawComparisonError = String(error)
+  }
+  const read = (resource: string, args: readonly string[]) => {
+    const result = git(repoRoot, readonlyArgs(args), 64 * 1024 * 1024, baseEnv)
+    return result.status === 0 ? { value: result.stdout } : { error: `cannot read ${resource}: ${gitDetail(result)}` }
+  }
+  const index = actualIndexPath(repoRoot, baseEnv)
+  const indexLock = (() => {
+    if (!index.ok) {
+      return { state: "unreadable", error: `cannot read actual index path: ${index.detail}` }
+    }
+    const path = `${index.indexPath}.lock`
+    try {
+      lstatSync(path)
+      const ageMs = lockAgeOf(path)
+      return {
+        path,
+        state: "present",
+        ageMs,
+        ...(ageMs === null ? { error: `age of ${path} unknown: gone or unreadable when read` } : {}),
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return { path, state: "absent" }
+      return { path, state: "unreadable", error: `cannot read ${path}: ${String(error)}` }
+    }
+  })()
+  return ` Recovery refusal facts: ${JSON.stringify({
+    recordedHead,
+    baseline,
+    target,
+    observedHead: read("HEAD", ["rev-parse", "--verify", "HEAD"]),
+    refs: read("full refs", ["for-each-ref", "--format=%(refname) %(objectname)"]),
+    indexLock,
+    rawMismatches,
+    rawComparisonComplete: rawComparisonError === undefined,
+    ...(rawComparisonError === undefined ? {} : { rawComparisonError }),
+  })}. These are sequential refusal-time observations, not an atomic snapshot or a claim that the whole recovery changed nothing.`
 }
 
 function reverifyNormalizedIndex(repoRoot: string, proof: NormalizedIndexProof): void {
@@ -670,6 +723,7 @@ function verifyRecoveryContent(
   baseline: string,
   target: string,
   baseEnv?: NodeJS.ProcessEnv,
+  mismatches?: string[],
 ): void {
   const delta = git(
     repoRoot,
@@ -683,6 +737,10 @@ function verifyRecoveryContent(
   for (const path of nulPaths(delta.stdout)) {
     const expected = baselinePath(repoRoot, head, path, baseEnv)
     if (!capturesEqual(expected, readCapturedPath(repoRoot, path))) {
+      if (mismatches !== undefined) {
+        mismatches.push(path)
+        continue
+      }
       throw new Error(
         `recovery path ${path} has raw bytes or mode different from recorded HEAD ${head}; no transition ran`,
       )
@@ -893,6 +951,20 @@ function walkWindow(index: number): number {
 /** One `%H %T` line: two sha256 ids, a space and a newline, rounded up. */
 const WALK_LINE_BYTES_MAX = 160
 
+function actualIndexPath(
+  repoRoot: string,
+  baseEnv?: NodeJS.ProcessEnv,
+): { ok: true; indexPath: string } | { ok: false; detail: string } {
+  const located = git(
+    repoRoot,
+    readonlyArgs(["rev-parse", "--path-format=absolute", "--git-path", "index"]),
+    undefined,
+    baseEnv,
+  )
+  if (located.status !== 0 || located.stdout === "") return { ok: false, detail: gitDetail(located) }
+  return { ok: true, indexPath: located.stdout }
+}
+
 /**
  * The tree id the index holds, written from a copy of it so that `.git/index.lock` is never taken. The copy sits
  * beside the index, in the directory `git rev-parse --git-path index` names, because a split index finds its shared
@@ -902,18 +974,16 @@ function indexTreeFromCopy(
   repoRoot: string,
   baseEnv?: NodeJS.ProcessEnv,
 ): { ok: true; tree: string; indexPath: string; indexHash: string } | { ok: false; detail: string } {
-  const located = git(
-    repoRoot,
-    readonlyArgs(["rev-parse", "--path-format=absolute", "--git-path", "index"]),
-    undefined,
-    baseEnv,
-  )
-  if (located.status !== 0 || located.stdout === "") return { ok: false, detail: gitDetail(located) }
-  const copy = join(dirname(located.stdout), `index.gitomic-read-${process.pid}-${randomUUID()}`)
+  const located = actualIndexPath(repoRoot, baseEnv)
+  if (!located.ok) return located
+  const copy = join(dirname(located.indexPath), `index.gitomic-read-${process.pid}-${randomUUID()}`)
   try {
-    copyFileSync(located.stdout, copy)
+    copyFileSync(located.indexPath, copy)
   } catch (error) {
-    return { ok: false, detail: `copying ${located.stdout}: ${error instanceof Error ? error.message : String(error)}` }
+    return {
+      ok: false,
+      detail: `copying ${located.indexPath}: ${error instanceof Error ? error.message : String(error)}`,
+    }
   }
   try {
     const capturedHash = indexHash(copy)
@@ -933,7 +1003,7 @@ function indexTreeFromCopy(
         detail: gitDetail({ status: written.status ?? 1, stdout: tree, stderr: (written.stderr ?? "").trim() }),
       }
     }
-    return { ok: true, tree, indexPath: located.stdout, indexHash: capturedHash }
+    return { ok: true, tree, indexPath: located.indexPath, indexHash: capturedHash }
   } finally {
     rmSync(copy, { force: true })
   }
@@ -1440,7 +1510,16 @@ export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): Check
       error:
         `${ref} in ${repoRoot}: ${from} -> ${to} would overwrite locally edited or removed paths ` +
         `[${matching.blockers.join(", ")}]. The checkout was not changed.` +
-        (unstage === undefined ? "" : ` Could not unstage matching paths: ${unstage}.`),
+        (unstage === undefined ? "" : ` Could not unstage matching paths: ${unstage}.`) +
+        (request.recovery === true
+          ? recoveryRefusalFacts(
+              repoRoot,
+              from,
+              authored.mergeBase ?? carried.indexBase ?? normalized?.tree ?? from,
+              to,
+              baseEnv,
+            )
+          : ""),
     }
   }
   const expected = [...authored.expectedDirtyPaths].sort()
@@ -1468,7 +1547,8 @@ export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): Check
         error:
           `${ref} in the checkout ${repoRoot} did not move from ${from}, but the checkout's dirty pathset ` +
           `[${current.paths.join(", ")}] does not match the [${expected.join(", ")}] captured with the ` +
-          `operation, so the index or working tree does not reflect ${to} exactly. Nothing was changed.`,
+          `operation, so the index or working tree does not reflect ${to} exactly. ` +
+          (request.recovery === true ? "Recovery did not finish." : "Nothing was changed."),
       }
     }
     // Current is a claim about the index too: HEAD at `to` over an index that holds some other tree is the
@@ -1525,7 +1605,19 @@ export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): Check
         baseEnv,
       )
     } catch (error) {
-      return { ok: false, kind: "dirt-unverifiable", error: `${ref} in ${repoRoot}: ${String(error)}` }
+      return {
+        ok: false,
+        kind: "dirt-unverifiable",
+        error:
+          `${ref} in ${repoRoot}: ${String(error)}` +
+          recoveryRefusalFacts(
+            repoRoot,
+            from,
+            authored.mergeBase ?? carried.indexBase ?? normalized?.tree ?? from,
+            to,
+            baseEnv,
+          ),
+      }
     }
   }
   const merged = git(
@@ -1911,7 +2003,15 @@ function projectFetchedCommit(request: RemoteFirstProjectionRequest, sourceOid: 
         `${ref} in ${repoRoot}: commit ${to} would overwrite locally edited or removed paths ` +
         `[${matching.blockers.join(", ")}]. The branch still holds ${localTip} and ` +
         "the working tree was not changed." +
-        (unstage === undefined ? "" : ` Could not unstage matching paths: ${unstage}.`),
+        (unstage === undefined ? "" : ` Could not unstage matching paths: ${unstage}.`) +
+        (request.recovery === true
+          ? recoveryRefusalFacts(
+              repoRoot,
+              localTip,
+              authored.mergeBase ?? carried.indexBase ?? normalized?.tree ?? localTip,
+              to,
+            )
+          : ""),
     }
   }
   if (normalized !== undefined) {
@@ -1935,7 +2035,18 @@ function projectFetchedCommit(request: RemoteFirstProjectionRequest, sourceOid: 
         to,
       )
     } catch (error) {
-      return { ok: false, kind: "dirt-unverifiable", error: `${ref} in ${repoRoot}: ${String(error)}` }
+      return {
+        ok: false,
+        kind: "dirt-unverifiable",
+        error:
+          `${ref} in ${repoRoot}: ${String(error)}` +
+          recoveryRefusalFacts(
+            repoRoot,
+            localTip,
+            authored.mergeBase ?? carried.indexBase ?? normalized?.tree ?? localTip,
+            to,
+          ),
+      }
     }
   }
   const probed = git(repoRoot, [
@@ -1999,6 +2110,21 @@ function projectFetchedCommit(request: RemoteFirstProjectionRequest, sourceOid: 
     expectedDirtyPaths: authored.expectedDirtyPaths,
     recovery: request.recovery,
   })
+  // The verification delegate receives from=to in recovery, but the whole operation entered at localTip.
+  // Its failure must not imply that the earlier successful transition and ref advance did not happen.
+  if (request.recovery === true && !verified.ok) {
+    return {
+      ...verified,
+      error:
+        verified.error +
+        recoveryRefusalFacts(
+          repoRoot,
+          localTip,
+          authored.mergeBase ?? carried.indexBase ?? normalized?.tree ?? localTip,
+          to,
+        ),
+    }
+  }
   return reported(
     request.recovery === true && verified.ok && verified.kind === "already-current"
       ? { ...verified, kind: "synchronized" }
