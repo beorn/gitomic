@@ -17,6 +17,18 @@ export function assertUtf8(value: unknown, label: string): asserts value is stri
   }
 }
 
+/** Shared character boundary for single-line writer fields; not a public export. */
+export function assertSingleLine(value: string, label: string): void {
+  const invalid = [...value].find((character) => {
+    const codePoint = character.codePointAt(0)!
+    return codePoint <= 0x1f || codePoint === 0x7f || codePoint === 0x2028 || codePoint === 0x2029
+  })
+  if (invalid !== undefined) {
+    const name = `U+${invalid.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}`
+    throw new TypeError(`${label} must be a single line; ${name} is not allowed`)
+  }
+}
+
 /**
  * Decode a blob, or keep its raw bytes when it is not valid UTF-8.
  *

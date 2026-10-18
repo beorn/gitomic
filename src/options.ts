@@ -2,7 +2,7 @@
  * Option validation shared by gitomic's doors (`open`, `openReader`,
  * `openEvents`). Internal: not exported from the package.
  */
-import { assertUtf8 } from "./utf8.ts"
+import { assertSingleLine, assertUtf8 } from "./utf8.ts"
 
 export const DEFAULT_RETRY_BUDGET_MS = 30_000
 export const DEFAULT_READER_POLL_INTERVAL_MS = 1_000
@@ -76,11 +76,8 @@ export function waitForPoll(milliseconds: number, signal: AbortSignal): Promise<
 /** The writer label leads the commit subject and must round-trip through its separator. */
 export function assertWriter(writer: string): void {
   assertUtf8(writer, "writer")
-  const hasControlCharacter = [...writer].some((character) => {
-    const codePoint = character.codePointAt(0) ?? 0
-    return codePoint <= 0x1f || codePoint === 0x7f
-  })
-  if (writer.trim().length === 0 || hasControlCharacter) {
+  assertSingleLine(writer, "writer")
+  if (writer.trim().length === 0) {
     throw new TypeError("writer must be a non-empty, single-line identifier")
   }
   if (writer.includes(": ")) {

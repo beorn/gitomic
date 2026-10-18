@@ -12,7 +12,7 @@ import type {
   Trailer,
 } from "./types.js"
 import { Conflict } from "./errors.ts"
-import { assertUtf8, decodeUtf8 } from "./utf8.ts"
+import { assertSingleLine, assertUtf8, decodeUtf8 } from "./utf8.ts"
 
 export const GITOMIC_NAME = "gitomic"
 export const GITOMIC_EMAIL = "gitomic@localhost"
@@ -342,11 +342,8 @@ export function assertTrailers(trailers: readonly Trailer[]): readonly Trailer[]
     }
     if (typeof value !== "string") throw new TypeError(`trailer ${key} value must be a string`)
     assertUtf8(value, `trailer ${key}`)
-    const hasControlCharacter = [...value].some((character) => {
-      const codePoint = character.codePointAt(0) ?? 0
-      return codePoint <= 0x1f || codePoint === 0x7f
-    })
-    if (hasControlCharacter || value !== value.trim()) {
+    assertSingleLine(value, `trailer ${key} value`)
+    if (value !== value.trim()) {
       throw new TypeError(`trailer ${key} value must be one line without surrounding whitespace`)
     }
   }

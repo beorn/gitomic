@@ -37,7 +37,7 @@ import {
 } from "./options.ts"
 import { createShellBackend } from "./shell.ts"
 import type { Clock, CommitMeta, GitomicBackend, Ident, Oid, RefUpdate, Trailer } from "./types.js"
-import { assertUtf8 } from "./utf8.ts"
+import { assertSingleLine, assertUtf8 } from "./utf8.ts"
 
 /** One trailer as written: key, then value. Order and duplicates are kept. */
 export type Prop = Trailer
@@ -254,11 +254,8 @@ function normalizeLimit(value: number | undefined): number {
 function assertLine(value: string, field: string): string {
   if (typeof value !== "string") throw new TypeError(`${field} must be a string`)
   assertUtf8(value, field)
-  const hasControlCharacter = [...value].some((character) => {
-    const codePoint = character.codePointAt(0) ?? 0
-    return codePoint <= 0x1f || codePoint === 0x7f
-  })
-  if (value.trim().length === 0 || hasControlCharacter || value !== value.trim()) {
+  assertSingleLine(value, field)
+  if (value.trim().length === 0 || value !== value.trim()) {
     throw new TypeError(`${field} must be a non-empty, single line`)
   }
   return value
