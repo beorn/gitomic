@@ -14,6 +14,7 @@ import {
   readFileSync,
   rmSync,
   symlinkSync,
+  statSync,
   utimesSync,
   writeFileSync,
 } from "node:fs"
@@ -1472,6 +1473,103 @@ describe("gitomic project and checkout synchronization", () => {
           )
           expect(readFileSync(join(checkout, "bystander.md"), "utf8")).toBe(dirt)
           expect(worktreeDirtyPaths(checkout)).toEqual(["bystander.md"])
+        },
+      )
+
+      // @failure Recovery discards a genuine stage present beside Git-normalized HEAD bytes, or refuses its second run.
+      // @level l1 @consumer on-demand checkout recovery @testonly none
+      test("recovery retains an already-present foreign stage through two invocations", async () => {
+        const { checkout, to } = fixture()
+        const staged = "# unrelated staged work\r\n"
+        writeFileSync(join(checkout, "bystander.md"), staged)
+        git(checkout, "add", "bystander.md")
+        const retainedEntry = git(checkout, "ls-files", "--stage", "--", "bystander.md")
+
+        const result = await projectCheckout({
+          repoRoot: checkout,
+          recovery: true as const,
+        })
+
+        expect(result, JSON.stringify(result)).toMatchObject({ ok: true, kind: "synchronized" })
+        expect(git(checkout, "rev-parse", "HEAD")).toBe(to)
+        expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# successor\n")
+        expect(git(checkout, "ls-files", "--stage", "--", "bystander.md")).toBe(retainedEntry)
+        expect(readFileSync(join(checkout, "bystander.md"), "utf8")).toBe(staged)
+        const indexPath = join(git(checkout, "rev-parse", "--absolute-git-dir"), "index")
+        const afterFirst = readFileSync(indexPath)
+
+        const repeated = await projectCheckout({
+          repoRoot: checkout,
+          recovery: true as const,
+        })
+
+        expect(repeated, JSON.stringify(repeated)).toMatchObject({ ok: true, kind: "already-current" })
+        expect(git(checkout, "rev-parse", "HEAD")).toBe(to)
+        expect(git(checkout, "ls-files", "--stage", "--", "bystander.md")).toBe(retainedEntry)
+        expect(readFileSync(indexPath)).toEqual(afterFirst)
+        expect(readFileSync(join(checkout, "bystander.md"), "utf8")).toBe(staged)
+      })
+
+      // @failure A Git-clean raw edit is overwritten between normalization proof and the recovery transition.
+      // @level l1 @consumer on-demand checkout recovery raw custody @testonly none
+      test.each(["same-stat", "clean-form"] as const)(
+        "recovery preserves a %s raw edit before its native transition",
+        async (shape) => {
+          const { checkout, head } = fixture(true, "bystander.md")
+          git(checkout, "fetch", "-q", "origin", "main")
+          const path = join(checkout, "bystander.md")
+          const original = readFileSync(path, "utf8")
+          const stat = statSync(path)
+          const edited =
+            shape === "same-stat" ? original.replace("bystander", "bystandEr") : original.replaceAll("\n", "\r\n")
+          git(checkout, "update-index", "--assume-unchanged", "bystander.md")
+          const indexPath = join(git(checkout, "rev-parse", "--absolute-git-dir"), "index")
+          const index = readFileSync(indexPath)
+          const refs = git(checkout, "for-each-ref", "--format=%(refname) %(objectname)")
+          const native = await vi.importActual<typeof import("node:child_process")>("node:child_process")
+          const mocked = vi.mocked(spawnSync)
+          let fired = false
+          let transitionStarted = false
+          mocked.mockImplementation((command, args, options) => {
+            const argv = args ?? []
+            if (
+              command === "git" &&
+              argv[1] === checkout &&
+              argv.includes("read-tree") &&
+              argv.includes("-m") &&
+              argv.includes("-u")
+            ) {
+              transitionStarted = true
+            }
+            if (
+              !fired &&
+              command === "git" &&
+              argv[1] === checkout &&
+              argv.includes("hash-object") &&
+              argv.includes("--no-filters") &&
+              argv.includes("--stdin")
+            ) {
+              fired = true
+              writeFileSync(path, edited)
+              utimesSync(path, stat.atime, stat.mtime)
+            }
+            return native.spawnSync(command, args, options)
+          })
+          try {
+            const result = await projectCheckout({ repoRoot: checkout, recovery: true })
+            expect(fired).toBe(true)
+            expect(transitionStarted).toBe(false)
+            expect(result, JSON.stringify(result)).toMatchObject({ ok: false })
+            if (result.ok) throw new Error("expected raw custody refusal")
+            expect(result.error).toContain("bystander.md")
+            expect(git(checkout, "rev-parse", "HEAD")).toBe(head)
+            expect(readFileSync(indexPath)).toEqual(index)
+            expect(readFileSync(path, "utf8")).toBe(edited)
+            expect(git(checkout, "for-each-ref", "--format=%(refname) %(objectname)")).toBe(refs)
+            expect(git(checkout, "diff", "--name-only", "--", "bystander.md")).toBe("")
+          } finally {
+            mocked.mockImplementation(native.spawnSync)
+          }
         },
       )
 

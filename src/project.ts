@@ -75,6 +75,8 @@ function readonlyArgs(args: readonly string[]): string[] {
 }
 
 export interface CheckoutSyncRequest {
+  /** On-demand recovery retains genuine stages; ordinary projections keep their existing admission. */
+  readonly recovery?: true | undefined
   /** Exact child environment; omission inherits process.env. Private Git overlays win. */
   readonly baseEnv?: NodeJS.ProcessEnv | undefined
   /** The checkout to bring forward. */
@@ -542,6 +544,7 @@ interface NormalizedIndexProof {
   readonly indexHash: string
   readonly paths: readonly CapturedPath[]
   readonly preserved: readonly CapturedPath[]
+  readonly retained?: readonly { readonly path: string; readonly entry: string }[]
 }
 
 function indexHash(path: string): string {
@@ -555,16 +558,37 @@ function proveNormalizedIndex(
   index: { tree: string; indexPath: string; indexHash: string },
   expected: readonly string[],
   baseEnv?: NodeJS.ProcessEnv,
+  recovery?: true,
 ): NormalizedIndexProof | undefined {
   const delta = git(repoRoot, readonlyArgs(["diff", "--name-only", "-z", tip, index.tree, "--"]), undefined, baseEnv)
   if (delta.status !== 0) throw new Error(`cannot read normalized index differences: ${gitDetail(delta)}`)
   const paths: CapturedPath[] = []
+  const retained: { path: string; entry: string }[] = []
   for (const path of nulPaths(delta.stdout)) {
     const baseline = baselinePath(repoRoot, tip, path, baseEnv)
     const staged = baselinePath(repoRoot, index.tree, path, baseEnv)
-    if (baseline.kind !== "regular" || staged.kind !== "regular" || baseline.mode !== staged.mode) return undefined
     const raw = readCapturedPath(repoRoot, path)
-    if (!capturesEqual(raw, baseline)) return undefined
+    const retain = () => {
+      if (recovery !== true) return false
+      const entry = git(
+        repoRoot,
+        readonlyArgs(["ls-files", "--stage", "-z", "--", `:(literal)${path}`]),
+        undefined,
+        baseEnv,
+      )
+      if (entry.status !== 0) throw new Error(`cannot read retained staged path ${path}: ${gitDetail(entry)}`)
+      retained.push({ path, entry: entry.stdout })
+      return true
+    }
+    if (
+      baseline.kind !== "regular" ||
+      staged.kind !== "regular" ||
+      baseline.mode !== staged.mode ||
+      !capturesEqual(raw, baseline)
+    ) {
+      if (retain()) continue
+      return undefined
+    }
     const normalized = gitWithInput(
       repoRoot,
       ["hash-object", `--path=${path}`, "--stdin"],
@@ -576,15 +600,57 @@ function proveNormalizedIndex(
     if (normalized.status !== 0 || indexed.status !== 0) {
       throw new Error(`cannot hash normalized index path ${path}: ${gitDetail(normalized)}; ${gitDetail(indexed)}`)
     }
-    if (normalized.stdout === "" || normalized.stdout !== indexed.stdout) return undefined
+    if (normalized.stdout === "" || normalized.stdout !== indexed.stdout) {
+      if (retain()) continue
+      return undefined
+    }
     paths.push(raw)
   }
-  if (paths.length === 0) return undefined
+  if (paths.length === 0 && recovery !== true) return undefined
+  let tree = index.tree
+  if (recovery === true) {
+    const scratch = mkdtempSync(join(dirname(index.indexPath), "gitomic-recovery-index-"))
+    const scratchIndex = join(scratch, "index")
+    try {
+      const run = (args: readonly string[]) => {
+        const result = gitWithInput(
+          repoRoot,
+          ["-c", "core.fsmonitor=false", "-c", "core.splitIndex=false", ...args],
+          Buffer.alloc(0),
+          { GIT_INDEX_FILE: scratchIndex },
+          baseEnv,
+        )
+        if (result.status !== 0) throw new Error(`cannot build recovery baseline: ${gitDetail(result)}`)
+        return result.stdout
+      }
+      run(["read-tree", tip])
+      for (const capture of paths) {
+        const entry = git(
+          repoRoot,
+          readonlyArgs(["ls-tree", "-z", index.tree, "--", `:(literal)${capture.path}`]),
+          undefined,
+          baseEnv,
+        )
+        if (entry.status !== 0) {
+          throw new Error(`cannot read normalized baseline path ${capture.path}: ${gitDetail(entry)}`)
+        }
+        const [mode, , oid] = entry.stdout.slice(0, entry.stdout.indexOf("\t")).split(" ")
+        if (!mode || !oid) throw new Error(`missing normalized baseline path ${capture.path}`)
+        run(["update-index", "--add", "--cacheinfo", `${mode},${oid},${capture.path}`])
+      }
+      tree = run(["write-tree"])
+      if (!tree) throw new Error("recovery baseline tree is empty")
+    } finally {
+      rmSync(scratch, { recursive: true, force: true })
+    }
+  }
   const resolved = new Set(paths.map((capture) => capture.path))
   return {
     ...index,
+    tree,
     paths,
     preserved: expected.filter((path) => !resolved.has(path)).map((path) => readCapturedPath(repoRoot, path)),
+    ...(recovery === true ? { retained } : {}),
   }
 }
 
@@ -597,14 +663,58 @@ function reverifyNormalizedIndex(repoRoot: string, proof: NormalizedIndexProof):
   }
 }
 
+/** Raw-byte custody for the on-demand mode; Git's clean filters and stat cache are not content proof. */
+function verifyRecoveryContent(
+  repoRoot: string,
+  head: string,
+  baseline: string,
+  target: string,
+  baseEnv?: NodeJS.ProcessEnv,
+): void {
+  const delta = git(
+    repoRoot,
+    readonlyArgs(["diff", "--name-only", "--no-renames", "-z", baseline, target, "--"]),
+    undefined,
+    baseEnv,
+  )
+  if (delta.status !== 0) {
+    throw new Error(`cannot read recovery transition paths ${baseline} -> ${target}: ${gitDetail(delta)}`)
+  }
+  for (const path of nulPaths(delta.stdout)) {
+    const expected = baselinePath(repoRoot, head, path, baseEnv)
+    if (!capturesEqual(expected, readCapturedPath(repoRoot, path))) {
+      throw new Error(
+        `recovery path ${path} has raw bytes or mode different from recorded HEAD ${head}; no transition ran`,
+      )
+    }
+  }
+}
+
 function verifyNormalizedMerge(
   repoRoot: string,
   to: string,
   proof: NormalizedIndexProof,
   baseEnv?: NodeJS.ProcessEnv,
 ): void {
-  const indexed = git(repoRoot, readonlyArgs(["diff-index", "--cached", "--quiet", to, "--"]), undefined, baseEnv)
+  const exclusions = proof.retained?.map(({ path }) => `:(exclude,literal)${path}`) ?? []
+  const indexed = git(
+    repoRoot,
+    readonlyArgs(["diff-index", "--cached", "--quiet", to, "--", ".", ...exclusions]),
+    undefined,
+    baseEnv,
+  )
   if (indexed.status !== 0) throw new Error(`target index differs after normalized merge: ${gitDetail(indexed)}`)
+  for (const { path, entry } of proof.retained ?? []) {
+    const current = git(
+      repoRoot,
+      readonlyArgs(["ls-files", "--stage", "-z", "--", `:(literal)${path}`]),
+      undefined,
+      baseEnv,
+    )
+    if (current.status !== 0 || current.stdout !== entry) {
+      throw new Error(`retained staged path ${path} changed during recovery`)
+    }
+  }
   for (const capture of proof.preserved) {
     if (!capturesEqual(capture, readCapturedPath(repoRoot, capture.path))) {
       throw new Error(`preserved checkout path ${capture.path} changed during normalized merge`)
@@ -638,6 +748,7 @@ function carryIndexTo(
   expectedDirtyPaths: readonly string[],
   alreadyAt?: string,
   baseEnv?: NodeJS.ProcessEnv,
+  recovery?: true,
 ): IndexCarry {
   const refuse = (error: string): IndexCarry => ({
     ok: false,
@@ -662,16 +773,16 @@ function carryIndexTo(
     )
   }
   // Already-current needs its own proof; this class only enables an actual fast-forward.
-  if (alreadyAt !== undefined && alreadyAt !== tip) {
+  if (alreadyAt !== undefined && (alreadyAt !== tip || recovery === true)) {
     try {
-      const normalized = proveNormalizedIndex(repoRoot, tip, indexTree, expected, baseEnv)
+      const normalized = proveNormalizedIndex(repoRoot, tip, indexTree, expected, baseEnv, recovery)
       if (normalized !== undefined) {
         const resolved = new Set(normalized.paths.map((capture) => capture.path))
         return {
           ok: true,
           expectedDirtyPaths: expected.filter((path) => !resolved.has(path)),
           normalized,
-          indexBase: indexTree.tree,
+          indexBase: normalized.tree,
         }
       }
     } catch (error) {
@@ -1269,7 +1380,7 @@ export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): Check
   }
 
   // The index must hold `from` (or already `to`) before the two-way merge can be trusted: carry a stale one forward.
-  const carried = carryIndexTo(repoRoot, from, ref, request.expectedDirtyPaths, to, baseEnv)
+  const carried = carryIndexTo(repoRoot, from, ref, request.expectedDirtyPaths, to, baseEnv, request.recovery)
   if (!carried.ok) return carried.outcome
   const repaired = carried.repairedIndexFrom === undefined ? {} : { repairedIndexFrom: carried.repairedIndexFrom }
   const matching =
@@ -1283,7 +1394,8 @@ export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): Check
       error: `${ref} in ${repoRoot}: ${matching.detail}. Nothing was changed.`,
     }
   }
-  const stagedPaths = [...new Set([...(request.authoredPaths ?? []), ...matching.paths])]
+  const stagedPaths =
+    request.recovery === true ? [] : [...new Set([...(request.authoredPaths ?? []), ...matching.paths])]
   const authored = stageAuthoredPaths(
     repoRoot,
     ref,
@@ -1339,15 +1451,27 @@ export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): Check
     }
     // Current is a claim about the index too: HEAD at `to` over an index that holds some other tree is the
     // stale checkout 25393 reported as current.
-    const indexed = git(repoRoot, readonlyArgs(["diff-index", "--cached", "--quiet", to, "--"]), undefined, baseEnv)
-    if (indexed.status !== 0) {
-      return {
-        ok: false,
-        kind: "dirt-unverifiable",
-        error:
-          `${ref} in the checkout ${repoRoot} is at ${to}, but its index ` +
-          `${indexed.status === 1 ? `does not hold ${to}'s tree` : `could not be compared with ${to} (${gitDetail(indexed)})`}, ` +
-          "so the checkout is not current. Nothing was changed.",
+    if (normalized?.retained !== undefined) {
+      try {
+        verifyNormalizedMerge(repoRoot, to, normalized, baseEnv)
+      } catch (error) {
+        return {
+          ok: false,
+          kind: "dirt-unverifiable",
+          error: `${ref} in ${repoRoot}: ${String(error)}. Nothing was changed.`,
+        }
+      }
+    } else {
+      const indexed = git(repoRoot, readonlyArgs(["diff-index", "--cached", "--quiet", to, "--"]), undefined, baseEnv)
+      if (indexed.status !== 0) {
+        return {
+          ok: false,
+          kind: "dirt-unverifiable",
+          error:
+            `${ref} in the checkout ${repoRoot} is at ${to}, but its index ` +
+            `${indexed.status === 1 ? `does not hold ${to}'s tree` : `could not be compared with ${to} (${gitDetail(indexed)})`}, ` +
+            "so the checkout is not current. Nothing was changed.",
+        }
       }
     }
     // A repaired index DID move, so the outcome says so: current only when nothing was brought forward.
@@ -1367,6 +1491,19 @@ export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): Check
         kind: "dirt-unverifiable",
         error: `${ref} in ${repoRoot}: ${String(error)}${rollback === undefined ? "" : `; authored rollback failed: ${rollback}`}. Merge did not run.`,
       }
+    }
+  }
+  if (request.recovery === true) {
+    try {
+      verifyRecoveryContent(
+        repoRoot,
+        from,
+        authored.mergeBase ?? carried.indexBase ?? normalized?.tree ?? from,
+        to,
+        baseEnv,
+      )
+    } catch (error) {
+      return { ok: false, kind: "dirt-unverifiable", error: `${ref} in ${repoRoot}: ${String(error)}` }
     }
   }
   const merged = git(
@@ -1436,6 +1573,8 @@ export function synchronizeCheckoutToCommit(request: CheckoutSyncRequest): Check
 }
 
 export interface RemoteFirstProjectionRequest {
+  /** Select the on-demand retained-stage recovery contract. */
+  readonly recovery?: true | undefined
   /** The checkout whose projection catches up. */
   readonly repoRoot: string
   /** The durable commit returned by the transport, contained in the fetched source. */
@@ -1589,7 +1728,7 @@ function projectFetchedCommit(request: RemoteFirstProjectionRequest, sourceOid: 
   const localTip = localTipRead.stdout
   // Carry an index left at any ancestor's tree forward to the local tip FIRST (25393): an object-side writer that
   // advanced the ref mid-flight leaves the index at an ancestor, which the search finds. From here on the index holds `localTip`, so every merge below starts there.
-  const carried = carryIndexTo(repoRoot, localTip, ref, request.expectedDirtyPaths, to)
+  const carried = carryIndexTo(repoRoot, localTip, ref, request.expectedDirtyPaths, to, undefined, request.recovery)
   if (!carried.ok) return carried.outcome
   const expectedDirtyPaths = carried.expectedDirtyPaths
   const authoredPaths = request.authoredPaths ?? []
@@ -1601,7 +1740,17 @@ function projectFetchedCommit(request: RemoteFirstProjectionRequest, sourceOid: 
   }
   if (localTip === to) {
     // The ref already holds the landing; already-current is verified against the expected dirt and the index.
-    return reported(synchronizeCheckoutToCommit({ repoRoot, from: to, to, ref, expectedDirtyPaths, authoredPaths }))
+    return reported(
+      synchronizeCheckoutToCommit({
+        repoRoot,
+        from: to,
+        to,
+        ref,
+        expectedDirtyPaths,
+        authoredPaths,
+        recovery: request.recovery,
+      }),
+    )
   }
 
   const ancestry = git(repoRoot, readonlyArgs(["merge-base", "--is-ancestor", localTip, to]))
@@ -1626,7 +1775,15 @@ function projectFetchedCommit(request: RemoteFirstProjectionRequest, sourceOid: 
         // verified either way. Claiming already-current here without merging
         // is the false report the moved-ref witness pins.
         return reported(
-          synchronizeCheckoutToCommit({ repoRoot, from: to, to: localTip, ref, expectedDirtyPaths, authoredPaths }),
+          synchronizeCheckoutToCommit({
+            repoRoot,
+            from: to,
+            to: localTip,
+            ref,
+            expectedDirtyPaths,
+            authoredPaths,
+            recovery: request.recovery,
+          }),
         )
       }
       if (published.status !== 1) {
@@ -1708,7 +1865,7 @@ function projectFetchedCommit(request: RemoteFirstProjectionRequest, sourceOid: 
       error: `${ref} in ${repoRoot}: ${matching.detail}. Nothing was changed.`,
     }
   }
-  const stagedPaths = [...new Set([...authoredPaths, ...matching.paths])]
+  const stagedPaths = request.recovery === true ? [] : [...new Set([...authoredPaths, ...matching.paths])]
   const authored = stageAuthoredPaths(
     repoRoot,
     ref,
@@ -1745,6 +1902,18 @@ function projectFetchedCommit(request: RemoteFirstProjectionRequest, sourceOid: 
         kind: "dirt-unverifiable",
         error: `${ref} in ${repoRoot}: ${String(error)}${rollback === undefined ? "" : `; authored rollback failed: ${rollback}`}. Ref was not advanced.`,
       }
+    }
+  }
+  if (request.recovery === true) {
+    try {
+      verifyRecoveryContent(
+        repoRoot,
+        localTip,
+        authored.mergeBase ?? carried.indexBase ?? normalized?.tree ?? localTip,
+        to,
+      )
+    } catch (error) {
+      return { ok: false, kind: "dirt-unverifiable", error: `${ref} in ${repoRoot}: ${String(error)}` }
     }
   }
   const probed = git(repoRoot, [
@@ -1800,12 +1969,24 @@ function projectFetchedCommit(request: RemoteFirstProjectionRequest, sourceOid: 
         `again from the current state is safe.`,
     }
   }
+  const verified = synchronizeCheckoutToCommit({
+    repoRoot,
+    from: request.recovery === true ? to : localTip,
+    to,
+    ref,
+    expectedDirtyPaths: authored.expectedDirtyPaths,
+    recovery: request.recovery,
+  })
   return reported(
-    synchronizeCheckoutToCommit({ repoRoot, from: localTip, to, ref, expectedDirtyPaths: authored.expectedDirtyPaths }),
+    request.recovery === true && verified.ok && verified.kind === "already-current"
+      ? { ...verified, kind: "synchronized" }
+      : verified,
   )
 }
 
 export interface ProjectCheckoutRequest {
+  /** Retain genuine stages during explicitly requested on-demand recovery. */
+  readonly recovery?: true | undefined
   /** The checkout to project. */
   readonly repoRoot: string
   /** Remote to fetch from. Defaults to "origin". */
@@ -1912,6 +2093,7 @@ export async function projectCheckout(request: ProjectCheckoutRequest): Promise<
       remote,
       sourceRef,
       expectedDirtyPaths,
+      recovery: request.recovery,
       ...(request.remoteTimeoutMs !== undefined ? { remoteTimeoutMs: request.remoteTimeoutMs } : {}),
       ...(request.beforeRefAdvance !== undefined ? { beforeRefAdvance: request.beforeRefAdvance } : {}),
     },
