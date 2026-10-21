@@ -215,6 +215,15 @@ export async function main(argv: string[], io: CliIo = {}): Promise<number> {
       )
       return OK
     }
+    // Help is answered before any verb parses its arguments, so a missing
+    // required flag cannot turn `<verb> --help` into a usage error (30531).
+    if (args[0] === "--help" || args[0] === "-h") {
+      const usage = (VERB_USAGE as Record<string, string | undefined>)[verb]
+      if (usage !== undefined) {
+        stdout.write(`Usage: ${usage}\n`)
+        return OK
+      }
+    }
     const cacheDir = remoteCacheDir(args, io.env ?? process.env)
     const source: AddressSource = {
       ...(backend === undefined ? {} : { backend }),
@@ -279,6 +288,28 @@ export const VERBS = [
   "project",
   "trust",
 ] as const
+
+/**
+ * Per-verb usage, printed by `<verb> --help` before that verb parses anything.
+ * Each entry is the argv the verb's own parser accepts, so a flag added to a
+ * parser must be added here beside it (tests/cli.test.ts holds the 30531 row).
+ */
+const VERB_USAGE: Record<(typeof VERBS)[number], string> = {
+  read: "gitomic read <repo>#<ref> <path> [--at <oid>]",
+  ls: "gitomic ls <repo>#<ref> [glob] [--at <oid>]",
+  grep: "gitomic grep <repo>#<ref> <pattern> [glob] [--at <oid>]",
+  log: "gitomic log <repo>#<ref> [glob] [--at <oid>] [-n <count>] [--json]",
+  diff: "gitomic diff <repo>#<ref> --base <oid> [glob] [--at <oid>] [--json]",
+  origin: "gitomic origin --repo <path>",
+  write:
+    "gitomic write <repo>#<ref> -m <message> <path> <file> [<path> <file>]... [--expect <path=oid>] [--create <path>] [--writer <seat>] [--author <actor>] [--trailer <text>] [--checkout <path>] [--json]",
+  rm: "gitomic rm <repo>#<ref> -m <message> <path>... [--expect <path=oid>] [--writer <seat>] [--author <actor>] [--trailer <text>] [--json]",
+  mv: "gitomic mv <repo>#<ref> -m <message> <from> <to> [--writer <seat>] [--author <actor>] [--trailer <text>] [--json]",
+  apply:
+    "gitomic apply <repo>#<ref> -m <message> <clause>... [--base <oid>] [--writer <seat>] [--author <actor>] [--trailer <text>] [--checkout <path>] [--lock-timeout <ms>] [--json]\n  clauses: put <path> <file> | put-bytes <path> <file> | append <path> <file> | replace <path> <file> | rm <path> | mv <from> <to>",
+  project: "gitomic project <path> [--remote <name>] [--ref <ref>] [--timeout <ms>] [--lock-timeout <ms>]",
+  trust: "gitomic trust <repo>#<ref>",
+}
 
 const OK = 0
 const RUNTIME_ERROR = 1

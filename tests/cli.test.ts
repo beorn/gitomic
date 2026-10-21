@@ -1420,6 +1420,19 @@ describe("gitomic CLI — usage errors (exit 2, never silent)", () => {
     for (const verb of VERBS) expect(result.stdout).toContain(verb)
   })
 
+  test.each(["--help", "-h"])("apply %s exits 0 with usage while -m is absent (30531)", async (flag) => {
+    const env = { ...process.env, GIT_CEILING_DIRECTORIES: join(workdir, "..") }
+    const result = await promisify(execFile)(
+      "bun",
+      [fileURLToPath(new URL("../src/bin.ts", import.meta.url)), "apply", flag],
+      { cwd: workdir, env, encoding: "utf8" },
+    )
+
+    expect(result.stderr).toBe("")
+    expect(result.stdout).toContain("Usage: gitomic apply <repo>#<ref>")
+    expect(result.stdout).toContain("-m <message>")
+  })
+
   test("an unknown verb fails loudly, naming itself", async () => {
     const backend = createMemBackend()
     const result = await run(backend, ["frobnicate", ADDRESS])
