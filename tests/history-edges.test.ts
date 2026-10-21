@@ -766,8 +766,11 @@ describe("readHistoryEdges", () => {
             if (pid !== undefined) beAlive(pid)
             // Rejection did not drop custody: the live standalone group is still registered and forwarded to.
             // An inherited lifetime never held anything.
-            if (lifetime === "standalone") expect(process.listenerCount("SIGTERM")).toBeGreaterThan(baseline)
-            else expect(process.listenerCount("SIGTERM")).toBe(baseline)
+            if (lifetime === "standalone") {
+              expect(process.listenerCount("SIGTERM")).toBeGreaterThan(baseline)
+            } else {
+              expect(process.listenerCount("SIGTERM")).toBe(baseline)
+            }
           })
         } finally {
           killSpy?.mockRestore()
@@ -848,8 +851,9 @@ describe("readHistoryEdges", () => {
               expect(teardown.cause).toBe(primary)
               expect((teardown.cleanup as NodeJS.ErrnoException).code).toBe("EPERM")
               expect(teardown.message).toMatch(/closed on its own; a stop signal failed: kill EPERM$/)
-              if (primaryKind === "frozen")
+              if (primaryKind === "frozen") {
                 expect(Object.getOwnPropertyNames(primary as object)).not.toContain("cleanup")
+              }
               // Proven means proven: the child is gone before the refusal is thrown.
               if (pid !== undefined) beDead(pid)
             },
