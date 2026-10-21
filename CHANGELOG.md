@@ -4,6 +4,21 @@
 
 ### Added
 
+- `createShellBackend({ lifetime })`: who owns the processes a shell backend
+  spawns. `"standalone"` (the default, unchanged) leads and holds a process
+  group for each bounded command and for the history stream, forwards host
+  signals to it and stops the group on a deadline, an overflow or an early
+  return. `"inherit"` creates every child in the caller's own process group:
+  Gitomic holds no group, forwards no signal and stops the direct child only, so
+  a supervisor that already owns that group (a deadline-and-RSS attempt runner)
+  charges, reaps and census-checks Git's helpers itself. POSIX group membership
+  only: a descendant that calls setsid/setpgid leaves it, and the bare
+  `runGit`/`runCommand`/`batchCheck` helpers have no backend and stay
+  standalone. `sigterm: "drain"` with `"inherit"` is refused at construction.
+  A stop signal that fails during a history-stream teardown is now kept beside
+  the failure in flight (`HistoryEdgesTeardown.cleanup`) instead of replacing
+  it, and a failed stop in the bounded runner's deadline or overflow path settles
+  the command instead of escaping as an uncaught timer error.
 - `repositoryCandidate({ inProcess })` runs a declared derive or check in the
   caller's process: `resolve(kind, command, context)` claims an exact declared
   command and returns an implementation that gets the spawned command's inputs

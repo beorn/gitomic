@@ -358,13 +358,20 @@ export class HistoryEdgesOverflow extends Error {
   }
 }
 
-/** A streamed history-edge walk could not prove its child process group had exited after cancellation. */
+/**
+ * A streamed history-edge walk could not prove its child process (standalone: its process group) had exited after
+ * cancellation, or a stop signal it sent failed. `cause` is the failure in flight when teardown began, when there
+ * was one; `cleanup` is the error a stop signal itself raised, kept apart so it never replaces that cause.
+ */
 export class HistoryEdgesTeardown extends Error {
   override readonly name = "HistoryEdgesTeardown"
   /** Stable machine key; the same string across every backend and release. */
   readonly code = "history-edges-teardown" as const
+  /** The error a stop signal raised during teardown, when one did; the primary failure stays in `cause`. */
+  readonly cleanup: unknown
 
-  constructor(message: string, options?: ErrorOptions) {
+  constructor(message: string, options?: ErrorOptions & { cleanup?: unknown }) {
     super(message, options)
+    this.cleanup = options?.cleanup
   }
 }

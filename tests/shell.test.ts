@@ -1298,6 +1298,22 @@ describe("shell backend failure boundaries", { concurrent: false }, () => {
     )
   })
 
+  // A caller that misspells the lifetime must not silently get standalone groups it asked to opt out of.
+  test.each(["", "detached", null, 0, true])("rejects an invalid lifetime %j at construction", (lifetime) => {
+    expect(() => Reflect.apply(createShellBackend, undefined, [{ lifetime }])).toThrow(
+      'lifetime must be "standalone" or "inherit"',
+    )
+  })
+
+  test("refuses sigterm drain with an inherited lifetime: there is no group to drain", () => {
+    expect(() => createShellBackend({ lifetime: "inherit", sigterm: "drain" })).toThrow(
+      /inherited lifetime holds no process group/,
+    )
+    expect(() => createShellBackend({ lifetime: "inherit" })).not.toThrow()
+    expect(() => createShellBackend({ lifetime: "inherit", sigterm: "forward" })).not.toThrow()
+    expect(() => createShellBackend({ lifetime: "standalone", sigterm: "drain" })).not.toThrow()
+  })
+
   test("pins every Git subprocess to the C locale", async () => {
     const wrapper = await createGitWrapper()
     const expected = "1".repeat(40)

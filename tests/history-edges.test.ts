@@ -14,7 +14,7 @@ import { join } from "node:path"
 
 import { describe, expect, test, vi } from "vitest"
 
-import { createShellBackend, HistoryEdgesOverflow, open } from "../src/index.js"
+import { createShellBackend, GitTimeout, HistoryEdgesOverflow, HistoryEdgesTeardown, open } from "../src/index.js"
 import type { GitomicBackend, HistoryEdgeEvent } from "../src/index.js"
 import { createMemBackend } from "../src/mem.js"
 import { createShellRuntime } from "../src/shell.js"
@@ -448,6 +448,334 @@ describe("readHistoryEdges", () => {
       rmSync(dir, { recursive: true, force: true })
     }
   }, 30_000)
+
+  // @failure A caller that already owns a process group (a deadline-and-RSS attempt runner) cannot have Gitomic
+  //          spawn INTO that group: every bounded command and the history stream lead a group of their own, so the
+  //          owner's census, deadline and forced kill miss Git's helpers, or Gitomic's own group signal hits a
+  //          sibling the owner placed beside it.
+  // @level l2
+  // @consumer the km lifecycle rig's registered evidence children (#28234); every default caller stays standalone
+  describe("lifetime", () => {
+    /** What a fake Git recorded about itself: one "pid pgid" line per process, in start order. */
+    function recorded(pidFile: string): Array<{ pid: number; pgid: number }> {
+      return readFileSync(pidFile, "utf8")
+        .split("\n")
+        .filter((line) => line !== "")
+        .map((line) => {
+          const [pid, pgid] = line.split(" ")
+          return { pid: Number(pid), pgid: Number(pgid) }
+        })
+    }
+
+    /** This process's own process-group id, from /proc (field 5 of stat, after the parenthesised comm). */
+    function ownProcessGroup(): number {
+      const stat = readFileSync("/proc/self/stat", "utf8")
+      return Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[2])
+    }
+
+    async function drain(iterator: AsyncIterator<HistoryEdgeEvent>): Promise<void> {
+      for (;;) {
+        const step = await iterator.next()
+        if (step.done) return
+      }
+    }
+
+    function eperm(): NodeJS.ErrnoException {
+      return Object.assign(new Error("kill EPERM"), { code: "EPERM", syscall: "kill" })
+    }
+
+    function killQuietly(pid: number | undefined): void {
+      if (pid === undefined) return
+      try {
+        process.kill(pid, "SIGKILL")
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error
+      }
+    }
+
+    const RECORD_SELF = [
+      'const fs = require("node:fs")',
+      'const stat = fs.readFileSync("/proc/self/stat", "utf8")',
+      'const pgid = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[2]',
+      'fs.appendFileSync(process.env.FAKE_PID_FILE, process.pid + " " + pgid + "\\n")',
+    ]
+    const RECORD_PID = [
+      'const fs = require("node:fs")',
+      'fs.appendFileSync(process.env.FAKE_PID_FILE, process.pid + "\\n")',
+    ]
+    /** One complete history record as rev-list frames it: a commit, one parent, end. */
+    const ONE_RECORD = '"\\n" + "a".repeat(40) + "\\0" + "b".repeat(40) + "\\0"'
+
+    async function withFakeGit<T>(
+      body: readonly string[],
+      work: (fakeGit: string, pidFile: string) => Promise<T>,
+    ): Promise<T> {
+      const dir = mkdtempSync(join(tmpdir(), "gitomic-lifetime-"))
+      try {
+        return await work(writeFakeGit(dir, body), join(dir, "pids"))
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    }
+
+    test.skipIf(process.platform !== "linux").each(["standalone", "inherit"] as const)(
+      "%s: a bounded command and the history stream land in the promised process group; unbounded never detaches",
+      async (lifetime) => {
+        const fixture = await createBareRepo()
+        const baseline = process.listenerCount("SIGTERM")
+        try {
+          await withFakeGit(
+            [
+              ...RECORD_SELF,
+              'if (args.includes("rev-list")) {',
+              "  process.stdout.write(" + ONE_RECORD + ")",
+              "  setTimeout(() => process.exit(0), 300)",
+              "} else {",
+              '  process.stdout.write("a".repeat(40) + "\\n")',
+              "  process.exit(0)",
+              "}",
+            ],
+            async (fakeGit, pidFile) => {
+              const baseEnv = { ...process.env, FAKE_PID_FILE: pidFile }
+              const runtime = createShellRuntime({ gitExecutable: fakeGit, baseEnv, localTimeoutMs: 5_000, lifetime })
+              // A bounded command: head runs rev-parse --verify under localTimeoutMs.
+              expect(await runtime.backend.head(fixture.repo, "refs/heads/main")).toBe("a".repeat(40))
+              // The stream: the fake lingers 300 ms past its record so the group is observable while it is live.
+              const iterator = runtime.backend.readHistoryEdges!(fixture.repo, [fixture.initial])[
+                Symbol.asyncIterator
+              ]()
+              expect((await iterator.next()).done).toBe(false)
+              const forwardersWhileStreaming = process.listenerCount("SIGTERM")
+              await drain(iterator)
+              // An unbounded command never led a group and still does not, whatever the lifetime.
+              const unbounded = createShellRuntime({ gitExecutable: fakeGit, baseEnv, lifetime })
+              expect(await unbounded.backend.head(fixture.repo, "refs/heads/main")).toBe("a".repeat(40))
+              const [command, stream, loose] = recorded(pidFile)
+              if (command === undefined || stream === undefined || loose === undefined) {
+                throw new Error("the fake Git recorded " + recorded(pidFile).length + " processes, expected 3")
+              }
+              if (lifetime === "standalone") {
+                expect(command.pgid).toBe(command.pid)
+                expect(stream.pgid).toBe(stream.pid)
+                expect(forwardersWhileStreaming).toBeGreaterThan(baseline)
+              } else {
+                expect(command.pgid).toBe(ownProcessGroup())
+                expect(stream.pgid).toBe(ownProcessGroup())
+                expect(forwardersWhileStreaming).toBe(baseline)
+              }
+              expect(loose.pgid).toBe(ownProcessGroup())
+            },
+          )
+          expect(process.listenerCount("SIGTERM")).toBe(baseline)
+        } finally {
+          await fixture.cleanup()
+        }
+      },
+    )
+
+    test.skipIf(process.platform !== "linux")(
+      "inherit: a deadline and an early return stop the direct child only; a sibling in the group survives",
+      async () => {
+        const fixture = await createBareRepo()
+        const sibling = childProcess.spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { stdio: "ignore" })
+        const killSpy = vi.spyOn(process, "kill")
+        const pids: number[] = []
+        try {
+          await withFakeGit(
+            [
+              ...RECORD_PID,
+              'process.on("SIGTERM", () => {})',
+              'if (args.includes("rev-list")) process.stdout.write(' + ONE_RECORD + ")",
+              "setInterval(() => {}, 1000)",
+            ],
+            async (fakeGit, pidFile) => {
+              const runtime = createShellRuntime({
+                gitExecutable: fakeGit,
+                baseEnv: { ...process.env, FAKE_PID_FILE: pidFile },
+                localTimeoutMs: 300,
+                lifetime: "inherit",
+              })
+              // The deadline: SIGTERM is ignored by the fake, so only the SIGKILL escalation ends it.
+              await expect(runtime.backend.head(fixture.repo, "refs/heads/main")).rejects.toBeInstanceOf(GitTimeout)
+              // The early return: the finalizer must stop a child that ignores SIGTERM the same way.
+              const iterator = runtime.backend.readHistoryEdges!(fixture.repo, [fixture.initial])[
+                Symbol.asyncIterator
+              ]()
+              expect((await iterator.next()).done).toBe(false)
+              await expect(iterator.return?.()).resolves.toMatchObject({ done: true })
+              pids.push(...recorded(pidFile).map(({ pid }) => pid))
+            },
+          )
+          expect(pids).toHaveLength(2)
+          for (const pid of pids) {
+            await waitForDeath(pid)
+            beDead(pid)
+          }
+          if (sibling.pid !== undefined) beAlive(sibling.pid)
+          // No signal went to a process GROUP: an inherited lifetime stops its direct child and nothing else.
+          const groupTargets = killSpy.mock.calls.filter(([target]) => typeof target === "number" && target < 0)
+          expect(groupTargets).toEqual([])
+        } finally {
+          killSpy.mockRestore()
+          for (const pid of pids) killQuietly(pid)
+          sibling.kill("SIGKILL")
+          await fixture.cleanup()
+        }
+      },
+      20_000,
+    )
+
+    test.skipIf(process.platform !== "linux").each(["standalone", "inherit"] as const)(
+      "%s: a stop signal that fails is kept beside the walk's own failure, never thrown over it",
+      async (lifetime) => {
+        const fixture = await createBareRepo()
+        const baseline = process.listenerCount("SIGTERM")
+        const realKill = process.kill.bind(process)
+        const spawnSpy = vi.spyOn(childProcess, "spawn")
+        let killSpy: { mockRestore(): void } | undefined
+        let pid: number | undefined
+        try {
+          await withFakeGit(
+            [
+              ...RECORD_PID,
+              // Two records, then hang: the second record trips maxRecords: 1 after the test has the child in hand.
+              "process.stdout.write(" + ONE_RECORD + ' + "\\n" + "c".repeat(40) + "\\0" + "\\0")',
+              "setInterval(() => {}, 1000)",
+            ],
+            async (fakeGit, pidFile) => {
+              const runtime = createShellRuntime({
+                gitExecutable: fakeGit,
+                baseEnv: { ...process.env, FAKE_PID_FILE: pidFile },
+                lifetime,
+              })
+              const iterator = runtime.backend.readHistoryEdges!(fixture.repo, [fixture.initial], { maxRecords: 1 })[
+                Symbol.asyncIterator
+              ]()
+              expect((await iterator.next()).done).toBe(false)
+              pid = recorded(pidFile)[0]?.pid
+              const child = spawnSpy.mock.results.at(-1)?.value as ChildProcess
+              expect(child.pid).toBe(pid)
+              if (lifetime === "standalone") {
+                // The group route THROWS: process.kill(-pgid) fails for a reason other than "already gone".
+                killSpy = vi.spyOn(process, "kill").mockImplementation((target, signal) => {
+                  if (typeof target === "number" && target < 0) throw eperm()
+                  return realKill(target, signal)
+                })
+              } else {
+                // The direct-child route REPORTS through the child's "error" event, as Node's kill does for EPERM.
+                killSpy = vi.spyOn(child, "kill").mockImplementation(() => {
+                  child.emit("error", eperm())
+                  return false
+                })
+              }
+              let refusal: unknown
+              try {
+                await drain(iterator)
+              } catch (error) {
+                refusal = error
+              }
+              expect(refusal).toBeInstanceOf(HistoryEdgesTeardown)
+              const teardown = refusal as HistoryEdgesTeardown
+              // The walk's own failure is the cause; the failed stop rides beside it and is named in the message.
+              expect(teardown.cause).toBeInstanceOf(HistoryEdgesOverflow)
+              expect((teardown.cleanup as NodeJS.ErrnoException).code).toBe("EPERM")
+              expect(teardown.message).toMatch(/a stop signal failed: kill EPERM/)
+              expect(teardown.message).toMatch(
+                lifetime === "standalone"
+                  ? /left process group \d+ unproven/
+                  : /left its child \d+ unproven .*caller's process group/,
+              )
+              // Nothing was able to stop it, and the refusal says so: the child is still alive.
+              if (pid !== undefined) beAlive(pid)
+            },
+          )
+        } finally {
+          killSpy?.mockRestore()
+          spawnSpy.mockRestore()
+          if (pid !== undefined) {
+            killQuietly(pid)
+            await waitForDeath(pid)
+          }
+          // Standalone retained custody at the refusal; the real close releases it. Inherit never held any.
+          for (let attempt = 0; attempt < 200 && process.listenerCount("SIGTERM") !== baseline; attempt += 1) {
+            await new Promise((settle) => setTimeout(settle, 25))
+          }
+          expect(process.listenerCount("SIGTERM")).toBe(baseline)
+          await fixture.cleanup()
+        }
+      },
+      20_000,
+    )
+
+    test.skipIf(process.platform !== "linux")(
+      "inherit: a stop that fails in the bounded runner's deadline path settles the command instead of escaping",
+      async () => {
+        const fixture = await createBareRepo()
+        const spawnSpy = vi.spyOn(childProcess, "spawn")
+        let killSpy: { mockRestore(): void } | undefined
+        let pid: number | undefined
+        try {
+          await withFakeGit([...RECORD_PID, "setInterval(() => {}, 1000)"], async (fakeGit, pidFile) => {
+            const runtime = createShellRuntime({
+              gitExecutable: fakeGit,
+              baseEnv: { ...process.env, FAKE_PID_FILE: pidFile },
+              localTimeoutMs: 300,
+              lifetime: "inherit",
+            })
+            const outcome = runtime.backend.head(fixture.repo, "refs/heads/main")
+            // Catch the rev-parse child between its spawn and its 300 ms deadline, and make its kill fail.
+            let child: ChildProcess | undefined
+            for (let attempt = 0; attempt < 200 && child === undefined; attempt += 1) {
+              child = spawnSpy.mock.results
+                .map((result) => result.value as ChildProcess)
+                .find((candidate) => candidate.spawnargs.includes("--verify"))
+              if (child === undefined) await new Promise((settle) => setTimeout(settle, 5))
+            }
+            if (child === undefined) throw new Error("the bounded rev-parse child never spawned")
+            const stubbed = child
+            killSpy = vi.spyOn(stubbed, "kill").mockImplementation(() => {
+              stubbed.emit("error", eperm())
+              return false
+            })
+            await expect(outcome).rejects.toMatchObject({ code: "EPERM", syscall: "kill" })
+            pid = recorded(pidFile)[0]?.pid
+            expect(pid).toBe(stubbed.pid)
+            // Past the escalation grace: a timer that escaped settlement would raise here as an unhandled error.
+            await new Promise((settle) => setTimeout(settle, GROUP_STOP_GRACE_MS + 300))
+            if (pid !== undefined) beAlive(pid)
+          })
+        } finally {
+          killSpy?.mockRestore()
+          spawnSpy.mockRestore()
+          if (pid !== undefined) {
+            killQuietly(pid)
+            await waitForDeath(pid)
+          }
+          await fixture.cleanup()
+        }
+      },
+      20_000,
+    )
+
+    test("inherit: a failed spawn rejects with its cause and never installs a signal forwarder", async () => {
+      const fixture = await createBareRepo()
+      const baseline = process.listenerCount("SIGTERM")
+      const dir = mkdtempSync(join(tmpdir(), "gitomic-lifetime-"))
+      try {
+        const fakeGit = writeFakeGit(dir, ["process.exit(1)"])
+        const runtime = createShellRuntime({ gitExecutable: fakeGit, lifetime: "inherit" })
+        await runtime.resolveGitDir(fixture.repo)
+        unlinkSync(fakeGit)
+        await expect(edges(runtime.backend.readHistoryEdges!(fixture.repo, [fixture.initial]))).rejects.toThrow(
+          /could not start/,
+        )
+        expect(process.listenerCount("SIGTERM")).toBe(baseline)
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+        await fixture.cleanup()
+      }
+    })
+  })
 
   test("an executable that disappears rejects loudly instead of raising an unhandled spawn error", async () => {
     const fixture = await createBareRepo()

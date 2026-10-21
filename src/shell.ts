@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks"
-import childProcess, { type ChildProcess } from "node:child_process"
+import childProcess, { type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process"
 import { randomUUID } from "node:crypto"
 import fs from "node:fs"
 import { mkdtemp, rm, writeFile } from "node:fs/promises"
@@ -130,8 +130,24 @@ export type ShellBackendOptions = {
    * past it rejects with `GitTimeout`. Defaults to 20 000.
    */
   remoteTimeoutMs?: number
-  /** Forward host SIGTERM immediately, or let bounded commands drain to their own deadlines. */
+  /** Forward host SIGTERM immediately, or let bounded commands drain to their own deadlines. Standalone lifetime only. */
   sigterm?: "forward" | "drain"
+  /**
+   * Who owns the processes this backend spawns.
+   *
+   * "standalone" (default): a bounded command (POSIX) and the history stream each lead their own process group;
+   * Gitomic holds that group, forwards host SIGINT, SIGTERM and SIGHUP to it, and stops the GROUP on a deadline,
+   * on output overflow and on an early return, so the helpers Git starts (ssh, index-pack, rev-list) go with it.
+   *
+   * "inherit": every child is created in the CALLER's process group. Gitomic holds no group and forwards no
+   * signal; a deadline, an overflow or an early return stops the DIRECT child only (SIGTERM, then SIGKILL after
+   * the grace). Helpers Git starts may outlive that child: the caller's own supervisor owns the group, reaps them
+   * and proves their absence with its own process-group census. This is POSIX process-group membership, not a
+   * security boundary: a descendant that deliberately calls setsid or setpgid leaves the group and is outside the
+   * promise, and the bare exported helpers (runGit, runCommand, batchCheck called outside a backend operation)
+   * have no backend and stay standalone.
+   */
+  lifetime?: "standalone" | "inherit"
 }
 
 /** The default limit for one fetch or push to a remote. */
@@ -141,9 +157,12 @@ const DANGLING_REF_SCAN_TIMEOUT_MS = 30_000
 const GROUP_STOP_GRACE_MS = 2_000
 
 const DURABLE_GIT_CONFIG = ["-c", "core.fsync=loose-object,reference", "-c", "core.fsyncMethod=fsync"] as const
+/** Who owns a shell-backend child; see {@link ShellBackendOptions.lifetime}. */
+type Lifetime = "standalone" | "inherit"
 const shellRuntime = new AsyncLocalStorage<{
   executable: string
   sigterm: "forward" | "drain"
+  lifetime: Lifetime
   localTimeoutMs: number | undefined
   absoluteDeadlineMs: number | undefined
 }>()
@@ -163,6 +182,14 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
   if (executable.trim() === "") throw new TypeError("gitExecutable must name a Git executable")
   const sigterm = options.sigterm === undefined ? "forward" : options.sigterm
   if (sigterm !== "forward" && sigterm !== "drain") throw new TypeError('sigterm must be "forward" or "drain"')
+  const lifetime: Lifetime = options.lifetime === undefined ? "standalone" : options.lifetime
+  if (lifetime !== "standalone" && lifetime !== "inherit") {
+    throw new TypeError('lifetime must be "standalone" or "inherit"')
+  }
+  // An inherited lifetime holds no group, so there is nothing for a deferred SIGTERM to drain.
+  if (lifetime === "inherit" && sigterm === "drain") {
+    throw new TypeError('sigterm "drain" needs the standalone lifetime: an inherited lifetime holds no process group')
+  }
   const remoteTimeoutMs = normalizeTimeoutMs(options.remoteTimeoutMs ?? DEFAULT_REMOTE_TIMEOUT_MS, "remoteTimeoutMs")
   const signing =
     options.signing === undefined
@@ -327,7 +354,7 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
   // Keeping the selection in the async call chain lets the Git plumbing below
   // use one runner without adding an executable argument to every operation.
   const inRuntime = <T>(work: () => Promise<T>): Promise<T> =>
-    shellRuntime.run({ executable, sigterm, localTimeoutMs, absoluteDeadlineMs }, work)
+    shellRuntime.run({ executable, sigterm, lifetime, localTimeoutMs, absoluteDeadlineMs }, work)
   const selectedBackend = Object.fromEntries(
     Object.entries(backend).map(([name, operation]) => {
       const invoke = (operation as (...args: unknown[]) => Promise<unknown>).bind(backend)
@@ -343,7 +370,15 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
   // attached unwrapped, carrying the selected executable explicitly and resolving
   // the git dir inside that runtime at iteration time.
   selectedBackend.readHistoryEdges = (repo, tips, edgesOptions) =>
-    readHistoryEdges((target) => inRuntime(() => resolveGitDir(target)), executable, repo, tips, edgesOptions, baseEnv)
+    readHistoryEdges(
+      (target) => inRuntime(() => resolveGitDir(target)),
+      executable,
+      lifetime,
+      repo,
+      tips,
+      edgesOptions,
+      baseEnv,
+    )
   return {
     backend: selectedBackend,
     resolveGitDir: (repo) => inRuntime(() => resolveGitDir(repo)),
@@ -566,13 +601,16 @@ async function run(command: string, args: readonly string[], options: GitOptions
   return new Promise((resolveResult, reject) => {
     const maxBytes = options.maxBytes === undefined ? undefined : normalizeHistoryEdgeByteCap(options.maxBytes)
     const bounded = (timeoutMs !== undefined || maxBytes !== undefined) && process.platform !== "win32"
-    const child = childProcess.spawn(command, args, {
-      env: { ...(options.baseEnv ?? process.env), ...options.env, GIT_TERMINAL_PROMPT: "0", LC_ALL: "C" },
-      stdio: ["pipe", "pipe", "pipe"],
-      // A bounded command leads its own process group, so the limit reaches
-      // the helpers Git starts (ssh, index-pack) and not only Git itself.
-      detached: bounded,
-    })
+    // A bounded standalone command leads its own process group, so the limit reaches
+    // the helpers Git starts (ssh, index-pack) and not only Git itself.
+    const { child, group, release } = spawnOwned(
+      command,
+      args,
+      { ...(options.baseEnv ?? process.env), ...options.env, GIT_TERMINAL_PROMPT: "0", LC_ALL: "C" },
+      runtime?.lifetime ?? "standalone",
+      bounded,
+      runtime?.sigterm ?? "forward",
+    )
     const stdout: Buffer[] = []
     const stderr: Buffer[] = []
     let settled = false
@@ -583,7 +621,6 @@ async function run(command: string, args: readonly string[], options: GitOptions
     let exitSignal: NodeJS.Signals | null = null
     let limit: ReturnType<typeof setTimeout> | undefined
     let escalation: ReturnType<typeof setTimeout> | undefined
-    const release = bounded && child.pid !== undefined ? holdGroup(child.pid, runtime?.sigterm ?? "forward") : () => {}
     const settle = (finish: () => void): void => {
       if (settled) return
       settled = true
@@ -594,8 +631,9 @@ async function run(command: string, args: readonly string[], options: GitOptions
     }
     // A child that failed to start (EMFILE, ENOENT) reports it with an "error" event and may have no pipes at all.
     // Listen first and touch no pipe it lacks: a later "error" with no listener takes the whole host down (@cto
-    // 6c9330ac).
-    child.once("error", (error) => settle(() => reject(error)))
+    // 6c9330ac). A stop signal `kill` could not deliver arrives here too, possibly more than once, so the listener
+    // stays on; `settle` is idempotent.
+    child.on("error", (error) => settle(() => reject(error)))
     if ([child.stdin, child.stdout, child.stderr].some((pipe: unknown) => pipe === null || pipe === undefined)) {
       settle(() => reject(new Error(`${describeGitCommand(command, args)} could not start: it has no stdio pipes`)))
       return
@@ -617,8 +655,18 @@ async function run(command: string, args: readonly string[], options: GitOptions
     }
     // Stops what is left of a bounded command's group and stops reading pipes a
     // helper that left the group could otherwise hold open indefinitely.
+    // A stop that fails for a reason other than "already gone" settles the command through its failure path:
+    // thrown from a timer or a pipe callback it would otherwise escape as an uncaught error and leave the
+    // command pending forever.
+    const stop = (signal: NodeJS.Signals): void => {
+      try {
+        stopProcess(child, signal, group)
+      } catch (error) {
+        settle(() => reject(error))
+      }
+    }
     const abandonHelpers = (): void => {
-      stopProcess(child, "SIGKILL", bounded)
+      stop("SIGKILL")
       child.stdout.destroy()
       child.stderr.destroy()
     }
@@ -633,8 +681,10 @@ async function run(command: string, args: readonly string[], options: GitOptions
           return
         }
         timedOut = true
-        stopProcess(child, "SIGTERM", bounded)
-        escalation = setTimeout(() => stopProcess(child, "SIGKILL", bounded), GROUP_STOP_GRACE_MS)
+        // Arm the escalation BEFORE the first stop: a stop that fails settles the command synchronously, and
+        // `settle` must find the timer to clear it, or a SIGKILL fires later at a pid the OS may have reused.
+        escalation = setTimeout(() => stop("SIGKILL"), GROUP_STOP_GRACE_MS)
+        stop("SIGTERM")
       }, timeoutMs)
     }
     const collect = (chunks: Buffer[], chunk: Buffer): void => {
@@ -644,8 +694,10 @@ async function run(command: string, args: readonly string[], options: GitOptions
         outputOverflow = new Error(
           `${describeGitCommand(command, args)} exceeded maxBytes ${maxBytes} after ${outputBytes} bytes`,
         )
-        stopProcess(child, "SIGTERM", bounded)
-        escalation = setTimeout(() => stopProcess(child, "SIGKILL", bounded), GROUP_STOP_GRACE_MS)
+        // Arm the escalation BEFORE the first stop: a stop that fails settles the command synchronously, and
+        // `settle` must find the timer to clear it, or a SIGKILL fires later at a pid the OS may have reused.
+        escalation = setTimeout(() => stop("SIGKILL"), GROUP_STOP_GRACE_MS)
+        stop("SIGTERM")
         return
       }
       chunks.push(chunk)
@@ -710,6 +762,33 @@ function describeGitCommand(command: string, args: readonly string[]): string {
   const [subcommand, ...operands] = rest
   const target = operands.filter((operand) => !operand.startsWith("-")).join(" ")
   return [command, subcommand, target].filter((part) => part !== undefined && part !== "").join(" ")
+}
+
+type OwnedChild = { child: ChildProcessWithoutNullStreams; group: boolean; release: () => void }
+
+/**
+ * The one place a shell-backend process is created. `standaloneGroup` is the call site's own standalone policy
+ * (a bounded `run()` on POSIX; the history stream always): the child then leads a group Gitomic holds and signals.
+ * An inherited lifetime never leads or holds a group, so the caller's supervisor owns every descendant.
+ */
+function spawnOwned(
+  command: string,
+  args: readonly string[],
+  env: NodeJS.ProcessEnv,
+  lifetime: Lifetime,
+  standaloneGroup: boolean,
+  sigterm: "forward" | "drain",
+): OwnedChild {
+  const group = lifetime === "standalone" && standaloneGroup
+  const child = childProcess.spawn(command, args, { env, stdio: ["pipe", "pipe", "pipe"], detached: group })
+  const release = group && child.pid !== undefined ? holdGroup(child.pid, sigterm) : noRelease
+  return { child, group, release }
+}
+
+/** Ride a failed stop signal on the failure already in flight, without replacing it. */
+function attachCleanupFailure(primary: unknown, cleanup: unknown): void {
+  if (typeof primary !== "object" || primary === null) return
+  Object.defineProperty(primary, "cleanup", { value: cleanup, enumerable: false, configurable: true, writable: true })
 }
 
 function stopProcess(child: ChildProcess, signal: NodeJS.Signals, group: boolean): void {
@@ -1594,6 +1673,7 @@ const HISTORY_EDGES_MAX_TOKEN_CHARS = 128
 async function* readHistoryEdges(
   resolveGitDir: (repo: string) => Promise<string>,
   executable: string,
+  lifetime: Lifetime,
   repo: string,
   tips: readonly Oid[],
   options: { readonly exclude?: readonly Oid[]; readonly maxBytes?: number; readonly maxRecords?: number } = {},
@@ -1606,16 +1686,36 @@ async function* readHistoryEdges(
   const gitdir = await resolveGitDir(repo)
   const exclude = (options.exclude ?? []).map((oid) => "^" + validateOid(oid, "invalid history exclusion"))
   const input = [...tips, ...exclude].join("\n") + "\n"
-  const child = childProcess.spawn(
+  // A standalone stream always leads its own group (no platform predicate, as before): its helpers must go with
+  // it on cancellation. An inherited lifetime places it in the caller's group and stops the direct child only.
+  const { child, group, release } = spawnOwned(
     executable,
     gitArgs(gitdir, ["rev-list", "--no-commit-header", "--format=%H%x00%P%x00", "--stdin"]),
-    {
-      env: { ...(baseEnv ?? process.env), GIT_TERMINAL_PROMPT: "0", LC_ALL: "C" },
-      stdio: ["pipe", "pipe", "pipe"],
-      detached: true,
-    },
+    { ...(baseEnv ?? process.env), GIT_TERMINAL_PROMPT: "0", LC_ALL: "C" },
+    lifetime,
+    true,
+    "forward",
   )
-  const release = child.pid === undefined ? noRelease : holdGroup(child.pid, "forward")
+  // A stop signal that fails for a reason other than "already gone" is remembered, never thrown over the walk's
+  // own failure: the finalizer names it beside that failure and still demands `closed` as teardown proof.
+  let cleanupFailure: unknown = undefined
+  let hasCleanupFailure = false
+  const recordCleanupFailure = (error: unknown): void => {
+    if (hasCleanupFailure) return
+    hasCleanupFailure = true
+    cleanupFailure = error
+  }
+  const stop = (signal: NodeJS.Signals): void => {
+    try {
+      stopProcess(child, signal, group)
+    } catch (error) {
+      recordCleanupFailure(error)
+    }
+  }
+  let spawned = false
+  child.once("spawn", () => {
+    spawned = true
+  })
   // Custody is released EXACTLY ONCE — and, for a walk that cannot PROVE teardown, only when the group
   // actually closes. Without this a child that exits after our bound stays in `heldGroups` forever, and the
   // next forwarded SIGTERM can target a process group id the OS has since REUSED.
@@ -1663,7 +1763,13 @@ async function* readHistoryEdges(
       releaseOnce()
     }
     child.once("close", (code, signal) => finish({ code, signal }))
-    child.once("error", (error: Error) => {
+    child.on("error", (error: Error) => {
+      // A signal `kill` could not deliver to a live direct child is reported here, not thrown: the process is NOT
+      // proven gone, so it is a cleanup failure, never teardown proof.
+      if (spawned || (error as NodeJS.ErrnoException).syscall === "kill") {
+        recordCleanupFailure(error)
+        return
+      }
       spawnError = error
       child.stdout.destroy()
       child.stderr.destroy()
@@ -1671,11 +1777,11 @@ async function* readHistoryEdges(
     })
   })
   const kill = (): void => {
-    stopProcess(child, "SIGTERM", true)
+    stop("SIGTERM")
     if (escalation !== undefined) return
     escalation = setTimeout(() => {
       escalation = undefined
-      stopProcess(child, "SIGKILL", true)
+      stop("SIGKILL")
     }, GROUP_STOP_GRACE_MS)
     escalation.unref?.()
   }
@@ -1710,6 +1816,23 @@ async function* readHistoryEdges(
   }
   let primaryFailure: unknown = undefined
   let hasPrimaryFailure = false
+  const teardownRefusal = (detail: string): HistoryEdgesTeardown => {
+    const options: ErrorOptions & { cleanup?: unknown } = {}
+    if (hasPrimaryFailure) options.cause = primaryFailure
+    else if (hasCleanupFailure) options.cause = cleanupFailure
+    if (hasCleanupFailure) options.cleanup = cleanupFailure
+    return new HistoryEdgesTeardown(
+      "git rev-list edges in " +
+        repo +
+        " " +
+        detail +
+        (hasCleanupFailure
+          ? "; a stop signal failed: " +
+            (cleanupFailure instanceof Error ? cleanupFailure.message : String(cleanupFailure))
+          : ""),
+      Object.keys(options).length === 0 ? undefined : options,
+    )
+  }
   try {
     child.stdin.end(input)
     try {
@@ -1795,29 +1918,44 @@ async function* readHistoryEdges(
     if (teardownProven) {
       releaseOnce()
     } else {
-      // Custody must not outlive the walk: stop the group, then require `closed` — process AND pipes — as proof.
+      // Custody must not outlive the walk: stop the child (standalone: its whole group), then require `closed` —
+      // process AND pipes — as proof.
       kill()
       let settled = await settlesWithin(closed, GROUP_STOP_GRACE_MS + 1_000)
       if (!settled) {
-        stopProcess(child, "SIGKILL", true)
+        stop("SIGKILL")
         settled = await settlesWithin(closed, 1_000)
       }
       if (settled) {
         releaseOnce()
       } else {
-        // Do NOT release: the group may still be running, and dropping the hold would orphan it silently.
-        // The teardown refusal CHAINS any in-flight failure as its cause rather than discarding it.
+        // Do NOT release: a standalone group may still be running, and dropping the hold would orphan it silently.
+        // The teardown refusal CHAINS any in-flight failure as its cause rather than discarding it; a stop that
+        // itself failed is named beside that cause and never replaces it.
         // oxlint-disable-next-line no-unsafe-finally -- the cause is preserved; see the line above.
-        throw new HistoryEdgesTeardown(
-          "git rev-list edges in " +
-            repo +
-            " left process group " +
-            (child.pid ?? "?") +
-            " unproven " +
-            (GROUP_STOP_GRACE_MS + 2_000) +
-            "ms after SIGKILL; custody retained (orphan escalation)",
-          hasPrimaryFailure ? { cause: primaryFailure } : undefined,
+        throw teardownRefusal(
+          group
+            ? "left process group " +
+                (child.pid ?? "?") +
+                " unproven " +
+                (GROUP_STOP_GRACE_MS + 2_000) +
+                "ms after SIGKILL; custody retained (orphan escalation)"
+            : "left its child " +
+                (child.pid ?? "?") +
+                " unproven " +
+                (GROUP_STOP_GRACE_MS + 2_000) +
+                "ms after SIGKILL; helpers may remain in the caller's process group",
         )
+      }
+    }
+    // Teardown is proven, but a stop signal failed on the way: with a failure in flight it rides along as
+    // `cleanup`; alone, it is the result, because the walk did not end on Gitomic's terms.
+    if (hasCleanupFailure) {
+      if (hasPrimaryFailure) {
+        attachCleanupFailure(primaryFailure, cleanupFailure)
+      } else {
+        // oxlint-disable-next-line no-unsafe-finally -- no cause is in flight; the failed stop is the result.
+        throw teardownRefusal("closed on its own")
       }
     }
   }
