@@ -93,7 +93,7 @@
   },
   "devDependencies": {
     "@types/node": "26.6.5",
-    "isomorphic-git": "1.44.2",
+    "isomorphic-git": "1.44.3",
     "oxfmt": "^0.59.0",
     "oxlint": "1.85.0",
     "removely": "0.3.0",
