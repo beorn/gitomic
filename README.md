@@ -325,7 +325,7 @@ When Git itself dies of a native signal, the runner rejects with the exported `G
 
 ### Reading raw commits
 
-`readRawCommits(repo, oids, { maxBytes, timeoutMs, run? })` reads deduplicated commit OIDs into a map of exact Buffers. Both bounds are required: `maxBytes` is a positive integer limiting cumulative raw payload bytes, and `timeoutMs` is the positive per-command deadline. Metadata preflight plans batches of at most 500 OIDs and 8 MiB of native output. Missing objects, non-commit types, identity or framing mismatches, and exceeded bounds reject with the affected object or command. This shell helper does not decode commit metadata or change refs. The optional `run` seam uses `RunGitOptions`; omitting it uses the native runner.
+`readRawCommits(repo, oids, { maxBytes, timeoutMs, run? })` reads deduplicated commit OIDs into a map of exact Buffers. Both bounds are required: `maxBytes` is a positive integer limiting cumulative raw payload bytes, and `timeoutMs` is the positive per-command deadline. Metadata preflight plans batches of at most 65,536 OIDs and 8 MiB of native output. Missing objects, non-commit types, identity or framing mismatches, and exceeded bounds reject with the affected object or command. This shell helper does not decode commit metadata or change refs. The optional `run` seam uses `RunGitOptions`; omitting it uses the native runner.
 
 ### Running a command
 

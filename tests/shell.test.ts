@@ -2252,12 +2252,14 @@ test("native output byte limit stops the emitter and preserves unlimited callers
 // @consumer public raw commit reader; the default-runner fidelity case above cannot exercise chunk boundaries cheaply
 // Existing raw-byte parity tests cover one distinct commit, not cumulative or per-native limits.
 test("raw commit batch bounds split large and many objects without changing exact bytes", async () => {
-  const oids = Array.from({ length: 501 }, (_, i) => (i + 1).toString(16).padStart(40, "0"))
+  const oids = Array.from({ length: 65_537 }, (_, i) => (i + 1).toString(16).padStart(40, "0"))
   const payloads = new Map(oids.map((oid, i) => [oid, Buffer.alloc(i < 2 ? 5 * 1024 * 1024 : 3, i % 256)]))
   const maxBytes = [...payloads.values()].reduce((n, b) => n + b.length, 0)
+  const preflights: number[] = []
   const run: NonNullable<gitomic.ReadRawCommitsOptions["run"]> = async (args, options) => {
     const requested = options?.input?.toString().trim().split("\n") ?? []
-    expect(requested.length).toBeLessThanOrEqual(500)
+    expect(requested.length).toBeLessThanOrEqual(65_536)
+    if (args.some((arg) => arg.startsWith("--batch-check"))) preflights.push(requested.length)
     expect(options?.timeoutMs).toBe(5000)
     expect(options?.maxBytes).toBe(8 * 1024 * 1024)
     const stdout = Buffer.concat(
@@ -2277,7 +2279,9 @@ test("raw commit batch bounds split large and many objects without changing exac
     maxBytes,
     timeoutMs: 5000,
   })
-  expect(found.size).toBe(501)
+  expect(found.size).toBe(65_537)
+  // A population of this size is planned in two preflights, not one per 500 OIDs (28925).
+  expect(preflights).toEqual([65_536, 1])
   for (const [oid, bytes] of payloads) expect(found.get(oid)?.equals(bytes)).toBe(true)
   await expect(
     gitomic.readRawCommits("/tmp/raw-commit-bound-fixture", oids, { run, maxBytes: maxBytes - 1, timeoutMs: 5000 }),

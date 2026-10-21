@@ -1078,7 +1078,10 @@ export type ReadRawCommitsOptions = Readonly<{
   run?: (args: readonly string[], options?: RunGitOptions) => Promise<GitResult>
 }>
 
-/** Read distinct commits as exact bytes, with at most 500 OIDs and 8 MiB per native batch. */
+/** OIDs per metadata preflight: its answers stay under the 8 MiB native bound even for SHA-256 ids and 20-digit sizes. */
+const RAW_COMMIT_CHECK_OIDS = 65_536
+
+/** Read distinct commits as exact bytes, with at most 65,536 OIDs per preflight and 8 MiB per native batch. */
 export async function readRawCommits(
   repo: string,
   oids: readonly Oid[],
@@ -1093,8 +1096,8 @@ export async function readRawCommits(
   const nativeMaxBytes = 8 * 1024 * 1024
   const result = new Map<Oid, Buffer>()
   let totalBytes = 0
-  for (let offset = 0; offset < distinct.length; offset += 500) {
-    const candidates = distinct.slice(offset, offset + 500)
+  for (let offset = 0; offset < distinct.length; offset += RAW_COMMIT_CHECK_OIDS) {
+    const candidates = distinct.slice(offset, offset + RAW_COMMIT_CHECK_OIDS)
     const args = [...at, "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"]
     const checked = await invoke(args, { input: candidates.join("\n") + "\n", timeoutMs, maxBytes: nativeMaxBytes })
     if (checked.code !== 0) throw commandFailure(repo, args, checked)
