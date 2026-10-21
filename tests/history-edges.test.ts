@@ -13,6 +13,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import { describe, expect, test, vi } from "vitest"
+import { tempTree } from "removely"
 
 import { createShellBackend, GitTimeout, HistoryEdgesOverflow, HistoryEdgesTeardown, open } from "../src/index.js"
 import type { GitomicBackend, HistoryEdgeEvent } from "../src/index.js"
@@ -898,7 +899,8 @@ describe("readHistoryEdges", () => {
 
   test("an executable that disappears rejects loudly instead of raising an unhandled spawn error", async () => {
     const fixture = await createBareRepo()
-    const dir = mkdtempSync(join(tmpdir(), "gitomic-edges-"))
+    await using scratch = await tempTree("gitomic-edges-")
+    const dir = scratch.path
     try {
       const fakeGit = writeFakeGit(dir, ["process.exit(1)"])
       const runtime = createShellRuntime({ gitExecutable: fakeGit })
@@ -909,13 +911,13 @@ describe("readHistoryEdges", () => {
       )
     } finally {
       await fixture.cleanup()
-      rmSync(dir, { recursive: true, force: true })
     }
   })
 
   test("a large stderr is drained but only a bounded tail is reported", async () => {
     const fixture = await createBareRepo()
-    const dir = mkdtempSync(join(tmpdir(), "gitomic-edges-"))
+    await using scratch = await tempTree("gitomic-edges-")
+    const dir = scratch.path
     try {
       const fakeGit = writeFakeGit(dir, ["process.stderr.write('x'.repeat(256 * 1024))", "process.exitCode = 1"])
       const backend = createShellBackend({ gitExecutable: fakeGit })
@@ -928,7 +930,6 @@ describe("readHistoryEdges", () => {
       expect(failure!.message.length).toBeLessThan(64 * 1024)
     } finally {
       await fixture.cleanup()
-      rmSync(dir, { recursive: true, force: true })
     }
   })
 
