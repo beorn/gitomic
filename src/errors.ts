@@ -258,15 +258,18 @@ export class RelativeOnlyEditRefused extends Error {
 }
 
 /**
- * A native Git command outlived its time limit. The command led its own process
- * group, and the whole group was stopped, so helpers Git started (ssh,
- * index-pack) do not outlive it. Facts only: the command and the limit.
+ * A native Git command outlived its time limit. Under the standalone lifetime the command led its own process
+ * group and the whole group was stopped, so helpers Git started (ssh, index-pack) do not outlive it; under an
+ * inherited lifetime only the command's own process was stopped and its helpers stay in the caller's process
+ * group. Facts only: the command, the limit and what was stopped.
  */
 export class GitTimeout extends Error {
   /** The Git command that was stopped, as `git <subcommand>` plus its target. */
   readonly command: string
   /** The limit it exceeded, in milliseconds. */
   readonly timeoutMs: number
+  /** What the deadline stopped: the command's whole process group (standalone) or only its own process (inherit). */
+  readonly stopped: "group" | "child"
   override readonly name = "GitTimeout"
 
   constructor(
@@ -274,11 +277,19 @@ export class GitTimeout extends Error {
     command: string,
     /** The limit it exceeded, in milliseconds. */
     timeoutMs: number,
-    options?: ErrorOptions,
+    options?: ErrorOptions & { stopped?: "group" | "child" },
   ) {
-    super(`${command} did not finish within its ${timeoutMs} ms limit; its process group was stopped`, options)
+    const stopped = options?.stopped ?? "group"
+    super(
+      `${command} did not finish within its ${timeoutMs} ms limit; ` +
+        (stopped === "group"
+          ? "its process group was stopped"
+          : "its process was stopped; helpers it started stay in the caller's process group"),
+      options,
+    )
     this.command = command
     this.timeoutMs = timeoutMs
+    this.stopped = stopped
   }
 }
 

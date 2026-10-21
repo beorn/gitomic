@@ -15,10 +15,14 @@
   only: a descendant that calls setsid/setpgid leaves it, and the bare
   `runGit`/`runCommand`/`batchCheck` helpers have no backend and stay
   standalone. `sigterm: "drain"` with `"inherit"` is refused at construction.
-  A stop signal that fails during a history-stream teardown is now kept beside
-  the failure in flight (`HistoryEdgesTeardown.cleanup`) instead of replacing
-  it, and a failed stop in the bounded runner's deadline or overflow path settles
-  the command instead of escaping as an uncaught timer error.
+  A stop signal that fails during a history-stream teardown is now reported as
+  a `HistoryEdgesTeardown` whose `cause` is the walk's own failure, exactly as
+  thrown, and whose `cleanup` is the failed stop; a failed stop in the bounded
+  runner's deadline or overflow path settles the command instead of escaping as
+  an uncaught timer error and keeps a standalone group held, and host signals
+  forwarded to it, until its real close. `GitTimeout` says what the deadline
+  stopped (`stopped: "group" | "child"`): the whole process group under
+  standalone, only the command's own process under inherit.
 - `repositoryCandidate({ inProcess })` runs a declared derive or check in the
   caller's process: `resolve(kind, command, context)` claims an exact declared
   command and returns an implementation that gets the spawned command's inputs

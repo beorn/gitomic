@@ -596,7 +596,16 @@ describe("readHistoryEdges", () => {
                 lifetime: "inherit",
               })
               // The deadline: SIGTERM is ignored by the fake, so only the SIGKILL escalation ends it.
-              await expect(runtime.backend.head(fixture.repo, "refs/heads/main")).rejects.toBeInstanceOf(GitTimeout)
+              const timedOut: unknown = await runtime.backend.head(fixture.repo, "refs/heads/main").then(
+                () => undefined,
+                (error: unknown) => error,
+              )
+              expect(timedOut).toBeInstanceOf(GitTimeout)
+              // The error says what was stopped: only the child; its helpers stay in the caller's group.
+              expect((timedOut as GitTimeout).stopped).toBe("child")
+              expect((timedOut as GitTimeout).message).toMatch(
+                /its process was stopped; helpers it started stay in the caller's process group$/,
+              )
               // The early return: the finalizer must stop a child that ignores SIGTERM the same way.
               const iterator = runtime.backend.readHistoryEdges!(fixture.repo, [fixture.initial])[
                 Symbol.asyncIterator
@@ -707,10 +716,12 @@ describe("readHistoryEdges", () => {
       20_000,
     )
 
-    test.skipIf(process.platform !== "linux")(
-      "inherit: a stop that fails in the bounded runner's deadline path settles the command instead of escaping",
-      async () => {
+    test.skipIf(process.platform !== "linux").each(["standalone", "inherit"] as const)(
+      "%s: a stop that fails in the bounded runner's deadline path settles the command; a live group stays held until its real close",
+      async (lifetime) => {
         const fixture = await createBareRepo()
+        const baseline = process.listenerCount("SIGTERM")
+        const realKill = process.kill.bind(process)
         const spawnSpy = vi.spyOn(childProcess, "spawn")
         let killSpy: { mockRestore(): void } | undefined
         let pid: number | undefined
@@ -720,10 +731,10 @@ describe("readHistoryEdges", () => {
               gitExecutable: fakeGit,
               baseEnv: { ...process.env, FAKE_PID_FILE: pidFile },
               localTimeoutMs: 300,
-              lifetime: "inherit",
+              lifetime,
             })
             const outcome = runtime.backend.head(fixture.repo, "refs/heads/main")
-            // Catch the rev-parse child between its spawn and its 300 ms deadline, and make its kill fail.
+            // Catch the rev-parse child between its spawn and its 300 ms deadline, and make its stop fail.
             let child: ChildProcess | undefined
             for (let attempt = 0; attempt < 200 && child === undefined; attempt += 1) {
               child = spawnSpy.mock.results
@@ -733,16 +744,30 @@ describe("readHistoryEdges", () => {
             }
             if (child === undefined) throw new Error("the bounded rev-parse child never spawned")
             const stubbed = child
-            killSpy = vi.spyOn(stubbed, "kill").mockImplementation(() => {
-              stubbed.emit("error", eperm())
-              return false
-            })
+            if (lifetime === "standalone") {
+              // The group route THROWS: process.kill(-pgid) fails for a reason other than "already gone".
+              killSpy = vi.spyOn(process, "kill").mockImplementation((target, signal) => {
+                if (typeof target === "number" && target < 0) throw eperm()
+                return realKill(target, signal)
+              })
+            } else {
+              // The direct-child route REPORTS through the child's "error" event, as Node's kill does for EPERM.
+              killSpy = vi.spyOn(stubbed, "kill").mockImplementation(() => {
+                stubbed.emit("error", eperm())
+                return false
+              })
+            }
+            // The command rejects promptly with the stop that failed, not with a timeout it could not enforce.
             await expect(outcome).rejects.toMatchObject({ code: "EPERM", syscall: "kill" })
             pid = recorded(pidFile)[0]?.pid
             expect(pid).toBe(stubbed.pid)
             // Past the escalation grace: a timer that escaped settlement would raise here as an unhandled error.
             await new Promise((settle) => setTimeout(settle, GROUP_STOP_GRACE_MS + 300))
             if (pid !== undefined) beAlive(pid)
+            // Rejection did not drop custody: the live standalone group is still registered and forwarded to.
+            // An inherited lifetime never held anything.
+            if (lifetime === "standalone") expect(process.listenerCount("SIGTERM")).toBeGreaterThan(baseline)
+            else expect(process.listenerCount("SIGTERM")).toBe(baseline)
           })
         } finally {
           killSpy?.mockRestore()
@@ -751,6 +776,96 @@ describe("readHistoryEdges", () => {
             killQuietly(pid)
             await waitForDeath(pid)
           }
+          // The real close is the one release of a held group: the forwarders come off then, and only then.
+          for (let attempt = 0; attempt < 200 && process.listenerCount("SIGTERM") !== baseline; attempt += 1) {
+            await new Promise((settle) => setTimeout(settle, 25))
+          }
+          expect(process.listenerCount("SIGTERM")).toBe(baseline)
+          await fixture.cleanup()
+        }
+      },
+      20_000,
+    )
+
+    test.skipIf(process.platform !== "linux").each([
+      ["standalone", "frozen"],
+      ["standalone", "primitive"],
+      ["inherit", "frozen"],
+      ["inherit", "primitive"],
+    ] as const)(
+      "%s: a proven close after a failed stop refuses with the %s primary exactly as thrown, never mutated",
+      async (lifetime, primaryKind) => {
+        const fixture = await createBareRepo()
+        const baseline = process.listenerCount("SIGTERM")
+        const realKill = process.kill.bind(process)
+        const spawnSpy = vi.spyOn(childProcess, "spawn")
+        let killSpy: { mockRestore(): void } | undefined
+        let pid: number | undefined
+        try {
+          await withFakeGit(
+            [
+              ...RECORD_PID,
+              // One record, then the fake ends on its own 400 ms later: teardown is PROVEN by its real close.
+              "process.stdout.write(" + ONE_RECORD + ")",
+              "setTimeout(() => process.exit(0), 400)",
+            ],
+            async (fakeGit, pidFile) => {
+              const runtime = createShellRuntime({
+                gitExecutable: fakeGit,
+                baseEnv: { ...process.env, FAKE_PID_FILE: pidFile },
+                lifetime,
+              })
+              const iterator = runtime.backend.readHistoryEdges!(fixture.repo, [fixture.initial])[
+                Symbol.asyncIterator
+              ]()
+              expect((await iterator.next()).done).toBe(false)
+              pid = recorded(pidFile)[0]?.pid
+              const child = spawnSpy.mock.results.at(-1)?.value as ChildProcess
+              expect(child.pid).toBe(pid)
+              if (lifetime === "standalone") {
+                killSpy = vi.spyOn(process, "kill").mockImplementation((target, signal) => {
+                  if (typeof target === "number" && target < 0) throw eperm()
+                  return realKill(target, signal)
+                })
+              } else {
+                killSpy = vi.spyOn(child, "kill").mockImplementation(() => {
+                  child.emit("error", eperm())
+                  return false
+                })
+              }
+              // The caller's own failure: a frozen Error can take no property, a primitive has none to take.
+              const primary: unknown = primaryKind === "frozen" ? Object.freeze(new Error("primary")) : "primary"
+              let refusal: unknown
+              try {
+                await iterator.throw!(primary)
+              } catch (error) {
+                refusal = error
+              }
+              // The walk did not end on Gitomic's terms, so the result is a teardown refusal: the exact primary is
+              // its cause, the failed stop its cleanup, and the message names both. Nothing replaced either value.
+              expect(refusal).toBeInstanceOf(HistoryEdgesTeardown)
+              const teardown = refusal as HistoryEdgesTeardown
+              expect(teardown.cause).toBe(primary)
+              expect((teardown.cleanup as NodeJS.ErrnoException).code).toBe("EPERM")
+              expect(teardown.message).toMatch(/closed on its own; a stop signal failed: kill EPERM$/)
+              if (primaryKind === "frozen")
+                expect(Object.getOwnPropertyNames(primary as object)).not.toContain("cleanup")
+              // Proven means proven: the child is gone before the refusal is thrown.
+              if (pid !== undefined) beDead(pid)
+            },
+          )
+        } finally {
+          killSpy?.mockRestore()
+          spawnSpy.mockRestore()
+          if (pid !== undefined) {
+            killQuietly(pid)
+            await waitForDeath(pid)
+          }
+          // Standalone released its hold at the real close; inherit never held any.
+          for (let attempt = 0; attempt < 200 && process.listenerCount("SIGTERM") !== baseline; attempt += 1) {
+            await new Promise((settle) => setTimeout(settle, 25))
+          }
+          expect(process.listenerCount("SIGTERM")).toBe(baseline)
           await fixture.cleanup()
         }
       },

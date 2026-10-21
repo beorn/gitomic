@@ -50,9 +50,16 @@ test("public command runner preserves command output and refuses missing or time
   await expect(
     gitomic.runCommand(join(tmpdir(), "gitomic-required-command-does-not-exist"), [], { timeoutMs: 5_000 }),
   ).rejects.toMatchObject({ code: "ENOENT" })
-  await expect(
-    gitomic.runCommand(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { timeoutMs: 100 }),
-  ).rejects.toBeInstanceOf(gitomic.GitTimeout)
+  const timedOut: unknown = await gitomic
+    .runCommand(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { timeoutMs: 100 })
+    .then(
+      () => undefined,
+      (error: unknown) => error,
+    )
+  expect(timedOut).toBeInstanceOf(gitomic.GitTimeout)
+  // The bare runner is standalone: the whole group was stopped, and the error says exactly that.
+  expect((timedOut as gitomic.GitTimeout).stopped).toBe("group")
+  expect((timedOut as gitomic.GitTimeout).message).toMatch(/its process group was stopped$/)
 })
 
 // @failure An opt-in signed batch is emitted unsigned or a failed configured signer silently falls back.

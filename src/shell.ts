@@ -621,19 +621,25 @@ async function run(command: string, args: readonly string[], options: GitOptions
     let exitSignal: NodeJS.Signals | null = null
     let limit: ReturnType<typeof setTimeout> | undefined
     let escalation: ReturnType<typeof setTimeout> | undefined
-    const settle = (finish: () => void): void => {
+    // The command's result and the group's custody settle together, except when a stop FAILED: the command then
+    // rejects at once, but a standalone group that may still be alive stays held (and host signals forwarded to it)
+    // until the child's real close, as the history stream does. Release happens exactly once either way.
+    let holdUntilClose = false
+    const settle = (finish: () => void, custody: "release" | "hold" = "release"): void => {
       if (settled) return
       settled = true
       clearTimeout(limit)
       clearTimeout(escalation)
-      release()
+      if (custody === "hold") holdUntilClose = true
+      else release()
       finish()
     }
     // A child that failed to start (EMFILE, ENOENT) reports it with an "error" event and may have no pipes at all.
     // Listen first and touch no pipe it lacks: a later "error" with no listener takes the whole host down (@cto
     // 6c9330ac). A stop signal `kill` could not deliver arrives here too, possibly more than once, so the listener
-    // stays on; `settle` is idempotent.
-    child.on("error", (error) => settle(() => reject(error)))
+    // stays on; `settle` is idempotent. A failure after the spawn leaves a standalone group possibly alive, so
+    // custody is kept until the real close (before the spawn there is no hold to keep).
+    child.on("error", (error) => settle(() => reject(error), "hold"))
     if ([child.stdin, child.stdout, child.stderr].some((pipe: unknown) => pipe === null || pipe === undefined)) {
       settle(() => reject(new Error(`${describeGitCommand(command, args)} could not start: it has no stdio pipes`)))
       return
@@ -662,7 +668,7 @@ async function run(command: string, args: readonly string[], options: GitOptions
       try {
         stopProcess(child, signal, group)
       } catch (error) {
-        settle(() => reject(error))
+        settle(() => reject(error), "hold")
       }
     }
     const abandonHelpers = (): void => {
@@ -715,9 +721,15 @@ async function run(command: string, args: readonly string[], options: GitOptions
       }
       if (!timedOut) return
       abandonHelpers()
-      settle(() => reject(new GitTimeout(describeGitCommand(command, args), timeoutMs ?? 0)))
+      settle(() =>
+        reject(
+          new GitTimeout(describeGitCommand(command, args), timeoutMs ?? 0, { stopped: group ? "group" : "child" }),
+        ),
+      )
     })
     child.once("close", (code, signal) => {
+      // The real close is the one proof a group kept past a failed stop is gone: release it here, exactly once.
+      if (holdUntilClose) release()
       if (timedOut) return
       settleOutcome(code, signal)
     })
@@ -783,12 +795,6 @@ function spawnOwned(
   const child = childProcess.spawn(command, args, { env, stdio: ["pipe", "pipe", "pipe"], detached: group })
   const release = group && child.pid !== undefined ? holdGroup(child.pid, sigterm) : noRelease
   return { child, group, release }
-}
-
-/** Ride a failed stop signal on the failure already in flight, without replacing it. */
-function attachCleanupFailure(primary: unknown, cleanup: unknown): void {
-  if (typeof primary !== "object" || primary === null) return
-  Object.defineProperty(primary, "cleanup", { value: cleanup, enumerable: false, configurable: true, writable: true })
 }
 
 function stopProcess(child: ChildProcess, signal: NodeJS.Signals, group: boolean): void {
@@ -1948,15 +1954,12 @@ async function* readHistoryEdges(
         )
       }
     }
-    // Teardown is proven, but a stop signal failed on the way: with a failure in flight it rides along as
-    // `cleanup`; alone, it is the result, because the walk did not end on Gitomic's terms.
+    // Teardown is proven, but a stop signal failed on the way: the walk did not end on Gitomic's terms. The result
+    // is a teardown refusal whose `cause` is the walk's own failure, exactly as thrown (a frozen or primitive value
+    // is never mutated), and whose `cleanup` is the failed stop, so neither is dropped or replaced.
     if (hasCleanupFailure) {
-      if (hasPrimaryFailure) {
-        attachCleanupFailure(primaryFailure, cleanupFailure)
-      } else {
-        // oxlint-disable-next-line no-unsafe-finally -- no cause is in flight; the failed stop is the result.
-        throw teardownRefusal("closed on its own")
-      }
+      // oxlint-disable-next-line no-unsafe-finally -- both values are preserved on the refusal; see above.
+      throw teardownRefusal("closed on its own")
     }
   }
 }
