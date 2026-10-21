@@ -302,11 +302,11 @@ const VERB_USAGE: Record<(typeof VERBS)[number], string> = {
   diff: "gitomic diff <repo>#<ref> --base <oid> [glob] [--at <oid>] [--json]",
   origin: "gitomic origin --repo <path>",
   write:
-    "gitomic write <repo>#<ref> -m <message> <path> <file> [<path> <file>]... [--expect <path=oid>] [--create <path>] [--writer <seat>] [--author <actor>] [--trailer <text>] [--checkout <path>] [--json]",
+    "gitomic write <repo>#<ref> -m <message> [--expect <path=oid>] [--create <path>] [--writer <seat>] [--author <actor>] [--trailer <text>] [--checkout <path>] [--json] <path>=<file>...",
   rm: "gitomic rm <repo>#<ref> -m <message> <path>... [--expect <path=oid>] [--writer <seat>] [--author <actor>] [--trailer <text>] [--json]",
   mv: "gitomic mv <repo>#<ref> -m <message> <from> <to> [--writer <seat>] [--author <actor>] [--trailer <text>] [--json]",
   apply:
-    "gitomic apply <repo>#<ref> -m <message> <clause>... [--base <oid>] [--writer <seat>] [--author <actor>] [--trailer <text>] [--checkout <path>] [--lock-timeout <ms>] [--json]\n  clauses: put <path> <file> | put-bytes <path> <file> | append <path> <file> | replace <path> <file> | rm <path> | mv <from> <to>",
+    "gitomic apply <repo>#<ref> -m <message> [--base <oid>] [--writer <seat>] [--author <actor>] [--trailer <text>] [--checkout <path>] [--lock-timeout <ms>] [--json] <clause>...\n  clauses: put <path> <file> [--expect <oid> | --create] | put-bytes <path> <file> [--expect <oid> | --create] | append <path> <file> | replace <path> <old-file> <new-file> | rm <path> [--expect <oid>] | mv <from> <to> [--expect <oid>]",
   project: "gitomic project <path> [--remote <name>] [--ref <ref>] [--timeout <ms>] [--lock-timeout <ms>]",
   trust: "gitomic trust <repo>#<ref>",
 }

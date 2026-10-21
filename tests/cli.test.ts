@@ -1431,6 +1431,23 @@ describe("gitomic CLI — usage errors (exit 2, never silent)", () => {
     expect(result.stderr).toBe("")
     expect(result.stdout).toContain("Usage: gitomic apply <repo>#<ref>")
     expect(result.stdout).toContain("-m <message>")
+    // The clause forms and flag order must match runApply's parser (review of 30531).
+    expect(result.stdout).toContain("replace <path> <old-file> <new-file>")
+    expect(result.stdout.indexOf("--base <oid>")).toBeLessThan(result.stdout.indexOf("<clause>..."))
+    expect(result.stdout).not.toContain("<clause>... [--base")
+  })
+
+  test("write --help prints the <path>=<file> pair form its parser accepts (30531)", async () => {
+    const env = { ...process.env, GIT_CEILING_DIRECTORIES: join(workdir, "..") }
+    const result = await promisify(execFile)(
+      "bun",
+      [fileURLToPath(new URL("../src/bin.ts", import.meta.url)), "write", "--help"],
+      { cwd: workdir, env, encoding: "utf8" },
+    )
+
+    expect(result.stderr).toBe("")
+    expect(result.stdout).toContain("<path>=<file>...")
+    expect(result.stdout).not.toContain("<path> <file>")
   })
 
   test("an unknown verb fails loudly, naming itself", async () => {
