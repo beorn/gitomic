@@ -182,6 +182,23 @@ describe("the checkout lock", () => {
     expect(result.stderr).toContain('got "stdin"')
   })
 
+  test("unrecognized --limit on log names -n <count> (#30712)", () => {
+    const { checkout } = fixture()
+    const result = gitomic(["log", checkout, "--limit", "5"])
+    expect(result.code).toBe(2)
+    expect(result.stderr).toContain("unrecognized flag: --limit (use -n <count>)")
+  })
+
+  test("unwritable checkout lock file names permission error and host-managed rail cure (#30712)", () => {
+    const { checkout } = fixture()
+    const lockPath = join(git(checkout, "rev-parse", "--absolute-git-dir"), "km-state-write.lock")
+    writeFileSync(lockPath, "", { mode: 0o400 })
+    const result = gitomic(["project", checkout, "--lock-timeout", "100"])
+    expect(result.code).toBe(1)
+    expect(result.stderr).toContain(`cannot acquire checkout lock ${lockPath} (EACCES)`)
+    expect(result.stderr).toContain("use the host-managed 'km bd ...' rail")
+  })
+
   // Native Node runs the real lock while the existing holder fixture runs Bun.
   test.runIf(!("Bun" in globalThis))(
     "Node projects and applies under the shared lock, and a Bun holder refuses its write",

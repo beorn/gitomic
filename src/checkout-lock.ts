@@ -91,7 +91,19 @@ export function holdCheckoutLock(repoRoot: string, options: HoldCheckoutLockOpti
   const deadline = Date.now() + timeoutMs
   const waitCell = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT))
   while (true) {
-    const lock = tryAcquireFlock(path)
+    let lock: FlockHandle | null
+    try {
+      lock = tryAcquireFlock(path)
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException | null)?.code
+      if (code === "EACCES" || code === "EPERM") {
+        throw new Error(
+          `cannot acquire checkout lock ${path} (${code}): this process lacks write permission to ${repoRoot} — use the host-managed 'km bd ...' rail for bead writes or send a type=request to @chief for root-repo prose/config writes`,
+          { cause: err },
+        )
+      }
+      throw err
+    }
     if (lock !== null) {
       // The body names the holder for a waiter's refusal. It is a label, never
       // authority: the flock alone decides who holds the lock.
