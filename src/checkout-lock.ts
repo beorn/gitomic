@@ -49,10 +49,9 @@ export type HoldCheckoutLockOutcome =
   | { readonly ok: true; readonly lock: CheckoutLock; readonly borrowed: boolean }
   | {
       readonly ok: false
-      readonly kind: "checkout-lock-busy" | "checkout-lock-denied"
+      readonly kind: "checkout-lock-busy"
       readonly path: string
       readonly error: string
-      readonly cause?: unknown
     }
 
 export interface HoldCheckoutLockOptions {
@@ -103,13 +102,10 @@ export function holdCheckoutLock(repoRoot: string, options: HoldCheckoutLockOpti
     } catch (err) {
       const code = (err as NodeJS.ErrnoException | null)?.code
       if (code === "EACCES" || code === "EPERM") {
-        return {
-          ok: false,
-          kind: "checkout-lock-denied",
-          path,
-          error: `cannot open checkout lock ${path} (${code}): this process cannot write ${repoRoot}; run it as a user who can write this checkout`,
-          cause: err,
-        }
+        throw new Error(
+          `cannot open checkout lock ${path} (${code}): this process cannot write ${repoRoot}; run it as a user who can write this checkout`,
+          { cause: err },
+        )
       }
       throw err
     }

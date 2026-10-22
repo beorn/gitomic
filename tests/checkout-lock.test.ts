@@ -191,26 +191,18 @@ describe("the checkout lock", () => {
   })
 
   test.skipIf(process.getuid?.() === 0)(
-    "unwritable checkout lock file returns checkout-lock-denied and names generic permission cure (#30712)",
+    "unwritable checkout lock file throws and names generic permission cure (#30712)",
     () => {
       const { checkout } = fixture()
       const lockPath = join(git(checkout, "rev-parse", "--absolute-git-dir"), "km-state-write.lock")
       writeFileSync(lockPath, "", { mode: 0o400 })
+      const expected = `cannot open checkout lock ${lockPath} (EACCES): this process cannot write ${checkout}; run it as a user who can write this checkout`
 
-      const held = holdCheckoutLock(checkout, { timeoutMs: 0 })
-      expect(held).toMatchObject({
-        ok: false,
-        kind: "checkout-lock-denied",
-        path: lockPath,
-        error: `cannot open checkout lock ${lockPath} (EACCES): this process cannot write ${checkout}; run it as a user who can write this checkout`,
-      })
+      expect(() => holdCheckoutLock(checkout, { timeoutMs: 0 })).toThrow(expected)
 
       const result = gitomic(["project", checkout, "--lock-timeout", "100"])
-      expect(result.code).toBe(5)
-      expect(result.stderr).toContain(
-        `cannot open checkout lock ${lockPath} (EACCES): this process cannot write ${checkout}; run it as a user who can write this checkout`,
-      )
-      expect(result.stderr).toContain(`kind=checkout-lock-denied path=${lockPath}`)
+      expect(result.code).toBe(1)
+      expect(result.stderr).toContain(expected)
     },
   )
 
