@@ -14,7 +14,7 @@
         "isomorphic-git": "1.44.3",
         "oxfmt": "^0.59.0",
         "oxlint": "1.85.0",
-        "removely": "0.3.0",
+        "removely": "0.5.0",
         "typescript": "^7.0.2",
         "unstorage": "^1.17.5",
         "vitest": "5.0.4",
@@ -33,6 +33,8 @@
     "@bearly/flock": ["@bearly/flock@0.2.2", "", { "dependencies": { "koffi": "3.3.2" } }, "sha512-pmQ0SfqqZ1sLLQImQ3NnmfugIKHg/SC9WyAVPKSZNC1PYRw9LRhRaZrOuzzAJG35i931BG7lF5KCXBZ6FPt8Kg=="],
 
     "@bearly/pacing": ["@bearly/pacing@0.1.0", "", {}, "sha512-t5c9YUrcZjETONe+DvjjnRtfqlNzPexR3CgFFe7sdqeWlMCVQ8e41qHl/ACHwm42wpRERRrn9dHRuZFLl9I7cg=="],
+
+    "@bearly/process-sources": ["@bearly/process-sources@0.1.0", "", {}, "sha512-FV53KkJdGgfq2/K1iuR7aFK7oqKTdQDzxLDhAHyD3UnWQ6TfDzVdtzmHaNsasgSxgO2HGbv1Ah4i4QEnS4f1Zw=="],
 
     "@emnapi/core": ["@emnapi/core@1.11.1", "", { "dependencies": { "@emnapi/wasi-threads": "1.2.2", "tslib": "^2.4.0" } }, "sha512-RSvbQmHzdKzNsLYa/wHrbc3KN4sYLKAdPZxqiM2HATqv/SBk2/ENSHpvXGaLOMcsAyz0poEGqkmmKYG3OWiJEQ=="],
 
@@ -430,7 +432,7 @@
 
     "readdirp": ["readdirp@5.0.0", "", {}, "sha512-9u/XQ1pvrQtYyMpZe7DXKv2p5CNvyVwzUB6uhLAnQwHMSgKMBR62lc7AHljaeteeHXn11XTAaLLUVZYVZyuRBQ=="],
 
-    "removely": ["removely@0.3.0", "", { "bin": { "removely": "dist/cli.mjs" } }, "sha512-sjEgr6cgk8LiYcMMXOctcpxHBiW3lKNsTVy6gunWPqryVUI+5OozVnu64ZjRa/2IoSIfYfRovXm8JDdBaZdUcQ=="],
+    "removely": ["removely@0.5.0", "", { "dependencies": { "@bearly/process-sources": "^0.1.0" }, "bin": { "removely": "dist/cli.mjs" } }, "sha512-QIAP0uyXjK8Y3m5hDUqvW6ciyy0c879dwUPZNXSBKFFmZmkEuh4+BA0EUkZIyt9Q3wcaPgfENNKPW2Sf2+2a3w=="],
 
     "rolldown": ["rolldown@1.1.5", "", { "dependencies": { "@oxc-project/types": "=0.139.0", "@rolldown/pluginutils": "^1.0.0" }, "optionalDependencies": { "@rolldown/binding-android-arm64": "1.1.5", "@rolldown/binding-darwin-arm64": "1.1.5", "@rolldown/binding-darwin-x64": "1.1.5", "@rolldown/binding-freebsd-x64": "1.1.5", "@rolldown/binding-linux-arm-gnueabihf": "1.1.5", "@rolldown/binding-linux-arm64-gnu": "1.1.5", "@rolldown/binding-linux-arm64-musl": "1.1.5", "@rolldown/binding-linux-ppc64-gnu": "1.1.5", "@rolldown/binding-linux-s390x-gnu": "1.1.5", "@rolldown/binding-linux-x64-gnu": "1.1.5", "@rolldown/binding-linux-x64-musl": "1.1.5", "@rolldown/binding-openharmony-arm64": "1.1.5", "@rolldown/binding-wasm32-wasi": "1.1.5", "@rolldown/binding-win32-arm64-msvc": "1.1.5", "@rolldown/binding-win32-x64-msvc": "1.1.5" }, "bin": { "rolldown": "./bin/cli.mjs" } }, "sha512-t9z29cJjXf/vxQ8dyhCSpt6H6aSwHTk8cT5I3iy6SMXuFpk5mB6PL6XfC8PCwrPTx93udwKUm9HRteAlTGBLiA=="],
 
