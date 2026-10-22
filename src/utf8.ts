@@ -10,9 +10,13 @@ export function decodeUtf8(data: Uint8Array, label: string): string {
   }
 }
 
+/**
+ * A string is valid UTF-8 exactly when it holds no unpaired surrogate, which the platform answers in place: encoding it
+ * and decoding the bytes cost a buffer and a copy per call, and a whole-tree check makes one call per path (29914 3a).
+ */
 export function assertUtf8(value: unknown, label: string): asserts value is string {
   if (typeof value !== "string") throw new TypeError(`${label} must be a UTF-8 string`)
-  if (decodeUtf8(Buffer.from(value, "utf8"), label) !== value) {
+  if (!value.isWellFormed()) {
     throw new TypeError(`${label} must be valid UTF-8; unpaired Unicode surrogates are not supported`)
   }
 }

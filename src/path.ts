@@ -128,7 +128,12 @@ export function isPublicPath(path: string): boolean {
 export function assertTreeShape(paths: Iterable<string>): void {
   const stored = new Set(paths)
   for (const path of stored) assertStoredPath(path)
+  // A path in the directory of the last path whose ancestors were all checked has exactly those ancestors, none of
+  // them stored, so it is skipped rather than sliced again: the first collision, and the pair it names, is unchanged.
+  // The ancestor slices were a third of a whole-tree check's allocation (29914 step 3a, about 80k paths per create).
+  let cleared: string | undefined
   for (const path of stored) {
+    if (cleared !== undefined && sameDirectory(cleared, path)) continue
     let separator = path.indexOf("/")
     while (separator >= 0) {
       const ancestor = path.slice(0, separator)
@@ -137,6 +142,35 @@ export function assertTreeShape(paths: Iterable<string>): void {
       }
       separator = path.indexOf("/", separator + 1)
     }
+    cleared = path
+  }
+}
+
+/** Whether two paths are in one directory, compared in place so neither directory is sliced out. */
+function sameDirectory(a: string, b: string): boolean {
+  const directory = a.lastIndexOf("/")
+  if (directory < 0 || b.lastIndexOf("/") !== directory) return false
+  for (let index = 0; index < directory; index++) {
+    if (a.charCodeAt(index) !== b.charCodeAt(index)) return false
+  }
+  return true
+}
+
+/**
+ * Whether a component of `path` is empty, "." or "..": `path.split("/").some(...)` without the array or the parts,
+ * which were half of a whole-tree check's allocation (29914 step 3a).
+ */
+function hasEmptyOrDotComponent(path: string): boolean {
+  let start = 0
+  for (;;) {
+    const end = path.indexOf("/", start)
+    const length = (end < 0 ? path.length : end) - start
+    if (length === 0) return true
+    if (length <= 2 && path.charCodeAt(start) === 0x2e && (length === 1 || path.charCodeAt(start + 1) === 0x2e)) {
+      return true
+    }
+    if (end < 0) return false
+    start = end + 1
   }
 }
 
@@ -153,7 +187,7 @@ function assertStoredPath(path: string): void {
     path.endsWith("/") ||
     path.includes("\\") ||
     path.includes("\0") ||
-    path.split("/").some((part) => part === "" || part === "." || part === "..")
+    hasEmptyOrDotComponent(path)
   ) {
     throw new Error(`backend returned an invalid Git tree path: ${JSON.stringify(path)}`)
   }
