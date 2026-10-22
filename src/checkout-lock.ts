@@ -47,7 +47,12 @@ export type CheckoutLock = FlockHandle
 
 export type HoldCheckoutLockOutcome =
   | { readonly ok: true; readonly lock: CheckoutLock; readonly borrowed: boolean }
-  | { readonly ok: false; readonly kind: "checkout-lock-busy"; readonly path: string; readonly error: string }
+  | {
+      readonly ok: false
+      readonly kind: "checkout-lock-busy"
+      readonly path: string
+      readonly error: string
+    }
 
 export interface HoldCheckoutLockOptions {
   /** Maximum wait for another holder, in ms. `0` tries once. Default {@link DEFAULT_CHECKOUT_LOCK_TIMEOUT_MS}. */
@@ -91,7 +96,19 @@ export function holdCheckoutLock(repoRoot: string, options: HoldCheckoutLockOpti
   const deadline = Date.now() + timeoutMs
   const waitCell = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT))
   while (true) {
-    const lock = tryAcquireFlock(path)
+    let lock: FlockHandle | null
+    try {
+      lock = tryAcquireFlock(path)
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException | null)?.code
+      if (code === "EACCES" || code === "EPERM") {
+        throw new Error(
+          `cannot open checkout lock ${path} (${code}): this process cannot write ${repoRoot}; run it as a user who can write this checkout`,
+          { cause: err },
+        )
+      }
+      throw err
+    }
     if (lock !== null) {
       // The body names the holder for a waiter's refusal. It is a label, never
       // authority: the flock alone decides who holds the lock.

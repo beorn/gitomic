@@ -1437,7 +1437,10 @@ function extractFlags(
     if (token === undefined) break
     const kind = spec[token]
     if (kind === undefined) {
-      if (token.startsWith("-") && token !== "-") throw new UsageError(`unrecognized flag: ${token}`)
+      if (token.startsWith("-") && token !== "-") {
+        const hint = (token === "--limit" || token.startsWith("--limit=")) && "-n" in spec ? " (use -n <count>)" : ""
+        throw new UsageError(`unrecognized flag: ${token}${hint}`)
+      }
       positionals.push(token)
       continue
     }
