@@ -221,19 +221,40 @@ describe("gitomic CLI — the kept copy per URL (--cache-dir, GITOMIC_CACHE_DIR)
   /** The source CLI in its own process, as a seat runs it, with git's trace2 events recorded per invocation. */
   function invoke(args: string[], env: Record<string, string> = {}) {
     const trace = join(traces, `${invocation++}.jsonl`)
-    return promisify(execFile)("bun", [fileURLToPath(new URL("../src/bin.ts", import.meta.url)), ...args], {
+    const entrypoint = fileURLToPath(new URL("../src/bin.ts", import.meta.url))
+    const entrypointSha256 = createHash("sha256").update(fs.readFileSync(entrypoint)).digest("hex")
+    const argv = ["bun", entrypoint, ...args]
+    const started = new Date().toISOString()
+    const child = promisify(execFile)("bun", argv.slice(1), {
       cwd: workdir,
       env: { ...process.env, TMPDIR: scratch, GIT_TERMINAL_PROMPT: "0", GIT_TRACE2_EVENT: trace, ...env },
       encoding: "utf8",
-    }).then(
-      (result) => ({ code: 0, ...result, trace }),
-      (error: { code?: number; stdout?: string; stderr?: string }) => ({
-        code: error.code ?? -1,
-        stdout: error.stdout ?? "",
-        stderr: error.stderr ?? "",
+    })
+    return child
+      .then(
+        (result) => ({ code: 0, ...result, nativeExit: 0, signal: null, spawnError: null }),
+        (error: { code?: number | string; signal?: string; message: string; stdout?: string; stderr?: string }) => ({
+          code: typeof error.code === "number" ? error.code : -1,
+          stdout: error.stdout ?? "",
+          stderr: error.stderr ?? "",
+          nativeExit: typeof error.code === "number" && !error.signal ? error.code : null,
+          signal: error.signal ?? null,
+          spawnError: error.message,
+        }),
+      )
+      .then((result) => ({
+        ...result,
         trace,
-      }),
-    )
+        execution: {
+          argv,
+          cwd: workdir,
+          pid: child.child.pid,
+          started,
+          ended: new Date().toISOString(),
+          entrypointSha256,
+          cacheDir: env.GITOMIC_CACHE_DIR ?? null,
+        },
+      }))
   }
 
   /** The target directory of every `git clone` the invocation ran. */
@@ -337,6 +358,46 @@ describe("gitomic CLI — the kept copy per URL (--cache-dir, GITOMIC_CACHE_DIR)
     expect(fs.readdirSync(cacheDir).filter((name) => !name.startsWith("."))).toEqual([keptName()])
     await git(join(cacheDir, keptName()), "fsck", "--no-progress")
     await git(fixture.repo, "fsck", "--no-progress")
+  })
+
+  /** @failure Pinned reads use reader refresh, which the memory read and concurrent apply cases bypass (30951). */
+  test("pinned URL reads sharing one kept copy return exact bytes", async ({ annotate }) => {
+    const cacheDir = join(workdir, "kept")
+    const env = { GITOMIC_CACHE_DIR: cacheDir }
+    const expected = "first fixture commit\n"
+    const first = await put("note.md", expected, env)
+    const pinned = await git(fixture.repo, "rev-parse", "main")
+    const later = await put("note.md", "later fixture commit\n", env)
+    const args = ["read", `${url}#main`, "note.md", "--at", pinned]
+    const serial = await invoke(args, env)
+    const concurrent = await Promise.allSettled([invoke(args, env), invoke(args, env)])
+    const reads = [serial, ...concurrent.flatMap((result) => (result.status === "fulfilled" ? [result.value] : []))]
+    const evidence = join(workdir, "pinned-read-evidence.json")
+    await writeFile(
+      evidence,
+      JSON.stringify({
+        case: "30951 pinned reads",
+        fixture: fixture.repo,
+        cacheDir,
+        pinned,
+        expected,
+        outcomes: [first, later, ...reads].map((result) => ({
+          ...result,
+          traceContents: fs.readFileSync(result.trace, "utf8"),
+        })),
+        rejected: concurrent.flatMap((result) => (result.status === "rejected" ? [String(result.reason)] : [])),
+      }),
+    )
+    // Vitest retains a copy even when afterEach removes the private fixture and no blob reporter is selected.
+    await annotate("Pinned URL read child evidence", {
+      contentType: "application/json",
+      path: evidence,
+    })
+    for (const result of [first, later]) expect(result).toMatchObject({ code: 0, stderr: "" })
+    expect(reads).toHaveLength(3)
+    for (const result of reads) {
+      expect(result).toMatchObject({ code: 0, nativeExit: 0, signal: null, stdout: expected, stderr: "" })
+    }
   })
 
   test("a CLI apply concurrent with a library Store refreshing the same kept copy (km's shape) both land", async () => {
