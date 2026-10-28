@@ -510,6 +510,41 @@ describe("gitomic project and checkout synchronization", () => {
       expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# remote edit\n")
     })
 
+    // A target-equal path must not delay preservation of a distinct genuine conflict (31410, CTO3a64e2a4).
+    // Existing equal-only and conflict-only rows cannot exercise repair's mixed selection; both callers matter.
+    test.each([false, true])(
+      "repair preserves only real conflicting dirt beside a young target-equal file (local commit=%s)",
+      async (localCommit) => {
+        const { checkout, landAtOrigin } = remoteFixture(true)
+        if (localCommit) {
+          writeFileSync(join(checkout, "local.md"), "# local commit kept\n")
+          git(checkout, "add", "local.md")
+          git(checkout, "commit", "-qm", "local-only work")
+        }
+        const localTip = git(checkout, "rev-parse", "HEAD")
+        writeFileSync(join(checkout, "tracked.md"), "# genuine local conflict\n")
+        const equal = "# authority bytes already present\n"
+        writeFileSync(join(checkout, "bystander.md"), equal)
+        landAtOrigin("tracked.md", "# remote tracked edit\n")
+        const remoteTip = landAtOrigin("bystander.md", equal)
+        advancePastQuietPeriod()
+        // Age the genuine conflict, while only the matching file has a young effective timestamp.
+        const now = new Date(Date.now())
+        utimesSync(join(checkout, "bystander.md"), now, now)
+
+        const result = await projectCheckoutWithSetAside({ repoRoot: checkout })
+
+        expect(result, JSON.stringify(result)).toMatchObject({ ok: true, kind: "set-aside", to: remoteTip })
+        if (!result.ok || result.kind !== "set-aside") throw new Error("expected conflict preservation")
+        expect(git(checkout, "diff", "--name-only", localTip, result.preserveRef)).toBe("tracked.md")
+        expect(git(checkout, "show", `${result.preserveRef}:tracked.md`)).toBe("# genuine local conflict")
+        if (localCommit) expect(git(checkout, "show", `${result.preserveRef}:local.md`)).toBe("# local commit kept")
+        expect(readFileSync(join(checkout, "bystander.md"), "utf8")).toBe(equal)
+        expect(git(checkout, "rev-parse", "HEAD")).toBe(remoteTip)
+        expect(worktreeDirtyPaths(checkout)).toEqual([])
+      },
+    )
+
     test("a writer's reserved path is untouched even after the quiet period", async () => {
       const { checkout, landAtOrigin } = remoteFixture(true)
       writeFileSync(join(checkout, "tracked.md"), "# writer's preauthored bytes\n")
