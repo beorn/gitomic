@@ -4,6 +4,12 @@
 
 ### Added
 
+- `gitomic log --stop-at <oid>` bounds a path-filtered read at a caller-supplied ancestor: the anchor commit is
+  examined and the first-parent walk then ends, so a filter that matches nothing costs the distance to the anchor
+  instead of the whole history (160.6 s and 100 pages on a 101,928-commit chain). An anchor that is not an ancestor
+  fails before any paging, and one reachable only through a second parent fails after the walk naming the depth
+  reached; both exit 1. Without the flag the walk is unchanged.
+
 - `createShellBackend({ lifetime })`: who owns the processes a shell backend
   spawns. `"standalone"` (the default, unchanged) leads and holds a process
   group for each bounded command and for the history stream, forwards host

@@ -542,6 +542,133 @@ describe("gitomic CLI — path-filtered log past one scan window (#31240)", () =
   })
 })
 
+describe("gitomic CLI — caller-supplied stop anchor (#31349)", () => {
+  test("stops at the anchor instead of walking to root when nothing matches", async () => {
+    const backend = createMemBackend()
+    const store = await open({ repo: "repo", ref: "main", backend, writer: "history", clock: () => 946_684_800 })
+    for (let index = 0; index < 20; index += 1) {
+      await store.transact(async (map) => map.set(`old-${index}`, String(index)), `old noise ${index}`)
+    }
+    const anchor = await store.transact(async (map) => map.set("anchor", "1"), "anchor")
+    for (let index = 0; index < 12; index += 1) {
+      await store.transact(async (map) => map.set(`noise-${index}`, String(index)), `noise ${index}`)
+    }
+    const reader = await openReader({ repo: "repo", ref: "main", backend })
+    const tip = await reader.head()
+
+    const bounded = await logGlobMatches({
+      reader,
+      from: tip,
+      limit: 1,
+      glob: "never-touched.md",
+      pageSize: 4,
+      stopAt: anchor.oid,
+    })
+    expect(bounded.commits).toEqual([])
+    expect(bounded.anchorConsumed).toBe(true)
+    expect(bounded.reachedRoot).toBe(false)
+    // The anchor commit is examined, then the walk ends. `walked` counts paged commits, so the page containing the
+    // anchor is read whole: twelve recent commits plus the anchor inside four pages of four, and the twenty older
+    // commits below it are never touched.
+    expect(bounded.walked).toBe(16)
+
+    const unbounded = await logGlobMatches({ reader, from: tip, limit: 1, glob: "never-touched.md", pageSize: 4 })
+    expect(unbounded.reachedRoot).toBe(true)
+    expect(unbounded.walked).toBe(34)
+  })
+
+  test("returns a match above the anchor in one page", async () => {
+    const backend = createMemBackend()
+    const store = await open({ repo: "repo", ref: "main", backend, writer: "history", clock: () => 946_684_800 })
+    const anchor = await store.transact(async (map) => map.set("anchor", "1"), "anchor")
+    const plan = await store.transact(async (map) => map.set("plan.md", "v1"), "plan v1")
+    for (let index = 0; index < 3; index += 1) {
+      await store.transact(async (map) => map.set(`noise-${index}`, String(index)), `noise ${index}`)
+    }
+    const reader = await openReader({ repo: "repo", ref: "main", backend })
+    const tip = await reader.head()
+
+    const bounded = await logGlobMatches({
+      reader,
+      from: tip,
+      limit: 1,
+      glob: "plan.md",
+      pageSize: 4,
+      stopAt: anchor.oid,
+    })
+    expect(bounded.commits.map(({ oid }) => oid)).toEqual([plan.oid])
+    // Filling the limit is a result, not a chain that ran out before its anchor.
+    expect(bounded.reachedRoot).toBe(false)
+  })
+
+  test("fails after the walk when the anchor sits only on a second parent", async () => {
+    const fixture = await createBareRepo()
+    try {
+      const blob = (content: string) => gitWithInput(fixture.repo, content, "hash-object", "-w", "--stdin")
+      const tree = (entries: Array<[string, string]>) =>
+        gitWithInput(fixture.repo, entries.map(([path, oid]) => `100644 blob ${oid}\t${path}\n`).join(""), "mktree")
+      const commit = (treeOid: string, parents: string[], message: string) =>
+        git(fixture.repo, "commit-tree", treeOid, ...parents.flatMap((parent) => ["-p", parent]), "-m", message)
+
+      const noise = await blob("noise\n")
+      const planV1 = await blob("plan v1\n")
+      const planV2 = await blob("plan v2\n")
+      const noiseTree = await tree([
+        ["noise.md", noise],
+        ["plan.md", planV1],
+      ])
+      const planV2Tree = await tree([
+        ["noise.md", noise],
+        ["plan.md", planV2],
+      ])
+
+      const root = await commit(noiseTree, [], "root")
+      const second = await commit(noiseTree, [root], "noise 2")
+      // The anchor is reachable only through the merge's second parent, so `--is-ancestor` accepts it and the first-parent
+      // walk never consumes it.
+      const side = await commit(planV2Tree, [second], "side touches plan")
+      const merged = await commit(noiseTree, [second, side], "merge side")
+      await git(fixture.repo, "update-ref", "refs/heads/main", merged)
+
+      const backend = createShellBackend()
+      const reader = await openReader({ repo: fixture.repo, ref: "main", backend })
+      const tip = await reader.head()
+      const walked = await logGlobMatches({ reader, from: tip, limit: 5, glob: "plan.md", pageSize: 2, stopAt: side })
+      expect(walked.anchorConsumed).toBe(false)
+      expect(walked.reachedRoot).toBe(true)
+
+      const result = await run(backend, ["log", `${fixture.repo}#main`, "plan.md", "--stop-at", side])
+      expect(result.code).toBe(1)
+      expect(result.stderr).toContain(side)
+      expect(result.stderr).toContain("first-parent")
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  test("refuses an anchor on an unfiltered read instead of ignoring it", async () => {
+    const backend = createMemBackend()
+    const { tip } = await historyOfSize(3)
+    const result = await run(backend, ["log", ADDRESS, "--stop-at", tip])
+    expect(result.code).toBe(2)
+    expect(result.stderr).toContain("--stop-at")
+  })
+
+  test("fails before the walk when the anchor does not resolve", async () => {
+    const fixture = await createBareRepo()
+    try {
+      const backend = createShellBackend()
+      const missing = "0123456789abcdef0123456789abcdef01234567"
+      const result = await run(backend, ["log", `${fixture.repo}#main`, "plan.md", "--stop-at", missing])
+      expect(result.code).toBe(1)
+      expect(result.stderr).toContain(missing)
+      expect(result.stdout).toBe("")
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+})
+
 describe("gitomic CLI — history reads", () => {
   test("log and diff expose anchored metadata and sorted blob changes in plain and JSON modes", async () => {
     const backend = createMemBackend()

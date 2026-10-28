@@ -617,17 +617,17 @@ URL and scp-style addresses use `openRemoteRepository` for the command's lifetim
 
 **Read verbs** open an immutable snapshot, pinned at `--at <oid>` or the tip:
 
-| verb                                                      | prints                                                               |
-| --------------------------------------------------------- | -------------------------------------------------------------------- |
-| `read <addr> <path> [--at <oid>]`                         | the path's exact content                                             |
-| `ls <addr> [<glob>] [--at <oid>]`                         | matching paths, sorted, one per line                                 |
-| `grep <addr> <pattern> [<glob>] [--at <oid>]`             | `path:line` for every line matching the JS regex `pattern`           |
-| `log <addr> [<glob>] [--at <oid>] [-n <count>] [--json]`  | full commit id and first message line; JSON: `CommitMeta[]`          |
-| `diff <addr> --base <oid> [--at <oid>] [<glob>] [--json]` | `A`, `D`, or `M`, a tab, then the path; JSON: `{ path, from, to }[]` |
+| verb                                                                       | prints                                                               |
+| -------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| `read <addr> <path> [--at <oid>]`                                          | the path's exact content                                             |
+| `ls <addr> [<glob>] [--at <oid>]`                                          | matching paths, sorted, one per line                                 |
+| `grep <addr> <pattern> [<glob>] [--at <oid>]`                              | `path:line` for every line matching the JS regex `pattern`           |
+| `log <addr> [<glob>] [--at <oid>] [--stop-at <oid>] [-n <count>] [--json]` | full commit id and first message line; JSON: `CommitMeta[]`          |
+| `diff <addr> --base <oid> [--at <oid>] [<glob>] [--json]`                  | `A`, `D`, or `M`, a tab, then the path; JSON: `{ path, from, to }[]` |
 
 `read` on an absent path fails loudly (exit 1); `ls`/`grep` matching nothing print nothing and exit 0; `grep` skips a non-UTF-8 blob with a note on stderr rather than failing the whole scan.
 
-For `log`, `--at` selects the starting commit; `-n` defaults to 50 and accepts 1–1,024. A glob counts matching commits, using first-parent blob changes and all paths at a root commit. Literal-file filters compare the existing exact-path blob identities instead of expanding whole trees; wildcard filters keep the whole-tree comparison. The filtered scan loads up to 1,024 metadata records even when an early commit matches. Reaching the root with fewer than `-n` matches succeeds; reaching the cap with a parent still remaining and too few matches fails with exit 1 and empty stdout. A root-complete short result names the address, starting commit, filter, inspected count, and exclusions on stderr; it reports no matches or the returned/requested match counts. Stdout remains the complete result.
+For `log`, `--at` selects the starting commit; `-n` defaults to 50 and accepts 1–1,024. A glob counts matching commits, using first-parent blob changes and all paths at a root commit. Literal-file filters compare the existing exact-path blob identities instead of expanding whole trees; wildcard filters keep the whole-tree comparison. The filtered scan pages along the first-parent chain, 1,024 commits at a time, until `-n` matches are found or the chain ends; a filtered read of a path that matches nothing therefore walks the whole history rather than refusing at a window. Bounding that walk is the caller's job: `--stop-at <oid>` names a known-good ancestor that is examined and then ends the walk, so a no-match read costs the distance to the anchor, not the distance to the root. An anchor that is not an ancestor of the starting commit fails before any paging, and one reachable only through a second parent fails after the walk, because the walk follows first parents; both are exit 1 with a message naming the anchor and the depth walked. Stdout remains the complete result, and a short result names the address, starting commit, filter, inspected count and exclusions on stderr.
 
 For `diff`, `--base` is required and `--at` selects the other endpoint, defaulting to one pinned tip. The optional glob narrows the blob-identity changes described under Reading. No changed paths means success with empty plain output or `[]` in JSON, but a missing endpoint is an error, including when both ids are equal.
 

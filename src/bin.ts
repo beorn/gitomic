@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { spawnSync } from "node:child_process"
+import { existsSync } from "node:fs"
 import { readFile } from "node:fs/promises"
 import { dirname, isAbsolute, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -299,7 +300,7 @@ const VERB_USAGE: Record<(typeof VERBS)[number], string> = {
   read: "gitomic read <repo>#<ref> <path> [--at <oid>]",
   ls: "gitomic ls <repo>#<ref> [glob] [--at <oid>]",
   grep: "gitomic grep <repo>#<ref> <pattern> [glob] [--at <oid>]",
-  log: "gitomic log <repo>#<ref> [glob] [--at <oid>] [-n <count>] [--json]",
+  log: "gitomic log <repo>#<ref> [glob] [--at <oid>] [--stop-at <oid>] [-n <count>] [--json]",
   diff: "gitomic diff <repo>#<ref> --base <oid> [glob] [--at <oid>] [--json]",
   origin: "gitomic origin --repo <path>",
   write:
@@ -324,8 +325,13 @@ export async function logGlobMatches(options: {
   limit: number
   glob: string
   pageSize?: number
-}): Promise<{ commits: CommitMeta[]; walked: number }> {
-  const { reader, from, limit, glob, pageSize = HISTORY_SCAN_LIMIT } = options
+  /**
+   * Inclusive first-parent stop boundary: the walk examines this commit and then ends. A caller that already knows a
+   * good ancestor bounds a no-match read instead of walking to root (#31349).
+   */
+  stopAt?: Oid | undefined
+}): Promise<{ commits: CommitMeta[]; walked: number; anchorConsumed: boolean; reachedRoot: boolean }> {
+  const { reader, from, limit, glob, pageSize = HISTORY_SCAN_LIMIT, stopAt } = options
   const normalized = glob.normalize("NFC")
   // Literal file history asks the existing scoped snapshot question, rather than expanding two whole trees.
   // Other patterns retain glob semantics, including invalid/reserved path spellings that simply match nothing.
@@ -335,12 +341,14 @@ export async function logGlobMatches(options: {
       : undefined
   const commits: CommitMeta[] = []
   let walked = 0
+  let anchorConsumed = stopAt === undefined
   let cursor: string | null = from
   while (cursor !== null && commits.length < limit) {
     const page = await reader.log({ from: cursor, limit: pageSize })
     if (page.length === 0) break
     walked += page.length
     for (const commit of page) {
+      const atAnchor = stopAt !== undefined && commit.oid === stopAt
       if (literalPath !== undefined) {
         const [before, after] = await Promise.all([
           commit.parent === null ? Promise.resolve(undefined) : reader.at(commit.parent).oid(literalPath),
@@ -354,13 +362,20 @@ export async function logGlobMatches(options: {
             : (await reader.diff(commit.parent, commit.oid)).map(({ path }) => path)
         if (paths.some((path) => matchGlob(glob, path))) commits.push(commit)
       }
+      if (atAnchor) {
+        anchorConsumed = true
+        break
+      }
       if (commits.length === limit) break
     }
+    if (anchorConsumed && stopAt !== undefined) break
     const last = page.at(-1)
     // Only a full page proves the window was truncated; a short page means the chain ended.
     cursor = page.length === pageSize && last?.parent != null ? last.parent : null
   }
-  return { commits, walked }
+  // A walk that filled its limit legitimately stopped before the anchor; only a chain that ran out is a fault.
+  const reachedRoot = commits.length < limit && !(stopAt !== undefined && anchorConsumed)
+  return { commits, walked, anchorConsumed, reachedRoot }
 }
 
 const OK = 0
@@ -428,11 +443,21 @@ async function runGrep(args: string[], stdout: CliWriter, stderr: CliWriter, sou
 }
 
 async function runLog(args: string[], stdout: CliWriter, stderr: CliWriter, source: AddressSource): Promise<number> {
-  const { positionals, flags } = extractFlags(args, { "--at": "value", "-n": "value", "--json": "boolean" })
+  const { positionals, flags } = extractFlags(args, {
+    "--at": "value",
+    "--stop-at": "value",
+    "-n": "value",
+    "--json": "boolean",
+  })
   const address = requirePositional(positionals, 0, "<address>")
   assertNoExtraPositionals(positionals, 2, "<addr> [glob]", "log")
   const glob = positionals.at(1)
   let from = historyOidFlag(flags, "--at")
+  const stopAt = historyOidFlag(flags, "--stop-at")
+  // The bound exists for the filtered walk; on an unfiltered read it would accept and then do nothing.
+  if (stopAt !== undefined && glob === undefined) {
+    throw new UsageError("--stop-at bounds a filtered read; give a path or glob")
+  }
   const rawLimit = optionalStringFlag(flags, "-n")
   const limit = rawLimit === undefined ? 50 : Number(rawLimit)
   if (
@@ -447,16 +472,27 @@ async function runLog(args: string[], stdout: CliWriter, stderr: CliWriter, sour
     using repository = await openAddressFor(address, source)
     const reader = await openReader(repository)
     from ??= await reader.head()
+    if (stopAt !== undefined) await assertStopAtAncestor(repository.repo, stopAt, from)
     let commits: CommitMeta[]
     if (glob === undefined) {
       commits = await reader.log({ from, limit })
     } else {
-      const matched = await logGlobMatches({ reader, from, limit, glob })
+      const matched = await logGlobMatches({ reader, from, limit, glob, stopAt })
       commits = matched.commits
+      if (stopAt !== undefined && matched.reachedRoot) {
+        throw new Error(
+          `stop-at anchor ${stopAt} is not on the first-parent chain below ${from}: ` +
+            `reached root after ${matched.walked} commits`,
+        )
+      }
       if (commits.length < limit) {
         const scope = `${describeAddress(address, from)} filter=${JSON.stringify(glob)}; first-parent blob changes (mode-only changes excluded)`
         const result = commits.length === 0 ? "no matches" : `returned ${commits.length} of ${limit} requested matches`
-        stderr.write(`gitomic: log: ${result} for ${scope}; reached root after ${matched.walked} commits\n`)
+        stderr.write(
+          stopAt === undefined
+            ? `gitomic: log: ${result} for ${scope}; reached root after ${matched.walked} commits\n`
+            : `gitomic: log: ${result} for ${scope}; stopped at ${stopAt} after ${matched.walked} commits\n`,
+        )
       }
     }
     stdout.write(
@@ -513,6 +549,27 @@ function historyOidFlag(flags: FlagValues, flag: string): Oid | undefined {
   } catch (error) {
     throw new UsageError(error instanceof Error ? error.message : String(error))
   }
+}
+
+/**
+ * Fail a `--stop-at` anchor fast, before any paging, when it cannot be consumed at all. `merge-base --is-ancestor` is
+ * any-parent, so passing it only proves reachability; {@link logGlobMatches} still verifies the anchor on the
+ * first-parent chain it actually walks. Both failures are ordinary runtime errors on the exit code a bad read address
+ * already uses, never a new refusal (#31349).
+ */
+async function assertStopAtAncestor(repoPath: string, stopAt: Oid, from: Oid): Promise<void> {
+  // An injected backend owns its own objects and has no Git directory to ask. This skips only the fast refusal; the
+  // walk still ends it loudly on a first-parent chain that never consumes the anchor.
+  if (!existsSync(repoPath)) return
+  const result = await runGit(["-C", repoPath, "merge-base", "--is-ancestor", stopAt, from])
+  if (result.code === 0) return
+  if (result.code === 1) {
+    throw new Error(`stop-at anchor ${stopAt} is not an ancestor of ${from}`)
+  }
+  const detail = decodeUtf8(result.stderr, "stop-at ancestry check").trim()
+  throw new Error(
+    `stop-at anchor ${stopAt}: cannot verify ancestry against ${from}${detail === "" ? "" : `: ${detail}`}`,
+  )
 }
 
 /** The keys of `snapshot`, optionally narrowed to a glob — shared by `ls` and `grep`. */
