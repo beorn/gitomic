@@ -508,9 +508,18 @@ describe("gitomic CLI — path-filtered log past one scan window (#31240)", () =
       const planV1 = await blob("plan v1\n")
       const planV2 = await blob("plan v2\n")
       // Noise commits keep plan.md byte-identical, so only the two deliberate edits count as touches.
-      const noiseTree = await tree([["noise.md", noise], ["plan.md", planV1]])
-      const planV1Tree = await tree([["noise.md", noise], ["plan.md", planV1]])
-      const planV2Tree = await tree([["noise.md", noise], ["plan.md", planV2]])
+      const noiseTree = await tree([
+        ["noise.md", noise],
+        ["plan.md", planV1],
+      ])
+      const planV1Tree = await tree([
+        ["noise.md", noise],
+        ["plan.md", planV1],
+      ])
+      const planV2Tree = await tree([
+        ["noise.md", noise],
+        ["plan.md", planV2],
+      ])
 
       const root = await commit(planV1Tree, [], "root")
       const second = await commit(noiseTree, [root], "noise 2")
