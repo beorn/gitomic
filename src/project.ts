@@ -2522,6 +2522,8 @@ function selectOldBlockingPaths(
   changedPaths: ReadonlySet<string>,
   quietSeconds: number,
   reservedPaths: readonly string[],
+  landing: { readonly from: string; readonly to: string },
+  localOnlyPaths: ReadonlySet<string>,
 ): { readonly ok: true; readonly captures: readonly CapturedPath[] } | { readonly ok: false; readonly error: string } {
   try {
     const blockers = worktreeDirtyPaths(repoRoot).filter((path) => changedPaths.has(path))
@@ -2530,8 +2532,13 @@ function selectOldBlockingPaths(
     if (owned.length > 0) {
       return { ok: false, error: `reserved writer paths [${owned.join(", ")}] may not be captured or cleared` }
     }
+    const matching = matchingLandingDirt(repoRoot, landing.from, landing.to, blockers)
+    if (!matching.ok) return { ok: false, error: matching.detail }
+    // Locally committed paths must be cleared before the repair rewinds to its base, even when target-equal.
+    const excluded = new Set(matching.paths.filter((path) => !localOnlyPaths.has(path)))
     const captures: CapturedPath[] = []
     for (const path of blockers) {
+      if (excluded.has(path)) continue
       const captured = readCapturedPath(repoRoot, path)
       const statPath = captured.kind === "absent" ? dirname(join(repoRoot, path)) : join(repoRoot, path)
       const stat = lstatSync(statPath)
@@ -2654,10 +2661,18 @@ export async function projectCheckoutWithSetAside(
     if (!index.ok || localTree.status !== 0 || index.tree !== localTree.stdout) {
       return refused("the index holds staged, unmerged or unprovable work, so no dirty path may be cleared")
     }
+    // Rename detection can omit the old name here; matchingLandingDirt instead uses --no-renames.
     const changed = git(repoRoot, readonlyArgs(["diff", "--name-only", "-z", localTip, to, "--"]))
     if (changed.status !== 0) return refused(`source commit's changed paths cannot be listed (${gitDetail(changed)})`)
     const changedSet = new Set(nulPaths(changed.stdout))
-    const selection = selectOldBlockingPaths(repoRoot, changedSet, policy.quietSeconds, request.reservedPaths ?? [])
+    const selection = selectOldBlockingPaths(
+      repoRoot,
+      changedSet,
+      policy.quietSeconds,
+      request.reservedPaths ?? [],
+      { from: localTip, to },
+      new Set(),
+    )
     if (!selection.ok) return refused(selection.error)
     const captures = selection.captures
     if (captures.length === 0) {
@@ -2737,13 +2752,22 @@ export async function projectCheckoutWithSetAside(
   let preservedOid: string = localTip
   let combinedCaptures: readonly CapturedPath[] = []
   if (!indexAtBase) {
+    // Rename detection can omit the old name here; matchingLandingDirt instead uses --no-renames.
     const localChanges = git(repoRoot, readonlyArgs(["diff", "--name-only", "-z", base, localTip, "--"]))
     const remoteChanges = git(repoRoot, readonlyArgs(["diff", "--name-only", "-z", base, to, "--"]))
     if (localChanges.status !== 0 || remoteChanges.status !== 0) {
       return refused("local or remote changed paths cannot be listed")
     }
-    const changed = new Set([...nulPaths(localChanges.stdout), ...nulPaths(remoteChanges.stdout)])
-    const selection = selectOldBlockingPaths(repoRoot, changed, policy.quietSeconds, request.reservedPaths ?? [])
+    const localOnlyPaths = new Set(nulPaths(localChanges.stdout))
+    const changed = new Set([...localOnlyPaths, ...nulPaths(remoteChanges.stdout)])
+    const selection = selectOldBlockingPaths(
+      repoRoot,
+      changed,
+      policy.quietSeconds,
+      request.reservedPaths ?? [],
+      { from: base, to },
+      localOnlyPaths,
+    )
     if (!selection.ok) return refused(selection.error)
     if (selection.captures.length > 0) {
       combinedCaptures = selection.captures

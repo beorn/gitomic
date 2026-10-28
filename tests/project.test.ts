@@ -545,6 +545,63 @@ describe("gitomic project and checkout synchronization", () => {
       },
     )
 
+    // A local-only commit must be rewound before landing; even target-equal dirt needs capture on its paths.
+    test.each([false, true])(
+      "repair captures target-equal dirt on a locally committed path (remote edit=%s)",
+      async (remoteEdit) => {
+        const { checkout, landAtOrigin } = remoteFixture(true)
+        const baseBytes = readFileSync(join(checkout, "tracked.md"), "utf8")
+        writeFileSync(join(checkout, "tracked.md"), "# local committed edit\n")
+        git(checkout, "add", "tracked.md")
+        git(checkout, "commit", "-qm", "local-only tracked edit")
+        const targetBytes = remoteEdit ? "# remote tracked edit\n" : baseBytes
+        const target = landAtOrigin(remoteEdit ? "tracked.md" : "bystander.md", remoteEdit ? targetBytes : "# remote\n")
+        writeFileSync(join(checkout, "tracked.md"), targetBytes)
+        advancePastQuietPeriod()
+
+        const result = await projectCheckoutWithSetAside({ repoRoot: checkout })
+
+        expect(result, JSON.stringify(result)).toMatchObject({ ok: true, kind: "set-aside", to: target })
+        if (!result.ok || result.kind !== "set-aside") throw new Error("expected local dirt preservation")
+        expect(git(checkout, "show", `${result.preserveRef}:tracked.md`)).toBe(targetBytes.trim())
+        expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe(targetBytes)
+        expect(worktreeDirtyPaths(checkout)).toEqual([])
+      },
+    )
+
+    test("repair refuses an unverifiable landing match before preserving or clearing", async () => {
+      const { checkout, landAtOrigin } = remoteFixture(true)
+      writeFileSync(join(checkout, "local.md"), "# local work\n")
+      git(checkout, "add", "local.md")
+      git(checkout, "commit", "-qm", "local-only work")
+      const localTip = git(checkout, "rev-parse", "HEAD")
+      writeFileSync(join(checkout, "tracked.md"), "# conflicting dirt\n")
+      landAtOrigin("tracked.md", "# remote edit\n")
+      advancePastQuietPeriod()
+      const native = await vi.importActual<typeof import("node:child_process")>("node:child_process")
+      const mocked = vi.mocked(spawnSync)
+      mocked.mockImplementation((command, args, options) => {
+        const result = native.spawnSync(command, args, options)
+        if (command === "git" && args?.includes("hash-object") && args.includes("--path=tracked.md")) {
+          return { ...result, status: 128, stdout: "", stderr: "injected clean-filter failure" }
+        }
+        return result
+      })
+      try {
+        const result = await projectCheckoutWithSetAside({ repoRoot: checkout })
+
+        expect(result).toMatchObject({ ok: false, kind: "set-aside-refused" })
+        if (result.ok) throw new Error("expected unverifiable-match refusal")
+        expect(result.error).toContain("clean-filtering tracked.md")
+        expect(result.error).toContain("injected clean-filter failure")
+        expect(git(checkout, "for-each-ref", "refs/preserve/state-checkout/")).toBe("")
+        expect(git(checkout, "rev-parse", "HEAD")).toBe(localTip)
+        expect(readFileSync(join(checkout, "tracked.md"), "utf8")).toBe("# conflicting dirt\n")
+      } finally {
+        mocked.mockImplementation(native.spawnSync)
+      }
+    })
+
     test("a writer's reserved path is untouched even after the quiet period", async () => {
       const { checkout, landAtOrigin } = remoteFixture(true)
       writeFileSync(join(checkout, "tracked.md"), "# writer's preauthored bytes\n")
