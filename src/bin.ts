@@ -37,6 +37,7 @@ import {
   type Ident,
   type Oid,
   type OpenOptions,
+  type Reader,
   type RemoteFirstProjectionOutcome,
   type Snapshot,
   type Trailer,
@@ -311,6 +312,57 @@ const VERB_USAGE: Record<(typeof VERBS)[number], string> = {
   trust: "gitomic trust <repo>#<ref>",
 }
 
+/**
+ * Path-filtered history along the first-parent chain, paged until the requested matches are found or the root is
+ * reached. The single-page form threw "scan exhausted after 1024 commits" whenever the newest match sat deeper than
+ * one page, which broke the cycle's plan pin read (#31240) as soon as the last commit touching the plan passed the
+ * 1,024-commit window. `pageSize` is internal, so a test needs no 1,025-commit fixture.
+ */
+export async function logGlobMatches(options: {
+  reader: Reader
+  from: Oid
+  limit: number
+  glob: string
+  pageSize?: number
+}): Promise<{ commits: CommitMeta[]; walked: number }> {
+  const { reader, from, limit, glob, pageSize = HISTORY_SCAN_LIMIT } = options
+  const normalized = glob.normalize("NFC")
+  // Literal file history asks the existing scoped snapshot question, rather than expanding two whole trees.
+  // Other patterns retain glob semantics, including invalid/reserved path spellings that simply match nothing.
+  const literalPath =
+    !/[*?[]/u.test(normalized) && invalidTreePathReason(normalized) === undefined && isPublicPath(normalized)
+      ? normalized
+      : undefined
+  const commits: CommitMeta[] = []
+  let walked = 0
+  let cursor: string | null = from
+  while (cursor !== null && commits.length < limit) {
+    const page = await reader.log({ from: cursor, limit: pageSize })
+    if (page.length === 0) break
+    walked += page.length
+    for (const commit of page) {
+      if (literalPath !== undefined) {
+        const [before, after] = await Promise.all([
+          commit.parent === null ? Promise.resolve(undefined) : reader.at(commit.parent).oid(literalPath),
+          reader.at(commit.oid).oid(literalPath),
+        ])
+        if (before !== after) commits.push(commit)
+      } else {
+        const paths =
+          commit.parent === null
+            ? await reader.at(commit.oid).keys()
+            : (await reader.diff(commit.parent, commit.oid)).map(({ path }) => path)
+        if (paths.some((path) => matchGlob(glob, path))) commits.push(commit)
+      }
+      if (commits.length === limit) break
+    }
+    const last = page.at(-1)
+    // Only a full page proves the window was truncated; a short page means the chain ended.
+    cursor = page.length === pageSize && last?.parent != null ? last.parent : null
+  }
+  return { commits, walked }
+}
+
 const OK = 0
 const RUNTIME_ERROR = 1
 const USAGE_ERROR = 2
@@ -395,42 +447,16 @@ async function runLog(args: string[], stdout: CliWriter, stderr: CliWriter, sour
     using repository = await openAddressFor(address, source)
     const reader = await openReader(repository)
     from ??= await reader.head()
-    const history = await reader.log({ from, limit: glob === undefined ? limit : HISTORY_SCAN_LIMIT })
-    let commits: CommitMeta[] = history
-    if (glob !== undefined) {
-      const normalized = glob.normalize("NFC")
-      // Literal file history asks the existing scoped snapshot question, rather than expanding two whole trees.
-      // Other patterns retain glob semantics, including invalid/reserved path spellings that simply match nothing.
-      const literalPath =
-        !/[*?[]/u.test(normalized) && invalidTreePathReason(normalized) === undefined && isPublicPath(normalized)
-          ? normalized
-          : undefined
-      commits = []
-      for (const commit of history) {
-        if (literalPath !== undefined) {
-          const [before, after] = await Promise.all([
-            commit.parent === null ? Promise.resolve(undefined) : reader.at(commit.parent).oid(literalPath),
-            reader.at(commit.oid).oid(literalPath),
-          ])
-          if (before !== after) commits.push(commit)
-        } else {
-          const paths =
-            commit.parent === null
-              ? await reader.at(commit.oid).keys()
-              : (await reader.diff(commit.parent, commit.oid)).map(({ path }) => path)
-          if (paths.some((path) => matchGlob(glob, path))) commits.push(commit)
-        }
-        if (commits.length === limit) break
-      }
-      const scope = `${describeAddress(address, from)} filter=${JSON.stringify(glob)}; first-parent blob changes (mode-only changes excluded)`
-      if (commits.length < limit && history.length === HISTORY_SCAN_LIMIT && history.at(-1)?.parent !== null) {
-        throw new Error(
-          `scan exhausted after 1024 commits for ${scope}; found ${commits.length} of ${limit} requested matches, root not reached`,
-        )
-      }
+    let commits: CommitMeta[]
+    if (glob === undefined) {
+      commits = await reader.log({ from, limit })
+    } else {
+      const matched = await logGlobMatches({ reader, from, limit, glob })
+      commits = matched.commits
       if (commits.length < limit) {
+        const scope = `${describeAddress(address, from)} filter=${JSON.stringify(glob)}; first-parent blob changes (mode-only changes excluded)`
         const result = commits.length === 0 ? "no matches" : `returned ${commits.length} of ${limit} requested matches`
-        stderr.write(`gitomic: log: ${result} for ${scope}; reached root after ${history.length} commits\n`)
+        stderr.write(`gitomic: log: ${result} for ${scope}; reached root after ${matched.walked} commits\n`)
       }
     }
     stdout.write(

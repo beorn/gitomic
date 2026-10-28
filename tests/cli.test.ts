@@ -17,9 +17,9 @@ import { promisify } from "node:util"
 
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest"
 
-import { main, VERBS } from "../src/bin.js"
+import { logGlobMatches, main, VERBS } from "../src/bin.js"
 import { objectOid } from "../src/git-object.js"
-import { createShellBackend, open, type CommitMeta, type GitomicBackend } from "../src/index.js"
+import { createShellBackend, open, openReader, type CommitMeta, type GitomicBackend } from "../src/index.js"
 import { createMemBackend } from "../src/mem.js"
 import { perCommitReads, createBareRepo, git, gitWithInput } from "./helpers/git.js"
 
@@ -467,6 +467,72 @@ async function historyOfSize(size: number) {
   return { backend, store, tip: await store.head() }
 }
 
+describe("gitomic CLI — path-filtered log past one scan window (#31240)", () => {
+  test("pages the same first-parent chain instead of failing at the 1,024-commit window", async () => {
+    const backend = createMemBackend()
+    const store = await open({ repo: "repo", ref: "main", backend, writer: "history", clock: () => 946_684_800 })
+    const initial = await store.head()
+    const touchedAtStart = await store.transact(async (map) => map.set("plan.md", "v1"), "plan v1")
+    for (let index = 0; index < 8; index += 1) {
+      await store.transact(async (map) => map.set(`noise-${index}`, String(index)), `noise ${index}`)
+    }
+    const touchedNearTip = await store.transact(async (map) => map.set("plan.md", "v2"), "plan v2")
+    const reader = await openReader({ repo: "repo", ref: "main", backend })
+    const tip = await reader.head()
+
+    // Page size 4 puts the second match past the first window: the old single-window scan threw here.
+    const newest = await logGlobMatches({ reader, from: tip, limit: 1, glob: "plan.md", pageSize: 4 })
+    expect(newest.commits.map(({ oid }) => oid)).toEqual([touchedNearTip.oid])
+
+    const both = await logGlobMatches({ reader, from: tip, limit: 2, glob: "plan.md", pageSize: 4 })
+    expect(both.commits.map(({ oid }) => oid)).toEqual([touchedNearTip.oid, touchedAtStart.oid])
+
+    const none = await logGlobMatches({ reader, from: tip, limit: 1, glob: "never-touched.md", pageSize: 4 })
+    expect(none.commits).toEqual([])
+    // Root reached, so the walked count is the whole chain and the caller reports "no matches" rather than a refusal.
+    const chain = 1 + 1 + 8 + 1
+    expect(none.walked).toBe(chain)
+    expect(touchedAtStart.oid).not.toBe(initial)
+  })
+
+  test("never reports a merged-in second-parent touch while paging across the boundary", async () => {
+    const fixture = await createBareRepo()
+    try {
+      const blob = (content: string) => gitWithInput(fixture.repo, content, "hash-object", "-w", "--stdin")
+      const tree = (entries: Array<[string, string]>) =>
+        gitWithInput(fixture.repo, entries.map(([path, oid]) => `100644 blob ${oid}\t${path}\n`).join(""), "mktree")
+      const commit = (treeOid: string, parents: string[], message: string) =>
+        git(fixture.repo, "commit-tree", treeOid, ...parents.flatMap((parent) => ["-p", parent]), "-m", message)
+
+      const noise = await blob("noise\n")
+      const planV1 = await blob("plan v1\n")
+      const planV2 = await blob("plan v2\n")
+      // Noise commits keep plan.md byte-identical, so only the two deliberate edits count as touches.
+      const noiseTree = await tree([["noise.md", noise], ["plan.md", planV1]])
+      const planV1Tree = await tree([["noise.md", noise], ["plan.md", planV1]])
+      const planV2Tree = await tree([["noise.md", noise], ["plan.md", planV2]])
+
+      const root = await commit(planV1Tree, [], "root")
+      const second = await commit(noiseTree, [root], "noise 2")
+      const third = await commit(noiseTree, [second], "noise 3")
+      const side = await commit(planV2Tree, [third], "side touches plan")
+      const merged = await commit(noiseTree, [third, side], "merge side")
+      const sixth = await commit(noiseTree, [merged], "noise 6")
+      const seventh = await commit(planV2Tree, [sixth], "plan again")
+      await git(fixture.repo, "update-ref", "refs/heads/main", seventh)
+
+      const reader = await openReader({ repo: fixture.repo, ref: "main", backend: createShellBackend() })
+      const tip = await reader.head()
+      expect(tip).toBe(seventh)
+      const matches = await logGlobMatches({ reader, from: tip, limit: 5, glob: "plan.md", pageSize: 2 })
+      const subjects = matches.commits.map((commit) => commit.message.split("\n", 1)[0])
+      expect(subjects).toEqual(["plan again", "root"])
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+})
+
 describe("gitomic CLI — history reads", () => {
   test("log and diff expose anchored metadata and sorted blob changes in plain and JSON modes", async () => {
     const backend = createMemBackend()
@@ -606,19 +672,21 @@ describe("gitomic CLI — history reads", () => {
     }
   })
 
-  test("exactly 1024 records with a remaining parent fails before stdout unless the requested matches were found", async () => {
+  test("past 1024 records with a remaining parent pages to root and reports no matches without expanding whole trees", async () => {
     const { backend, tip } = await historyOfSize(1_025)
     // 29598: a literal-file lookup must not expand every tree; the real STATE specimen did so 2,048 times.
     // Existing cap/output coverage checked correctness but could not detect that allocation and I/O cost.
     const wholeTrees = vi.fn(backend.readTree)
+    // 31240: reaching root is a complete answer, not a refusal — the second page continues the same chain.
     const literal = await run({ ...backend, readTree: wholeTrees }, ["log", ADDRESS, "hh.hab.tsx", "-n", "4", "--json"])
-    expect(literal).toMatchObject({ code: 1, stdout: "" })
-    expect(literal.stderr).toContain("found 0 of 4")
+    expect(literal).toMatchObject({ code: 0, stdout: "[]\n" })
+    expect(literal.stderr).toContain("no matches")
+    expect(literal.stderr).toContain("reached root after 1025 commits")
     expect(wholeTrees).not.toHaveBeenCalled()
     for (const json of [[], ["--json"]]) {
       const result = await run(backend, ["log", ADDRESS, "absent/**", "-n", "1", ...json])
-      expect(result).toMatchObject({ code: 1, stdout: "" })
-      for (const fact of [ADDRESS, tip, "absent/**", "1024", "first-parent"]) expect(result.stderr).toContain(fact)
+      expect(result).toMatchObject({ code: 0, stdout: json.length > 0 ? "[]\n" : "" })
+      for (const fact of [ADDRESS, tip, "absent/**", "1025", "first-parent"]) expect(result.stderr).toContain(fact)
     }
     let reads = 0
     const observed: GitomicBackend = {
