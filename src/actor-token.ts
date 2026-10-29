@@ -52,7 +52,8 @@ export function parseActorTokenDeclaration(
 }
 
 /**
- * The character classes a session value may not hold, by name: each would end the trailer line and start a forged one.
+ * The character classes a session value may not hold, by name. A carriage return or line feed would end the trailer
+ * line and start a forged one; NUL and the other control characters are refused as unreadable.
  * A colon is allowed: a trailer line is `Key: value` and every reader takes the key up to the FIRST colon, so a colon
  * stays inside the value. A Hab timer run's sid is its run id, `<service>:<ms>` (31526, @cto 1090434c).
  */
