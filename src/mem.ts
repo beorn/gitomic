@@ -30,9 +30,11 @@ import type {
   PublishResult,
   RefSwap,
   RefUpdate,
+  TreeChange,
   TreeEntry,
   TreeListing,
 } from "./types.js"
+import { diffTreeListings } from "./types.ts"
 import { rejectLegacyProvenance, validateRefNames } from "./options.ts"
 import { assertGitPrefixMatched, assertTreePath, normalizePath, normalizePrefix } from "./path.ts"
 import {
@@ -140,6 +142,10 @@ export function createMemBackend(): GitomicBackend {
     if (content === undefined) return undefined
     return { oid: blobOid(repo, content), mode: "100644" }
   }
+
+  // Mem holds every commit's files already, so the change is its two listings compared: parity, not a bound.
+  const readTreeDiff = async (name: string, from: Oid, to: Oid): Promise<readonly TreeChange[]> =>
+    diffTreeListings(await readTree(name, from), await readTree(name, to))
 
   const readBlobs = async (name: string, oids: readonly Oid[]): Promise<ReadonlyMap<Oid, BlobValue>> => {
     const repo = getRepo(name)
@@ -374,6 +380,7 @@ export function createMemBackend(): GitomicBackend {
       }),
     readTree,
     readTreeExact,
+    readTreeDiff,
     readBlobs,
     writeCommit,
     compareAndSwap,

@@ -244,6 +244,37 @@ export type TreeEntry = {
 /** A tree's regular blobs by path, with no value decoded: what a transaction is strict about. */
 export type TreeListing = ReadonlyMap<string, TreeEntry>
 
+/**
+ * One path whose entry differs between two trees: its entry on each side, `undefined` where the path is absent. A
+ * mode-only change is a change here; a Reader's `diff`, which compares blob identities, leaves it out.
+ */
+export type TreeChange = {
+  readonly path: string
+  readonly from: TreeEntry | undefined
+  readonly to: TreeEntry | undefined
+}
+
+/** Tree changes in path order: the order a listing comparison yields, whatever order the backend read them in. */
+export function sortTreeChanges(changes: TreeChange[]): TreeChange[] {
+  return changes.sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0))
+}
+
+/**
+ * The changes between two listings a backend already holds: the mem and iso answer to `readTreeDiff`, whose
+ * listings are what their reads produce anyway. A path changes when its oid or its mode differs.
+ */
+export function diffTreeListings(before: TreeListing, after: TreeListing): TreeChange[] {
+  const changes: TreeChange[] = []
+  for (const [path, from] of before) {
+    const to = after.get(path)
+    if (to === undefined || to.oid !== from.oid || to.mode !== from.mode) changes.push({ path, from, to })
+  }
+  for (const [path, to] of after) {
+    if (!before.has(path)) changes.push({ path, from: undefined, to })
+  }
+  return sortTreeChanges(changes)
+}
+
 export type GitomicBackend = {
   /** Repository object format, independent of refs and object contents; shell caches it per Git directory. */
   objectFormat(repo: string): Promise<"sha1" | "sha256">
@@ -273,6 +304,17 @@ export type GitomicBackend = {
    * @cto 0f5c2039).
    */
   readTreeExact(repo: string, commit: Oid, path: string): Promise<TreeEntry | undefined>
+  /**
+   * The paths whose entry, oid or mode, differs between the trees of commits `from` and `to`, sorted by path, with
+   * neither tree listed: what this holds grows with the change, not the tree (#29809). The shell backend runs ONE
+   * `git diff-tree -r -z --no-renames` per pair. There is no rename or copy detection: a path is an identity, so a
+   * file that becomes a directory is the file deleted and each path below it added.
+   *
+   * Each side's entry is in the listing vocabulary, narrowed and refused by name through the same
+   * `assertTreeEntryMode` boundary `readTree` uses; whether that mode is ACCEPTABLE stays a policy applied where an
+   * entry is exposed. A commit the repository does not hold throws naming it, also when `from` equals `to`.
+   */
+  readTreeDiff(repo: string, from: Oid, to: Oid): Promise<readonly TreeChange[]>
   /**
    * Read the named blobs, by oid, in ONE read. The oids are deduplicated; an
    * oid the repository does not hold, or that is not a blob, throws naming it.

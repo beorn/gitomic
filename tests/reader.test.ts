@@ -7,9 +7,10 @@ import { promisify } from "node:util"
 
 import { describe, expect, test, vi } from "vitest"
 
-import { open, openReader } from "../src/index.js"
+import { createShellBackend, open, openReader } from "../src/index.js"
 import type { GitomicBackend } from "../src/index.js"
-import { perCommitReads } from "./helpers/git.js"
+import { isPublicPath } from "../src/path.js"
+import { createBareRepo, git, gitWithInput, perCommitReads } from "./helpers/git.js"
 import { createMemBackend } from "../src/mem.js"
 
 describe("read-only reader", () => {
@@ -208,7 +209,7 @@ describe("read-only reader", () => {
     expect(result.retainedBytes).toBeLessThan(4 * 1024 * 1024)
   })
 
-  test("diff sorts add/remove/modify identities and respects the backend file projection", async () => {
+  test("diff sorts add/remove/modify identities and respects the backend's diff projection", async () => {
     const mem = createMemBackend()
     const repo = "reader-projected-diff"
     const writer = await open({ repo, ref: "main", backend: mem })
@@ -223,11 +224,12 @@ describe("read-only reader", () => {
       map.set("visible/add", "new")
       map.set("hidden/noise", "after")
     }, "after")
-    const readTree = vi.fn(
-      async (name: string, oid: string, prefix?: string) =>
-        new Map([...(await mem.readTree(name, oid, prefix))].filter(([path]) => path.startsWith("visible/"))),
+    // A backend that projects its listing projects its diff too: diff reads the change, never either listing.
+    const readTree = vi.fn(mem.readTree)
+    const readTreeDiff = vi.fn(async (name: string, from: string, to: string) =>
+      (await mem.readTreeDiff(name, from, to)).filter(({ path }) => path.startsWith("visible/")),
     )
-    const reader = await openReader({ repo, backend: { ...mem, readTree } })
+    const reader = await openReader({ repo, backend: { ...mem, readTree, readTreeDiff } })
     expect(await reader.diff(first.oid, second.oid)).toEqual([
       { path: "visible/add", from: null, to: await writer.at(second.oid).oid("visible/add") },
       {
@@ -237,11 +239,12 @@ describe("read-only reader", () => {
       },
       { path: "visible/remove", from: await writer.at(first.oid).oid("visible/remove"), to: null },
     ])
-    expect(readTree).toHaveBeenCalledTimes(2)
+    expect(readTreeDiff).toHaveBeenCalledTimes(1)
+    expect(readTree).not.toHaveBeenCalled()
     expect(await reader.diff(second.oid, second.oid)).toEqual([])
   })
 
-  test("diff values do not retain the backing storage of whole tree listings", async () => {
+  test("diff values do not retain the backing storage of the backend's change read", async () => {
     // The accepted lifetime contract concerns Bun's sliced strings, even when Vitest runs on Node.
     // Keep all three changed identities alive across GC: equality tests cannot detect their backing storage.
     const { stdout, stderr } = await promisify(execFile)(
@@ -259,16 +262,22 @@ describe("read-only reader", () => {
           const newOid = "d".repeat(40);
           const backend = {
             ...createMemBackend(),
-            async readTree(_repo, commit) {
-              const records = commit === before
-                ? [["notes/change-雪.md", oldOid], ["notes/remove-🦊.md", oldOid]]
-                : [["notes/add-é.md", newOid], ["notes/change-雪.md", newOid]];
-              const listing = Buffer.from("x".repeat(8 * 1024 * 1024) + "\\0" +
-                records.map(([path, oid]) => oid + "\\t" + path).join("\\0"), "utf8").toString("utf8");
-              return new Map(listing.split("\\0").slice(1).map(record => {
-                const tab = record.indexOf("\\t");
-                return [record.slice(tab + 1), { oid: record.slice(0, tab), mode: "100644" }];
-              }));
+            async readTreeDiff() {
+              const records = [
+                ["notes/add-é.md", "", newOid],
+                ["notes/change-雪.md", oldOid, newOid],
+                ["notes/remove-🦊.md", oldOid, ""],
+              ];
+              const read = Buffer.from("x".repeat(8 * 1024 * 1024) + "\\0" +
+                records.map((fields) => fields.join("\\t")).join("\\0"), "utf8").toString("utf8");
+              return read.split("\\0").slice(1).map(record => {
+                const [path, fromOid, toOid] = record.split("\\t");
+                return {
+                  path,
+                  from: fromOid === "" ? undefined : { oid: fromOid, mode: "100644" },
+                  to: toOid === "" ? undefined : { oid: toOid, mode: "100644" },
+                };
+              });
             },
           };
           const reader = await openReader({ repo: "reader-owned-diff", backend });
@@ -295,7 +304,7 @@ describe("read-only reader", () => {
       { path: "notes/change-雪.md", from: "c".repeat(40), to: "d".repeat(40) },
       { path: "notes/remove-🦊.md", from: "c".repeat(40), to: null },
     ])
-    // Allow runtime noise far beyond these few hundred bytes, but never either 8 MiB listing.
+    // Allow runtime noise far beyond these few hundred bytes, but never the 8 MiB read.
     expect(result.retainedBytes).toBeLessThan(4 * 1024 * 1024)
   })
 
@@ -315,28 +324,111 @@ describe("read-only reader", () => {
   })
 
   test.each(["120000", "160000"] as const)(
-    "diff refuses unchanged unsupported mode %s in its whole scope",
+    "diff refuses a changed entry with unsupported mode %s by name; an unchanged one is not exposed",
     async (mode) => {
-      const mem = createMemBackend()
-      const repo = `reader-diff-mode-${mode}`
-      const writer = await open({ repo, ref: "main", backend: mem })
-      const first = await writer.transact(async (map) => map.set("changed", "before"), "before")
-      const second = await writer.transact(async (map) => map.set("changed", "after"), "after")
-      const backend: GitomicBackend = {
-        ...mem,
-        readTree: async (name, commit, prefix) => {
-          const listing = new Map(await mem.readTree(name, commit, prefix))
-          listing.set("unchanged/unsupported", { mode, oid: first.oid })
-          return listing
-        },
-      }
-      const reader = await openReader({ repo, backend })
-      const reason = `unsupported Git tree mode ${mode} at "unchanged/unsupported"`
+      const fixture = await createBareRepo()
+      try {
+        const { repo } = fixture
+        const blob = (text: string) => gitWithInput(repo, text, "hash-object", "-w", "--stdin")
+        const commit = async (entries: string) =>
+          git(repo, "commit-tree", await gitWithInput(repo, entries, "mktree", "-z"), "-m", "fixture")
+        const type = mode === "160000" ? "commit" : "blob"
+        const emptyTree = await gitWithInput(repo, "", "mktree")
+        const [target, other] =
+          mode === "160000"
+            ? [fixture.initial, await git(repo, "commit-tree", emptyTree, "-m", "other")]
+            : [await blob("target"), await blob("other")]
+        const before = await blob("before\n")
+        const after = await blob("after\n")
+        const unsupported = (oid: string) => `${mode} ${type} ${oid}\tunsupported\0`
+        const first = await commit(`100644 blob ${before}\tchanged\0` + unsupported(target))
+        const second = await commit(`100644 blob ${after}\tchanged\0` + unsupported(target))
+        const moved = await commit(`100644 blob ${after}\tchanged\0` + unsupported(other))
+        const without = await commit(`100644 blob ${after}\tchanged\0`)
+        const reader = await openReader({ repo, backend: createShellBackend() })
+        const reason = `unsupported Git tree mode ${mode} at "unsupported"`
 
-      await expect(reader.diff(first.oid, second.oid)).rejects.toThrow(reason)
-      await expect(reader.diff(second.oid, second.oid)).rejects.toThrow(reason)
+        // 27226: a verb validates the entries it EXPOSES. An unchanged entry is not in the diff, so it is not exposed.
+        expect(await reader.diff(first, second)).toEqual([{ path: "changed", from: before, to: after }])
+        expect(await reader.diff(second, second)).toEqual([])
+        // A changed entry is exposed: moved on both sides, or present on the one side that adds or deletes it.
+        await expect(reader.diff(second, moved)).rejects.toThrow(reason)
+        await expect(reader.diff(without, second)).rejects.toThrow(reason)
+        await expect(reader.diff(second, without)).rejects.toThrow(reason)
+      } finally {
+        await fixture.cleanup()
+      }
     },
   )
+
+  test("diff answers what comparing the two whole listings answered, on the reader fixtures", async () => {
+    // The answer diff gave before #29809 C2, from two whole listings, kept as the oracle the one tree diff must equal.
+    const listingDiff = async (backend: GitomicBackend, repo: string, from: string, to: string) => {
+      const [before, after] = await Promise.all([backend.readTree(repo, from), backend.readTree(repo, to)])
+      return [...new Set([...before.keys(), ...after.keys()])]
+        .filter(isPublicPath)
+        .sort()
+        .flatMap((path) => {
+          const fromOid = before.get(path)?.oid ?? null
+          const toOid = after.get(path)?.oid ?? null
+          return fromOid === toOid ? [] : [{ path, from: fromOid, to: toOid }]
+        })
+    }
+    const fixture = await createBareRepo()
+    try {
+      const backends: readonly { repo: string; backend: GitomicBackend }[] = [
+        { repo: "reader-equivalence", backend: createMemBackend() },
+        { repo: fixture.repo, backend: createShellBackend() },
+      ]
+      for (const { repo, backend } of backends) {
+        const writer = await open({ repo, ref: "main", backend })
+        const initial = await writer.head()
+        const one = await writer.transact(async (map) => map.set("notes/one.md", "one\n"), "write one")
+        const two = await writer.transact(async (map) => map.set("notes/two.md", "two\n"), "write two")
+        const first = await writer.transact(async (map) => {
+          map.set("visible/remove", "gone")
+          map.set("visible/change", "before")
+          map.set("hidden/noise", "before")
+        }, "before")
+        const second = await writer.transact(async (map) => {
+          map.delete("visible/remove")
+          map.set("visible/change", "after")
+          map.set("visible/add", "new")
+          map.set("hidden/noise", "after")
+          map.delete("notes/one.md")
+        }, "after")
+        const reader = await openReader({ repo, backend })
+        const commits = [initial, one.oid, two.oid, first.oid, second.oid]
+        for (const from of commits) {
+          for (const to of commits) {
+            expect(await reader.diff(from, to)).toEqual(await listingDiff(backend, repo, from, to))
+          }
+        }
+      }
+      // A mode-only change: the listings compared oids only, so it was no Change, and it is none now.
+      const { repo } = fixture
+      const script = await gitWithInput(repo, "#!/bin/sh\n", "hash-object", "-w", "--stdin")
+      const plain = await git(
+        repo,
+        "commit-tree",
+        await gitWithInput(repo, `100644 blob ${script}\trun.sh\0`, "mktree", "-z"),
+        "-m",
+        "plain",
+      )
+      const executable = await git(
+        repo,
+        "commit-tree",
+        await gitWithInput(repo, `100755 blob ${script}\trun.sh\0`, "mktree", "-z"),
+        "-m",
+        "x",
+      )
+      const reader = await openReader({ repo, backend: createShellBackend() })
+      expect(await reader.diff(plain, executable)).toEqual([])
+      expect(await listingDiff(createShellBackend(), repo, plain, executable)).toEqual([])
+    } finally {
+      await fixture.cleanup()
+    }
+  })
 
   test("defaults to main and validates refs before invoking the backend", async () => {
     const mem = createMemBackend()
