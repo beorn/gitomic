@@ -51,12 +51,15 @@ export function parseActorTokenDeclaration(
   })
 }
 
-/** The character classes a session value may not hold, by name: each would split or forge a trailer line. */
+/**
+ * The character classes a session value may not hold, by name: each would end the trailer line and start a forged one.
+ * A colon is allowed: a trailer line is `Key: value` and every reader takes the key up to the FIRST colon, so a colon
+ * stays inside the value. A Hab timer run's sid is its run id, `<service>:<ms>` (31526, @cto 1090434c).
+ */
 const SESSION_REFUSALS: readonly (readonly [RegExp, string])[] = [
   [/\r/u, "a carriage return"],
   [/\n/u, "a line feed"],
   [/\0/u, "a NUL"],
-  [/:/u, "a colon"],
   // eslint-disable-next-line no-control-regex -- the refusal is exactly the remaining C0 controls and DEL.
   [/[\u0001-\u001f\u007f]/u, "a control character"],
 ]

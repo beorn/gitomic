@@ -52,6 +52,12 @@
 
 ### Changed
 
+- `actorTrailersFromToken` accepts a colon in the session claim. A trailer line is `Key: value` and every
+  reader takes the key up to the first colon, so a colon stays inside the one `Actor-Session` value; carriage
+  return, line feed, NUL and the other control characters stay refused, since only a line break can forge a
+  trailer. A Hab timer run's session is its run id, `<service>:<ms>`, and was refused, so every timer-run
+  service write lost both trailers.
+
 - A remote chain read fetches only what it does not already hold. The remote's answer is still taken
   fresh on every read — the `ls-remote` is unchanged and is what the read returns — and the
   `git fetch` is skipped when the oid just listed already sits at gitomic's private fetched ref. What

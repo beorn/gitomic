@@ -1,5 +1,6 @@
-// @failure Two callers decode the same actor token differently, a token with a line break or colon in its session forges
-// a trailer, an oversized token is decoded at all, or a refusal leaks the token into a warning.
+// @failure Two callers decode the same actor token differently, a token with a line break in its session forges a
+// trailer, a colon-joined session (a Hab timer run's id) loses both trailers, an oversized token is decoded at all, or a
+// refusal leaks the token into a warning.
 // @level l1
 // @consumer km's caller attribution and hh's CODE commit-msg hook, which both stamp these trailers (who-acted WA-R12, WA-R14)
 // @testonly none
@@ -57,7 +58,6 @@ describe("actorTrailersFromToken", () => {
     ["a CR in the session", token({ sid: "a\rb", gen: 1 }), /claim sid contains a carriage return/u],
     ["an LF in the session", token({ sid: "a\nActor-Session: forged", gen: 1 }), /claim sid contains a line feed/u],
     ["a NUL in the session", token({ sid: "a\0b", gen: 1 }), /claim sid contains a NUL/u],
-    ["a colon in the session", token({ sid: "Actor-Session:forged", gen: 1 }), /claim sid contains a colon/u],
     ["a tab in the session", token({ sid: "a\tb", gen: 1 }), /claim sid contains a control character/u],
     ["surrounding whitespace in the session", token({ sid: " a", gen: 1 }), /claim sid has surrounding whitespace/u],
     ["a missing generation claim", token({ sid: "a" }), /claim gen is missing/u],
@@ -72,6 +72,20 @@ describe("actorTrailersFromToken", () => {
     // A reason names the cause, never the token: a warning must not leak a credential into a log.
     expect("reason" in result ? result.reason : "").not.toContain(raw)
   })
+
+  // A trailer line is `Key: value`, and every reader takes the key up to the FIRST colon, so a colon in the value
+  // forges nothing; only a line break does. A Hab timer run's sid is its run id, `<service>:<ms>` (31526, @cto 1090434c).
+  test.each(["dark-work:1793230159269", "Actor-Session:forged"])(
+    "a colon in the session %s decodes to one Actor-Session trailer holding the whole value",
+    (sid) => {
+      expect(actorTrailersFromToken(token({ sid, gen: 0 }), DECLARATION)).toEqual({
+        trailers: [
+          ["Actor-Session", sid],
+          ["Actor-Generation", "0"],
+        ],
+      })
+    },
+  )
 
   test("a token of exactly the byte limit is decoded; one byte more is refused", () => {
     const head = `e30.${b64(JSON.stringify({ sid: "a", gen: 1 }))}.`
