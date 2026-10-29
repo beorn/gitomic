@@ -24,8 +24,17 @@ import { createDurableObjectWriter } from "./iso-durable.ts"
 import { rejectLegacyProvenance } from "./options.ts"
 import { assertGitPrefixMatched, assertRegularBlob, assertTreePath, normalizePath, normalizePrefix } from "./path.ts"
 import { createShellRuntime } from "./shell.ts"
-import { assertTreeEntryMode } from "./types.ts"
-import type { BlobValue, CommitInput, GitomicBackend, Oid, TreeEntry, TreeEntryMode, TreeListing } from "./types.js"
+import { assertTreeEntryMode, diffTreeListings } from "./types.ts"
+import type {
+  BlobValue,
+  CommitInput,
+  GitomicBackend,
+  Oid,
+  TreeChange,
+  TreeEntry,
+  TreeEntryMode,
+  TreeListing,
+} from "./types.js"
 import { decodeBlob } from "./utf8.ts"
 
 type BlobEntry = {
@@ -150,6 +159,11 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
     }
     return undefined
   }
+
+  // isomorphic-git has no tree-to-tree diff, so the change is the two listings compared: parity with shell, not its
+  // bound; a walk pruned at equal subtree oids can come later on evidence (#29809).
+  const readTreeDiff = async (repo: string, from: Oid, to: Oid): Promise<readonly TreeChange[]> =>
+    diffTreeListings(await listTree(repo, from), await listTree(repo, to))
 
   const readBlobBatch = async (repo: string, oids: readonly Oid[]): Promise<ReadonlyMap<Oid, BlobValue>> => {
     const gitdir = await resolveGitDir(repo)
@@ -300,6 +314,7 @@ export function createIsoBackend(options: { fs?: FsClient } = {}): GitomicBacken
     },
     readTree: listTree,
     readTreeExact,
+    readTreeDiff,
     readBlobs: readBlobBatch,
     readCommit: async (repo, oid) => {
       validateOid(oid)

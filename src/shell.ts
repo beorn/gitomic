@@ -49,7 +49,7 @@ import {
   validateOid,
 } from "./git-object.ts"
 import { assertGitPrefixMatched, assertTreePath, normalizePath, normalizePrefix } from "./path.ts"
-import { assertTreeEntryMode } from "./types.ts"
+import { assertTreeEntryMode, sortTreeChanges } from "./types.ts"
 import type {
   BlobValue,
   CommitInput,
@@ -61,6 +61,7 @@ import type {
   PublishResult,
   RefSwap,
   RefUpdate,
+  TreeChange,
   TreeEntry,
   TreeListing,
 } from "./types.js"
@@ -265,6 +266,7 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
     },
     readTree: async (repo, commit, prefix) => readTree(await resolveGitDir(repo), commit, prefix, baseEnv),
     readTreeExact: async (repo, commit, path) => readTreeExact(await resolveGitDir(repo), commit, path, baseEnv),
+    readTreeDiff: async (repo, from, to) => readTreeDiff(await resolveGitDir(repo), from, to, baseEnv),
     readBlobs: async (repo, oids) => readBlobs(await resolveGitDir(repo), oids, baseEnv),
     // A completed commit is unreferenced until the compare-and-swap below adopts
     // it. Gitomic writes NO ref to protect that window: Git's default gc grace
@@ -963,7 +965,7 @@ async function readTree(repo: string, commit: Oid, prefix?: string, baseEnv?: No
   const normalizedPrefix = prefix === undefined ? "" : normalizePrefix(prefix)
   const listing = await git(repo, ["ls-tree", "-r", "-z", "--full-tree", commit], { baseEnv })
   const entries = new Map<string, TreeEntry>()
-  for (const record of decodeUtf8(listing, "Git tree paths").split("\0")) {
+  for (const record of treeFields(listing)) {
     if (!record) continue
     const separator = record.indexOf("\t")
     if (separator < 0) throw new Error("git ls-tree returned a malformed record")
@@ -1002,7 +1004,7 @@ async function readTreeExact(
   const output = await git(repo, ["ls-tree", "-z", "--full-tree", commit, "--", `:(literal)${normalized}`], {
     baseEnv,
   })
-  const records = decodeUtf8(output, "Git tree paths").split("\0")
+  const records = treeFields(output)
   let found: TreeEntry | undefined
   for (const record of records) {
     if (!record) continue
@@ -1029,6 +1031,77 @@ async function readTreeExact(
     if (type === "tree") return undefined
   }
   return found
+}
+
+/**
+ * The NUL-separated fields of one `-z` tree read, every path byte decoded through the one UTF-8 check: `ls-tree` and
+ * `diff-tree` print the same path bytes, so they are read the same way.
+ */
+function treeFields(output: Buffer): string[] {
+  return decodeUtf8(output, "Git tree paths").split("\0")
+}
+
+const DIFF_TREE_OID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/
+
+/**
+ * One `diff-tree -r -z --no-renames --no-abbrev --no-ext-diff` per pair. Git compares the two trees subtree oid by
+ * subtree oid, so an unchanged directory is never read and the output is the change, not the tree (#29809).
+ *
+ * Each record is `:<mode> <mode> <oid> <oid> <status>`, a NUL, then the path and a NUL; mode 000000 with the zero
+ * oid is the side where the path is absent. `--no-renames` leaves A, D, M and T as the only statuses, so any other
+ * status, or a record whose sides do not parse or disagree with its status, is refused naming the record rather than
+ * read as a change. Each side's mode is narrowed through the `assertTreeEntryMode` boundary readTree uses, naming
+ * that side's commit. A commit the repository does not hold fails in Git, whose error names it.
+ */
+async function readTreeDiff(
+  repo: string,
+  from: Oid,
+  to: Oid,
+  baseEnv?: NodeJS.ProcessEnv,
+): Promise<readonly TreeChange[]> {
+  validateOid(from)
+  validateOid(to)
+  const output = await git(repo, ["diff-tree", "-r", "-z", "--no-renames", "--no-abbrev", "--no-ext-diff", from, to], {
+    baseEnv,
+  })
+  const fields = treeFields(output)
+  const refuse = (record: string, reason: string): Error =>
+    new Error(`git diff-tree returned ${reason} for ${from}..${to}: ${JSON.stringify(record)}`)
+  // Every field ends with a NUL, so a complete output splits into an empty field after its last path.
+  const last = fields.pop()
+  if (last !== "") throw refuse(last ?? "", "an unterminated record")
+  const changes: TreeChange[] = []
+  for (let index = 0; index < fields.length; index += 2) {
+    const record = fields[index] ?? ""
+    const path = fields[index + 1]
+    if (path === undefined || path === "") throw refuse(record, "a record with no path")
+    const shown = `${record}\0${path}`
+    const metadata = record.startsWith(":") ? record.slice(1).split(" ") : []
+    if (metadata.length !== 5) throw refuse(shown, "a malformed record")
+    const [fromMode = "", toMode = "", fromOid = "", toOid = "", status = ""] = metadata
+    const side = (mode: string, oid: string, commit: Oid): TreeEntry | undefined => {
+      if (!DIFF_TREE_OID.test(oid)) throw refuse(shown, "a malformed object id")
+      if (mode === "000000") {
+        if (!isZeroOid(oid)) throw refuse(shown, "an absent side with an object id")
+        return undefined
+      }
+      if (isZeroOid(oid)) throw refuse(shown, "a present side with the zero object id")
+      return { oid, mode: assertTreeEntryMode(mode, path, commit) }
+    }
+    const before = side(fromMode, fromOid, from)
+    const after = side(toMode, toOid, to)
+    const agrees =
+      status === "A"
+        ? before === undefined && after !== undefined
+        : status === "D"
+          ? before !== undefined && after === undefined
+          : (status === "M" || status === "T") && before !== undefined && after !== undefined
+    if (!agrees) {
+      throw refuse(shown, `status ${JSON.stringify(status)} against its sides (A adds, D deletes, M and T change both)`)
+    }
+    changes.push({ path, from: before, to: after })
+  }
+  return sortTreeChanges(changes)
 }
 
 /** One `cat-file --batch` for the distinct oids; a missing object or a non-blob fails naming the oid. */

@@ -1,6 +1,31 @@
 # Changelog
 
-## Unreleased
+## 0.11.0 — 2026-10-28
+
+### Breaking
+
+- `GitomicBackend.readTreeDiff(repo, from, to)` is required (#29809): the paths
+  whose entry, oid or mode, differs between two commits' trees, as `TreeChange`
+  `{ path, from, to }` (a `TreeEntry` on each side, `undefined` where the path is
+  absent), sorted by path, with neither tree listed. The shell backend runs one
+  `git diff-tree -r -z --no-renames --no-abbrev --no-ext-diff` per pair, so what
+  it holds grows with the change, not the tree; mem and iso compare the listings
+  they hold. A status outside A, D, M and T, or a record that does not parse, is
+  refused naming the record; a mode outside the listing vocabulary is refused by
+  name, as `readTree` refuses it. Custom backends must implement it, and its
+  answer must equal comparing the two `readTree` listings. A wrapper that
+  projects `readTree` must project `readTreeDiff` too: spreading a backend passes
+  it through unprojected.
+
+### Changed
+
+- `Reader.diff` reads one `readTreeDiff` instead of two whole listings (#29809)
+  and validates only the entries it returns (27226: a verb validates the paths it
+  exposes). A changed symlink or gitlink still refuses by name; an unchanged one
+  no longer refuses the whole diff. The `Change[]` shape, the internal-path filter
+  and the oid-only comparison are unchanged, so a mode-only change is still not a
+  `Change`. A backend that projected `diff` through `readTree` alone now projects
+  it through `readTreeDiff`.
 
 ### Added
 

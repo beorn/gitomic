@@ -41,7 +41,7 @@ import {
   TreePathCollision,
 } from "./errors.ts"
 import { cloneIdent, GITOMIC_IDENT, validateOid } from "./git-object.ts"
-import { assertTreeShape, normalizePath, normalizePrefix } from "./path.ts"
+import { assertTreeShape, isPublicPath, normalizePath, normalizePrefix } from "./path.ts"
 export { assertRegularBlob, invalidTreePathReason } from "./path.ts"
 import { assertExposed, createSnapshotBase, readLazyBase, type LazyBase } from "./lazy-base.ts"
 import { createShellBackend } from "./shell.ts"
@@ -71,6 +71,7 @@ import type {
   SequenceStep,
   Store,
   Trailer,
+  TreeEntry,
 } from "./types.js"
 import { assertUtf8, decodeUtf8 } from "./utf8.ts"
 
@@ -210,6 +211,7 @@ export type {
   Trailer,
   Store,
   TransactOptions,
+  TreeChange,
   TreeEntry,
   TreeListing,
   Update,
@@ -380,24 +382,26 @@ export async function openReader(options: OpenReaderOptions): Promise<Reader> {
     async diff(from, to) {
       validateOid(from)
       validateOid(to)
-      // Diff exposes both whole trees; readLazyBase reuses the whole-exposure validation that keys() applied.
-      const [before, after] = await Promise.all([
-        readLazyBase(context.backend, context.repo, from),
-        readLazyBase(context.backend, context.repo, to),
-      ])
+      // ONE tree-to-tree diff, neither tree listed (#29809). Diff exposes only the entries it returns, so the 27226 rule
+      // (each verb validates the paths it EXPOSES) checks those entries, each side as the tree it came from: a changed
+      // symlink or gitlink still refuses by name, an unchanged one is not exposed. A Change is a blob identity, so a
+      // mode-only change is not one.
+      const before = new Map<string, TreeEntry>()
+      const after = new Map<string, TreeEntry>()
       const changes: Change[] = []
-      for (const path of [...new Set([...before.publicPaths(), ...after.publicPaths()])].sort()) {
-        const beforeOid = before.oid(path)
-        const afterOid = after.oid(path)
-        if (beforeOid !== afterOid) {
-          // Own these small values: backend slices can otherwise keep whole tree listings alive.
-          changes.push({
-            path: ownUtf8(path),
-            from: beforeOid === undefined ? null : ownUtf8(beforeOid),
-            to: afterOid === undefined ? null : ownUtf8(afterOid),
-          })
-        }
+      for (const change of await context.backend.readTreeDiff(context.repo, from, to)) {
+        if (!isPublicPath(change.path) || change.from?.oid === change.to?.oid) continue
+        if (change.from !== undefined) before.set(change.path, change.from)
+        if (change.to !== undefined) after.set(change.path, change.to)
+        // Own these small values: backend slices can otherwise keep the backend's whole read alive.
+        changes.push({
+          path: ownUtf8(change.path),
+          from: change.from === undefined ? null : ownUtf8(change.from.oid),
+          to: change.to === undefined ? null : ownUtf8(change.to.oid),
+        })
       }
+      assertExposed(before, [...before.keys()])
+      assertExposed(after, [...after.keys()])
       return changes
     },
     watch: (watchOptions) => watchRef(context, watchOptions),
