@@ -393,7 +393,7 @@ async function runRead(args: string[], stdout: CliWriter, source: AddressSource)
   const { positionals, flags } = extractFlags(args, { "--at": "value" })
   const address = requirePositional(positionals, 0, "<address>")
   const path = requirePositional(positionals, 1, "<path>")
-  const at: Oid | undefined = optionalStringFlag(flags, "--at")
+  const at = oidFlag(flags, "--at")
   using repository = await openAddressFor(address, source)
   const reader = await openReader(repository)
   const value = await reader.at(at).get(path)
@@ -406,7 +406,7 @@ async function runLs(args: string[], stdout: CliWriter, source: AddressSource): 
   const { positionals, flags } = extractFlags(args, { "--at": "value" })
   const address = requirePositional(positionals, 0, "<address>")
   const glob = positionals.at(1)
-  const at: Oid | undefined = optionalStringFlag(flags, "--at")
+  const at = oidFlag(flags, "--at")
   using repository = await openAddressFor(address, source)
   const reader = await openReader(repository)
   for (const key of await matchingKeys(reader.at(at), glob)) stdout.write(`${key}\n`)
@@ -419,7 +419,7 @@ async function runGrep(args: string[], stdout: CliWriter, stderr: CliWriter, sou
   const pattern = requirePositional(positionals, 1, "<pattern>")
   const glob = positionals.at(2)
   assertNoExtraPositionals(positionals, 3, "<addr> <pattern> [glob]", "grep")
-  const at: Oid | undefined = optionalStringFlag(flags, "--at")
+  const at = oidFlag(flags, "--at")
   const regex = compilePattern(pattern)
   using repository = await openAddressFor(address, source)
   const reader = await openReader(repository)
@@ -452,8 +452,8 @@ async function runLog(args: string[], stdout: CliWriter, stderr: CliWriter, sour
   const address = requirePositional(positionals, 0, "<address>")
   assertNoExtraPositionals(positionals, 2, "<addr> [glob]", "log")
   const glob = positionals.at(1)
-  let from = historyOidFlag(flags, "--at")
-  const stopAt = historyOidFlag(flags, "--stop-at")
+  let from = oidFlag(flags, "--at")
+  const stopAt = oidFlag(flags, "--stop-at")
   // The bound exists for the filtered walk; on an unfiltered read it would accept and then do nothing.
   if (stopAt !== undefined && glob === undefined) {
     throw new UsageError("--stop-at bounds a filtered read; give a path or glob")
@@ -515,9 +515,9 @@ async function runDiff(args: string[], stdout: CliWriter, source: AddressSource)
   const address = requirePositional(positionals, 0, "<address>")
   assertNoExtraPositionals(positionals, 2, "<addr> [glob]", "diff")
   const glob = positionals.at(1)
-  const base = historyOidFlag(flags, "--base")
+  const base = oidFlag(flags, "--base")
   if (base === undefined) throw new UsageError("missing --base <oid>")
-  let to = historyOidFlag(flags, "--at")
+  let to = oidFlag(flags, "--at")
   try {
     using repository = await openAddressFor(address, source)
     const reader = await openReader(repository)
@@ -541,7 +541,8 @@ async function runDiff(args: string[], stdout: CliWriter, source: AddressSource)
 }
 
 /** Only input validation becomes usage failure; backend/data errors retain exit 1. */
-function historyOidFlag(flags: FlagValues, flag: string): Oid | undefined {
+/** Every `--at`-shaped flag: a full 40/64-hex oid or a loud usage error (31619). */
+function oidFlag(flags: FlagValues, flag: string): Oid | undefined {
   const value = optionalStringFlag(flags, flag)
   if (value === undefined) return undefined
   try {

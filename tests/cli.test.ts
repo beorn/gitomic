@@ -407,6 +407,11 @@ describe("gitomic CLI — read verbs", () => {
 
     const atFirst = await run(backend, ["read", ADDRESS, "a.md", "--at", first.stdout.trim()])
     expect(atFirst).toMatchObject({ code: 0, stdout: "one\n" })
+
+    // 31619: a short oid must never be resolved as a prefix and answered from another revision.
+    const shortAt = await run(backend, ["read", ADDRESS, "a.md", "--at", first.stdout.trim().slice(0, 12)])
+    expect(shortAt.code).toBe(2)
+    expect(shortAt.stderr).toContain("expected a full 40- or 64-character lowercase hex id")
   })
 
   test("grep prints path:line for every matching line, across matching paths", async () => {
@@ -1652,6 +1657,22 @@ describe("gitomic CLI — usage errors (exit 2, never silent)", () => {
     expect(result.stderr).toBe("")
     expect(result.stdout).toContain("<path>=<file>...")
     expect(result.stdout).not.toContain("<path> <file>")
+  })
+
+  test.each([
+    ["read", ["note.md"]],
+    ["ls", []],
+    ["grep", ["x"]],
+    ["log", []],
+    ["diff", ["--base", "0".repeat(40)]],
+  ] as const)("%s refuses a 12-char --at with the malformed-oid usage error (31619)", async (verb, extra) => {
+    const backend = createMemBackend()
+    await writeOne(backend, "note.md", "x\n")
+
+    const result = await run(backend, [verb, ADDRESS, ...extra, "--at", "ae5427c3a0dc"])
+
+    expect(result.code).toBe(2)
+    expect(result.stderr).toContain("expected a full 40- or 64-character lowercase hex id")
   })
 
   test("an unknown verb fails loudly, naming itself", async () => {
