@@ -141,7 +141,7 @@
 - `GitomicBackend.readTreeExact(repo, commit, path)` is required (27226 part 2):
   the second tree entry point a Snapshot reads through. `get`, `oid` and `has`
   resolve one exact path with one scoped read — `git ls-tree -z --full-tree
-<commit> -- <path>` on the shell backend — instead of listing the whole tree.
+  <commit> -- <path>` on the shell backend — instead of listing the whole tree.
   A path the tree does not hold answers `undefined`, and so does a directory,
   because a listing recurses trees away; a mode outside the listing vocabulary is
   refused by name, exactly as `readTree` refuses it. Custom backends must
