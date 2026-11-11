@@ -538,6 +538,22 @@ describe("remote: one atomic push, one fetch", () => {
           fetchRefs(pair.local.repo, ["refs/yrd/q/changes/b", "refs/yrd/q/changes/nope"], "origin"),
           name,
         ).rejects.toThrow("refs/yrd/q/changes/nope")
+        // #33403: batching large optional selections must leave small selections
+        // at one process, with missing names omitted, for both public backends.
+        const optionalSpy = vi.spyOn(childProcess, "spawn")
+        try {
+          expect(
+            [
+              ...(await fetchRefs(pair.local.repo, ["refs/yrd/q/changes/b", "refs/yrd/q/changes/nope"], "origin", {
+                absent: "omit",
+              })),
+            ],
+            name,
+          ).toEqual([["refs/yrd/q/changes/b", there.get("refs/yrd/q/changes/b")]])
+          expect(gitSpawns(optionalSpy), name).toBe(1)
+        } finally {
+          optionalSpy.mockRestore()
+        }
         // No application ref moved: fetchRefs writes only gitomic's private namespace.
         expect(await tipOf(pair.local.repo, writer, "refs/yrd/q/changes/b"), name).toBeUndefined()
       } finally {
