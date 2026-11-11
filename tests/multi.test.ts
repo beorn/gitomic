@@ -615,6 +615,85 @@ describe("remote: one atomic push, one fetch", () => {
     }
   })
 
+  // @failure A batched named fetch that skips a ref already held at its listed tip never asks the remote about
+  //          that ref again, so a ref that moves right after the listing is returned at its old tip: before the
+  //          skip, the fetch reported the move and the observation restarted. yrd's queue-core-up fetch-ref-race
+  //          rows exited 2 on main (hh 33504); this is the vendor's own row for the vendor's rule.
+  // @level l2 (real origin and local repositories, real git behind a Git executable that moves a ref after ls-remote)
+  // @consumer yrd's queue listing, through readMultiPrefixInventory
+  test("a skipped held ref that moves after the listing restarts the observation, and a second move is a Conflict", async () => {
+    const pair = await remotePair()
+    try {
+      const { chmod, writeFile } = await import("node:fs/promises")
+      const { join } = await import("node:path")
+      const writer = createShellBackend()
+      const first = await workCommit(pair.origin.repo, writer, "first")
+      const second = await workCommit(pair.origin.repo, writer, "second")
+      // More than 256 names select the batched path the skip lives on.
+      const names = Array.from({ length: 300 }, (_, n) => `refs/yrd/q/changes/r${String(n).padStart(3, "0")}`)
+      await gitWithInput(
+        pair.origin.repo,
+        names.map((ref) => `update ${ref} ${first}\n`).join(""),
+        "update-ref",
+        "--stdin",
+      )
+      const racing = names[0] ?? ""
+      const count = join(pair.origin.repo, "race-count")
+      const limit = join(pair.origin.repo, "race-limit")
+      const racer = join(pair.origin.repo, "race-git")
+      const native = childProcess.execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim()
+      const q = (value: string) => `'${value.replaceAll("'", "'\\''")}'`
+      await writeFile(
+        racer,
+        `#!/bin/sh
+case " $* " in
+  *" ls-remote "*)
+    ${q(native)} "$@" || exit "$?"
+    n=$(cat ${q(count)}); max=$(cat ${q(limit)})
+    if [ "$n" -lt "$max" ]; then
+      cur=$(${q(native)} --git-dir ${q(pair.origin.repo)} rev-parse ${q(racing)})
+      if [ "$cur" = ${q(first)} ]; then next=${q(second)}; else next=${q(first)}; fi
+      ${q(native)} --git-dir ${q(pair.origin.repo)} update-ref ${q(racing)} "$next" "$cur" || exit "$?"
+      echo "$((n + 1))" > ${q(count)}
+    fi
+    ;;
+  *) exec ${q(native)} "$@" ;;
+esac
+`,
+      )
+      await chmod(racer, 0o755)
+      const race = async (moves: number) => {
+        await writeFile(count, "0")
+        await writeFile(limit, String(moves))
+      }
+      const fetchRefs = createShellBackend({ gitExecutable: racer }).fetchRefs as NonNullable<
+        GitomicBackend["fetchRefs"]
+      >
+      const listing = async () =>
+        new Map(await listRefs("refs/yrd/q/changes/", { repo: pair.origin.repo, backend: writer }))
+
+      // Every ref held at its tip, no race yet.
+      await race(0)
+      expect(await fetchRefs(pair.local.repo, names, "origin", { absent: "omit" })).toEqual(await listing())
+
+      // One move, right after the first listing, of a ref the read skips as held: the observation restarts and
+      // returns the moved tip, never the stale one it listed first.
+      await race(1)
+      const restarted = await fetchRefs(pair.local.repo, names, "origin", { absent: "omit" })
+      expect(restarted.get(racing)).toBe(second)
+      expect(restarted).toEqual(await listing())
+
+      // It keeps moving: the second observation sees it move again and refuses, naming the ref.
+      await race(1_000_000)
+      const refused = fetchRefs(pair.local.repo, names, "origin", { absent: "omit" })
+      await expect(refused).rejects.toBeInstanceOf(Conflict)
+      await expect(refused).rejects.toMatchObject({ refs: [racing] })
+      await expect(refused).rejects.toThrow("moved twice")
+    } finally {
+      await pair.cleanup()
+    }
+  })
+
   test("chainsUnder a remote prefix reads every chain in two processes and matches the remote's own read", async () => {
     const pair = await remotePair()
     try {
