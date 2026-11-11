@@ -350,7 +350,7 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
     fetchRefs: async (repo, refs, remote, options) =>
       fetchRefs(await resolveGitDir(repo), refs, remote, remoteTimeoutMs, baseEnv, options?.absent ?? "throw"),
     fetchedTip: async (repo, ref, remote) =>
-      optionalRef(await resolveGitDir(repo), fetchedLocal(remote, ref), baseEnv, "commit"),
+      (await heldTips(await resolveGitDir(repo), [ref], remote, baseEnv)).get(ref),
   }
   // Each backend owns its executable even when two backends run concurrently.
   // Keeping the selection in the async call chain lets the Git plumbing below
@@ -389,18 +389,9 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
   }
 }
 
-async function optionalRef(
-  repo: string,
-  ref: string,
-  baseEnv?: NodeJS.ProcessEnv,
-  peel?: "commit",
-): Promise<Oid | undefined> {
-  // `peel: "commit"` asks for the commit `ref` names, not the name's own value: a ref whose object
-  // was pruned still resolves by name and prints a sha nothing can read, and a ref that names a blob
-  // or a tree resolves too. Both answer `undefined` here, so a caller that is deciding whether the
-  // objects are already present ("fetch or not") is told the truth instead of a name.
-  const target = peel === "commit" ? `${ref}^{commit}` : ref
-  const result = await run(selectedGit(), gitArgs(repo, ["rev-parse", "--verify", "--quiet", target]), { baseEnv })
+async function optionalRef(repo: string, ref: string, baseEnv?: NodeJS.ProcessEnv): Promise<Oid | undefined> {
+  // A name's own value. Whether its objects are held ("fetch or not") is heldTips' question, never this one.
+  const result = await run(selectedGit(), gitArgs(repo, ["rev-parse", "--verify", "--quiet", ref]), { baseEnv })
   if (result.code === 1 && result.stdout.length === 0) return undefined
   if (result.code !== 0) {
     const detail = result.stderr.toString("utf8").trim()
@@ -2772,6 +2763,38 @@ function fetchedLocal(remote: string, ref: string): string {
   return `${fetchedNamespace(remote)}${ref.slice("refs/".length)}`
 }
 
+/**
+ * The commit gitomic holds at its private ref for each of `refs` at `remote`, or `undefined` when that
+ * ref is absent or does not peel to a commit this repository can read. It is the ONE predicate a remote
+ * read asks before fetching — {@link GitomicBackend.fetchedTip} asks it for one ref, a batched named
+ * fetch for many (hh 33504) — and it answers in one process however many refs it is asked about. A ref
+ * whose object was pruned, or that names a blob or tree, answers `undefined`, which means "fetch".
+ */
+async function heldTips(
+  repo: string,
+  refs: readonly string[],
+  remote: string,
+  baseEnv?: NodeJS.ProcessEnv,
+): Promise<ReadonlyMap<string, Oid | undefined>> {
+  if (refs.length === 0) return new Map()
+  const names = refs.map((ref) => `${fetchedLocal(remote, ref)}^{commit}`)
+  const output = decodeUtf8(
+    await git(repo, ["cat-file", "--batch-check=%(objectname)"], { baseEnv, input: `${names.join("\n")}\n` }),
+    "git cat-file --batch-check",
+  )
+  const answers = output === "" ? [] : output.replace(/\n$/u, "").split("\n")
+  if (answers.length !== names.length) {
+    throw new Error(`git cat-file --batch-check answered ${answers.length} lines for ${names.length} held refs`)
+  }
+  return new Map(
+    refs.map((ref, index) => {
+      const answer = answers[index] ?? ""
+      if (answer === `${names[index]} missing`) return [ref, undefined] as const
+      return [ref, validateOid(answer, `git cat-file --batch-check returned a malformed answer for ${ref}`)] as const
+    }),
+  )
+}
+
 const FETCH_RACE_ATTEMPTS = 3
 
 // #33403, 7,821 cold refs: one fetch peaked at 6,373 MiB. Batches of 256
@@ -2833,9 +2856,23 @@ async function fetchOptionalNamedRefs(
       return oid === undefined ? [] : [{ ref, oid }]
     })
     const tips = new Map<string, Oid>()
+    // A ref already held at exactly the tip this observation just listed is not fetched: the fetch could
+    // bring nothing this read returns. The skip is decided against this listing only, by the same
+    // predicate as fetchedTip, so a moved, first-seen or unreadable ref is still fetched (hh 33504).
+    const held = await heldTips(
+      repo,
+      present.map(({ ref }) => ref),
+      remote,
+      baseEnv,
+    )
+    const wanted = present.filter(({ ref, oid }) => {
+      if (held.get(ref) !== oid) return true
+      tips.set(ref, oid)
+      return false
+    })
     let moved: { ref: string; listed: Oid; fetched: Oid | "absent" } | undefined
-    for (let offset = 0; offset < present.length; offset += NAMED_FETCH_BATCH_SIZE) {
-      const batch = present.slice(offset, offset + NAMED_FETCH_BATCH_SIZE)
+    for (let offset = 0; offset < wanted.length; offset += NAMED_FETCH_BATCH_SIZE) {
+      const batch = wanted.slice(offset, offset + NAMED_FETCH_BATCH_SIZE)
       let fetched: ReadonlyMap<string, Oid>
       try {
         // Exact names preserve the observed selection; never fetch a wider glob.

@@ -18,7 +18,7 @@ import { createIsoBackend } from "../src/iso.js"
 import { createMemBackend } from "../src/mem.js"
 import { createShellBackend, fetchedNamespace } from "../src/shell.js"
 import type { GitomicBackend, Oid } from "../src/types.js"
-import { createBareRepo, git } from "./helpers/git.js"
+import { createBareRepo, git, gitWithInput } from "./helpers/git.js"
 
 const CHAIN = "refs/events/demo"
 const BRANCH = "refs/heads/feature"
@@ -559,6 +559,59 @@ describe("remote: one atomic push, one fetch", () => {
       } finally {
         await pair.cleanup()
       }
+    }
+  })
+
+  // @failure A batched optional named fetch re-fetches every ref on every read, though gitomic already holds
+  // each listed tip: a yrd listing spent 53 s in 44 sequential fetches that moved nothing (hh 33504).
+  // @level l2 (real origin and local repositories, real git)
+  // @consumer yrd's queue listing, through readMultiPrefixInventory
+  test("a batched named fetch fetches only the refs it does not already hold at the listed tip", async () => {
+    const pair = await remotePair()
+    try {
+      const backend = createShellBackend()
+      const fetchRefs = backend.fetchRefs as NonNullable<GitomicBackend["fetchRefs"]>
+      const writer = createShellBackend()
+      const first = await workCommit(pair.origin.repo, writer, "first")
+      const second = await workCommit(pair.origin.repo, writer, "second")
+      // More than one batch of 256, so the skip is proven across the batch boundary.
+      const names = Array.from({ length: 300 }, (_, n) => `refs/yrd/q/changes/c${String(n).padStart(3, "0")}`)
+      const point = async (refs: readonly string[], oid: Oid) =>
+        gitWithInput(pair.origin.repo, refs.map((ref) => `update ${ref} ${oid}\n`).join(""), "update-ref", "--stdin")
+      await point(names.slice(0, 299), first)
+      const fetchedSources = (spy: { mock: { calls: unknown[][] } }): string[] =>
+        spy.mock.calls
+          .filter((call) => call[0] === "git" && Array.isArray(call[1]) && (call[1] as string[]).includes("fetch"))
+          .flatMap((call) => (call[1] as string[]).filter((arg) => arg.startsWith("+")))
+          .map((spec) => spec.slice(1).split(":")[0] ?? "")
+          .sort()
+      const listing = async () =>
+        new Map(await listRefs("refs/yrd/q/changes/", { repo: pair.origin.repo, backend: writer }))
+
+      // First sight: nothing is held, so every listed ref is fetched.
+      expect(await fetchRefs(pair.local.repo, names, "origin", { absent: "omit" })).toEqual(await listing())
+
+      // Everything held at the listed tip: no fetch at all, and the listed tips are returned.
+      const quiet = vi.spyOn(childProcess, "spawn")
+      expect(await fetchRefs(pair.local.repo, names, "origin", { absent: "omit" })).toEqual(await listing())
+      expect(fetchedSources(quiet)).toEqual([])
+      quiet.mockRestore()
+
+      // A mixed read across the batch boundary: two refs moved (one in each batch), one appeared for the first
+      // time, and one held ref no longer peels to a commit (it names a blob). Only those four are fetched.
+      // (A held ref naming a MISSING object is refused by git fetch itself, before and after this change.)
+      const moved = [names[10] ?? "", names[280] ?? ""]
+      const appeared = names[299] ?? ""
+      const unreadable = names[5] ?? ""
+      await point([...moved, appeared], second)
+      const blob = await gitWithInput(pair.local.repo, "not a commit\n", "hash-object", "-w", "--stdin")
+      await git(pair.local.repo, "update-ref", `${fetchedNamespace("origin")}${unreadable.slice("refs/".length)}`, blob)
+      const mixed = vi.spyOn(childProcess, "spawn")
+      expect(await fetchRefs(pair.local.repo, names, "origin", { absent: "omit" })).toEqual(await listing())
+      expect(fetchedSources(mixed)).toEqual([...moved, appeared, unreadable].sort())
+      mixed.mockRestore()
+    } finally {
+      await pair.cleanup()
     }
   })
 
