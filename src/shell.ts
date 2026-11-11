@@ -2767,8 +2767,9 @@ function fetchedLocal(remote: string, ref: string): string {
  * The commit gitomic holds at its private ref for each of `refs` at `remote`, or `undefined` when that
  * ref is absent or does not peel to a commit this repository can read. It is the ONE predicate a remote
  * read asks before fetching — {@link GitomicBackend.fetchedTip} asks it for one ref, a batched named
- * fetch for many (hh 33504) — and it answers in one process however many refs it is asked about. A ref
- * whose object was pruned, or that names a blob or tree, answers `undefined`, which means "fetch".
+ * fetch for many (hh 33504) — and it answers in one {@link batchCheck} however many refs it is asked
+ * about, run through this backend's selected Git and environment. A ref whose object was pruned, or that
+ * names a blob or tree, answers `undefined`, which means "fetch".
  */
 async function heldTips(
   repo: string,
@@ -2776,21 +2777,16 @@ async function heldTips(
   remote: string,
   baseEnv?: NodeJS.ProcessEnv,
 ): Promise<ReadonlyMap<string, Oid | undefined>> {
-  if (refs.length === 0) return new Map()
-  const names = refs.map((ref) => `${fetchedLocal(remote, ref)}^{commit}`)
-  const output = decodeUtf8(
-    await git(repo, ["cat-file", "--batch-check=%(objectname)"], { baseEnv, input: `${names.join("\n")}\n` }),
-    "git cat-file --batch-check",
+  const answers = await batchCheck(
+    repo,
+    refs.map((ref) => `${fetchedLocal(remote, ref)}^{commit}`),
+    { run: (args, options) => run(selectedGit(), args, { ...options, baseEnv }) },
   )
-  const answers = output === "" ? [] : output.replace(/\n$/u, "").split("\n")
-  if (answers.length !== names.length) {
-    throw new Error(`git cat-file --batch-check answered ${answers.length} lines for ${names.length} held refs`)
-  }
   return new Map(
     refs.map((ref, index) => {
-      const answer = answers[index] ?? ""
-      if (answer === `${names[index]} missing`) return [ref, undefined] as const
-      return [ref, validateOid(answer, `git cat-file --batch-check returned a malformed answer for ${ref}`)] as const
+      const answer = answers[index]
+      if (answer === undefined) throw new Error(`git cat-file --batch-check gave no answer for held ref ${ref}`)
+      return [ref, "missing" in answer ? undefined : answer.oid] as const
     }),
   )
 }

@@ -394,7 +394,9 @@ describe("shell backend failure boundaries", { concurrent: false }, () => {
             GITOMIC_FAKE_REF_NAMES: JSON.stringify(names),
             GITOMIC_FAKE_REF_MARK: `${wrapper.log}.observations`,
             // Nothing is held yet, so every listed ref is fetched; skipping held refs is multi.test.ts's case (33504).
-            GITOMIC_FAKE_BATCH_CHECK: names.map((ref) => `${fetchedNamespace("origin")}${ref.slice(5)}^{commit} missing\n`).join(""),
+            GITOMIC_FAKE_BATCH_CHECK: names
+              .map((ref) => `${fetchedNamespace("origin")}${ref.slice(5)}^{commit} missing\n`)
+              .join(""),
             GITOMIC_FAKE_REF_OBSERVATIONS: JSON.stringify(
               observations.map((row) => ({
                 listed: row.listed.repeat(40),
