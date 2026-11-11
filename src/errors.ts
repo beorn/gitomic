@@ -19,7 +19,7 @@ export class TreePathCollision extends Error {
 
 export class Conflict extends Error {
   override readonly name = "Conflict"
-  /** The refs whose lease a MULTI publish lost, as the tool named them; empty otherwise. */
+  /** Refs that moved during acquisition or whose publish lease was lost; empty otherwise. */
   readonly refs: readonly string[]
 
   constructor(message?: string, options?: ErrorOptions & { refs?: readonly string[] }) {

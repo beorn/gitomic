@@ -2868,8 +2868,9 @@ async function fetchOptionalNamedRefs(
     }
     if (moved === undefined) return new Map([...tips].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
     if (observation === 1) {
-      throw new Error(
+      throw new Conflict(
         `git fetch remote ${remote} moved twice while observing ${moved.ref}: listed ${moved.listed}, fetched ${moved.fetched}; retry the fetch`,
+        { refs: [moved.ref] },
       )
     }
   }
