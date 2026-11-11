@@ -1172,9 +1172,11 @@ describe("shell backend failure boundaries", { concurrent: false }, () => {
           localTimeoutMs: 1000,
         })
         const started = performance.now()
-        const read =
+        const read: Promise<ReadonlyMap<string, unknown>> =
           stage === "held"
-            ? backend.fetchedTip("ignored", "refs/heads/main", "origin").then((oid) => new Map([["refs/heads/main", oid]]))
+            ? backend
+                .fetchedTip("ignored", "refs/heads/main", "origin")
+                .then((oid) => new Map([["refs/heads/main", oid]]))
             : backend.listRefs!("ignored", "refs/heads/")
         const outcome = await read.then(
           (value) => ({ status: "fulfilled" as const, value }),
