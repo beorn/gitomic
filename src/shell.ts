@@ -2870,9 +2870,11 @@ async function fetchOptionalNamedRefs(
       remote,
       baseEnv,
     )
+    const skipped: { ref: string; oid: Oid }[] = []
     const wanted = present.filter(({ ref, oid }) => {
       if (held.get(ref) !== oid) return true
       tips.set(ref, oid)
+      skipped.push({ ref, oid })
       return false
     })
     let moved: { ref: string; listed: Oid; fetched: Oid | "absent" } | undefined
@@ -2907,6 +2909,20 @@ async function fetchOptionalNamedRefs(
         tips.set(ref, actual)
       }
       if (moved !== undefined) break
+    }
+    // A fetched ref proves its listed tip still stood when the fetch ran; a skipped ref was never asked.
+    // One more listing after the fetches gives the skipped refs that same proof, so a ref that moves right
+    // after the first listing restarts the observation as it did before the skip (hh 33504, queue-core-up
+    // fetch-ref-race). One listing process, however many refs were skipped.
+    if (moved === undefined && skipped.length > 0) {
+      const confirmed = await listRefs(repo, "refs/", remote, timeoutMs, baseEnv)
+      for (const { ref, oid } of skipped) {
+        const actual = confirmed.get(ref) ?? "absent"
+        if (actual !== oid) {
+          moved = { ref, listed: oid, fetched: actual }
+          break
+        }
+      }
     }
     if (moved === undefined) return new Map([...tips].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
     if (observation === 1) {
