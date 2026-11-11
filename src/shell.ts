@@ -2774,6 +2774,10 @@ function fetchedLocal(remote: string, ref: string): string {
 
 const FETCH_RACE_ATTEMPTS = 3
 
+// #33403, 7,821 cold refs: one fetch peaked at 6,373 MiB. Batches of 256
+// peaked at 143 MiB / 45s; 1,024 at 252 MiB / 37s. Prefer the lower peak.
+const NAMED_FETCH_BATCH_SIZE = 256
+
 /**
  * How a fetch lost a race with a concurrent fetch in the same repository for refs in `namespace`:
  * "moved" when the other fetch already moved a ref (retry at once), "held" when it still holds a
@@ -2815,12 +2819,69 @@ function pauseFor(ms: number): Promise<void> {
   })
 }
 
+async function fetchOptionalNamedRefs(
+  repo: string,
+  named: readonly string[],
+  remote: string,
+  timeoutMs: number,
+  baseEnv?: NodeJS.ProcessEnv,
+): Promise<ReadonlyMap<string, Oid>> {
+  for (let observation = 0; true; observation++) {
+    const listed = await listRefs(repo, "refs/", remote, timeoutMs, baseEnv)
+    const present = named.flatMap((ref) => {
+      const oid = listed.get(ref)
+      return oid === undefined ? [] : [{ ref, oid }]
+    })
+    const tips = new Map<string, Oid>()
+    let moved: { ref: string; listed: Oid; fetched: Oid | "absent" } | undefined
+    for (let offset = 0; offset < present.length; offset += NAMED_FETCH_BATCH_SIZE) {
+      const batch = present.slice(offset, offset + NAMED_FETCH_BATCH_SIZE)
+      let fetched: ReadonlyMap<string, Oid>
+      try {
+        // Exact names preserve the observed selection; never fetch a wider glob.
+        fetched = await fetchRefs(
+          repo,
+          batch.map(({ ref }) => ref),
+          remote,
+          timeoutMs,
+          baseEnv,
+        )
+      } catch (error) {
+        const missing =
+          error instanceof Error
+            ? /(?:^|: |\n)fatal: couldn't find remote ref ([^\r\n]+)$/u.exec(error.message)?.[1]
+            : undefined
+        const disappeared = batch.find(({ ref }) => ref === missing)
+        if (disappeared === undefined) throw error
+        moved = { ref: disappeared.ref, listed: disappeared.oid, fetched: "absent" }
+        break
+      }
+      for (const { ref, oid: expected } of batch) {
+        const actual = fetched.get(ref) ?? "absent"
+        if (actual !== expected) {
+          moved = { ref, listed: expected, fetched: actual }
+          break
+        }
+        tips.set(ref, actual)
+      }
+      if (moved !== undefined) break
+    }
+    if (moved === undefined) return new Map([...tips].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
+    if (observation === 1) {
+      throw new Error(
+        `git fetch remote ${remote} moved twice while observing ${moved.ref}: listed ${moved.listed}, fetched ${moved.fetched}; retry the fetch`,
+      )
+    }
+  }
+}
+
 /**
- * ONE `git fetch --verbose --porcelain` of every ref under a prefix, or of exactly
- * the named refs, into {@link fetchedNamespace}. Verbose porcelain prints a line
- * for every ref it considered, unchanged ones included (`=`), so the whole tip map
- * comes from this one process. Prefix mode prunes, and the refspec confines the
- * prune to the private namespace. A named ref missing on the remote throws.
+ * One observation of every ref under a prefix, or exactly the named refs, into
+ * {@link fetchedNamespace}. Large optional named selections use one listing and
+ * bounded fetches, verifying each reported id against that listing. A moved or
+ * vanished ref restarts the whole observation once. Other selections use one
+ * process. Prefix mode prunes only the private namespace. Missing named refs
+ * throw unless `absent` is "omit".
  */
 async function fetchRefs(
   repo: string,
@@ -2845,6 +2906,9 @@ async function fetchRefs(
       }
     }
     if (new Set(named).size !== named.length) throw new TypeError("fetchRefs names a ref more than once")
+  }
+  if (prefix === undefined && absent === "omit" && named.length > NAMED_FETCH_BATCH_SIZE) {
+    return fetchOptionalNamedRefs(repo, named, remote, timeoutMs, baseEnv)
   }
   // `prefix*` rather than `prefix/*`, so a ref named exactly `prefix` is included,
   // as listRefs includes it; the result is filtered by the same prefix rule.

@@ -440,11 +440,13 @@ export type GitomicBackend = {
   publish?(repo: string, updates: readonly RefUpdate[], remote?: string): Promise<PublishResult>
   /**
    * Fetch every ref under a prefix, or exactly the named refs, from `remote` in
-   * ONE git process, and return each ref's tip under its original name. It
+   * one observation, and return each ref's tip under its original name. It
    * writes only gitomic's private namespace `refs/gitomic/fetched/<remote-key>/`,
    * never an application ref. A named ref missing on the remote throws, unless
-   * `absent: "omit"`: then it is left out of the result (still one process; the
-   * store's per-attempt `fetch` of refs that may not exist yet uses this).
+   * `absent: "omit"`: then it is left out of the result. Large optional named
+   * selections use several processes, verifying fetched ids against one listing;
+   * remote movement restarts the observation once, then throws with the ref and
+   * listed/fetched ids. Other selections use one process.
    */
   fetchRefs?(
     repo: string,

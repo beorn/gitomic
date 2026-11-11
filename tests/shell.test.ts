@@ -244,8 +244,27 @@ async function createGitWrapper(): Promise<{
       "  process.stderr.write(process.env.GITOMIC_FAKE_FETCH_ERROR)",
       "  process.exit(128)",
       "}",
-      'if (args.includes("fetch") && process.env.GITOMIC_FAKE_FETCH_REPORT !== undefined) {',
-      "  process.stdout.write(process.env.GITOMIC_FAKE_FETCH_REPORT)",
+      'if ((args.includes("fetch") || args.includes("ls-remote")) && process.env.GITOMIC_FAKE_REF_OBSERVATIONS) {',
+      "  const observations = JSON.parse(process.env.GITOMIC_FAKE_REF_OBSERVATIONS)",
+      "  const names = JSON.parse(process.env.GITOMIC_FAKE_REF_NAMES)",
+      "  const mark = process.env.GITOMIC_FAKE_REF_MARK",
+      '  let seen = existsSync(mark) ? Number(readFileSync(mark, "utf8")) : -1',
+      '  if (args.includes("ls-remote")) { seen++; writeFileSync(mark, String(seen)) }',
+      "  const observation = observations[Math.min(Math.max(seen, 0), observations.length - 1)]",
+      "  const moving = names.at(-1)",
+      '  if (args.includes("ls-remote")) {',
+      '    process.stdout.write(names.map(ref => `${ref === moving ? observation.listed : "1".repeat(40)}\\t${ref}\\n`).join(""))',
+      "  } else {",
+      '    for (const spec of args.filter(arg => arg.startsWith("+"))) {',
+      '      const [source, destination] = spec.slice(1).split(":").map(ref => ref.replace(/\\*$/, ""))',
+      "      if (!names.includes(source)) continue",
+      "      if (source === moving && observation.fetched === null) {",
+      "        process.stderr.write(`fatal: couldn\u0027t find remote ref ${source}\\n`)",
+      "        process.exit(128)",
+      "      }",
+      '      process.stdout.write(`= ${"0".repeat(40)} ${source === moving ? observation.fetched : "1".repeat(40)} ${destination}\\n`)',
+      "    }",
+      "  }",
       "  process.exit(0)",
       "}",
       'if (args.includes("cat-file") && args.some((arg) => arg.startsWith("--batch-check=")) && process.env.GITOMIC_FAKE_BATCH_CHECK !== undefined) {',
@@ -321,37 +340,100 @@ async function createGitWrapper(): Promise<{
 }
 
 describe("shell backend failure boundaries", { concurrent: false }, () => {
-  // @failure Thousands of named optional ref globs make one Git fetch allocate gigabytes (#33403).
+  // @failure Large optional selections exhaust memory or mix tips observed before/after a remote move (#33403).
   // @level l1
   // @consumer km daemon production-size item acquisition through the public shell backend
-  // Existing missing-ref tests use one name and cannot cross a bounded refspec batch.
-  test("bounds named optional fetch refspecs per Git process (#33403)", async () => {
-    const wrapper = await createGitWrapper()
-    try {
-      const backend = createShellBackend({
-        gitExecutable: join(wrapper.bin, "git"),
-        baseEnv: {
-          PATH: process.env.PATH,
-          GITOMIC_COMMAND_LOG: wrapper.log,
-          GITOMIC_FAKE_GITDIR: "/gitomic-named-fetch-shape.git",
-          GITOMIC_FAKE_FETCH_REPORT: "",
-        },
-      })
+  // Existing missing-ref tests use one name and cannot cross a batch or move between listing and fetch.
+  test.each([
+    ["stable", [{ listed: "1", fetched: "1" }], "1"],
+    [
+      "moves once",
+      [
+        { listed: "1", fetched: "2" },
+        { listed: "2", fetched: "2" },
+      ],
+      "2",
+    ],
+    [
+      "moves twice",
+      [
+        { listed: "1", fetched: "2" },
+        { listed: "2", fetched: "3" },
+      ],
+      "error",
+    ],
+    [
+      "vanishes once",
+      [
+        { listed: "1", fetched: null },
+        { listed: "2", fetched: "2" },
+      ],
+      "2",
+    ],
+    [
+      "vanishes twice",
+      [
+        { listed: "1", fetched: null },
+        { listed: "2", fetched: null },
+      ],
+      "absent",
+    ],
+  ] as const)(
+    "bounds named optional fetches and verifies one observation when a ref %s (#33403)",
+    async (_kind, observations, outcome) => {
+      const wrapper = await createGitWrapper()
       const names = Array.from({ length: 257 }, (_, n) => `refs/km/items/i${n}`)
-      expect(await backend.fetchRefs!("ignored", names, "origin", { absent: "omit" })).toEqual(new Map())
-      const commands = (await readFile(wrapper.log, "utf8"))
-        .trim()
-        .split("\n")
-        .map((line) => JSON.parse(line) as string[])
-      const fetches = commands.filter((args) => args.includes("fetch"))
-      expect(fetches.length).toBeGreaterThan(0)
-      for (const args of fetches) {
-        expect(args.filter((arg) => arg.startsWith("+")).length).toBeLessThanOrEqual(256)
+      const moving = names.at(-1)!
+      try {
+        const backend = createShellBackend({
+          gitExecutable: join(wrapper.bin, "git"),
+          baseEnv: {
+            PATH: process.env.PATH,
+            GITOMIC_COMMAND_LOG: wrapper.log,
+            GITOMIC_FAKE_GITDIR: "/gitomic-named-fetch-shape.git",
+            GITOMIC_FAKE_REF_NAMES: JSON.stringify(names),
+            GITOMIC_FAKE_REF_MARK: `${wrapper.log}.observations`,
+            GITOMIC_FAKE_REF_OBSERVATIONS: JSON.stringify(
+              observations.map((row) => ({
+                listed: row.listed.repeat(40),
+                fetched: row.fetched?.repeat(40) ?? null,
+              })),
+            ),
+          },
+        })
+        const fetched = backend.fetchRefs!("ignored", [...names, "refs/km/items/absent"], "origin", { absent: "omit" })
+        if (outcome === "error" || outcome === "absent") {
+          const failure = await fetched.then(
+            () => undefined,
+            (error: unknown) => error,
+          )
+          expect(failure).toBeInstanceOf(Error)
+          expect((failure as Error).message).toContain(moving)
+          expect((failure as Error).message).toContain("2".repeat(40))
+          expect((failure as Error).message).toContain(outcome === "absent" ? "absent" : "3".repeat(40))
+        } else {
+          expect(await fetched).toEqual(
+            new Map(names.sort().map((ref) => [ref, (ref === moving ? outcome : "1").repeat(40)])),
+          )
+        }
+        const commands = (await readFile(wrapper.log, "utf8"))
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line) as string[])
+        const fetches = commands.filter((args) => args.includes("fetch"))
+        expect(commands.filter((args) => args.includes("ls-remote"))).toHaveLength(observations.length)
+        // Movement occurs in the second batch: the retry must also re-fetch the first batch.
+        expect(fetches).toHaveLength(observations.length * 2)
+        for (const args of fetches) {
+          const specs = args.filter((arg) => arg.startsWith("+"))
+          expect(specs.length).toBeLessThanOrEqual(256)
+          expect(specs.every((spec) => !spec.includes("*") && !spec.includes("refs/km/items/absent"))).toBe(true)
+        }
+      } finally {
+        await wrapper.cleanup()
       }
-    } finally {
-      await wrapper.cleanup()
-    }
-  })
+    },
+  )
 
   test("fails open when Git is too old for the durability contract", async () => {
     const wrapper = await createGitWrapper()
