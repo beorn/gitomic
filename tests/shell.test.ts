@@ -244,6 +244,10 @@ async function createGitWrapper(): Promise<{
       "  process.stderr.write(process.env.GITOMIC_FAKE_FETCH_ERROR)",
       "  process.exit(128)",
       "}",
+      'if (args.includes("fetch") && process.env.GITOMIC_FAKE_FETCH_REPORT !== undefined) {',
+      "  process.stdout.write(process.env.GITOMIC_FAKE_FETCH_REPORT)",
+      "  process.exit(0)",
+      "}",
       'if (args.includes("cat-file") && args.some((arg) => arg.startsWith("--batch-check=")) && process.env.GITOMIC_FAKE_BATCH_CHECK !== undefined) {',
       "  process.stdout.write(process.env.GITOMIC_FAKE_BATCH_CHECK)",
       "  process.exit(0)",
@@ -317,6 +321,38 @@ async function createGitWrapper(): Promise<{
 }
 
 describe("shell backend failure boundaries", { concurrent: false }, () => {
+  // @failure Thousands of named optional ref globs make one Git fetch allocate gigabytes (#33403).
+  // @level l1
+  // @consumer km daemon production-size item acquisition through the public shell backend
+  // Existing missing-ref tests use one name and cannot cross a bounded refspec batch.
+  test("bounds named optional fetch refspecs per Git process (#33403)", async () => {
+    const wrapper = await createGitWrapper()
+    try {
+      const backend = createShellBackend({
+        gitExecutable: join(wrapper.bin, "git"),
+        baseEnv: {
+          PATH: process.env.PATH,
+          GITOMIC_COMMAND_LOG: wrapper.log,
+          GITOMIC_FAKE_GITDIR: "/gitomic-named-fetch-shape.git",
+          GITOMIC_FAKE_FETCH_REPORT: "",
+        },
+      })
+      const names = Array.from({ length: 257 }, (_, n) => `refs/km/items/i${n}`)
+      expect(await backend.fetchRefs!("ignored", names, "origin", { absent: "omit" })).toEqual(new Map())
+      const commands = (await readFile(wrapper.log, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as string[])
+      const fetches = commands.filter((args) => args.includes("fetch"))
+      expect(fetches.length).toBeGreaterThan(0)
+      for (const args of fetches) {
+        expect(args.filter((arg) => arg.startsWith("+")).length).toBeLessThanOrEqual(256)
+      }
+    } finally {
+      await wrapper.cleanup()
+    }
+  })
+
   test("fails open when Git is too old for the durability contract", async () => {
     const wrapper = await createGitWrapper()
     const restore = replaceEnvironment({
