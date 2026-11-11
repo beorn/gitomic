@@ -228,12 +228,12 @@ async function createGitWrapper(): Promise<{
       'if (log) appendFileSync(log, `${process.env.LC_ALL ?? "<unset>"}\\n`)',
       "const fullLog = process.env.GITOMIC_GIT_FULL_ENV_LOG",
       "if (fullLog) appendFileSync(fullLog, `${JSON.stringify({ GIT_DIR: process.env.GIT_DIR, GIT_TERMINAL_PROMPT: process.env.GIT_TERMINAL_PROMPT, LC_ALL: process.env.LC_ALL })}\\n`)",
-      'const stage = args[0] === "--version" ? "version" : args.includes("--git-common-dir") ? "resolve" : args.includes("for-each-ref") ? "refs" : args.includes("fetch") ? "fetch" : undefined',
+      'const stage = args[0] === "--version" ? "version" : args.includes("--git-common-dir") ? "resolve" : args.includes("for-each-ref") ? "refs" : args.includes("fetch") ? "fetch" : args.some((arg) => arg.startsWith("--batch-check=")) ? "held" : undefined',
       "if (stage !== undefined && process.env.GITOMIC_DELAY_STAGE === stage) {",
       '  appendFileSync(process.env.GITOMIC_DELAY_LOG, JSON.stringify({ stage, pid: process.pid }) + "\\n")',
       '  process.on("SIGTERM", () => {})',
       "  setTimeout(() => {",
-      '    const output = stage === "version" ? "git version 2.39.0\\n" : stage === "resolve" ? process.env.GITOMIC_FAKE_GITDIR + "\\n" : process.env.GITOMIC_FAKE_LOCAL_REFS',
+      '    const output = stage === "version" ? "git version 2.39.0\\n" : stage === "resolve" ? process.env.GITOMIC_FAKE_GITDIR + "\\n" : stage === "held" ? process.env.GITOMIC_FAKE_BATCH_CHECK : process.env.GITOMIC_FAKE_LOCAL_REFS',
       "    process.stdout.write(output)",
       "    process.exit(0)",
       "  }, 8000)",
@@ -1151,8 +1151,9 @@ describe("shell backend failure boundaries", { concurrent: false }, () => {
    * @level l2
    * @consumer createShellBackend localTimeoutMs (27385); existing remote-write coverage cannot reach these reads.
    * Real selected executable ignores TERM and exits naturally at8s; the existing runner must stop its group first.
+   * `held` is fetchedTip's held-tip check (hh 33504): its batchCheck limit must not outlive a shorter localTimeoutMs.
    */
-  test.skipIf(process.platform !== "linux").each(["version", "resolve", "refs"])(
+  test.skipIf(process.platform !== "linux").each(["version", "resolve", "refs", "held"])(
     "bounds a TERM-resistant local %s command before its natural exit",
     async (stage) => {
       const wrapper = await createGitWrapper()
@@ -1164,13 +1165,18 @@ describe("shell backend failure boundaries", { concurrent: false }, () => {
             PATH: process.env.PATH,
             GITOMIC_FAKE_GITDIR: "/tmp/gitomic-local-deadline.git",
             GITOMIC_FAKE_LOCAL_REFS: `${expected} refs/heads/main\n`,
+            GITOMIC_FAKE_BATCH_CHECK: `${expected} commit\n`,
             GITOMIC_DELAY_STAGE: stage,
             GITOMIC_DELAY_LOG: wrapper.log,
           },
           localTimeoutMs: 1000,
         })
         const started = performance.now()
-        const outcome = await backend.listRefs!("ignored", "refs/heads/").then(
+        const read =
+          stage === "held"
+            ? backend.fetchedTip("ignored", "refs/heads/main", "origin").then((oid) => new Map([["refs/heads/main", oid]]))
+            : backend.listRefs!("ignored", "refs/heads/")
+        const outcome = await read.then(
           (value) => ({ status: "fulfilled" as const, value }),
           (error: unknown) => ({ status: "rejected" as const, error }),
         )

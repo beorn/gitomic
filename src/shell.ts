@@ -2662,16 +2662,13 @@ function remoteWriteOutcomeUnknown(
   return new RemoteWriteOutcomeUnknown(updates, { cause })
 }
 
-async function diagnoseMissingObjectFetch(
-  repo: string,
-  remote: string,
-  original: unknown,
-  baseEnv?: NodeJS.ProcessEnv,
-): Promise<never> {
-  if (original instanceof AbsoluteDeadlineExpired) throw original
-  const message = original instanceof Error ? original.message : String(original)
-  if (!isMissingObjectFetchError(message)) throw original
-  const invoke = (args: readonly string[], options: RunGitOptions = {}) => {
+/**
+ * A {@link batchCheck}/{@link danglingRefs} runner that uses this backend's selected Git and environment and
+ * keeps its timeout policy: a helper's own limit (default {@link DANGLING_REF_SCAN_TIMEOUT_MS}) never outlives
+ * a shorter `localTimeoutMs`, and the absolute deadline still caps both inside {@link run}.
+ */
+function selectedGitRunner(baseEnv?: NodeJS.ProcessEnv) {
+  return (args: readonly string[], options: RunGitOptions = {}) => {
     const localTimeoutMs = shellRuntime.getStore()?.localTimeoutMs
     return run(selectedGit(), args, {
       ...options,
@@ -2683,6 +2680,18 @@ async function diagnoseMissingObjectFetch(
           }),
     })
   }
+}
+
+async function diagnoseMissingObjectFetch(
+  repo: string,
+  remote: string,
+  original: unknown,
+  baseEnv?: NodeJS.ProcessEnv,
+): Promise<never> {
+  if (original instanceof AbsoluteDeadlineExpired) throw original
+  const message = original instanceof Error ? original.message : String(original)
+  if (!isMissingObjectFetchError(message)) throw original
+  const invoke = selectedGitRunner(baseEnv)
   let dangling: readonly DanglingRef[]
   try {
     dangling = await danglingRefs(repo, { run: invoke })
@@ -2768,7 +2777,7 @@ function fetchedLocal(remote: string, ref: string): string {
  * ref is absent or does not peel to a commit this repository can read. It is the ONE predicate a remote
  * read asks before fetching — {@link GitomicBackend.fetchedTip} asks it for one ref, a batched named
  * fetch for many (hh 33504) — and it answers in one {@link batchCheck} however many refs it is asked
- * about, run through this backend's selected Git and environment. A ref whose object was pruned, or that
+ * about, run through {@link selectedGitRunner} so a shorter `localTimeoutMs` still bounds it. A ref whose object was pruned, or that
  * names a blob or tree, answers `undefined`, which means "fetch".
  */
 async function heldTips(
@@ -2780,7 +2789,7 @@ async function heldTips(
   const answers = await batchCheck(
     repo,
     refs.map((ref) => `${fetchedLocal(remote, ref)}^{commit}`),
-    { run: (args, options) => run(selectedGit(), args, { ...options, baseEnv }) },
+    { run: selectedGitRunner(baseEnv) },
   )
   return new Map(
     refs.map((ref, index) => {
