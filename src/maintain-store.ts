@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer"
 import fs from "node:fs"
 import { join } from "node:path"
 import { performance } from "node:perf_hooks"
@@ -13,6 +14,11 @@ import { runGit } from "./shell.ts"
  * their cost grows with the ref count. This is the owner's explicit replacement: the store's one owner calls it on its
  * own cadence (the km daemon for a kept copy, the state-authority-pack unit for the state authority); nothing here
  * decides when.
+ *
+ * It also writes the store's multi-pack-index (hh 33853): every fetch into a kept copy adds one pack, and with gc off
+ * nothing indexes them, so a lookup searched 931 pack indexes one by one (a one-path rev-list on the root authority's
+ * kept copy: 37.7 s, 7.0 s with a current multi-pack-index, 5.0 s with the commit-graph too). The index is one new file
+ * over the packs that exist; no pack is rewritten or removed.
  *
  * Non-pruning means no object and no ref value is lost. It does remove files: commit-graph layers that have left the
  * chain, only once older than {@link GRAPH_LAYER_GRACE} (git refreshes a layer's mtime when it retires it), and the
@@ -34,10 +40,12 @@ export const MAINTAIN_STORE_COMMIT_GRAPH_ARGS = [
   `--expire-time=${GRAPH_LAYER_GRACE}`,
 ] as const
 export const MAINTAIN_STORE_PACK_REFS_ARGS = ["pack-refs", "--all"] as const
+/** Index every pack the store holds in one file; never `repack` or `expire`, which rewrite or delete packs. */
+export const MAINTAIN_STORE_MULTI_PACK_INDEX_ARGS = ["multi-pack-index", "write", "--no-progress"] as const
 
 /**
- * What one call did. `maintained` only when both commands succeeded AND the graph is really there: a chain file whose
- * every listed layer exists. `refs` and `layers` are observations, not promises: writes may overlap, and a concurrent
+ * What one call did. `maintained` only when every command succeeded AND the graph and index are really there: a chain
+ * file whose every listed layer exists, and a multi-pack-index file. `refs` and `layers` are observations, not promises: writes may overlap, and a concurrent
  * update legitimately leaves a newer loose ref over a packed tip, which this never fails on and never removes.
  * Everything else is named (NO SILENT ERRORS): a store with no commits is `empty`; a store whose config disables the
  * commit-graph is `graph-disabled`, because git would exit 0 there without writing one; a failed step names itself.
@@ -46,6 +54,7 @@ export type StoreMaintenance =
   | Readonly<{
       outcome: "maintained"
       repo: string
+      multiPackIndexMs: number
       commitGraphMs: number
       packRefsMs: number
       refs: number
@@ -56,9 +65,10 @@ export type StoreMaintenance =
   | Readonly<{
       outcome: "failed"
       repo: string
-      step: "probe" | "commit-graph" | "pack-refs" | "verify"
+      step: "probe" | "multi-pack-index" | "commit-graph" | "pack-refs" | "verify"
       code: number | "timeout"
       detail: string
+      multiPackIndexMs?: number
       commitGraphMs?: number
       packRefsMs?: number
     }>
@@ -137,9 +147,13 @@ function readChain(repo: string): { layers: number } | { problem: string } {
   return { layers: listed.length }
 }
 
-/** Write the store's commit-graph incrementally and pack its refs; see {@link StoreMaintenance} for what it answers. */
+/**
+ * Index the store's packs, write its commit-graph incrementally and pack its refs; see {@link StoreMaintenance} for
+ * what it answers.
+ */
 export async function maintainStore(repo: string, options: MaintainStoreOptions = {}): Promise<StoreMaintenance> {
   const timeoutMs = commandBoundMs(options.timeoutMs)
+  let multiPackIndexMs: number | undefined
   let commitGraphMs: number | undefined
   let packRefsMs: number | undefined
   try {
@@ -158,6 +172,16 @@ export async function maintainStore(repo: string, options: MaintainStoreOptions 
         .filter(Boolean)
       return { outcome: "empty", repo, refs: refs.length }
     }
+    // The index first: the commit-graph write then reads commits through it. A store whose objects are all loose has
+    // no pack to index, and git refuses the write there ("no pack files to index"), so it is skipped, not failed.
+    const packs = countPacks(repo)
+    if (typeof packs === "string") throw new StepFailed("probe", 0, packs)
+    const indexStart = performance.now()
+    try {
+      if (packs > 0) await git(repo, "multi-pack-index", MAINTAIN_STORE_MULTI_PACK_INDEX_ARGS, timeoutMs)
+    } finally {
+      multiPackIndexMs = performance.now() - indexStart
+    }
     const graphStart = performance.now()
     try {
       await git(repo, "commit-graph", MAINTAIN_STORE_COMMIT_GRAPH_ARGS, timeoutMs)
@@ -172,10 +196,22 @@ export async function maintainStore(repo: string, options: MaintainStoreOptions 
     }
     const chain = readChain(repo)
     if ("problem" in chain) throw new StepFailed("verify", 0, chain.problem)
+    if (packs > 0) {
+      const index = readMultiPackIndex(repo)
+      if ("problem" in index) throw new StepFailed("verify", 0, index.problem)
+    }
     const refs = (await git(repo, "verify", ["for-each-ref", "--format=%(refname)"], timeoutMs))
       .split("\n")
       .filter(Boolean)
-    return { outcome: "maintained", repo, commitGraphMs, packRefsMs, refs: refs.length, layers: chain.layers }
+    return {
+      outcome: "maintained",
+      repo,
+      multiPackIndexMs,
+      commitGraphMs,
+      packRefsMs,
+      refs: refs.length,
+      layers: chain.layers,
+    }
   } catch (error) {
     if (!(error instanceof StepFailed)) throw error
     return {
@@ -184,8 +220,70 @@ export async function maintainStore(repo: string, options: MaintainStoreOptions 
       step: error.step,
       code: error.code,
       detail: error.detail,
+      ...(multiPackIndexMs === undefined ? {} : { multiPackIndexMs }),
       ...(commitGraphMs === undefined ? {} : { commitGraphMs }),
       ...(packRefsMs === undefined ? {} : { packRefsMs }),
     }
   }
+}
+
+/** How many packs the store holds, or why its pack directory cannot be listed. */
+function countPacks(repo: string): number | string {
+  const directory = join(repo, "objects", "pack")
+  try {
+    return fs.readdirSync(directory).filter((name) => name.endsWith(".pack")).length
+  } catch (error) {
+    return `no readable pack directory at ${directory}: ${error instanceof Error ? error.message : String(error)}`
+  }
+}
+
+/** How many packs the store's multi-pack-index covers, from its header, or why it cannot be read. */
+function readMultiPackIndex(repo: string): { packs: number } | { problem: string } {
+  const file = join(repo, "objects", "pack", "multi-pack-index")
+  let header: Buffer
+  try {
+    const fd = fs.openSync(file, "r")
+    try {
+      header = Buffer.alloc(12)
+      const read = fs.readSync(fd, header, 0, 12, 0)
+      if (read < 12) return { problem: `the multi-pack-index at ${file} is shorter than its 12-byte header` }
+    } finally {
+      fs.closeSync(fd)
+    }
+  } catch (error) {
+    return {
+      problem: `no readable multi-pack-index at ${file}: ${error instanceof Error ? error.message : String(error)}`,
+    }
+  }
+  // Header (git's gitformat-pack): "MIDX", version, object id version, chunk count, base count, then the pack count.
+  if (header.toString("latin1", 0, 4) !== "MIDX") {
+    return { problem: `the multi-pack-index at ${file} does not start with its MIDX signature` }
+  }
+  return { packs: header.readUInt32BE(8) }
+}
+
+/**
+ * A kept copy is maintained once this many packs sit outside its multi-pack-index (hh 33853): each fetch adds one, so
+ * a copy read often is maintained about every 32 fetches, and most commands pay nothing.
+ */
+export const KEPT_STORE_UNINDEXED_PACK_LIMIT = 32
+
+/**
+ * Whether a kept copy needs {@link maintainStore} before a command reads it, decided from one directory listing and two
+ * small file reads, with no git process (hh 33853, @cto fcdc1e71). A missing or unreadable commit-graph chain or
+ * multi-pack-index is a reason to maintain, never a reason to skip. The answer names why, so a caller can say it.
+ */
+export function keptStoreMaintenanceReason(repo: string): string | undefined {
+  const chain = readChain(repo)
+  if ("problem" in chain) return chain.problem
+  const packs = countPacks(repo)
+  if (typeof packs === "string") return packs
+  // All objects loose: there is nothing to index (maintainStore skips the index there too).
+  if (packs === 0) return undefined
+  const index = readMultiPackIndex(repo)
+  if ("problem" in index) return index.problem
+  const unindexed = packs - index.packs
+  return unindexed > KEPT_STORE_UNINDEXED_PACK_LIMIT
+    ? `${unindexed} packs outside the multi-pack-index (limit ${KEPT_STORE_UNINDEXED_PACK_LIMIT})`
+    : undefined
 }

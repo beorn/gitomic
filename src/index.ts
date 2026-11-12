@@ -149,6 +149,8 @@ export {
 export { openRemoteRepository, type OpenedRemoteRepository, type OpenRemoteRepositoryOptions } from "./repository.ts"
 export {
   GRAPH_LAYER_GRACE,
+  KEPT_STORE_UNINDEXED_PACK_LIMIT,
+  keptStoreMaintenanceReason,
   MAINTAIN_STORE_TIMEOUT_MS,
   maintainStore,
   type MaintainStoreOptions,
