@@ -379,6 +379,29 @@ export async function openReader(options: OpenReaderOptions): Promise<Reader> {
         parents: commit.parents.map(ownUtf8),
       }))
     },
+    ...(context.backend.readHistory === undefined || context.backend.countHistory === undefined
+      ? {}
+      : {
+          async pathLog({ from, path, limit }: { from: Oid; path: string; limit: number }) {
+            const start = validateOid(from)
+            const [commits, chain] = await Promise.all([
+              (context.backend.readHistory as NonNullable<typeof context.backend.readHistory>)(context.repo, [start], {
+                limit,
+                path,
+              }),
+              (context.backend.countHistory as NonNullable<typeof context.backend.countHistory>)(context.repo, start),
+            ])
+            return {
+              commits: commits.map((commit) => ({
+                ...commit,
+                oid: ownUtf8(commit.oid),
+                parent: commit.parent === null ? null : ownUtf8(commit.parent),
+                parents: commit.parents.map(ownUtf8),
+              })),
+              chain,
+            }
+          },
+        }),
     async diff(from, to) {
       validateOid(from)
       validateOid(to)

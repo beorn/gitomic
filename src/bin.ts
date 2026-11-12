@@ -340,6 +340,24 @@ export async function logGlobMatches(options: {
       ? normalized
       : undefined
   const commits: CommitMeta[] = []
+  // #33840: an unbounded literal read asks the backend's one narrowed walk for candidates, then applies the SAME rule
+  // the per-commit walk below applies, to those candidates only. A stop-at read keeps the per-commit walk: its anchor
+  // already bounds it (#31349), and the anchor must be seen on the chain, which a narrowed walk would skip past.
+  if (literalPath !== undefined && stopAt === undefined && reader.pathLog !== undefined) {
+    let cursor: string | null = from
+    let chain = 0
+    while (cursor !== null && commits.length < limit) {
+      const page = await reader.pathLog({ from: cursor, path: literalPath, limit: pageSize })
+      chain ||= page.chain
+      for (const commit of page.commits) {
+        if (await literalPathChanged(reader, commit, literalPath)) commits.push(commit)
+        if (commits.length === limit) break
+      }
+      const last = page.commits.at(-1)
+      cursor = page.commits.length === pageSize && last?.parent != null ? last.parent : null
+    }
+    return { commits, walked: chain, anchorConsumed: true, reachedRoot: commits.length < limit }
+  }
   let walked = 0
   let anchorConsumed = stopAt === undefined
   let cursor: string | null = from
@@ -350,11 +368,7 @@ export async function logGlobMatches(options: {
     for (const commit of page) {
       const atAnchor = stopAt !== undefined && commit.oid === stopAt
       if (literalPath !== undefined) {
-        const [before, after] = await Promise.all([
-          commit.parent === null ? Promise.resolve(undefined) : reader.at(commit.parent).oid(literalPath),
-          reader.at(commit.oid).oid(literalPath),
-        ])
-        if (before !== after) commits.push(commit)
+        if (await literalPathChanged(reader, commit, literalPath)) commits.push(commit)
       } else {
         const paths =
           commit.parent === null
@@ -376,6 +390,15 @@ export async function logGlobMatches(options: {
   // A walk that filled its limit legitimately stopped before the anchor; only a chain that ran out is a fault.
   const reachedRoot = commits.length < limit && !(stopAt !== undefined && anchorConsumed)
   return { commits, walked, anchorConsumed, reachedRoot }
+}
+
+/** The literal-path rule: the path's blob differs between a commit and its first parent (mode-only excluded). */
+async function literalPathChanged(reader: Reader, commit: CommitMeta, path: string): Promise<boolean> {
+  const [before, after] = await Promise.all([
+    commit.parent === null ? Promise.resolve(undefined) : reader.at(commit.parent).oid(path),
+    reader.at(commit.oid).oid(path),
+  ])
+  return before !== after
 }
 
 const OK = 0

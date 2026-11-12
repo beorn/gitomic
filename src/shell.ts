@@ -310,6 +310,7 @@ export function createShellRuntime(options: ShellBackendOptions = {}): {
     },
     readHistory: async (repo, tips, historyOptions) =>
       readHistory(await resolveGitDir(repo), tips, historyOptions, baseEnv),
+    countHistory: async (repo, tip) => countHistory(await resolveGitDir(repo), tip, baseEnv),
     writeGenesis: async (repo) => {
       const gitdir = await resolveGitDir(repo)
       let genesis = genesisByGitDir.get(gitdir)
@@ -1669,10 +1670,18 @@ const HISTORY_FIELDS = 8
 async function readHistory(
   repo: string,
   tips: readonly Oid[],
-  options: { readonly exclude?: readonly Oid[]; readonly limit?: number; readonly allParents?: boolean } = {},
+  options: {
+    readonly exclude?: readonly Oid[]
+    readonly limit?: number
+    readonly allParents?: boolean
+    readonly path?: string
+  } = {},
   baseEnv?: NodeJS.ProcessEnv,
 ): Promise<CommitMeta[]> {
   if (tips.length === 0) return []
+  if (options.path !== undefined && options.allParents === true) {
+    throw new TypeError("readHistory path narrows the first-parent walk; it is never combined with allParents")
+  }
   for (const tip of tips) validateOid(tip, "invalid history tip")
   const exclude = (options.exclude ?? []).map((oid) => `^${validateOid(oid, "invalid history exclusion")}`)
   const limit = options.limit === undefined ? [] : [`--max-count=${options.limit}`]
@@ -1688,6 +1697,10 @@ async function readHistory(
       "--no-commit-header",
       "--format=%H%x00%P%x00%ct%x00%an%x00%ae%x00%cn%x00%ce%x00%B%x00",
       "--stdin",
+      // One literal path as its own argv element: `:(literal)` turns off pathspec magic, so `*`, `?`, `[` and a
+      // leading `:` in a file name match only that name (#33840, @cto 9b936cce condition a). %P stays the commit's
+      // own parents: parent rewriting needs --parents, which is not passed.
+      ...(options.path === undefined ? [] : ["--", `:(literal)${options.path}`]),
     ],
     // This call consumes complete output; buffering avoids one pipe delivery per commit.
     { baseEnv, input: revisions, env: { GIT_FLUSH: "0" } },
@@ -1715,6 +1728,20 @@ async function readHistory(
     commits.push(commitMeta(oid, parents, timestamp, fields[index + 7] ?? "", { author, committer }))
   }
   return commits
+}
+
+/** The first-parent chain's length from `tip`, `tip` included, in one `git rev-list --count` (#33840). */
+async function countHistory(repo: string, tip: Oid, baseEnv?: NodeJS.ProcessEnv): Promise<number> {
+  validateOid(tip, "invalid history tip")
+  const output = decodeUtf8(
+    await git(repo, ["rev-list", "--first-parent", "--count", tip], { baseEnv }),
+    "git rev-list --count",
+  ).trim()
+  const count = Number(output)
+  if (!/^\d+$/.test(output) || !Number.isSafeInteger(count)) {
+    throw new Error(`git rev-list --count returned ${JSON.stringify(output)}`)
+  }
+  return count
 }
 
 /** Cap on the stderr tail kept for a stream-failure message: always drained, reported bounded. */

@@ -387,8 +387,16 @@ export type GitomicBackend = {
        * Defaults to false: every existing caller keeps first-parent semantics.
        */
       readonly allParents?: boolean
+      /**
+       * Narrow a first-parent walk to the commits whose entry at this ONE literal path differs from their first
+       * parent's, in the same process (#33840). It is a narrowing, never the rule: a caller applies its own exact
+       * comparison to what comes back. Never combined with `allParents`.
+       */
+      readonly path?: string
     },
   ): Promise<CommitMeta[]>
+  /** How many commits the first-parent chain from `tip` holds, `tip` included, counted in ONE process (#33840). */
+  countHistory?(repo: string, tip: Oid): Promise<number>
   /**
    * Every parent of every commit reachable from `tips`, streamed as
    * `{ oid, parents }` edges in ONE process, with NO commit bodies read. This
@@ -556,6 +564,12 @@ export type Reader = {
   at(commit?: Oid): Snapshot
   /** Newest-first first-parent history, pinned once; default 50, maximum 1024. */
   log(options?: { from?: Oid; limit?: number }): Promise<CommitMeta[]>
+  /**
+   * First-parent history narrowed to one literal path in one walk, plus the length of the chain it walked, when the
+   * backend can (#33840: a path changed 13 times in 147,162 commits took two git processes per commit otherwise).
+   * Absent on a backend without a narrowed walk; callers then use their own per-commit walk.
+   */
+  pathLog?(options: { from: Oid; path: string; limit: number }): Promise<{ commits: CommitMeta[]; chain: number }>
   diff(from: Oid, to: Oid): Promise<Change[]>
   watch(options: RefTipWatchOptions): AsyncIterable<RefTipChange>
 }
