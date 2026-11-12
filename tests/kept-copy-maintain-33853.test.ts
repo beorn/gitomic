@@ -173,4 +173,26 @@ describe("the gitomic CLI maintains its kept copy before a command reads it (#33
     expect(lines[0]).toContain(`gitomic: kept copy ${kept} not maintained (no commit-graph chain at `)
     expect(lines[0]).toMatch(/: commit-graph failed \(\d+\): .*commit-graph-chain\.lock.*; continuing$/u)
   }, 60_000)
+
+  test("a maintainer that loses the multi-pack-index lock leaves the old index whole, says so once, and reads", async () => {
+    const { kept, log } = await workspace()
+    expect((await log()).code).toBe(0)
+    // Take the copy back to needing upkeep (its index gone) while another maintainer holds the index lock.
+    const pack = join(kept, "objects", "pack")
+    const before = fs.readdirSync(pack).sort()
+    fs.rmSync(join(pack, "multi-pack-index"))
+    fs.writeFileSync(join(pack, "multi-pack-index.lock"), "")
+    const held = await log()
+    expect(held.code).toBe(0)
+    expect(held.stdout).toMatch(/^[0-9a-f]{40} pack 3\n$/u)
+    const lines = held.stderr.split("\n").filter(Boolean)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toContain(`gitomic: kept copy ${kept} not maintained (no readable multi-pack-index at `)
+    expect(lines[0]).toMatch(/: multi-pack-index failed \(\d+\): .*multi-pack-index\.lock.*; continuing$/u)
+    // Git refused before writing: no index, no partial one, and the packs and the held lock are as they were.
+    expect(fs.readdirSync(pack).sort()).toEqual(
+      [...before.filter((name) => name !== "multi-pack-index"), "multi-pack-index.lock"].sort(),
+    )
+    expect(fs.readFileSync(join(pack, "multi-pack-index.lock"), "utf8")).toBe("")
+  }, 60_000)
 })
