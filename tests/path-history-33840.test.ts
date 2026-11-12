@@ -3,6 +3,7 @@
  *           chain, so a path changed 13 times in a 147,162-commit history ran past 300 s with no output.
  * @level    l2 — the real shell backend on bare repositories built with git plumbing; no daemon.
  * @consumer gitomic log <addr> <path> (logGlobMatches), the state-history reads seats run.
+ * @reach    fs-walk <fixture-only: the shell backend runs against temporary Git repositories>
  * @testonly none
  */
 import { Buffer } from "node:buffer"
