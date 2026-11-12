@@ -16,6 +16,8 @@ import {
   CandidateRefused,
   EditDoesNotApply,
   RelativeOnlyEditRefused,
+  keptStoreMaintenanceReason,
+  maintainStore,
   matchGlob,
   open,
   openReader,
@@ -41,6 +43,7 @@ import {
   type Reader,
   type RemoteFirstProjectionOutcome,
   type Snapshot,
+  type StoreMaintenance,
   type Trailer,
 } from "./index.ts"
 import { putPrecondition, readTextFile } from "./checkout-edits.ts"
@@ -230,6 +233,7 @@ export async function main(argv: string[], io: CliIo = {}): Promise<number> {
     const source: AddressSource = {
       ...(backend === undefined ? {} : { backend }),
       ...(cacheDir === undefined ? {} : { cacheDir }),
+      stderr,
     }
     switch (verb) {
       case "read":
@@ -1695,9 +1699,9 @@ type OpenedAddress = OpenOptions & Disposable & { readonly ref: string; readonly
 
 /** One CLI selection point; a failed local open never selects a remote. */
 /** What a verb opens its address with: an injected backend, or the kept-copy directory for a URL address. */
-type AddressSource = { readonly backend?: GitomicBackend; readonly cacheDir?: string }
+type AddressSource = { readonly backend?: GitomicBackend; readonly cacheDir?: string; readonly stderr?: CliWriter }
 
-async function openAddressFor(address: string, { backend, cacheDir }: AddressSource): Promise<OpenedAddress> {
+async function openAddressFor(address: string, { backend, cacheDir, stderr }: AddressSource): Promise<OpenedAddress> {
   const { repo, ref } = parseAddressOrUsageError(address)
   const local = { repo, ref, ...(backend === undefined ? {} : { backend }), [Symbol.dispose]() {} }
   if (backend !== undefined) return local
@@ -1707,7 +1711,41 @@ async function openAddressFor(address: string, { backend, cacheDir }: AddressSou
   // Given a kept-copy directory, a refusal to open it (unwritable, foreign or non-bare) propagates:
   // never a silent fall back to a temporary clone.
   const repository = await openRemoteRepository(repo, cacheDir === undefined ? {} : { cacheDir })
+  if (cacheDir !== undefined) await maintainKeptCopy(repository.repo, stderr ?? process.stderr)
   return { ...repository, ref, url: repo, [Symbol.dispose]: () => repository[Symbol.dispose]() }
+}
+
+/** Each git command of a kept copy's upkeep stops after this; the command then runs on the copy as it is. */
+export const KEPT_COPY_MAINTAIN_TIMEOUT_MS = 60_000
+
+/**
+ * The CLI owns the kept copies under its cache directory, so it is their maintainer (hh 33853, @chief 4824ecaa): before
+ * a command reads a copy that needs it, it runs the shared non-pruning {@link maintainStore}. Git's own lock files keep
+ * it to one maintainer per copy; a command that loses that race, times out, or meets any other refusal names the store
+ * and the step in one stderr line and runs on the copy as it is, without waiting. Nothing is repacked or deleted, and
+ * only the kept copy is touched, never the origin it was cloned from.
+ */
+async function maintainKeptCopy(repo: string, stderr: CliWriter): Promise<void> {
+  const reason = keptStoreMaintenanceReason(repo)
+  if (reason === undefined) return
+  let result: StoreMaintenance
+  try {
+    result = await maintainStore(repo, { timeoutMs: KEPT_COPY_MAINTAIN_TIMEOUT_MS })
+  } catch (error) {
+    stderr.write(
+      `gitomic: kept copy ${repo} not maintained (${reason}): ${(error instanceof Error ? error.message : String(error)).replace(/\s*\n\s*/gu, " | ")}; continuing\n`,
+    )
+    return
+  }
+  if (result.outcome === "maintained" || result.outcome === "empty") return
+  const detail =
+    result.outcome === "graph-disabled"
+      ? `graph-disabled: ${result.reason}`
+      : `${result.step} ${result.code === "timeout" ? `timed out after ${KEPT_COPY_MAINTAIN_TIMEOUT_MS} ms` : `failed (${result.code})`}: ${result.detail}`
+  // One line, whatever git printed: its own stderr can span several.
+  stderr.write(
+    `gitomic: kept copy ${repo} not maintained (${reason}): ${detail.replace(/\s*\n\s*/gu, " | ")}; continuing\n`,
+  )
 }
 
 const CACHE_DIR_HELP =
