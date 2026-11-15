@@ -26,7 +26,7 @@ import {
   normalizeHistoryEdgeByteCap,
   normalizeHistoryEdgeRecordCap,
 } from "./history-edges.ts"
-import { journalLeaseRejection } from "./lease-journal.ts"
+import { journalLeaseRejection, type LeaseRejectionUpdate } from "./lease-journal.ts"
 import { rejectLegacyProvenance, validateRefNames } from "./options.ts"
 import {
   assertRefUpdates,
@@ -1107,6 +1107,66 @@ async function readBlobs(
   for (const oid of distinct) validateOid(oid, "readBlobs needs valid Git object ids")
   const output = await git(repo, ["cat-file", "--batch"], { baseEnv, input: `${distinct.join("\n")}\n` })
   return new Map([...parseBatch(distinct, output, "blob")].map(([oid, raw]) => [oid, decodeBlob(raw)]))
+}
+
+/**
+ * The receipts carried by the commits a push offered, one entry per offered ref (hh 33319). Read from the candidates'
+ * own `Gitomic-Instance`/`Gitomic-Seq` trailers in ONE batched `cat-file`, at the rejection site, so the record names
+ * the attempt that was refused rather than one a retry would build. A read that fails never throws: the reason is
+ * recorded on that candidate, because a metadata problem must not replace the rejection answer.
+ */
+async function offeredWithReceipts(
+  repo: string,
+  offered: readonly { readonly ref: string; readonly oid: Oid | null }[],
+  baseEnv?: NodeJS.ProcessEnv,
+): Promise<LeaseRejectionUpdate[]> {
+  const candidates = offered.flatMap(({ oid }) => (oid === null ? [] : [oid]))
+  const read = await readCommitMetas(repo, candidates, baseEnv)
+  return offered.map(({ ref, oid }) => {
+    if (oid === null) return { ref, oid: null }
+    const found = read.get(oid)
+    if (typeof found === "string") return { ref, oid, unreceipted: found }
+    if (found === undefined) return { ref, oid, unreceipted: "unreadable: batch read returned no commit" }
+    if (found.instance === null || found.seq === null) return { ref, oid, unreceipted: "no-trailers" }
+    return { ref, oid, receipt: { instance: found.instance, seq: found.seq } }
+  })
+}
+
+/**
+ * One `cat-file --batch` for the distinct oids. Each commit is parsed on its own, so one malformed object names itself
+ * instead of costing every other candidate its receipt.
+ */
+async function readCommitMetas(
+  repo: string,
+  oids: readonly Oid[],
+  baseEnv?: NodeJS.ProcessEnv,
+): Promise<ReadonlyMap<Oid, CommitMeta | string>> {
+  const distinct = [...new Set(oids)]
+  const parsed = new Map<Oid, CommitMeta | string>()
+  if (distinct.length === 0) return parsed
+  for (const oid of distinct) validateOid(oid, "receipts need valid Git object ids")
+  let bodies: ReadonlyMap<Oid, Buffer>
+  try {
+    const output = await git(repo, ["cat-file", "--batch"], { baseEnv, input: `${distinct.join("\n")}\n` })
+    bodies = parseBatch(distinct, output, "commit")
+  } catch (error) {
+    const reason = `unreadable: ${(error as Error).message}`
+    for (const oid of distinct) parsed.set(oid, reason)
+    return parsed
+  }
+  for (const oid of distinct) {
+    const body = bodies.get(oid)
+    if (body === undefined) {
+      parsed.set(oid, "unreadable: batch read returned no commit")
+      continue
+    }
+    try {
+      parsed.set(oid, parseCommit(oid, body))
+    } catch (error) {
+      parsed.set(oid, `unreadable: ${(error as Error).message}`)
+    }
+  }
+  return parsed
 }
 
 function parseBatch(oids: readonly Oid[], output: Buffer, type: "commit" | "blob"): ReadonlyMap<Oid, Buffer> {
@@ -2326,7 +2386,13 @@ async function compareAndSwapRemote(
     if (isRemoteCompareAndSwapRejection(detail)) {
       // Journaled before the caller sees the loss (hh 25626). This site throws no Conflict to attach a journal failure
       // to, so that failure is said on stderr with its path and the lost lease is still answered.
-      await journalLeaseRejection(repo, "compareAndSwapRemote", remote, [{ ref, expect: expected }])
+      await journalLeaseRejection(
+        repo,
+        "compareAndSwapRemote",
+        remote,
+        [{ ref, expect: expected }],
+        await offeredWithReceipts(repo, [{ ref, oid: next }], baseEnv),
+      )
       return { landed: false }
     }
     const rejected = rejectedPush(
@@ -2633,7 +2699,19 @@ async function publishRemote(
     }
     const lost = stale.map(({ ref, expect }) => ({ ref, expect, observed: observed(ref) }))
     // Journaled before the Conflict is thrown (hh 25626); a journal failure rides on it as its cause, never instead.
-    const journalFailure = await journalLeaseRejection(repo, "publishRemote", remote, lost)
+    // Every offered ref is recorded, not only the lost ones: an atomic push may lose a companion's lease while the
+    // receipt-bearing candidate sits on another ref (hh 33319). A metadata read failure rides in the record.
+    const journalFailure = await journalLeaseRejection(
+      repo,
+      "publishRemote",
+      remote,
+      lost,
+      await offeredWithReceipts(
+        repo,
+        updates.map(({ ref, oid }) => ({ ref, oid })),
+        baseEnv,
+      ),
+    )
     const conflict = leaseConflict(lost)
     if (journalFailure === undefined) throw conflict
     throw new Conflict(conflict.message, { refs: conflict.refs, cause: journalFailure })

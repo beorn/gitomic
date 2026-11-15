@@ -13,7 +13,7 @@ import { basename, join } from "node:path"
 import { chmod, mkdir, readdir, readFile, writeFile } from "node:fs/promises"
 
 import { open } from "../src/index.js"
-import { createRemoteRepos, git } from "./helpers/git.js"
+import { createRemoteRepos, EMPTY_TREE, git } from "./helpers/git.js"
 
 function deferred(): { promise: Promise<void>; resolve(): void } {
   let resolve!: () => void
@@ -31,6 +31,20 @@ type Rejection = {
   remote: string
   site: string
   refs: { ref: string; expect: string; observed?: string }[]
+  updates?: {
+    ref: string
+    oid: string | null
+    receipt?: { instance: string; seq: number }
+    unreceipted?: string
+  }[]
+}
+
+/** The receipt a commit stores in its own final paragraph, as a reader would parse it. */
+async function receiptOf(repo: string, oid: string): Promise<{ instance: string; seq: number } | undefined> {
+  const message = await git(repo, "log", "-1", "--format=%B", oid)
+  const instance = /^Gitomic-Instance: (.+)$/m.exec(message)?.[1]
+  const seq = /^Gitomic-Seq: (\d+)$/m.exec(message)?.[1]
+  return instance === undefined || seq === undefined ? undefined : { instance, seq: Number(seq) }
 }
 
 /** Every line of every day's journal under `repo`'s gitomic folder; none when the folder was never made. */
@@ -95,8 +109,107 @@ describe("remote lease rejections are journaled (hh 25626, @cto 96930a63)", () =
       // `observed` is written only where gitomic already read the remote's tip (publishRemote): reading it for the
       // journal alone would add a session to the count this journal exists to measure.
       if (main?.observed !== undefined) expect(main.observed).toBe(await git(fixture.remote, "rev-parse", "main^"))
+      // The receipt is stable across the replay, which is what lets a reader find the landed commit: the row names
+      // the attempt and its pair, and the commit that eventually landed carries the same pair (hh 33319).
+      const [offered] = row?.updates ?? []
+      expect(offered?.ref).toBe("refs/heads/main")
+      expect(offered?.unreceipted).toBeUndefined()
+      const refused = await receiptOf(fixture.left, offered?.oid ?? "")
+      expect(offered?.receipt).toEqual(refused)
+      const landed = await receiptOf(fixture.left, await git(fixture.left, "rev-parse", "main"))
+      expect(landed).toEqual(offered?.receipt)
+      // The offered commit is not the landed one: the retry rebuilt it on the new tip with the same receipt.
+      expect(offered?.oid).not.toBe(await git(fixture.left, "rev-parse", "main"))
       // The winner's write was accepted, so it journals nothing.
       await expect(journal(fixture.right)).resolves.toEqual([])
+    } finally {
+      await fixture.cleanup()
+    }
+  }, 30_000)
+
+  test("a lost companion ref still records the receipt-bearing candidate offered on main", async () => {
+    const fixture = await createRemoteRepos()
+    const companion = "refs/km/companion/2026-11-14"
+    try {
+      await git(fixture.remote, "update-ref", companion, fixture.initial)
+      const store = await open({ repo: fixture.left, ref: "main", writer: "left", remote: "origin" })
+      let attempts = 0
+      let rival = ""
+      await store.transact(async (map) => map.set("left", "1"), "left write", {
+        beside: async () => {
+          attempts += 1
+          if (attempts === 1) {
+            // Move the companion behind our back: the beside lease is now stale while main's is still good.
+            rival = await git(fixture.remote, "commit-tree", EMPTY_TREE, "-p", fixture.initial, "-m", "rival")
+            await git(fixture.remote, "update-ref", companion, rival)
+            return [{ ref: companion, expect: fixture.initial, oid: fixture.initial }]
+          }
+          return [{ ref: companion, expect: rival, oid: fixture.initial }]
+        },
+      })
+
+      const rows = await journal(fixture.left)
+      expect(rows).toHaveLength(1)
+      const [row] = rows
+      expect(row?.site).toBe("publishRemote")
+      // The lost list is unchanged in shape and names ONLY the companion: main was refused atomically, not stale.
+      expect(row?.refs.map((entry) => entry.ref)).toEqual([companion])
+      expect(row?.refs[0]?.observed).toBe(rival)
+      // Every offered ref is recorded, so the receipt-bearing candidate on main survives a companion-only loss.
+      const updates = row?.updates ?? []
+      expect(updates.map((entry) => entry.ref)).toEqual(["refs/heads/main", companion])
+      const main = updates[0]
+      expect(main?.unreceipted).toBeUndefined()
+      expect(main?.receipt?.seq).toEqual(expect.any(Number))
+      expect(await receiptOf(fixture.left, main?.oid ?? "")).toEqual(main?.receipt)
+      // A plain companion commit carries no receipt and says so by name, rather than being reported as absent.
+      expect(updates[1]?.oid).toBe(fixture.initial)
+      expect(updates[1]?.receipt).toBeUndefined()
+      expect(updates[1]?.unreceipted).toBe("no-trailers")
+    } finally {
+      await fixture.cleanup()
+    }
+  }, 30_000)
+
+  test("a replay whose final step becomes a noop records the receipt the refused attempt carried", async () => {
+    const fixture = await createRemoteRepos()
+    try {
+      const store = await open({ repo: fixture.left, ref: "main", writer: "left", remote: "origin" })
+      const rival = await open({ repo: fixture.right, ref: "main", writer: "rival", remote: "origin" })
+      let intruded = false
+      await store.transactSequence(
+        async (attempt) => {
+          const first = await attempt.step(async (map) => map.set("one.md", "one"), "first")
+          const second = await attempt.step(async (map) => map.set("two.md", "two"), "second")
+          return { first, second }
+        },
+        {
+          beside: async () => {
+            if (!intruded) {
+              intruded = true
+              // The rival lands step 2's own content on a tip without step 1's file, so the replay's LAST step
+              // becomes a noop and the published commit is step 1's, carrying step 1's seq instead of step 2's.
+              await rival.transact(async (map) => map.set("two.md", "two"), "rival advances")
+            }
+            return []
+          },
+        },
+      )
+
+      const rows = await journal(fixture.left)
+      expect(rows).toHaveLength(1)
+      const [row] = rows
+      const [offered] = row?.updates ?? []
+      expect(offered?.ref).toBe("refs/heads/main")
+      expect(await receiptOf(fixture.left, offered?.oid ?? "")).toEqual(offered?.receipt)
+
+      const landedTip = await git(fixture.left, "rev-parse", "main")
+      const landed = await receiptOf(fixture.left, landedTip)
+      // Same live store, different slot: the row names the attempt that was refused, and the landed commit carries
+      // the slot the replay actually used. A reader must report that as a bounded non-match, never as a lost write.
+      expect(landed?.instance).toBe(offered?.receipt?.instance)
+      expect(landed?.seq).not.toBe(offered?.receipt?.seq)
+      expect(offered?.oid).not.toBe(landedTip)
     } finally {
       await fixture.cleanup()
     }
