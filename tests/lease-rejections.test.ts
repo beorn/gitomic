@@ -215,6 +215,56 @@ describe("remote lease rejections are journaled (hh 25626, @cto 96930a63)", () =
     }
   }, 30_000)
 
+
+  test("a malformed candidate names why its receipt could not be read, and the write still lands", async () => {
+    const fixture = await createRemoteRepos()
+    const companion = "refs/km/companion/2026-11-14"
+    try {
+      await git(fixture.remote, "update-ref", companion, fixture.initial)
+      const store = await open({ repo: fixture.left, ref: "main", writer: "left", remote: "origin" })
+      let attempts = 0
+      let rival = ""
+      let malformed = ""
+      const landed = await store.transact(async (map) => map.set("left", "1"), "left write", {
+        beside: async () => {
+          attempts += 1
+          if (attempts === 1) {
+            rival = await git(fixture.remote, "commit-tree", EMPTY_TREE, "-p", fixture.initial, "-m", "rival")
+            await git(fixture.remote, "update-ref", companion, rival)
+            // A candidate that is not a well-formed gitomic commit: parseCommit throws on the trailer, so this is a
+            // real, reachable metadata-READ failure and not a journal-write one (@dev/7 hold 2026-11-14).
+            malformed = await git(
+              fixture.left,
+              "commit-tree",
+              EMPTY_TREE,
+              "-p",
+              fixture.initial,
+              "-m",
+              "w: bad trailers\n\nGitomic-Instance: 11111111-1111-1111-1111-111111111111\nGitomic-Seq: seven",
+            )
+            return [{ ref: companion, expect: fixture.initial, oid: malformed }]
+          }
+          return [{ ref: companion, expect: rival, oid: fixture.initial }]
+        },
+      })
+      // The caller's answer is unchanged: the retry landed exactly as it would with a healthy journal.
+      expect(landed.retries).toBe(1)
+
+      const [row] = await journal(fixture.left)
+      expect(row?.refs.map((entry) => entry.ref)).toEqual([companion])
+      const updates = row?.updates ?? []
+      const bad = updates.find((entry) => entry.ref === companion)
+      expect(bad?.oid).toBe(malformed)
+      expect(bad?.receipt).toBeUndefined()
+      expect(bad?.unreceipted).toMatch(/^unreadable: .*Gitomic-Seq/)
+      // One unreadable candidate does not cost the others their receipts.
+      const main = updates.find((entry) => entry.ref === "refs/heads/main")
+      expect(main?.receipt?.seq).toEqual(expect.any(Number))
+    } finally {
+      await fixture.cleanup()
+    }
+  }, 30_000)
+
   test("a policy rejection is not a lease rejection and journals nothing", async () => {
     const fixture = await createRemoteRepos()
     try {
