@@ -1133,6 +1133,13 @@ async function parseReplaceClause(tokens: readonly string[], claimStdin: () => P
     throw new UsageError("replace old text cannot be empty")
   }
   const newText = newFile === "-" ? await claimStdin() : await readTextFile(newFile)
+  // Old text that ends a line, replaced by text that does not, glues the next line onto the replacement (#31509): a
+  // file written without its final newline. Refused, never repaired: a deliberate join names the next line in both.
+  if (oldText.endsWith("\n") && newText.length > 0 && !newText.endsWith("\n")) {
+    throw new UsageError(
+      `replace new text in ${newFile === "-" ? "stdin" : newFile} does not end with a newline, but the old text does; the line after it would be joined onto it. End the new text with a newline, or put the next line in both old and new text to join them`,
+    )
+  }
   return { kind: "replace", path, oldText, newText }
 }
 

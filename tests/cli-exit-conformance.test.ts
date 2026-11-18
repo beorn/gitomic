@@ -250,6 +250,50 @@ describe.each(targets)("the CLI exit contract on $name", (target) => {
     expect(await tip()).toEqual(before)
   })
 
+  // #31509: a replacement file written without its trailing newline glued the next line onto the replaced one
+  // (three root commits and two repairs). A replace whose old text ends a line must keep the line end.
+  test("replace whose old text ends a line but whose new file does not exits 2 naming the file, and the ref does not move", async () => {
+    const address = target.address(fixture.repo)
+    const seeded = await cli(target, [
+      "apply",
+      address,
+      "-m",
+      "seed",
+      "put",
+      "a.md",
+      await file("a-seed.md", "row 1\nrow 2\n"),
+    ])
+    expect(seeded.code).toBe(0)
+    const before = await tip()
+    const newFile = await file("new-no-eol.md", "row 1 changed")
+    const result = await cli(target, [
+      "apply",
+      address,
+      "-m",
+      "glue",
+      "replace",
+      "a.md",
+      await file("old-line.md", "row 1\n"),
+      newFile,
+    ])
+    expect(result.code).toBe(2)
+    expect(result.stdout).toBe("")
+    expect(result.stderr).toContain(`gitomic: replace new text in ${newFile} does not end with a newline`)
+    expect(await tip()).toEqual(before)
+
+    const kept = await cli(target, [
+      "apply",
+      address,
+      "-m",
+      "line kept",
+      "replace",
+      "a.md",
+      await file("old-line-2.md", "row 1\n"),
+      await file("new-eol.md", "row 1 changed\n"),
+    ])
+    expect(kept.code).toBe(0)
+  })
+
   test("two stdin '-' operands in one apply exit 2 as usage error", async () => {
     const address = target.address(fixture.repo)
     const before = await tip()
