@@ -3,11 +3,12 @@
 // @consumer remote-arbitrated gitomic writers
 
 import { describe, expect, test, vi } from "vitest"
+import { spawn } from "node:child_process"
 import fs from "node:fs"
-import { chmod, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises"
+import { chmod, mkdir, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
-import { pathToFileURL } from "node:url"
+import { fileURLToPath, pathToFileURL } from "node:url"
 
 import {
   createShellBackend,
@@ -84,6 +85,10 @@ describe("owned remote repositories", () => {
   test("failed clone cleans its allocation and preserves a simultaneous cleanup failure", async () => {
     const fixture = await createBareRepo()
     const source = pathToFileURL(join(fixture.repo, "missing.git")).href
+    // Its own TMPDIR: the first rmSync must be this clone's cleanup, never a sweep of another run's clone.
+    const scratch = await mkdtemp(join(tmpdir(), "gitomic-failed-clone-"))
+    const saved = process.env.TMPDIR
+    process.env.TMPDIR = scratch
     const remove = vi.spyOn(fs, "rmSync")
     try {
       await expect(openRemoteRepository(source)).rejects.toThrow(/git clone/)
@@ -112,6 +117,9 @@ describe("owned remote repositories", () => {
       const parents = remove.mock.calls.map(([path]) => path)
       remove.mockRestore()
       for (const parent of parents) fs.rmSync(parent, { recursive: true, force: true })
+      if (saved === undefined) delete process.env.TMPDIR
+      else process.env.TMPDIR = saved
+      await rm(scratch, { recursive: true, force: true })
       await fixture.cleanup()
     }
   })
@@ -133,6 +141,119 @@ describe("owned remote repositories", () => {
       }
       expect(fs.existsSync(parent)).toBe(false)
     } finally {
+      await fixture.cleanup()
+    }
+  })
+})
+
+const INDEX = fileURLToPath(new URL("../src/index.ts", import.meta.url))
+
+/** This process's pid namespace as a temporary clone's name records it. */
+function ownPidNamespace(): string | undefined {
+  if (process.platform !== "linux") return "host"
+  return /^pid:\[(\d+)\]$/.exec(fs.readlinkSync("/proc/self/ns/pid"))?.[1]
+}
+
+/** A pid that was just used and has exited, so nothing holds it. */
+async function exitedPid(): Promise<number> {
+  const child = spawn("true")
+  await new Promise((done) => child.on("exit", done))
+  const pid = child.pid ?? -1
+  expect(() => process.kill(pid, 0)).toThrow()
+  return pid
+}
+
+/** Opens a temporary clone of `source` in a separate Bun process under `scratch`, kills it with `signal`, answers the clone's directory. */
+async function cloneThenKill(source: string, scratch: string, signal: NodeJS.Signals): Promise<string> {
+  const script = [
+    `const { openRemoteRepository } = await import(${JSON.stringify(INDEX)})`,
+    `const repository = await openRemoteRepository(${JSON.stringify(source)})`,
+    'process.stdout.write(repository.repo + "\\n")',
+    "setInterval(() => {}, 1000)",
+  ].join("\n")
+  const child = spawn("bun", ["-e", script], {
+    env: { ...process.env, TMPDIR: scratch },
+    stdio: ["ignore", "pipe", "inherit"],
+  })
+  const exited = new Promise((done) => child.on("exit", done))
+  const repo = await new Promise<string>((resolveRepo, reject) => {
+    let output = ""
+    child.stdout.on("data", (chunk: Buffer) => {
+      output += chunk.toString("utf8")
+      if (output.includes("\n")) resolveRepo(output.trim())
+    })
+    child.on("exit", (code, killed) => reject(new Error(`child exited before opening: ${code ?? killed}`)))
+  })
+  child.kill(signal)
+  await exited
+  return dirname(repo)
+}
+
+async function withTmpdir<T>(scratch: string, body: () => Promise<T>): Promise<T> {
+  const saved = process.env.TMPDIR
+  process.env.TMPDIR = scratch
+  try {
+    return await body()
+  } finally {
+    if (saved === undefined) delete process.env.TMPDIR
+    else process.env.TMPDIR = saved
+  }
+}
+
+describe("abandoned temporary clones (hh 34908)", () => {
+  /**
+   * @failure 205 $TMPDIR/gitomic-remote-* clones, about 116 GiB, outlived CLI processes killed by a signal on hh's
+   *          host (hh 34908, a recurrence of 25615): a killed process never disposes, so the next temporary open
+   *          must remove every clone whose process is gone.
+   */
+  test.each(["SIGTERM", "SIGKILL"] as const)(
+    "the next temporary open removes the clone of a process killed with %s",
+    async (signal) => {
+      const fixture = await createBareRepo()
+      const scratch = await mkdtemp(join(tmpdir(), "gitomic-temp-sweep-"))
+      try {
+        const source = pathToFileURL(fixture.repo).href
+        const left = await cloneThenKill(source, scratch, signal)
+        expect(fs.existsSync(join(left, "repo.git"))).toBe(true)
+
+        const repository = await withTmpdir(scratch, () => openRemoteRepository(source))
+        const own = dirname(repository.repo)
+        repository[Symbol.dispose]()
+
+        expect(fs.existsSync(left)).toBe(false)
+        expect(fs.existsSync(own)).toBe(false)
+      } finally {
+        await rm(scratch, { recursive: true, force: true })
+        await fixture.cleanup()
+      }
+    },
+  )
+
+  test("a temporary open keeps a live process's clone, another pid namespace's, and a name it did not write", async () => {
+    const namespace = ownPidNamespace()
+    expect(namespace).toBeDefined()
+    const fixture = await createBareRepo()
+    const scratch = await mkdtemp(join(tmpdir(), "gitomic-temp-keep-"))
+    try {
+      const dead = await exitedPid()
+      const keptDirectories = [
+        `gitomic-remote-${namespace}-${process.pid}-live01`,
+        `gitomic-remote-1-${dead}-other1`,
+        "gitomic-remote-legacy",
+      ]
+      const keptFile = `gitomic-remote-${namespace}-${dead}-file01`
+      const abandoned = join(scratch, `gitomic-remote-${namespace}-${dead}-dead01`)
+      await mkdir(join(abandoned, "repo.git"), { recursive: true })
+      for (const name of keptDirectories) await mkdir(join(scratch, name))
+      await writeFile(join(scratch, keptFile), "not a clone\n")
+
+      const repository = await withTmpdir(scratch, () => openRemoteRepository(pathToFileURL(fixture.repo).href))
+      repository[Symbol.dispose]()
+
+      expect(fs.existsSync(abandoned)).toBe(false)
+      for (const name of [...keptDirectories, keptFile]) expect(fs.existsSync(join(scratch, name)), name).toBe(true)
+    } finally {
+      await rm(scratch, { recursive: true, force: true })
       await fixture.cleanup()
     }
   })

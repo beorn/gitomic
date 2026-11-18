@@ -64,7 +64,13 @@ async function openTemporary(
 ): Promise<OpenedRemoteRepository> {
   let parent: string
   try {
-    parent = fs.mkdtempSync(join(tmpdir(), "gitomic-remote-"))
+    const directory = tmpdir()
+    const namespace = pidNamespace()
+    // A process killed before disposal leaves its clone behind (hh 34908: 205 of them, 116 GiB): every
+    // temporary open first removes the clones whose process is gone, as openKept does for its builds.
+    if (namespace !== undefined) sweepAbandonedTemporaries(directory, namespace)
+    const prefix = namespace === undefined ? TEMPORARY_PREFIX : `${TEMPORARY_PREFIX}${namespace}-${process.pid}-`
+    parent = fs.mkdtempSync(join(directory, prefix))
   } catch (error) {
     throw new Error(`${JSON.stringify(source)}: cannot allocate temporary Git repository: ${String(error)}`, {
       cause: error,
@@ -73,8 +79,8 @@ async function openTemporary(
   const repo = join(parent, "repo.git")
   try {
     await build(source, repo, seed, timeoutMs)
-    // Disposal removes it, but a process killed first leaves it behind: a temporary clone never starts a
-    // background gc on storage nobody owns any more.
+    // Until the next temporary open removes a killed process's clone, it never starts a background gc on
+    // storage nobody owns any more.
     await gitOrThrow(source, ["--git-dir", repo, "config", "gc.auto", "0"], timeoutMs)
   } catch (failure) {
     removeFailedBuild(source, parent, failure)
@@ -249,6 +255,59 @@ function sweepAbandonedBuilds(cacheDir: string): void {
     const pid = Number(match[1])
     if (pid === process.pid || processExists(pid)) continue
     fs.rmSync(join(cacheDir, entry), { recursive: true, force: true })
+  }
+}
+
+/**
+ * A temporary clone is `<tmpdir>/gitomic-remote-<pid namespace>-<pid>-XXXXXX`: the name says which process
+ * owns it, so a later open can tell an abandoned clone from a live one.
+ */
+const TEMPORARY_PREFIX = "gitomic-remote-"
+const TEMPORARY_NAME = /^gitomic-remote-(host|\d+)-(\d+)-[A-Za-z0-9]{6}$/
+
+/**
+ * This process's pid namespace: "host" off Linux, which has none, else the namespace's inode. A pid means
+ * nothing outside its namespace, so a clone is judged only by an open in the same one. Undefined where the
+ * namespace cannot be read (a sandbox hiding /proc): that process neither names its clone by pid nor sweeps.
+ */
+function pidNamespace(): string | undefined {
+  if (process.platform !== "linux") return "host"
+  let link: string
+  try {
+    link = fs.readlinkSync("/proc/self/ns/pid")
+  } catch (error) {
+    // delete-fallback-allow: an unreadable namespace answers undefined, and undefined skips the sweep entirely, so a failed read can only shrink what is deleted (to nothing), never widen it.
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === "ENOENT" || code === "EACCES" || code === "EPERM") return undefined
+    throw error
+  }
+  const match = /^pid:\[(\d+)\]$/.exec(link)
+  if (match === null) throw new Error(`/proc/self/ns/pid reads ${JSON.stringify(link)}, not pid:[<inode>]`)
+  return match[1]
+}
+
+/**
+ * Remove every temporary clone in `directory` this user made from `namespace` whose process no longer exists.
+ * Kept: this process's, a live process's, another namespace's or user's, a name without an owner, and anything
+ * that is not a directory.
+ */
+function sweepAbandonedTemporaries(directory: string, namespace: string): void {
+  const uid = process.getuid?.()
+  for (const entry of fs.readdirSync(directory)) {
+    const match = TEMPORARY_NAME.exec(entry)
+    if (match === null || match[1] !== namespace) continue
+    const pid = Number(match[2])
+    if (pid === process.pid || processExists(pid)) continue
+    const path = join(directory, entry)
+    let stat: fs.Stats
+    try {
+      stat = fs.lstatSync(path)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue // another open removed it first
+      throw error
+    }
+    if (!stat.isDirectory() || (uid !== undefined && stat.uid !== uid)) continue
+    fs.rmSync(path, { recursive: true, force: true })
   }
 }
 
