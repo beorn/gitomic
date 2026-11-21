@@ -480,7 +480,8 @@ export async function batchCheck(
       )
     }
   }
-  const args = ["-C", resolve(repository), "cat-file", "--batch-check=%(objectname) %(objecttype)"]
+  // The runner collects the full result, so Git can buffer writes across answers.
+  const args = ["-C", resolve(repository), "cat-file", "--batch-check=%(objectname) %(objecttype)", "--buffer"]
   const checked = await (options.run ?? runGit)(args, {
     input: `${names.join("\n")}\n`,
     timeoutMs: options.timeoutMs ?? DANGLING_REF_SCAN_TIMEOUT_MS,

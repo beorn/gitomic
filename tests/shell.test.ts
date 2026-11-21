@@ -1900,7 +1900,7 @@ describe("shell backend failure boundaries", { concurrent: false }, () => {
     ])
     expect(calls).toEqual([
       {
-        args: ["-C", "/tmp/gitomic-batch", "cat-file", "--batch-check=%(objectname) %(objecttype)"],
+        args: ["-C", "/tmp/gitomic-batch", "cat-file", "--batch-check=%(objectname) %(objecttype)", "--buffer"],
         input: `${names.join("\n")}\n`,
       },
     ])
