@@ -222,6 +222,7 @@ async function createGitWrapper(): Promise<{
       "#!/usr/bin/env node",
       'const { appendFileSync, existsSync, readFileSync, writeFileSync } = require("node:fs")',
       "const args = process.argv.slice(2)",
+      'if (process.env.GITOMIC_FAKE_REF_OBSERVATIONS && args.includes("fetch") && args.includes("--stdin")) args.push(...readFileSync(0, "utf8").trim().split("\\n"))',
       "const commands = process.env.GITOMIC_COMMAND_LOG",
       'if (commands) appendFileSync(commands, JSON.stringify(args) + "\\n")',
       "const log = process.env.GITOMIC_GIT_ENV_LOG",
@@ -382,7 +383,7 @@ describe("shell backend failure boundaries", { concurrent: false }, () => {
     "bounds named optional fetches and verifies one observation when a ref %s (#33403)",
     async (_kind, observations, outcome) => {
       const wrapper = await createGitWrapper()
-      const names = Array.from({ length: 257 }, (_, n) => `refs/km/items/i${n}`)
+      const names = Array.from({ length: 1025 }, (_, n) => `refs/km/items/i${n}`)
       const moving = names.at(-1)!
       try {
         const backend = createShellBackend({
@@ -393,10 +394,7 @@ describe("shell backend failure boundaries", { concurrent: false }, () => {
             GITOMIC_FAKE_GITDIR: "/gitomic-named-fetch-shape.git",
             GITOMIC_FAKE_REF_NAMES: JSON.stringify(names),
             GITOMIC_FAKE_REF_MARK: `${wrapper.log}.observations`,
-            // Nothing is held yet, so every listed ref is fetched; skipping held refs is multi.test.ts's case (33504).
-            GITOMIC_FAKE_BATCH_CHECK: names
-              .map((ref) => `${fetchedNamespace("origin")}${ref.slice(5)}^{commit} missing\n`)
-              .join(""),
+            GITOMIC_FAKE_LOCAL_REFS: "",
             GITOMIC_FAKE_REF_OBSERVATIONS: JSON.stringify(
               observations.map((row) => ({
                 listed: row.listed.repeat(40),
@@ -428,9 +426,10 @@ describe("shell backend failure boundaries", { concurrent: false }, () => {
         expect(commands.filter((args) => args.includes("ls-remote"))).toHaveLength(observations.length)
         // Movement occurs in the second batch: the retry must also re-fetch the first batch.
         expect(fetches).toHaveLength(observations.length * 2)
+        expect(fetches.filter((args) => args.includes("--stdin"))).toHaveLength(observations.length)
         for (const args of fetches) {
           const specs = args.filter((arg) => arg.startsWith("+"))
-          expect(specs.length).toBeLessThanOrEqual(256)
+          expect(specs.length).toBeLessThanOrEqual(1024)
           expect(specs.every((spec) => !spec.includes("*") && !spec.includes("refs/km/items/absent"))).toBe(true)
         }
       } finally {

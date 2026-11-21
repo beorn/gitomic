@@ -2909,7 +2909,10 @@ const FETCH_RACE_ATTEMPTS = 3
 
 // #33403, 7,821 cold refs: one fetch peaked at 6,373 MiB. Batches of 256
 // peaked at 143 MiB / 45s; 1,024 at 252 MiB / 37s. Prefer the lower peak.
-const NAMED_FETCH_BATCH_SIZE = 256
+const NAMED_FETCH_OBSERVATION_THRESHOLD = 256
+// On 9,740 exact refs, 1,024 via stdin peaked at 154 MiB in 12.1 s versus 129 MiB in 34.6 s at 256.
+// Keep batches bounded: a single historical 7,821-ref fetch peaked at 6,373 MiB (hh 33403).
+const NAMED_FETCH_BATCH_SIZE = 1024
 
 /**
  * How a fetch lost a race with a concurrent fetch in the same repository for refs in `namespace`:
@@ -2969,12 +2972,18 @@ async function fetchOptionalNamedRefs(
     // A ref already held at exactly the tip this observation just listed is not fetched: the fetch could
     // bring nothing this read returns. The skip is decided against this listing only, by the same
     // predicate as fetchedTip, so a moved, first-seen or unreadable ref is still fetched (hh 33504).
-    const held = await heldTips(
-      repo,
-      present.map(({ ref }) => ref),
-      remote,
-      baseEnv,
-    )
+    if (present.length === 0) return tips
+    const privateTips = await listRefs(repo, fetchedNamespace(remote), undefined, timeoutMs, baseEnv)
+    const candidates = present.filter(({ ref, oid }) => privateTips.get(fetchedLocal(remote, ref)) === oid)
+    const held =
+      candidates.length === 0
+        ? new Map<string, Oid>()
+        : await heldTips(
+            repo,
+            candidates.map(({ ref }) => ref),
+            remote,
+            baseEnv,
+          )
     const skipped: { ref: string; oid: Oid }[] = []
     const wanted = present.filter(({ ref, oid }) => {
       if (held.get(ref) !== oid) return true
@@ -3065,13 +3074,13 @@ async function fetchRefs(
   if (prefix === undefined) {
     if (named.length === 0) throw new TypeError("fetchRefs needs a prefix or at least one ref")
     for (const ref of named) {
-      if (typeof ref !== "string" || !ref.startsWith("refs/")) {
+      if (typeof ref !== "string" || !ref.startsWith("refs/") || /[\r\n]/u.test(ref)) {
         throw new TypeError(`fetchRefs ref must be a full refs/ name: ${JSON.stringify(ref)}`)
       }
     }
     if (new Set(named).size !== named.length) throw new TypeError("fetchRefs names a ref more than once")
   }
-  if (prefix === undefined && absent === "omit" && named.length > NAMED_FETCH_BATCH_SIZE) {
+  if (prefix === undefined && absent === "omit" && named.length > NAMED_FETCH_OBSERVATION_THRESHOLD) {
     return fetchOptionalNamedRefs(repo, named, remote, timeoutMs, baseEnv)
   }
   // `prefix*` rather than `prefix/*`, so a ref named exactly `prefix` is included,
@@ -3082,6 +3091,7 @@ async function fetchRefs(
     prefix === undefined
       ? named.map((ref) => (absent === "omit" ? `+${ref}*:${local(ref)}*` : `+${ref}:${local(ref)}`))
       : [`+${prefix}*:${local(prefix)}*`]
+  const input = refspecs.length > NAMED_FETCH_OBSERVATION_THRESHOLD ? `${refspecs.join("\n")}\n` : undefined
   const fetchArgs = [
     "fetch",
     "--verbose",
@@ -3090,13 +3100,14 @@ async function fetchRefs(
     "--no-write-fetch-head",
     "--refmap=",
     ...(prefix === undefined ? [] : ["--prune"]),
+    ...(input === undefined ? [] : ["--stdin"]),
     remote,
-    ...refspecs,
+    ...(input === undefined ? refspecs : []),
   ]
   let output: Buffer | undefined
   for (let attempt = 1; output === undefined; attempt++) {
     try {
-      output = await git(repo, fetchArgs, { baseEnv, timeoutMs })
+      output = await git(repo, fetchArgs, { baseEnv, timeoutMs, input })
     } catch (error) {
       if (error instanceof AbsoluteDeadlineExpired) throw error
       // Another fetch in this repository moved or held one of our private

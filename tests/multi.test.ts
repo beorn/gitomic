@@ -588,8 +588,17 @@ describe("remote: one atomic push, one fetch", () => {
       const listing = async () =>
         new Map(await listRefs("refs/yrd/q/changes/", { repo: pair.origin.repo, backend: writer }))
 
-      // First sight: nothing is held, so every listed ref is fetched.
-      expect(await fetchRefs(pair.local.repo, names, "origin", { absent: "omit" })).toEqual(await listing())
+      // A cold fetched namespace has no objects whose suitability can let us skip a fetch.
+      const cold = vi.spyOn(childProcess, "spawn")
+      try {
+        expect(await fetchRefs(pair.local.repo, names, "origin", { absent: "omit" })).toEqual(await listing())
+        const coldFetches = cold.mock.calls.filter(([, args]) => Array.isArray(args) && args.includes("fetch"))
+        expect(coldFetches).toHaveLength(1)
+        expect(coldFetches[0]?.[1]).toContain("--stdin")
+        expect(cold.mock.calls.filter(([, args]) => Array.isArray(args) && args.includes("cat-file"))).toHaveLength(0)
+      } finally {
+        cold.mockRestore()
+      }
 
       // Everything held at the listed tip: no fetch at all, and the listed tips are returned.
       const quiet = vi.spyOn(childProcess, "spawn")
