@@ -603,17 +603,19 @@ describe("remote: one atomic push, one fetch", () => {
       // Everything held at the listed tip: no fetch at all, and the listed tips are returned.
       const quiet = vi.spyOn(childProcess, "spawn")
       expect(await fetchRefs(pair.local.repo, names, "origin", { absent: "omit" })).toEqual(await listing())
-      expect(fetchedSources(quiet)).toEqual([])
+      expect(quiet.mock.calls.some(([, args]) => Array.isArray(args) && args.includes("fetch"))).toBe(false)
       quiet.mockRestore()
 
-      // A mixed read across the batch boundary: two refs moved (one in each batch), one appeared for the first
-      // time, and one held ref no longer peels to a commit (it names a blob). Only those four are fetched.
+      // Two refs moved, one appeared, and one matches the advertised blob but cannot peel to a commit.
+      // All four still require a fetch.
       // (A held ref naming a MISSING object is refused by git fetch itself, before and after this change.)
       const moved = [names[10] ?? "", names[280] ?? ""]
       const appeared = names[299] ?? ""
       const unreadable = names[5] ?? ""
       await point([...moved, appeared], second)
       const blob = await gitWithInput(pair.local.repo, "not a commit\n", "hash-object", "-w", "--stdin")
+      expect(await gitWithInput(pair.origin.repo, "not a commit\n", "hash-object", "-w", "--stdin")).toBe(blob)
+      await point([unreadable], blob)
       await git(pair.local.repo, "update-ref", `${fetchedNamespace("origin")}${unreadable.slice("refs/".length)}`, blob)
       const mixed = vi.spyOn(childProcess, "spawn")
       expect(await fetchRefs(pair.local.repo, names, "origin", { absent: "omit" })).toEqual(await listing())
