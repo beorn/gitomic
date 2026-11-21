@@ -215,7 +215,6 @@ describe("remote lease rejections are journaled (hh 25626, @cto 96930a63)", () =
     }
   }, 30_000)
 
-
   test("a malformed candidate names why its receipt could not be read, and the write still lands", async () => {
     const fixture = await createRemoteRepos()
     const companion = "refs/km/companion/2026-11-14"

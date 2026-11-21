@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto"
 import fs from "node:fs"
 import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { dirname, join, resolve } from "node:path"
+import { dirname, isAbsolute, join, resolve } from "node:path"
 
 import { fullJitter, type RandomUnit } from "@bearly/pacing"
 
@@ -787,7 +787,19 @@ function spawnOwned(
   sigterm: "forward" | "drain",
 ): OwnedChild {
   const group = lifetime === "standalone" && standaloneGroup
-  const child = childProcess.spawn(command, args, { env, stdio: ["pipe", "pipe", "pipe"], detached: group })
+  // A bare-store command (`--git-dir <absolute store>`, see gitArgs) runs inside its store, never in the caller's
+  // cwd: Git reads its cwd at startup and exits 128 when that directory was deleted, as it is for a caller closing
+  // the environment it ran from (hh 37460). Inside the store Git also finds no work tree to scope the command to.
+  // A store that is not a directory keeps the caller's cwd, so Git itself names the missing repository: a missing
+  // spawn cwd would surface only as `spawn git ENOENT`.
+  const named = args[0] === "--git-dir" && args[1] !== undefined && isAbsolute(args[1]) ? args[1] : undefined
+  const store = named !== undefined && fs.statSync(named, { throwIfNoEntry: false })?.isDirectory() ? named : undefined
+  const child = childProcess.spawn(command, args, {
+    env,
+    stdio: ["pipe", "pipe", "pipe"],
+    detached: group,
+    ...(store === undefined ? {} : { cwd: store }),
+  })
   const release = group && child.pid !== undefined ? holdGroup(child.pid, sigterm) : noRelease
   return { child, group, release }
 }
