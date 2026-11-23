@@ -98,9 +98,14 @@ export type SnapshotBase = LazyBase & {
   wholeListing(): Promise<void>
 }
 
-export function createSnapshotBase(backend: GitomicBackend, repo: string, commit: Oid): SnapshotBase {
+export function createSnapshotBase(
+  backend: GitomicBackend,
+  repo: string,
+  commit: Oid,
+  retention: BlobRetention = {},
+): SnapshotBase {
   const entries = new Map<string, TreeEntry>()
-  const base = createLazyBase(backend, repo, commit, entries, "caller")
+  const base = createLazyBase(backend, repo, commit, entries, "caller", retention)
   const resolved = new Set<string>()
   const exact = new Map<string, Promise<void>>()
   let whole: Promise<void> | undefined
@@ -142,6 +147,15 @@ export function createSnapshotBase(backend: GitomicBackend, repo: string, commit
   }
 }
 
+/**
+ * How a base keeps the blob values it reads (#35061, @cto ruling on the km materialisation spike). `retainBlobValues`
+ * defaults to `true`, the documented memo: a blob read once is answered from the memo for this base's lifetime, so a
+ * repeat costs nothing. With `false` NOTHING is memoised: every `get`/`raw` re-reads its blob from the backend, and a
+ * second read of the same path is a second backend read - visible cost by contract, never a silent one. Nothing else
+ * changes: the exact-read, immutable revision, validation, retry and error semantics are the same either way.
+ */
+export type BlobRetention = { readonly retainBlobValues?: boolean }
+
 /** A lazy base over a listing already read: values fetched by oid on demand. */
 export function createLazyBase(
   backend: GitomicBackend,
@@ -149,9 +163,11 @@ export function createLazyBase(
   parent: Oid,
   listing: TreeListing,
   exposure: "whole" | "caller" = "whole",
+  retention: BlobRetention = {},
 ): LazyBase {
   if (exposure === "whole") assertExposed(listing, [...listing.keys()])
   const algorithm = parent.length === 64 ? "sha256" : "sha1"
+  const retainBlobValues = retention.retainBlobValues ?? true
   const memo = new Map<Oid, Promise<BlobValue>>()
   let pending: Map<Oid, Waiter[]> | undefined
 
@@ -229,7 +245,7 @@ export function createLazyBase(
     let value = memo.get(entry.oid)
     if (value === undefined) {
       value = request(entry.oid, path)
-      memo.set(entry.oid, value)
+      if (retainBlobValues) memo.set(entry.oid, value)
     }
     return value
   }

@@ -11,7 +11,7 @@ import { join } from "node:path"
 
 import { afterEach, describe, expect, test } from "vitest"
 
-import { apply, open } from "../src/index.js"
+import { apply, open, openReader } from "../src/index.js"
 import type { GitomicBackend, Oid } from "../src/index.js"
 import { createIsoBackend } from "../src/iso.js"
 import { createMemBackend } from "../src/mem.js"
@@ -667,5 +667,31 @@ describe("a snapshot reads its tree ONCE, however many paths it names (27226)", 
     } finally {
       await fixture.cleanup()
     }
+  })
+
+  // #35061 (@cto ruling on the km materialisation spike): a reader whose values are consumed once and then dropped
+  // - km writes the tree to a throwaway mount - must not pin the tree it read. `retainBlobValues: false` memoises
+  // nothing, so a repeat read goes back to the backend; the default reader keeps the documented memo and answers
+  // the repeat for free. Neither changes what a read returns.
+  test("35061 retainBlobValues false memoises nothing while the default reader keeps the memo", async () => {
+    const recorded = recordReads(createMemBackend())
+    const store = await open({ repo: "retention", ref: "main", writer: "worker", backend: recorded.backend })
+    const committed = await store.transact(async (map) => map.set("one.md", "# one\n"), "seed one note")
+
+    const memoised = (await openReader({ repo: "retention", ref: "main", backend: recorded.backend })).at(committed.oid)
+    recorded.reset()
+    expect(await memoised.get("one.md")).toBe("# one\n")
+    expect(await memoised.get("one.md")).toBe("# one\n")
+    expect(fetched(recorded.blobCalls)).toBe(1)
+
+    const bare = (
+      await openReader({ repo: "retention", ref: "main", backend: recorded.backend, retainBlobValues: false })
+    ).at(committed.oid)
+    recorded.reset()
+    expect(await bare.get("one.md")).toBe("# one\n")
+    expect(await bare.get("one.md")).toBe("# one\n")
+    // Nothing was memoised: the second read is a second backend read, never a silent one.
+    expect(fetched(recorded.blobCalls)).toBe(2)
+    expect(distinct(recorded.blobCalls)).toBe(1)
   })
 })

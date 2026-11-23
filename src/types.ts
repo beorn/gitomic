@@ -546,6 +546,13 @@ export type OpenReaderOptions = {
   ref?: string
   remote?: string
   backend?: GitomicBackend
+  /**
+   * Whether the reader's snapshots memoise the blob values they read (#35061). Default `true`: the LazyBase
+   * contract - a blob read once is answered from the memo for that base's lifetime. With `false` nothing is
+   * memoised and every `get`/`raw` re-reads its blob, for a reader whose values are consumed once and then
+   * dropped (km materialises the tree to a throwaway mount). It never changes what a read returns.
+   */
+  retainBlobValues?: boolean
 }
 
 export type RefTipChange = {

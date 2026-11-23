@@ -353,7 +353,7 @@ export async function openReader(options: OpenReaderOptions): Promise<Reader> {
   const context = await prepareReader(options)
   return {
     head: context.refresh,
-    at: (commit) => makeSnapshot(context, commit, context.refresh),
+    at: (commit) => makeSnapshot(context, commit, context.refresh, context.retainBlobValues),
     async log({ from, limit = 50 } = {}) {
       if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 1_024) {
         throw new TypeError("log limit must be a positive safe integer no greater than 1024")
@@ -544,6 +544,8 @@ type ReaderContext = {
   ref: string
   backend: GitomicBackend
   refresh(): Promise<Oid>
+  /** Whether this reader's snapshots memoise blob values (#35061). Default true; see OpenReaderOptions. */
+  retainBlobValues: boolean
 }
 
 async function prepareStore(options: OpenOptions): Promise<StoreContext> {
@@ -691,7 +693,7 @@ async function prepareReader(options: OpenReaderOptions): Promise<ReaderContext>
     refresh = async () => backendOid(await fetchRemote(repo, ref, remote))
   }
   await refresh()
-  return { repo, ref, backend, refresh }
+  return { repo, ref, backend, refresh, retainBlobValues: options.retainBlobValues ?? true }
 }
 
 type IsAncestor = NonNullable<GitomicBackend["isAncestor"]>
@@ -874,6 +876,7 @@ function makeSnapshot(
   context: Pick<StoreContext, "repo" | "ref" | "backend">,
   commit?: Oid,
   resolveCurrent: () => Promise<Oid> = async () => backendOid(await context.backend.head(context.repo, context.ref)),
+  retainBlobValues = true,
 ): Snapshot {
   const pinned = (commit === undefined ? resolveCurrent().then(backendOid) : Promise.resolve(validateOid(commit))).then(
     (oid) => ({ oid, algorithm: oid.length === 64 ? ("sha256" as const) : ("sha1" as const) }),
@@ -889,7 +892,7 @@ function makeSnapshot(
   // 25,138 entries) and would refuse a tree wholesale where the refusal was always scoped to what a read exposes
   // (tests/iso.test.ts "scopes reader blob validation to the requested path prefix"). A path or prefix the map does
   // not hold stays an empty view.
-  const root = pinned.then(({ oid }) => createSnapshotBase(context.backend, context.repo, oid))
+  const root = pinned.then(({ oid }) => createSnapshotBase(context.backend, context.repo, oid, { retainBlobValues }))
   const scope = async (path: string): Promise<LazyBase> => {
     const base = await root
     await base.resolveExact(path)
