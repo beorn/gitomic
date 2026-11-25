@@ -20,9 +20,15 @@ import { runGit } from "./shell.ts"
  * kept copy: 37.7 s, 7.0 s with a current multi-pack-index, 5.0 s with the commit-graph too). The index is one new file
  * over the packs that exist; no pack is rewritten or removed.
  *
+ * It also packs the loose objects a store's own writes leave behind (hh 33875). A rail writes one loose object per
+ * change, `gc.auto=0` stops git ever packing them, and the live km store reached 1,528,296 loose objects - which is
+ * why its doctor cannot witness integrity (a bounded `git fsck --full` cannot finish) and why every object read pays a
+ * loose-object lookup. The repack below is incremental and threshold-gated, so a store that keeps up stays cheap.
+ *
  * Non-pruning means no object and no ref value is lost. It does remove files: commit-graph layers that have left the
- * chain, only once older than {@link GRAPH_LAYER_GRACE} (git refreshes a layer's mtime when it retires it), and the
- * loose ref files whose values `pack-refs` has just written into packed-refs. No repack, no gc, no prune.
+ * chain, only once older than {@link GRAPH_LAYER_GRACE} (git refreshes a layer's mtime when it retires it), the
+ * loose ref files whose values `pack-refs` has just written into packed-refs, and the packs `repack -d` has just
+ * re-packed into one. No gc, no prune, no expire: an unreferenced object stays reachable-proof for its writer.
  *
  * The grace is the supported bound for an ordinary, bounded git reader: one that read the old chain and opens its
  * layer files within the hour. A reader paused longer than that between the two can miss a layer; nothing registers
@@ -40,8 +46,28 @@ export const MAINTAIN_STORE_COMMIT_GRAPH_ARGS = [
   `--expire-time=${GRAPH_LAYER_GRACE}`,
 ] as const
 export const MAINTAIN_STORE_PACK_REFS_ARGS = ["pack-refs", "--all"] as const
-/** Index every pack the store holds in one file; never `repack` or `expire`, which rewrite or delete packs. */
+/**
+ * Index every pack the store holds in one file. Written AFTER the repack, so the index covers the pack it just made.
+ */
 export const MAINTAIN_STORE_MULTI_PACK_INDEX_ARGS = ["multi-pack-index", "write", "--no-progress"] as const
+/**
+ * Pack loose objects into a pack and drop the packs they make redundant: `-d` never prunes an object (`--prune` and
+ * `-a` are absent on purpose), and `-l` keeps it to the store's own object directory. `-q` is `git repack`'s own
+ * quiet flag: it has no `--no-progress`, unlike `commit-graph` and `multi-pack-index`.
+ */
+export const MAINTAIN_STORE_REPACK_ARGS = ["repack", "-d", "-l", "-q"] as const
+/**
+ * Repack only once this many objects are loose. git's own `gc.auto` default, so a store that keeps up pays nothing:
+ * below it, one maintenance pass would rewrite a pack to fold in a handful of objects and charge every caller for it.
+ */
+export const MAINTAIN_STORE_REPACK_MIN_LOOSE = 6_700
+/**
+ * The repack's own bound, not {@link MAINTAIN_STORE_TIMEOUT_MS}. Every other step is a fixed-cost query, but a repack
+ * costs the backlog it is clearing: 1,528,296 loose objects took 1,048 s on the live km store (0.68 ms an object), so
+ * a bound it cannot fit would answer `failed` on every pass and never clear the backlog. The threshold above keeps a
+ * store that keeps up at about 5 s; this bound is for the store that arrives with a backlog.
+ */
+export const MAINTAIN_STORE_REPACK_TIMEOUT_MS = 1_800_000
 
 /**
  * What one call did. `maintained` only when every command succeeded AND the graph and index are really there: a chain
@@ -57,6 +83,8 @@ export type StoreMaintenance =
       multiPackIndexMs: number
       commitGraphMs: number
       packRefsMs: number
+      /** Present only when this pass repacked; a store below the loose threshold is left alone. */
+      repackMs?: number
       refs: number
       layers: number
     }>
@@ -65,9 +93,10 @@ export type StoreMaintenance =
   | Readonly<{
       outcome: "failed"
       repo: string
-      step: "probe" | "multi-pack-index" | "commit-graph" | "pack-refs" | "verify"
+      step: "probe" | "repack" | "multi-pack-index" | "commit-graph" | "pack-refs" | "verify"
       code: number | "timeout"
       detail: string
+      repackMs?: number
       multiPackIndexMs?: number
       commitGraphMs?: number
       packRefsMs?: number
@@ -85,15 +114,25 @@ export type MaintainStoreOptions = Readonly<{
    * its bound is stopped and the call answers `failed` with `timeout`.
    */
   timeoutMs?: number
+  /**
+   * The bound the repack alone gets. Defaults to {@link MAINTAIN_STORE_REPACK_TIMEOUT_MS} and is capped there for the
+   * same reason {@link timeoutMs} is capped: a caller cannot ask for an unbounded command.
+   */
+  repackTimeoutMs?: number
+  /**
+   * The loose-object count at which a pass repacks. Defaults to {@link MAINTAIN_STORE_REPACK_MIN_LOOSE}; a test or an
+   * owner with a different write rate may set another, and 0 repacks every pass.
+   */
+  repackMinLoose?: number
 }>
 
-/** The bound each command gets: the default, or a shorter explicit one; never none. */
-function commandBoundMs(requested: number | undefined): number {
-  if (requested === undefined) return MAINTAIN_STORE_TIMEOUT_MS
+/** The bound each command gets: the default, or a shorter explicit one; never none, never past the cap. */
+function commandBoundMs(requested: number | undefined, cap: number, name: string): number {
+  if (requested === undefined) return cap
   if (!(requested > 0)) {
-    throw new RangeError(`maintainStore timeoutMs must be a positive number, got ${String(requested)}`)
+    throw new RangeError(`maintainStore ${name} must be a positive number, got ${String(requested)}`)
   }
-  return Math.min(requested, MAINTAIN_STORE_TIMEOUT_MS)
+  return Math.min(requested, cap)
 }
 
 type Step = Extract<StoreMaintenance, { outcome: "failed" }>["step"]
@@ -152,7 +191,13 @@ function readChain(repo: string): { layers: number } | { problem: string } {
  * what it answers.
  */
 export async function maintainStore(repo: string, options: MaintainStoreOptions = {}): Promise<StoreMaintenance> {
-  const timeoutMs = commandBoundMs(options.timeoutMs)
+  const timeoutMs = commandBoundMs(options.timeoutMs, MAINTAIN_STORE_TIMEOUT_MS, "timeoutMs")
+  const repackTimeoutMs = commandBoundMs(options.repackTimeoutMs, MAINTAIN_STORE_REPACK_TIMEOUT_MS, "repackTimeoutMs")
+  const repackMinLoose = options.repackMinLoose ?? MAINTAIN_STORE_REPACK_MIN_LOOSE
+  if (!(Number.isSafeInteger(repackMinLoose) && repackMinLoose >= 0)) {
+    throw new RangeError(`maintainStore repackMinLoose must be a whole number >= 0, got ${String(repackMinLoose)}`)
+  }
+  let repackMs: number | undefined
   let multiPackIndexMs: number | undefined
   let commitGraphMs: number | undefined
   let packRefsMs: number | undefined
@@ -172,7 +217,17 @@ export async function maintainStore(repo: string, options: MaintainStoreOptions 
         .filter(Boolean)
       return { outcome: "empty", repo, refs: refs.length }
     }
-    // The index first: the commit-graph write then reads commits through it. A store whose objects are all loose has
+    // The repack first, so the index and the graph below cover the pack it makes rather than the packs it -d replaced.
+    const loose = await countLooseObjects(repo, timeoutMs)
+    if (loose >= repackMinLoose) {
+      const repackStart = performance.now()
+      try {
+        await git(repo, "repack", MAINTAIN_STORE_REPACK_ARGS, repackTimeoutMs)
+      } finally {
+        repackMs = performance.now() - repackStart
+      }
+    }
+    // The index next: the commit-graph write then reads commits through it. A store whose objects are all loose has
     // no pack to index, and git refuses the write there ("no pack files to index"), so it is skipped, not failed.
     const packs = countPacks(repo)
     if (typeof packs === "string") throw new StepFailed("probe", 0, packs)
@@ -206,6 +261,7 @@ export async function maintainStore(repo: string, options: MaintainStoreOptions 
     return {
       outcome: "maintained",
       repo,
+      ...(repackMs === undefined ? {} : { repackMs }),
       multiPackIndexMs,
       commitGraphMs,
       packRefsMs,
@@ -220,6 +276,7 @@ export async function maintainStore(repo: string, options: MaintainStoreOptions 
       step: error.step,
       code: error.code,
       detail: error.detail,
+      ...(repackMs === undefined ? {} : { repackMs }),
       ...(multiPackIndexMs === undefined ? {} : { multiPackIndexMs }),
       ...(commitGraphMs === undefined ? {} : { commitGraphMs }),
       ...(packRefsMs === undefined ? {} : { packRefsMs }),
@@ -235,6 +292,16 @@ function countPacks(repo: string): number | string {
   } catch (error) {
     return `no readable pack directory at ${directory}: ${error instanceof Error ? error.message : String(error)}`
   }
+}
+
+/** How many objects the store holds loose, or a refusal naming what git printed instead of a count. */
+async function countLooseObjects(repo: string, timeoutMs: number): Promise<number> {
+  const printed = await git(repo, "probe", ["count-objects", "-v"], timeoutMs)
+  const match = /^count: (\d+)$/mu.exec(printed)
+  if (match?.[1] === undefined) {
+    throw new StepFailed("probe", 0, `git count-objects -v printed no count: ${JSON.stringify(printed)}`)
+  }
+  return Number(match[1])
 }
 
 /** How many packs the store's multi-pack-index covers, from its header, or why it cannot be read. */
