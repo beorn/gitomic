@@ -15,7 +15,7 @@ import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, utimesSync
 import { dirname, join } from "node:path"
 import { afterEach, describe, expect, test, vi } from "vitest"
 import { MAINTAIN_STORE_TIMEOUT_MS, maintainStore } from "../src/index.js"
-import { appendEmptyHistory, createBareRepo, git } from "./helpers/git.js"
+import { appendEmptyHistory, createBareRepo, git, gitWithInput } from "./helpers/git.js"
 
 const cleanups: (() => Promise<void>)[] = []
 afterEach(async () => {
@@ -48,6 +48,22 @@ function looseRefFiles(directory: string): string[] {
 async function objectCount(repo: string): Promise<number> {
   return (await git(repo, "cat-file", "--batch-all-objects", "--batch-check=%(objectname)")).split("\n").filter(Boolean)
     .length
+}
+
+/** The loose-object count git itself reports, the number the loose-objects threshold is read against. */
+async function looseCount(repo: string): Promise<number> {
+  const printed = await git(repo, "count-objects", "-v")
+  const match = /^count: (\d+)$/mu.exec(printed)
+  if (match?.[1] === undefined) throw new Error(`count-objects printed no count: ${printed}`)
+  return Number(match[1])
+}
+
+/** How many objects a pack-file holds: what one loose-objects batch leaves behind. */
+async function packedCount(repo: string): Promise<number> {
+  const printed = await git(repo, "count-objects", "-v")
+  const match = /^in-pack: (\d+)$/mu.exec(printed)
+  if (match?.[1] === undefined) throw new Error(`count-objects printed no in-pack: ${printed}`)
+  return Number(match[1])
 }
 
 describe("maintainStore", () => {
@@ -84,6 +100,50 @@ describe("maintainStore", () => {
     expect(second).toMatchObject({ outcome: "maintained", refs: 12 })
     const after = (await git(repo, "for-each-ref")).split("\n").filter(Boolean)
     for (const line of before) expect(after).toContain(line)
+  })
+
+  test("packs one batch of the loose objects a rail leaves behind, and loses none of them", async () => {
+    const { repo } = await storeWithLooseRefs(2)
+    // A rail writes one loose object per change and gc.auto=0 never packs them (hh 33875: the live km store reached
+    // 1,528,296). Git's loose-objects task packs ONE batch per pass, so a backlog drains across passes (@cto) instead
+    // of one long pass that no bound can fit. An unreferenced blob is written too: no task here prunes, so it survives.
+    const dangling: string[] = []
+    for (let index = 0; index < 12; index++) {
+      dangling.push((await gitWithInput(repo, String(index), "hash-object", "-w", "--stdin")).trim())
+    }
+    await git(repo, "config", "maintenance.loose-objects.batchSize", "5")
+    const looseBefore = await looseCount(repo)
+    const packedBefore = await packedCount(repo)
+    const objectsBefore = await objectCount(repo)
+    expect(looseBefore).toBeGreaterThanOrEqual(12)
+
+    const first = await maintainStore(repo, { looseObjectsMin: 10 })
+
+    expect(first).toMatchObject({ outcome: "maintained", repo })
+    if (first.outcome !== "maintained") throw new Error("unreachable")
+    expect(first.looseObjectsMs).toBeGreaterThanOrEqual(0)
+    // One batch packed; its loose copies are deleted by the NEXT pass's first step, not this one's.
+    expect(await packedCount(repo)).toBeGreaterThan(packedBefore)
+    const looseAfterFirst = await looseCount(repo)
+
+    const second = await maintainStore(repo, { looseObjectsMin: 10 })
+    expect(second).toMatchObject({ outcome: "maintained", repo })
+    // The backlog drains: pass two deletes the first batch's loose copies and packs another batch.
+    expect(await looseCount(repo)).toBeLessThan(looseAfterFirst)
+    expect(await looseCount(repo)).toBeGreaterThan(0)
+
+    expect(await objectCount(repo)).toBe(objectsBefore)
+    for (const object of dangling) expect((await git(repo, "cat-file", "-e", object)).trim()).toBe("")
+  })
+
+  test("a store below the loose threshold is left alone: no pack is rewritten for a handful of objects", async () => {
+    const { repo } = await storeWithLooseRefs(2)
+    const looseBefore = await looseCount(repo)
+    const result = await maintainStore(repo)
+    expect(result).toMatchObject({ outcome: "maintained", repo })
+    if (result.outcome !== "maintained") throw new Error("unreachable")
+    expect(result.looseObjectsMs).toBeUndefined()
+    expect(await looseCount(repo)).toBeGreaterThanOrEqual(looseBefore)
   })
 
   test("a store with no commits is named empty, never maintained", async () => {

@@ -20,9 +20,18 @@ import { runGit } from "./shell.ts"
  * kept copy: 37.7 s, 7.0 s with a current multi-pack-index, 5.0 s with the commit-graph too). The index is one new file
  * over the packs that exist; no pack is rewritten or removed.
  *
+ * It also packs the loose objects a store's own writes leave behind (hh 33875). A rail writes one loose object per
+ * change, `gc.auto=0` stops git ever packing them, and the live km store reached 1,528,296 loose objects - which is
+ * why its doctor cannot witness integrity (a bounded `git fsck --full` cannot finish) and why every object read pays a
+ * loose-object lookup. Git's own `loose-objects` maintenance task does it `@cto`-bounded: one batch, fifty thousand
+ * objects by default (`maintenance.loose-objects.batchSize`), so one pass fits the shared bound below and a backlog
+ * drains across passes, unattended. It is threshold-gated too, so a store that keeps up pays nothing.
+ *
  * Non-pruning means no object and no ref value is lost. It does remove files: commit-graph layers that have left the
- * chain, only once older than {@link GRAPH_LAYER_GRACE} (git refreshes a layer's mtime when it retires it), and the
- * loose ref files whose values `pack-refs` has just written into packed-refs. No repack, no gc, no prune.
+ * chain, only once older than {@link GRAPH_LAYER_GRACE} (git refreshes a layer's mtime when it retires it), the
+ * loose ref files whose values `pack-refs` has just written into packed-refs, and the loose copies of objects a pack
+ * already holds (the first step of the loose-objects task). No gc, no prune, no expire: an unreferenced object stays
+ * reachable-proof for its writer, loose or packed.
  *
  * The grace is the supported bound for an ordinary, bounded git reader: one that read the old chain and opens its
  * layer files within the hour. A reader paused longer than that between the two can miss a layer; nothing registers
@@ -40,8 +49,23 @@ export const MAINTAIN_STORE_COMMIT_GRAPH_ARGS = [
   `--expire-time=${GRAPH_LAYER_GRACE}`,
 ] as const
 export const MAINTAIN_STORE_PACK_REFS_ARGS = ["pack-refs", "--all"] as const
-/** Index every pack the store holds in one file; never `repack` or `expire`, which rewrite or delete packs. */
+/**
+ * Index every pack the store holds in one file. Written AFTER the loose-objects task, so the index covers the pack it
+ * just made.
+ */
 export const MAINTAIN_STORE_MULTI_PACK_INDEX_ARGS = ["multi-pack-index", "write", "--no-progress"] as const
+/**
+ * Git's own loose-objects task, and only that task: it repacks one batch of loose objects into a new `loose-` pack
+ * (50,000 by default, `maintenance.loose-objects.batchSize`) after deleting the loose copies a pack already holds.
+ * `--task=` names the one job, so no other maintenance task (gc, prune, expire, incremental-repack) can run from here
+ * because of a store's config.
+ */
+export const MAINTAIN_STORE_LOOSE_OBJECTS_ARGS = ["maintenance", "run", "--task=loose-objects", "--quiet"] as const
+/**
+ * Run the task only once this many objects are loose. git's own `gc.auto` default, so a store that keeps up pays
+ * nothing: below it, a pass would mint a new pack for a handful of objects and charge every caller for it.
+ */
+export const MAINTAIN_STORE_LOOSE_OBJECTS_MIN = 6_700
 
 /**
  * What one call did. `maintained` only when every command succeeded AND the graph and index are really there: a chain
@@ -57,6 +81,8 @@ export type StoreMaintenance =
       multiPackIndexMs: number
       commitGraphMs: number
       packRefsMs: number
+      /** Present only when this pass ran the task; a store below the loose threshold is left alone. */
+      looseObjectsMs?: number
       refs: number
       layers: number
     }>
@@ -65,9 +91,10 @@ export type StoreMaintenance =
   | Readonly<{
       outcome: "failed"
       repo: string
-      step: "probe" | "multi-pack-index" | "commit-graph" | "pack-refs" | "verify"
+      step: "probe" | "loose-objects" | "multi-pack-index" | "commit-graph" | "pack-refs" | "verify"
       code: number | "timeout"
       detail: string
+      looseObjectsMs?: number
       multiPackIndexMs?: number
       commitGraphMs?: number
       packRefsMs?: number
@@ -85,15 +112,20 @@ export type MaintainStoreOptions = Readonly<{
    * its bound is stopped and the call answers `failed` with `timeout`.
    */
   timeoutMs?: number
+  /**
+   * The loose-object count at which a pass runs the task. Defaults to {@link MAINTAIN_STORE_LOOSE_OBJECTS_MIN}; a test
+   * or an owner with a different write rate may set another, and 0 runs it every pass.
+   */
+  looseObjectsMin?: number
 }>
 
-/** The bound each command gets: the default, or a shorter explicit one; never none. */
-function commandBoundMs(requested: number | undefined): number {
-  if (requested === undefined) return MAINTAIN_STORE_TIMEOUT_MS
+/** The bound each command gets: the default, or a shorter explicit one; never none, never past the cap. */
+function commandBoundMs(requested: number | undefined, cap: number, name: string): number {
+  if (requested === undefined) return cap
   if (!(requested > 0)) {
-    throw new RangeError(`maintainStore timeoutMs must be a positive number, got ${String(requested)}`)
+    throw new RangeError(`maintainStore ${name} must be a positive number, got ${String(requested)}`)
   }
-  return Math.min(requested, MAINTAIN_STORE_TIMEOUT_MS)
+  return Math.min(requested, cap)
 }
 
 type Step = Extract<StoreMaintenance, { outcome: "failed" }>["step"]
@@ -152,7 +184,12 @@ function readChain(repo: string): { layers: number } | { problem: string } {
  * what it answers.
  */
 export async function maintainStore(repo: string, options: MaintainStoreOptions = {}): Promise<StoreMaintenance> {
-  const timeoutMs = commandBoundMs(options.timeoutMs)
+  const timeoutMs = commandBoundMs(options.timeoutMs, MAINTAIN_STORE_TIMEOUT_MS, "timeoutMs")
+  const looseObjectsMin = options.looseObjectsMin ?? MAINTAIN_STORE_LOOSE_OBJECTS_MIN
+  if (!(Number.isSafeInteger(looseObjectsMin) && looseObjectsMin >= 0)) {
+    throw new RangeError(`maintainStore looseObjectsMin must be a whole number >= 0, got ${String(looseObjectsMin)}`)
+  }
+  let looseObjectsMs: number | undefined
   let multiPackIndexMs: number | undefined
   let commitGraphMs: number | undefined
   let packRefsMs: number | undefined
@@ -172,7 +209,17 @@ export async function maintainStore(repo: string, options: MaintainStoreOptions 
         .filter(Boolean)
       return { outcome: "empty", repo, refs: refs.length }
     }
-    // The index first: the commit-graph write then reads commits through it. A store whose objects are all loose has
+    // The loose-objects task first, so the index and the graph below cover the pack it makes.
+    const loose = await countLooseObjects(repo, timeoutMs)
+    if (loose >= looseObjectsMin) {
+      const looseStart = performance.now()
+      try {
+        await git(repo, "loose-objects", MAINTAIN_STORE_LOOSE_OBJECTS_ARGS, timeoutMs)
+      } finally {
+        looseObjectsMs = performance.now() - looseStart
+      }
+    }
+    // The index next: the commit-graph write then reads commits through it. A store whose objects are all loose has
     // no pack to index, and git refuses the write there ("no pack files to index"), so it is skipped, not failed.
     const packs = countPacks(repo)
     if (typeof packs === "string") throw new StepFailed("probe", 0, packs)
@@ -206,6 +253,7 @@ export async function maintainStore(repo: string, options: MaintainStoreOptions 
     return {
       outcome: "maintained",
       repo,
+      ...(looseObjectsMs === undefined ? {} : { looseObjectsMs }),
       multiPackIndexMs,
       commitGraphMs,
       packRefsMs,
@@ -220,6 +268,7 @@ export async function maintainStore(repo: string, options: MaintainStoreOptions 
       step: error.step,
       code: error.code,
       detail: error.detail,
+      ...(looseObjectsMs === undefined ? {} : { looseObjectsMs }),
       ...(multiPackIndexMs === undefined ? {} : { multiPackIndexMs }),
       ...(commitGraphMs === undefined ? {} : { commitGraphMs }),
       ...(packRefsMs === undefined ? {} : { packRefsMs }),
@@ -235,6 +284,16 @@ function countPacks(repo: string): number | string {
   } catch (error) {
     return `no readable pack directory at ${directory}: ${error instanceof Error ? error.message : String(error)}`
   }
+}
+
+/** How many objects the store holds loose, or a refusal naming what git printed instead of a count. */
+async function countLooseObjects(repo: string, timeoutMs: number): Promise<number> {
+  const printed = await git(repo, "probe", ["count-objects", "-v"], timeoutMs)
+  const match = /^count: (\d+)$/mu.exec(printed)
+  if (match?.[1] === undefined) {
+    throw new StepFailed("probe", 0, `git count-objects -v printed no count: ${JSON.stringify(printed)}`)
+  }
+  return Number(match[1])
 }
 
 /** How many packs the store's multi-pack-index covers, from its header, or why it cannot be read. */

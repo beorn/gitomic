@@ -1729,8 +1729,9 @@ export const KEPT_COPY_MAINTAIN_TIMEOUT_MS = 60_000
  * The CLI owns the kept copies under its cache directory, so it is their maintainer (hh 33853, @chief 4824ecaa): before
  * a command reads a copy that needs it, it runs the shared non-pruning {@link maintainStore}. Git's own lock files keep
  * it to one maintainer per copy; a command that loses that race, times out, or meets any other refusal names the store
- * and the step in one stderr line and runs on the copy as it is, without waiting. Nothing is repacked or deleted, and
- * only the kept copy is touched, never the origin it was cloned from.
+ * and the step in one stderr line and runs on the copy as it is, without waiting. It packs one batch of the loose
+ * objects a fetch leaves behind (git's loose-objects task, hh 33875) inside the same bound, and prunes nothing. Only
+ * the kept copy is touched, never the origin it was cloned from.
  */
 async function maintainKeptCopy(repo: string, stderr: CliWriter): Promise<void> {
   const reason = keptStoreMaintenanceReason(repo)
