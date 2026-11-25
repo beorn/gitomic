@@ -29,7 +29,8 @@ import { runGit } from "./shell.ts"
  *
  * It then folds the small packs that task and the fetches leave behind (`git multi-pack-index repack --batch-size=`
  * then `expire`, hh 33875). The batch is a byte budget, not a pack count: one pass copies the whole packs that fit it
- * into one pack, so it stays inside the same shared bound and a long tail of small packs shrinks across passes. The
+ * into one pack, so it stays inside the same shared bound and a long tail of small packs shrinks across passes, and it
+ * is sized above the pack a loose-objects pass mints so those fold too. The
  * repack alone never removes what it folded - git leaves that to `expire`, which deletes only the packs the rewritten
  * index no longer references, so the count actually comes down and no object is lost. It runs after the
  * multi-pack-index write above, so the index already covers the new pack, and it is gated on how many packs are
@@ -84,8 +85,14 @@ export const MAINTAIN_STORE_LOOSE_OBJECTS_MIN = 6_700
  * this same pass just wrote, so the selection sees the new pack.
  */
 export const MAINTAIN_STORE_MIDX_REPACK_ARGS = ["multi-pack-index", "repack", "--no-progress"] as const
-/** The size budget one repack pass may copy, in bytes. Smaller than any fetch pack here, so a pass folds the small ones. */
-export const MAINTAIN_STORE_MIDX_REPACK_BATCH_BYTES = 50 * 1024 * 1024
+/**
+ * The size budget one repack pass may copy, in bytes. Sized ABOVE the pack a loose-objects pass mints, not below it:
+ * `multi-pack-index repack` selects only packs whose expected size is under the batch, and one 50,000-object pass on
+ * the live store lands at 59.5-77.9 MiB, so a 50 MiB budget could never fold the packs the drain itself makes - it
+ * reclaimed the small fetch packs and left the drain's own to accumulate forever (@cto 2026-11-25, option b).
+ * Measured on that store at this size: repack 15,350 ms + expire 640 ms, 27 -> 13 packs, inside the bound below.
+ */
+export const MAINTAIN_STORE_MIDX_REPACK_BATCH_BYTES = 256 * 1024 * 1024
 /**
  * Delete the packs the repack just replaced. `multi-pack-index repack` writes the folded pack and rewrites the index
  * but removes nothing itself (git-multi-pack-index: "a later run of git multi-pack-index expire will delete the
