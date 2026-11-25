@@ -954,8 +954,65 @@ function text(buffer: Buffer): string {
   return buffer.toString("utf8").trim()
 }
 
+/** How many of the store's branch, tag and remote refs a refused lookup names; the list is evidence, not the ref space. */
+const REFUSAL_REF_LIMIT = 6
+
 async function head(repo: string, ref: string, baseEnv?: NodeJS.ProcessEnv): Promise<Oid> {
-  return text(await git(repo, ["rev-parse", "--verify", ref], { baseEnv }))
+  try {
+    return text(await git(repo, ["rev-parse", "--verify", ref], { baseEnv }))
+  } catch (error) {
+    throw await refDoesNotResolve(repo, ref, error, baseEnv)
+  }
+}
+
+/**
+ * 38554: a ref this store cannot resolve answered only `git rev-parse failed (128): fatal: Needed a single revision`,
+ * which names neither the repository, nor one ref it does hold, nor the form that works, so two seats spent their first
+ * minute guessing that `HEAD` or `origin/main` should be addressable. This keeps Git's own line as the cause and adds
+ * the three facts a caller needs: a bare name is read as refs/heads/<name>, a full ref name always works, and these
+ * are refs this store holds.
+ */
+async function refDoesNotResolve(
+  repo: string,
+  ref: string,
+  error: unknown,
+  baseEnv?: NodeJS.ProcessEnv,
+): Promise<Error> {
+  const detail = error instanceof Error ? error.message : String(error)
+  const failed = error instanceof Error ? error : new Error(detail)
+  if (!/rev-parse failed \(128\)/.test(detail)) return failed
+  let held: string[] = []
+  try {
+    held = text(
+      await git(
+        repo,
+        [
+          "for-each-ref",
+          `--count=${String(REFUSAL_REF_LIMIT)}`,
+          "--format=%(refname)",
+          "refs/heads",
+          "refs/tags",
+          "refs/remotes",
+        ],
+        { baseEnv },
+      ),
+    )
+      .split("\n")
+      .filter((line) => line !== "")
+  } catch {
+    // The listing is the helpful half of this message; when it fails, the refusal below still says what to try.
+  }
+  const store =
+    held.length === 0
+      ? "this store answered with no branch, tag or remote ref when asked"
+      : `this store holds ${held.join(", ")}${held.length >= REFUSAL_REF_LIMIT ? ", …" : ""}`
+  return new Error(
+    `ref ${JSON.stringify(ref)} does not resolve in ${repo}; ${store}. gitomic addresses a repository and a ref as ` +
+      `<repo>#<ref>, and that ref is a branch, tag or remote ref: a bare name is read as refs/heads/<name>, so ` +
+      `"main" works where refs/heads/main exists, and a full name (refs/heads/main, refs/remotes/origin/main, ` +
+      `refs/tags/v1) always works. HEAD and a bare commit sha are revisions, not refs, and are refused here. ` +
+      `Cause: ${detail}`,
+  )
 }
 
 /**
