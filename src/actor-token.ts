@@ -116,3 +116,41 @@ export function actorTrailersFromToken(raw: string, declaration: ActorTokenDecla
     ],
   }
 }
+
+/**
+ * Where a caller's token came from: the token itself, nothing set, or a file that could not be read. A reason and its
+ * `file` are the caller's to print; neither ever holds token contents.
+ */
+export type ActorTokenSource =
+  | { readonly token: string }
+  | { readonly absent: true }
+  | { readonly file: string; readonly reason: string }
+
+/** Reads one token file. The caller owns the filesystem: this library stays free of runtime dependencies. */
+export type ActorTokenFileReader = (path: string) => { readonly text: string } | { readonly reason: string }
+
+/**
+ * The one file-or-environment rule for an actor token, so every reader resolves it the same way (#38539).
+ *
+ * `<variable>` wins when it is set and nonempty — a caller that sets both means the value it just read.
+ * `<variable>_FILE` names a file whose contents are the token (Hab writes one newline; trailing line breaks are
+ * trimmed). Neither set is `absent`, which is a normal state, not a failure. A file that cannot be read, or holds no
+ * token, is returned by name with its reason.
+ *
+ * Read, never verified: decoding stays `actorTrailersFromToken`'s job.
+ */
+export function actorTokenFromEnvironment(
+  env: Readonly<Record<string, string | undefined>>,
+  declaration: ActorTokenDeclaration,
+  readFile: ActorTokenFileReader,
+): ActorTokenSource {
+  const fromVariable = env[declaration.variable]
+  if (fromVariable !== undefined && fromVariable !== "") return { token: fromVariable }
+  const file = env[`${declaration.variable}_FILE`]
+  if (file === undefined || file === "") return { absent: true }
+  const read = readFile(file)
+  if ("reason" in read) return { file, reason: read.reason }
+  const token = read.text.replace(/[\r\n]+$/u, "")
+  if (token === "") return { file, reason: "file holds no token" }
+  return { token }
+}

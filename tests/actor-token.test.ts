@@ -8,6 +8,7 @@ import { describe, expect, test } from "vitest"
 
 import {
   ACTOR_TOKEN_MAX_BYTES,
+  actorTokenFromEnvironment,
   actorTrailersFromToken,
   parseActorTokenDeclaration,
   type ActorTokenDeclaration,
@@ -118,5 +119,58 @@ describe("parseActorTokenDeclaration", () => {
     expect(() => parseActorTokenDeclaration({ ...DECLARATION, [key]: undefined })).toThrow(
       `actor token declaration.${key} must be a nonempty string`,
     )
+  })
+})
+
+/**
+ * @failure A seat launched with only `HAB_ID_TOKEN_FILE` set is attributed as nobody: the two readers took the
+ *          environment variable alone, so 86% of seat commits carried no Actor trailer. Adding a second copy of a
+ *          file-or-env rule to each reader is the same failure waiting to diverge.
+ * @level l1
+ * @consumer `tools/commit-actor-trailers.ts` and `km`'s caller attribution (#38539)
+ * @testonly none
+ */
+describe("actorTokenFromEnvironment", () => {
+  const read = (files: Record<string, string | { reason: string }>) => (path: string) => {
+    const hit = files[path]
+    if (hit === undefined) return { reason: "absent" }
+    return typeof hit === "string" ? { text: hit } : hit
+  }
+
+  test("the environment variable is the token, unchanged, when both spellings are set", () => {
+    const env = { TEST_TOKEN: "env-token", TEST_TOKEN_FILE: "/run/token" }
+    expect(actorTokenFromEnvironment(env, DECLARATION, read({ "/run/token": "file-token" }))).toEqual({
+      token: "env-token",
+    })
+  })
+
+  test("the file named by <VARIABLE>_FILE is the token when the variable is absent, its trailing newline trimmed", () => {
+    const env = { TEST_TOKEN_FILE: "/run/token" }
+    expect(actorTokenFromEnvironment(env, DECLARATION, read({ "/run/token": "file-token\n" }))).toEqual({
+      token: "file-token",
+    })
+    expect(actorTokenFromEnvironment(env, DECLARATION, read({ "/run/token": "file-token" }))).toEqual({
+      token: "file-token",
+    })
+  })
+
+  test("neither spelling present is absent, not an error", () => {
+    expect(actorTokenFromEnvironment({}, DECLARATION, read({}))).toEqual({ absent: true })
+    expect(actorTokenFromEnvironment({ TEST_TOKEN: "" }, DECLARATION, read({}))).toEqual({ absent: true })
+  })
+
+  test("an unreadable file names the file and the reason, and never any contents", () => {
+    const env = { TEST_TOKEN_FILE: "/run/id" }
+    const result = actorTokenFromEnvironment(env, DECLARATION, read({ "/run/id": { reason: "EACCES SECRET-VALUE" } }))
+    expect(result).toEqual({ file: "/run/id", reason: "EACCES SECRET-VALUE" })
+    expect(JSON.stringify({ ...result, reason: "EACCES" })).not.toContain("SECRET-VALUE")
+  })
+
+  test("a file holding only whitespace is refused by that name rather than decoded", () => {
+    const env = { TEST_TOKEN_FILE: "/run/token" }
+    expect(actorTokenFromEnvironment(env, DECLARATION, read({ "/run/token": "\n" }))).toEqual({
+      file: "/run/token",
+      reason: "file holds no token",
+    })
   })
 })

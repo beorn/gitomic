@@ -94,9 +94,12 @@ export {
 export type { EditKind, PreconditionType } from "./errors.js"
 export {
   ACTOR_TOKEN_MAX_BYTES,
+  actorTokenFromEnvironment,
   actorTrailersFromToken,
   parseActorTokenDeclaration,
   type ActorTokenDeclaration,
+  type ActorTokenFileReader,
+  type ActorTokenSource,
   type ActorTrailersResult,
 } from "./actor-token.ts"
 export { applyEdits, countOccurrences, parseEditsDeclaration, type EditsDeclaration } from "./edits.ts"
