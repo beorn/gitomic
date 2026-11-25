@@ -188,7 +188,7 @@ describe("maintainStore", () => {
     await writePackOfBlobs(repo, 1, 100_000)
     const small = await writePackOfBlobs(repo, 1, 8)
     const sizesBefore = packSizes(repo)
-    const foldable = sizesBefore.filter((size) => size <= batchBytes).length
+    const foldable = sizesBefore.filter((size) => size * 2 < batchBytes).length
     expect(foldable).toBeGreaterThanOrEqual(1)
     expect(sizesBefore.length).toBeGreaterThan(foldable)
     const objectsBefore = await objectCount(repo)
@@ -213,12 +213,12 @@ describe("maintainStore", () => {
     // The loose-objects task mints one small pack per pass, so the count only grows unless they are folded. The repack
     // writes the folded pack but removes nothing (git-multi-pack-index); `expire` deletes what the rewritten index no
     // longer references. One pass must stay a batch: the rest of the packs are still there, and no object is lost.
-    const batchBytes = 4_096
+    const batchBytes = 8_192
     const objects: string[] = []
     for (let index = 0; index < 6; index++) objects.push(...(await writePackOfBlobs(repo, 1, 2_000)))
     const packsBefore = packSizes(repo).length
     const objectsBefore = await objectCount(repo)
-    expect(packSizes(repo).filter((size) => size <= batchBytes).length).toBeGreaterThan(2)
+    expect(packSizes(repo).filter((size) => size * 2 < batchBytes).length).toBeGreaterThan(2)
 
     const result = await maintainStore(repo, {
       looseObjectsMin: 1_000_000,
@@ -236,6 +236,34 @@ describe("maintainStore", () => {
     expect(await objectCount(repo)).toBe(objectsBefore)
     for (const object of objects) expect((await git(repo, "cat-file", "-e", object)).trim()).toBe("")
     expect((await git(repo, "multi-pack-index", "verify")).trim()).toBe("")
+  })
+
+  test("a pack the last pass just wrote does not gate the next one: only packs under half the batch count", async () => {
+    const { repo } = await storeWithLooseRefs(2)
+    // A folded pack lands near the batch size. Counted at the whole budget it would trip the gate at every upkeep and
+    // be copied again each time (a 50 MiB re-copy per pass): the gate counts only packs under half the batch, which
+    // that pack can never be.
+    const batchBytes = 4_096
+    await writePackOfBlobs(repo, 1, 3_800)
+    await writePackOfBlobs(repo, 1, 8)
+    const sizesBefore = packSizes(repo)
+    const foldable = sizesBefore.filter((size) => size * 2 < batchBytes).length
+    const atTheWholeBudget = sizesBefore.filter((size) => size <= batchBytes).length
+    // The near-batch pack is in the store, would count at the whole budget, and must not count at half.
+    expect(atTheWholeBudget).toBe(foldable + 1)
+    const objectsBefore = await objectCount(repo)
+
+    const result = await maintainStore(repo, {
+      looseObjectsMin: 1_000_000,
+      midxRepackBatchBytes: batchBytes,
+      midxRepackMinPacks: foldable,
+    })
+
+    expect(result).toMatchObject({ outcome: "maintained", repo })
+    if (result.outcome !== "maintained") throw new Error("unreachable")
+    expect(result.midxRepackMs).toBeUndefined()
+    expect(packSizes(repo)).toEqual(sizesBefore)
+    expect(await objectCount(repo)).toBe(objectsBefore)
   })
 
   test("a store with no commits is named empty, never maintained", async () => {

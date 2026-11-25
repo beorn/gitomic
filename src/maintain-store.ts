@@ -32,9 +32,10 @@ import { runGit } from "./shell.ts"
  * into one pack, so it stays inside the same shared bound and a long tail of small packs shrinks across passes. The
  * repack alone never removes what it folded - git leaves that to `expire`, which deletes only the packs the rewritten
  * index no longer references, so the count actually comes down and no object is lost. It runs after the
- * multi-pack-index write above, so the index already covers the new pack, and it is gated on how many packs are at or
- * below the budget - never on the total pack count, where a kept copy's fetch packs would trigger a pass that folds
- * nothing.
+ * multi-pack-index write above, so the index already covers the new pack, and it is gated on how many packs are
+ * smaller than half the budget - never on the total pack count, where a kept copy's fetch packs would trigger a pass
+ * that folds nothing, and not on packs up to the whole budget, where the pack the last pass folded would count and be
+ * copied again every pass.
  *
  * Non-pruning means no object and no ref value is lost. It does remove files: commit-graph layers that have left the
  * chain, only once older than {@link GRAPH_LAYER_GRACE} (git refreshes a layer's mtime when it retires it), the
@@ -93,9 +94,11 @@ export const MAINTAIN_STORE_MIDX_REPACK_BATCH_BYTES = 50 * 1024 * 1024
  */
 export const MAINTAIN_STORE_MIDX_EXPIRE_ARGS = ["multi-pack-index", "expire", "--no-progress"] as const
 /**
- * Run the repack only once this many packs are at or below the batch size. A store with a few small packs gains nothing
- * from folding them, and a store whose packs are all larger than the batch (a kept copy's fetch packs) would run a pass
- * that selects nothing - so the count of foldable packs is the gate, never the total pack count.
+ * Run the repack only once this many packs are smaller than HALF the batch size. A store with a few small packs gains
+ * nothing from folding them, and a store whose packs are all larger than the batch (a kept copy's fetch packs) would run
+ * a pass that selects nothing - so the count of foldable packs is the gate, never the total pack count. Half, not the
+ * whole budget, because a pass leaves its output near the batch size: counted at the whole budget, last pass's pack
+ * would gate the next one and be copied again every time.
  */
 export const MAINTAIN_STORE_MIDX_REPACK_MIN_PACKS = 8
 
@@ -383,9 +386,10 @@ async function countLooseObjects(repo: string, timeoutMs: number): Promise<numbe
 }
 
 /**
- * How many packs the fold would consider: those at or below the batch size, whose whole contents `multi-pack-index
- * repack` copies in one pass. Anything larger is never folded by this budget, so counting it would gate a pass that
- * selects nothing; the result is the gate. A pack directory that cannot be listed is a named refusal, never a zero.
+ * How many packs the fold would consider worth it: those smaller than half the batch size, whose whole contents
+ * `multi-pack-index repack` copies in one pass. Anything at or above that is either never folded by this budget (a
+ * kept copy's fetch packs) or the shape the last pass just wrote; counting either would gate a pass that selects
+ * nothing or re-copy what was just written. A pack directory that cannot be listed is a named refusal, never a zero.
  */
 function countFoldablePacks(repo: string, batchBytes: number): number | string {
   const directory = join(repo, "objects", "pack")
@@ -399,7 +403,7 @@ function countFoldablePacks(repo: string, batchBytes: number): number | string {
   for (const entry of entries) {
     if (!entry.endsWith(".pack")) continue
     try {
-      if (fs.statSync(join(directory, entry)).size <= batchBytes) foldable++
+      if (fs.statSync(join(directory, entry)).size * 2 < batchBytes) foldable++
     } catch {
       // A pack that vanished between the listing and the stat is one this pass will not see; the next pass will.
     }
