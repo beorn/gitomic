@@ -27,6 +27,15 @@ import { runGit } from "./shell.ts"
  * objects by default (`maintenance.loose-objects.batchSize`), so one pass fits the shared bound below and a backlog
  * drains across passes, unattended. It is threshold-gated too, so a store that keeps up pays nothing.
  *
+ * It then folds the small packs that task and the fetches leave behind (`git multi-pack-index repack --batch-size=`
+ * then `expire`, hh 33875). The batch is a byte budget, not a pack count: one pass copies the whole packs that fit it
+ * into one pack, so it stays inside the same shared bound and a long tail of small packs shrinks across passes. The
+ * repack alone never removes what it folded - git leaves that to `expire`, which deletes only the packs the rewritten
+ * index no longer references, so the count actually comes down and no object is lost. It runs after the
+ * multi-pack-index write above, so the index already covers the new pack, and it is gated on how many packs are at or
+ * below the budget - never on the total pack count, where a kept copy's fetch packs would trigger a pass that folds
+ * nothing.
+ *
  * Non-pruning means no object and no ref value is lost. It does remove files: commit-graph layers that have left the
  * chain, only once older than {@link GRAPH_LAYER_GRACE} (git refreshes a layer's mtime when it retires it), the
  * loose ref files whose values `pack-refs` has just written into packed-refs, and the loose copies of objects a pack
@@ -66,6 +75,29 @@ export const MAINTAIN_STORE_LOOSE_OBJECTS_ARGS = ["maintenance", "run", "--task=
  * nothing: below it, a pass would mint a new pack for a handful of objects and charge every caller for it.
  */
 export const MAINTAIN_STORE_LOOSE_OBJECTS_MIN = 6_700
+/**
+ * Fold the small packs the loose-objects task keeps minting into bigger ones (`git multi-pack-index repack`), which
+ * otherwise leave the store with one new `loose-` pack per pass and no end to the count. The batch is a SIZE budget,
+ * not a pack count: `multi-pack-index repack` copies the whole small packs that fit in it, so one pass stays bounded by
+ * that many bytes rather than by how many packs the store happens to hold. The multi-pack-index it reads is the one
+ * this same pass just wrote, so the selection sees the new pack.
+ */
+export const MAINTAIN_STORE_MIDX_REPACK_ARGS = ["multi-pack-index", "repack", "--no-progress"] as const
+/** The size budget one repack pass may copy, in bytes. Smaller than any fetch pack here, so a pass folds the small ones. */
+export const MAINTAIN_STORE_MIDX_REPACK_BATCH_BYTES = 50 * 1024 * 1024
+/**
+ * Delete the packs the repack just replaced. `multi-pack-index repack` writes the folded pack and rewrites the index
+ * but removes nothing itself (git-multi-pack-index: "a later run of git multi-pack-index expire will delete the
+ * pack-files that were part of this batch"); without it the count only ever grows. `expire` deletes only packs the
+ * rewritten index no longer references (`.keep` packs excepted), so every object it removes is in the folded pack.
+ */
+export const MAINTAIN_STORE_MIDX_EXPIRE_ARGS = ["multi-pack-index", "expire", "--no-progress"] as const
+/**
+ * Run the repack only once this many packs are at or below the batch size. A store with a few small packs gains nothing
+ * from folding them, and a store whose packs are all larger than the batch (a kept copy's fetch packs) would run a pass
+ * that selects nothing - so the count of foldable packs is the gate, never the total pack count.
+ */
+export const MAINTAIN_STORE_MIDX_REPACK_MIN_PACKS = 8
 
 /**
  * What one call did. `maintained` only when every command succeeded AND the graph and index are really there: a chain
@@ -83,6 +115,8 @@ export type StoreMaintenance =
       packRefsMs: number
       /** Present only when this pass ran the task; a store below the loose threshold is left alone. */
       looseObjectsMs?: number
+      /** Present only when this pass folded a batch of small packs; a store below the foldable-pack threshold is left alone. */
+      midxRepackMs?: number
       refs: number
       layers: number
     }>
@@ -91,10 +125,19 @@ export type StoreMaintenance =
   | Readonly<{
       outcome: "failed"
       repo: string
-      step: "probe" | "loose-objects" | "multi-pack-index" | "commit-graph" | "pack-refs" | "verify"
+      step:
+        | "probe"
+        | "loose-objects"
+        | "multi-pack-index"
+        | "midx-repack"
+        | "midx-expire"
+        | "commit-graph"
+        | "pack-refs"
+        | "verify"
       code: number | "timeout"
       detail: string
       looseObjectsMs?: number
+      midxRepackMs?: number
       multiPackIndexMs?: number
       commitGraphMs?: number
       packRefsMs?: number
@@ -117,6 +160,16 @@ export type MaintainStoreOptions = Readonly<{
    * or an owner with a different write rate may set another, and 0 runs it every pass.
    */
   looseObjectsMin?: number
+  /**
+   * The size budget for the midx repack, in bytes. Defaults to {@link MAINTAIN_STORE_MIDX_REPACK_BATCH_BYTES}; a test
+   * picks a smaller one so a handful of tiny packs is already "small" against it.
+   */
+  midxRepackBatchBytes?: number
+  /**
+   * How many packs at or below that budget make a pass worth running. Defaults to
+   * {@link MAINTAIN_STORE_MIDX_REPACK_MIN_PACKS}; a test sets its own.
+   */
+  midxRepackMinPacks?: number
 }>
 
 /** The bound each command gets: the default, or a shorter explicit one; never none, never past the cap. */
@@ -189,7 +242,20 @@ export async function maintainStore(repo: string, options: MaintainStoreOptions 
   if (!(Number.isSafeInteger(looseObjectsMin) && looseObjectsMin >= 0)) {
     throw new RangeError(`maintainStore looseObjectsMin must be a whole number >= 0, got ${String(looseObjectsMin)}`)
   }
+  const midxRepackBatchBytes = options.midxRepackBatchBytes ?? MAINTAIN_STORE_MIDX_REPACK_BATCH_BYTES
+  if (!(Number.isSafeInteger(midxRepackBatchBytes) && midxRepackBatchBytes > 0)) {
+    throw new RangeError(
+      `maintainStore midxRepackBatchBytes must be a whole number > 0, got ${String(midxRepackBatchBytes)}`,
+    )
+  }
+  const midxRepackMinPacks = options.midxRepackMinPacks ?? MAINTAIN_STORE_MIDX_REPACK_MIN_PACKS
+  if (!(Number.isSafeInteger(midxRepackMinPacks) && midxRepackMinPacks >= 0)) {
+    throw new RangeError(
+      `maintainStore midxRepackMinPacks must be a whole number >= 0, got ${String(midxRepackMinPacks)}`,
+    )
+  }
   let looseObjectsMs: number | undefined
+  let midxRepackMs: number | undefined
   let multiPackIndexMs: number | undefined
   let commitGraphMs: number | undefined
   let packRefsMs: number | undefined
@@ -229,6 +295,24 @@ export async function maintainStore(repo: string, options: MaintainStoreOptions 
     } finally {
       multiPackIndexMs = performance.now() - indexStart
     }
+    // Then the fold: the small packs the task and the fetches leave behind, into one pack the index above already
+    // covers, and the packs it replaced deleted - the repack writes the pack but removes nothing by itself.
+    const foldable = countFoldablePacks(repo, midxRepackBatchBytes)
+    if (typeof foldable === "string") throw new StepFailed("probe", 0, foldable)
+    if (foldable > midxRepackMinPacks) {
+      const repackStart = performance.now()
+      try {
+        await git(
+          repo,
+          "midx-repack",
+          [...MAINTAIN_STORE_MIDX_REPACK_ARGS, `--batch-size=${midxRepackBatchBytes}`],
+          timeoutMs,
+        )
+        await git(repo, "midx-expire", MAINTAIN_STORE_MIDX_EXPIRE_ARGS, timeoutMs)
+      } finally {
+        midxRepackMs = performance.now() - repackStart
+      }
+    }
     const graphStart = performance.now()
     try {
       await git(repo, "commit-graph", MAINTAIN_STORE_COMMIT_GRAPH_ARGS, timeoutMs)
@@ -254,6 +338,7 @@ export async function maintainStore(repo: string, options: MaintainStoreOptions 
       outcome: "maintained",
       repo,
       ...(looseObjectsMs === undefined ? {} : { looseObjectsMs }),
+      ...(midxRepackMs === undefined ? {} : { midxRepackMs }),
       multiPackIndexMs,
       commitGraphMs,
       packRefsMs,
@@ -269,6 +354,7 @@ export async function maintainStore(repo: string, options: MaintainStoreOptions 
       code: error.code,
       detail: error.detail,
       ...(looseObjectsMs === undefined ? {} : { looseObjectsMs }),
+      ...(midxRepackMs === undefined ? {} : { midxRepackMs }),
       ...(multiPackIndexMs === undefined ? {} : { multiPackIndexMs }),
       ...(commitGraphMs === undefined ? {} : { commitGraphMs }),
       ...(packRefsMs === undefined ? {} : { packRefsMs }),
@@ -294,6 +380,31 @@ async function countLooseObjects(repo: string, timeoutMs: number): Promise<numbe
     throw new StepFailed("probe", 0, `git count-objects -v printed no count: ${JSON.stringify(printed)}`)
   }
   return Number(match[1])
+}
+
+/**
+ * How many packs the fold would consider: those at or below the batch size, whose whole contents `multi-pack-index
+ * repack` copies in one pass. Anything larger is never folded by this budget, so counting it would gate a pass that
+ * selects nothing; the result is the gate. A pack directory that cannot be listed is a named refusal, never a zero.
+ */
+function countFoldablePacks(repo: string, batchBytes: number): number | string {
+  const directory = join(repo, "objects", "pack")
+  let entries: string[]
+  try {
+    entries = fs.readdirSync(directory)
+  } catch (error) {
+    return `no readable pack directory at ${directory}: ${error instanceof Error ? error.message : String(error)}`
+  }
+  let foldable = 0
+  for (const entry of entries) {
+    if (!entry.endsWith(".pack")) continue
+    try {
+      if (fs.statSync(join(directory, entry)).size <= batchBytes) foldable++
+    } catch {
+      // A pack that vanished between the listing and the stat is one this pass will not see; the next pass will.
+    }
+  }
+  return foldable
 }
 
 /** How many packs the store's multi-pack-index covers, from its header, or why it cannot be read. */

@@ -11,7 +11,17 @@
  * @reach fs-walk <fixture-only: each temp bare store's refs/ and objects/info/commit-graphs/>
  */
 import { spawn } from "node:child_process"
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs"
+import { randomBytes } from "node:crypto"
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs"
 import { dirname, join } from "node:path"
 import { afterEach, describe, expect, test, vi } from "vitest"
 import { MAINTAIN_STORE_TIMEOUT_MS, maintainStore } from "../src/index.js"
@@ -64,6 +74,28 @@ async function packedCount(repo: string): Promise<number> {
   const match = /^in-pack: (\d+)$/mu.exec(printed)
   if (match?.[1] === undefined) throw new Error(`count-objects printed no in-pack: ${printed}`)
   return Number(match[1])
+}
+
+/** The size of every pack-file the store holds: what the fold's byte gate is read against. */
+function packSizes(repo: string): number[] {
+  const directory = join(repo, "objects", "pack")
+  if (!existsSync(directory)) return []
+  return readdirSync(directory)
+    .filter((name) => name.endsWith(".pack"))
+    .map((name) => statSync(join(directory, name)).size)
+}
+
+/**
+ * One pack-file holding `count` fresh blobs of `bytes` random bytes each, written beside the packs already there.
+ * Random content does not compress, so the pack's size follows `bytes` and a test can place it above or below a budget.
+ */
+async function writePackOfBlobs(repo: string, count: number, bytes: number): Promise<string[]> {
+  const ids: string[] = []
+  for (let index = 0; index < count; index++) {
+    ids.push((await gitWithInput(repo, randomBytes(bytes), "hash-object", "-w", "--stdin")).trim())
+  }
+  await gitWithInput(repo, `${ids.join("\n")}\n`, "pack-objects", "-q", join(repo, "objects", "pack", "pack"))
+  return ids
 }
 
 describe("maintainStore", () => {
@@ -144,6 +176,66 @@ describe("maintainStore", () => {
     if (result.outcome !== "maintained") throw new Error("unreachable")
     expect(result.looseObjectsMs).toBeUndefined()
     expect(await looseCount(repo)).toBeGreaterThanOrEqual(looseBefore)
+  })
+
+  test("many large packs and one small one fold nothing: the gate counts the packs a pass would fold, never the total", async () => {
+    const { repo } = await storeWithLooseRefs(2)
+    // A kept copy holds the fetch packs it has accumulated; they are all larger than the fold's budget. A gate on the
+    // TOTAL pack count would run a pass at every upkeep that selects none of them (@cto) and fold nothing, forever.
+    const batchBytes = 2_048
+    await writePackOfBlobs(repo, 1, 100_000)
+    await writePackOfBlobs(repo, 1, 100_000)
+    await writePackOfBlobs(repo, 1, 100_000)
+    const small = await writePackOfBlobs(repo, 1, 8)
+    const sizesBefore = packSizes(repo)
+    const foldable = sizesBefore.filter((size) => size <= batchBytes).length
+    expect(foldable).toBeGreaterThanOrEqual(1)
+    expect(sizesBefore.length).toBeGreaterThan(foldable)
+    const objectsBefore = await objectCount(repo)
+
+    const result = await maintainStore(repo, {
+      looseObjectsMin: 1_000_000,
+      midxRepackBatchBytes: batchBytes,
+      midxRepackMinPacks: foldable,
+    })
+
+    expect(result).toMatchObject({ outcome: "maintained", repo })
+    if (result.outcome !== "maintained") throw new Error("unreachable")
+    // The total count is over the gate and the foldable count is not: only the foldable count may decide.
+    expect(result.midxRepackMs).toBeUndefined()
+    expect(packSizes(repo)).toEqual(sizesBefore)
+    expect(await objectCount(repo)).toBe(objectsBefore)
+    for (const object of small) expect((await git(repo, "cat-file", "-e", object)).trim()).toBe("")
+  })
+
+  test("more small packs than the gate folds one batch, deletes the packs it replaced, and leaves the rest", async () => {
+    const { repo } = await storeWithLooseRefs(2)
+    // The loose-objects task mints one small pack per pass, so the count only grows unless they are folded. The repack
+    // writes the folded pack but removes nothing (git-multi-pack-index); `expire` deletes what the rewritten index no
+    // longer references. One pass must stay a batch: the rest of the packs are still there, and no object is lost.
+    const batchBytes = 4_096
+    const objects: string[] = []
+    for (let index = 0; index < 6; index++) objects.push(...(await writePackOfBlobs(repo, 1, 2_000)))
+    const packsBefore = packSizes(repo).length
+    const objectsBefore = await objectCount(repo)
+    expect(packSizes(repo).filter((size) => size <= batchBytes).length).toBeGreaterThan(2)
+
+    const result = await maintainStore(repo, {
+      looseObjectsMin: 1_000_000,
+      midxRepackBatchBytes: batchBytes,
+      midxRepackMinPacks: 2,
+    })
+
+    expect(result).toMatchObject({ outcome: "maintained", repo })
+    if (result.outcome !== "maintained") throw new Error("unreachable")
+    expect(result.midxRepackMs).toBeGreaterThanOrEqual(0)
+    const packsAfter = packSizes(repo).length
+    expect(packsAfter).toBeLessThan(packsBefore)
+    expect(packsAfter).toBeGreaterThan(1)
+    // Nothing the index references disappeared: the same objects are there, each readable, and the index verifies.
+    expect(await objectCount(repo)).toBe(objectsBefore)
+    for (const object of objects) expect((await git(repo, "cat-file", "-e", object)).trim()).toBe("")
+    expect((await git(repo, "multi-pack-index", "verify")).trim()).toBe("")
   })
 
   test("a store with no commits is named empty, never maintained", async () => {
