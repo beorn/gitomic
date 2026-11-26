@@ -1000,7 +1000,7 @@ async function refDoesNotResolve(
       .split("\n")
       .filter((line) => line !== "")
   } catch {
-    // The listing is the helpful half of this message; when it fails, the refusal below still says what to try.
+    // silent-fallback-allow: the listing is the helpful half of this message; when it fails, the refusal below still says what to try.
   }
   const store =
     held.length === 0

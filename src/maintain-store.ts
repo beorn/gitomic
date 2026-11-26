@@ -412,7 +412,7 @@ function countFoldablePacks(repo: string, batchBytes: number): number | string {
     try {
       if (fs.statSync(join(directory, entry)).size * 2 < batchBytes) foldable++
     } catch {
-      // A pack that vanished between the listing and the stat is one this pass will not see; the next pass will.
+      // silent-fallback-allow: a pack that vanished between the listing and the stat is one this pass will not see; the next pass will.
     }
   }
   return foldable
