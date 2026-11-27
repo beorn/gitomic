@@ -128,30 +128,41 @@ export function holdCheckoutLock(repoRoot: string, options: HoldCheckoutLockOpti
 }
 
 /**
- * The holder a busy lock's body records, when that process is still alive.
- * Writers that do not record themselves leave an older body behind, so a
- * recorded pid that no longer runs names nobody.
+ * What a busy lock's body says about its holder, phrased so a reader does not
+ * mistake the label for the holder.
+ *
+ * The body is written by whoever acquired the lock last through this module.
+ * Other writers on the same path (Tent, km-beads create, the checkout-sync
+ * timer) never write one, so a busy lock commonly carries an older body whose
+ * pid has since exited. The flock — never this text — decides who holds the
+ * lock, and the kernel releases it when the holder dies: a body naming a dead
+ * pid is a stale label, never evidence of an abandoned lock.
  */
 function recordedHolder(path: string): string {
   let body: string
   try {
     body = readFileSync(path, "utf8")
   } catch (error) {
-    return `another writer (the lock body could not be read: ${error instanceof Error ? error.message : String(error)})`
+    return `another writer (the flock is held; the lock body could not be read: ${error instanceof Error ? error.message : String(error)})`
   }
   let recorded: { pid?: unknown; argv?: unknown }
   try {
     recorded = JSON.parse(body) as { pid?: unknown; argv?: unknown }
   } catch {
-    return "another writer (the lock body records no holder)"
+    return "another writer (the flock is held; the lock body names no holder)"
   }
   const pid = recorded.pid
   if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0) {
-    return "another writer (the lock body records no holder)"
+    return "another writer (the flock is held; the lock body names no holder)"
   }
-  if (!isAlive(pid)) return `another writer (the recorded holder pid ${pid} is no longer running)`
+  if (!isAlive(pid)) {
+    return `another writer (the flock is held; the lock body names pid ${pid}, which is not running, so that label is stale)`
+  }
   const argv = Array.isArray(recorded.argv) ? ` ${JSON.stringify(recorded.argv)}` : ""
-  return `pid ${pid}${argv}`
+  return (
+    `another writer (the flock is held; the lock body names pid ${pid}${argv}, which is running but may not be the ` +
+    "current holder: Tent, km and the checkout-sync timer hold this lock without writing a body)"
+  )
 }
 
 function isAlive(pid: number): boolean {

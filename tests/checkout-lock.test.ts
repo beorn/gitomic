@@ -91,7 +91,13 @@ describe("the checkout lock", () => {
 
     expect(result.code).toBe(5)
     expect(result.stdout).toBe("")
-    expect(result.stderr).toContain(`the checkout lock ${lockPath} is held by pid ${pid} [`)
+    expect(result.stderr).toContain(
+      `the checkout lock ${lockPath} is held by another writer (the flock is held; the lock body names pid ${pid} [`,
+    )
+    expect(result.stderr).toContain(
+      "], which is running but may not be the current holder: Tent, km and the checkout-sync timer hold this lock " +
+        "without writing a body)",
+    )
     expect(result.stderr).toContain("after 200 ms; nothing was written")
     expect(result.stderr).toContain(`kind=checkout-lock-busy path=${lockPath}`)
   })
@@ -108,7 +114,7 @@ describe("the checkout lock", () => {
     expect(result.stderr).toContain(join(git(checkout, "rev-parse", "--absolute-git-dir"), "km-state-write.lock"))
   })
 
-  test("a holder that does not record itself is never misnamed by an older body", async () => {
+  test("a busy lock whose body names a dead pid reads as a stale label, not an abandoned lock", async () => {
     const { checkout } = fixture()
     const lockPath = join(git(checkout, "rev-parse", "--absolute-git-dir"), "km-state-write.lock")
     const gone = spawnSync("true")
@@ -118,7 +124,11 @@ describe("the checkout lock", () => {
     const result = gitomic(["project", checkout, "--lock-timeout", "100"])
 
     expect(result.code).toBe(5)
-    expect(result.stderr).toContain(`the recorded holder pid ${gone.pid} is no longer running`)
+    // The flock alone decides who holds the lock; the body is a label another writer may have left
+    // behind. A dead pid in it must read as stale, never as the holder or as an abandoned lock.
+    expect(result.stderr).toContain("the flock is held")
+    expect(result.stderr).toContain(`the lock body names pid ${gone.pid}, which is not running, so that label is stale`)
+    expect(result.stderr).not.toContain("the recorded holder pid")
     expect(result.stderr).not.toContain("earlier")
   })
 
