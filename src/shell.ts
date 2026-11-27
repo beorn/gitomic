@@ -982,6 +982,7 @@ async function refDoesNotResolve(
   const failed = error instanceof Error ? error : new Error(detail)
   if (!/rev-parse failed \(128\)/.test(detail)) return failed
   let held: string[] = []
+  let listingFailed: string | undefined
   try {
     held = text(
       await git(
@@ -999,13 +1000,16 @@ async function refDoesNotResolve(
     )
       .split("\n")
       .filter((line) => line !== "")
-  } catch {
-    // The listing is the helpful half of this message; when it fails, the refusal below still says what to try.
+  } catch (listingError) {
+    // The listing is the helpful half of this message; when it fails, the refusal says so and still says what to try.
+    listingFailed = listingError instanceof Error ? listingError.message : String(listingError)
   }
   const store =
-    held.length === 0
-      ? "this store answered with no branch, tag or remote ref when asked"
-      : `this store holds ${held.join(", ")}${held.length >= REFUSAL_REF_LIMIT ? ", …" : ""}`
+    listingFailed !== undefined
+      ? `this store's refs could not be listed (${listingFailed})`
+      : held.length === 0
+        ? "this store answered with no branch, tag or remote ref when asked"
+        : `this store holds ${held.join(", ")}${held.length >= REFUSAL_REF_LIMIT ? ", …" : ""}`
   return new Error(
     `ref ${JSON.stringify(ref)} does not resolve in ${repo}; ${store}. gitomic addresses a repository and a ref as ` +
       `<repo>#<ref>, and that ref is a branch, tag or remote ref: a bare name is read as refs/heads/<name>, so ` +

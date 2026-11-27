@@ -411,8 +411,10 @@ function countFoldablePacks(repo: string, batchBytes: number): number | string {
     if (!entry.endsWith(".pack")) continue
     try {
       if (fs.statSync(join(directory, entry)).size * 2 < batchBytes) foldable++
-    } catch {
+    } catch (error) {
       // A pack that vanished between the listing and the stat is one this pass will not see; the next pass will.
+      // Any other stat failure is a store this count cannot read, so it propagates.
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
     }
   }
   return foldable
